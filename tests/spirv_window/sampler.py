@@ -148,7 +148,7 @@ def check_sampler_tables(source, folder, assembler, validator, cross):
     many = many.replace("OpImageSampleExplicitLod %vec4 %si %uv Lod %lod", "OpImageSampleImplicitLod %vec4 %si %uv")
     many = many.replace("OpDecorate %out DescriptorSet 0", "".join(
         f"OpDecorate %{n} DescriptorSet 0\nOpDecorate %{n} Binding {b}\n"
-        for n, b in (("second", 2), ("third", 3), ("fourth", 4))) + "OpDecorate %out DescriptorSet 0")
+        for n, b in (("second", 3), ("third", 5), ("fourth", 7))) + "OpDecorate %out DescriptorSet 0")
     many = many.replace("%out = OpVariable %buf StorageBuffer", "%out = OpVariable %buf StorageBuffer\n" + "".join(
         f"%{n} = OpVariable %_ptr_UC_rt_smp UniformConstant\n" for n in ("second", "third", "fourth")))
     many = many.replace("GLCompute", "Fragment").replace(" %out %tid", " %out").replace("LocalSize 1 1 1", "OriginUpperLeft")
@@ -158,23 +158,43 @@ def check_sampler_tables(source, folder, assembler, validator, cross):
     bridges = [line for line in lines if re.match(r"%bridge_cmp(_table_\d+)? = ", line)]
     assert bridges == ["%bridge_cmp = OpVariable %_ptr_UC_rt_smp UniformConstant",
                        "%bridge_cmp_table_1 = OpVariable %_ptr_UC_rt_smp UniformConstant"], bridges
-    for decoration in ("OpDecorate %bridge_cmp Binding 1", "OpDecorate %bridge_cmp_table_1 Binding 2"):
+    for decoration in ("OpDecorate %bridge_cmp Binding 1", "OpDecorate %bridge_cmp_table_1 Binding 3"):
         assert decoration in lines, decoration
-    assert not any("Binding 3" in line and "bridge" in line for line in lines)
-    assert not any("Binding 4" in line and "bridge" in line for line in lines)
+    assert not any("Binding 5" in line and "bridge" in line for line in lines)
+    assert not any("Binding 7" in line and "bridge" in line for line in lines)
     assert sum("%bridge_cmp_table_1 %i" in line for line in lines) == 1
     assert sum("%bridge_cmp %i" in line for line in lines) == 1
     assert "%cmp4 = OpImageSampleDrefExplicitLod %float %si4 %uv %half Lod %lod" in lines
     emit_checked(split_sampler_views(many), folder, assembler, validator, cross)
-    # Tables in different sets with one binding number would collide at set 3.
-    clash = many.replace("OpDecorate %second DescriptorSet 0", "OpDecorate %second DescriptorSet 1").replace(
-        "OpDecorate %second Binding 2", "OpDecorate %second Binding 1")
-    try:
-        split_sampler_views(clash)
-    except ValueError as error:
-        assert "share binding 1" in str(error), error
-    else:
-        raise AssertionError("two bridges accepted at one binding")
+    # Every view lands in set 3, so the register ranges of two split tables must not overlap, whatever their
+    # original sets: a size-2 table at binding 1 covers s1..s2, and a runtime-sized one has no end.
+    def second_at(binding, runtime=False):
+        text = many.replace("OpDecorate %second DescriptorSet 0", "OpDecorate %second DescriptorSet 1").replace(
+            "OpDecorate %second Binding 3", f"OpDecorate %second Binding {binding}")
+        if runtime:
+            text = text.replace("%second = OpVariable %_ptr_UC_rt_smp UniformConstant",
+                                "%second = OpVariable %_ptr_UC_rtarr UniformConstant").replace(
+                "%samplers = OpVariable", "%rtarr = OpTypeRuntimeArray %smp\n%_ptr_UC_rtarr = OpTypePointer UniformConstant %rtarr\n"
+                "%samplers = OpVariable").replace("OpCapability Shader", "OpCapability Shader\nOpCapability RuntimeDescriptorArray")
+        return text
+
+    for binding, runtime, clash in ((1, False, True), (2, False, True), (3, False, False), (0, False, True),
+                                    (4, True, False), (0, True, True)):
+        text = second_at(binding, runtime)
+        try:
+            split_sampler_views(text)
+        except ValueError as error:
+            assert clash and "overlap in the set 3 register range" in str(error), (binding, runtime, error)
+        else:
+            assert not clash, (binding, runtime)
+    # A comment may follow any declaration, and a semicolon in a name is not a comment.
+    named = source.replace('"main" %texture', '"main;x" %texture')
+    commented = named.replace("%smp = OpTypeSampler", "%smp = OpTypeSampler ; sampler type").replace(
+        "%samplers %out\n", "%samplers %out ; interface\n")
+    assert commented.count(";") == 3 + source.count(";"), "expected three semicolons added"
+    assert split_lines(commented) == split_lines(named), "a comment changed the result"
+    assert any(line.startswith("OpEntryPoint") and line.endswith("%out %bridge_cmp") for line in split_lines(commented))
+    emit_checked(split_sampler_views(commented), folder, assembler, validator, cross)
     # A sparse ordinary sample is still an ordinary use of the table (text-level: no residency capability here).
     sparse = source.replace("%raw = OpImageSampleImplicitLod %vec4 %si %uv", "%raw = OpImageSparseSampleImplicitLod %vec4 %si %uv")
     assert sparse != source and any(line.startswith("OpDecorate %bridge_cmp ") for line in split_lines(sparse))

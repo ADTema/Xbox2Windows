@@ -6549,7 +6549,7 @@ reach it; a table used for only one of the two is left alone. The first view
 is `%bridge_cmp` and later ones `%bridge_cmp_table_N`. These are refused with
 a message: a table without exactly one literal `DescriptorSet` and `Binding`
 decoration, a decorated or initialized table, set 3 already in use or a
-`bridge_cmp` ID, two tables whose views would share one set 3 binding, and a
+`bridge_cmp` ID, two tables whose views would overlap in the set 3 register range (a fixed table covers its binding plus its size, a runtime one has no end), and a
 depth-reference sample whose sampled image, load or chain does not lead to a
 sampler. A variable that is not an array of samplers is not a table.
 
@@ -6569,7 +6569,7 @@ original, so a view wired to the wrong table changes a precise word. The
 driver also checks, without a GPU, a runtime-sized table at set 2, binding 7
 (the emitted HLSL has the comparison view at `register(s7, space3)`), two
 split tables at their own bindings with an ordinary-only and a
-comparison-only table left alone, and each refusal above. The renamed GPU run
+comparison-only table left alone, `;` comments after any declaration, and each refusal above. The renamed GPU run
 has not been executed on a physical adapter by the author; the Windows CI jobs
 `spirv_sampler_views_{hardware,warp}` are the check.
 

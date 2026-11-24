@@ -12,6 +12,21 @@ BRIDGE = "%bridge_cmp"
 BRIDGE_SET = "3"
 
 
+def strip_comment(line):
+    """Drop a trailing `;` comment, leaving any `;` inside a quoted string alone."""
+    quoted = escaped = False
+    for position, char in enumerate(line):
+        if quoted and escaped:
+            escaped = False
+        elif quoted and char == "\\":
+            escaped = True
+        elif char == '"':
+            quoted = not quoted
+        elif char == ";" and not quoted:
+            return line[:position].rstrip()
+    return line
+
+
 def read_module(lines):
     """Collect result definitions, sample instructions and decorations from the assembly lines."""
     module = {"defs": {}, "comparisons": [], "ordinary": [], "decorated": set(), "indirect": False,
@@ -117,14 +132,25 @@ def table_slot(module, table):
     return sets[0][0], bindings[0][0]
 
 
+def register_end(defs, table, binding):
+    """The first register after a table's views; a runtime or unresolvable size has no end."""
+    shape = defs[defs[defs[table][1]][2]]
+    length = defs.get(shape[2], []) if shape[0] == "OpTypeArray" else []
+    if len(length) == 3 and length[0] == "OpConstant" and length[2].isdigit() and int(length[2]) > 0:
+        return int(binding) + int(length[2])
+    return None
+
+
 def bridge_names(module, split):
     """Name one bridge variable per split table; the first keeps the plain prefix."""
-    names, used = {}, {}
+    names, ranges = {}, []
     for number, table in enumerate(split):
         _, binding = table_slot(module, table)
-        if binding in used:
-            raise ValueError("sampler tables share binding " + binding + ": " + used[binding] + " and " + table)
-        used[binding] = table
+        end = register_end(module["defs"], table, binding)
+        for other, start, stop in ranges:
+            if (stop is None or int(binding) < stop) and (end is None or start < end):
+                raise ValueError(f"sampler tables {other} and {table} overlap in the set 3 register range")
+        ranges.append((table, int(binding), end))
         names[table] = BRIDGE if number == 0 else f"{BRIDGE}_table_{number}"
     return names
 
@@ -132,7 +158,7 @@ def bridge_names(module, split):
 def split_sampler_views(assembly):
     if "Dref" not in assembly:
         return assembly
-    lines = assembly.splitlines()
+    lines = [strip_comment(line) for line in assembly.splitlines()]
     module = read_module(lines)
     defs = module["defs"]
     tables, plains = sampler_variables(defs)
