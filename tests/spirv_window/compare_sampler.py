@@ -20,8 +20,14 @@ ORDINARY_BINDING = 5
 SHARED = Path(__file__).with_name("shared_sampler.spvasm").read_text(encoding="utf-8")
 # The same module with arrayed (Texture2DArray) images and a float3 coordinate (u, v, layer 0).
 SHARED_ARRAY = Path(__file__).with_name("shared_sampler_array.spvasm").read_text(encoding="utf-8")
+# The arrayed module reading layer 1 instead of layer 0 (the coordinate's third component becomes 1).
+SHARED_ARRAY_LAYER1 = SHARED_ARRAY.replace(
+    "%15 = OpConstantComposite %v3float %float_0_25 %float_0_25 %float_0",
+    "%float_1 = OpConstant %float 1\n         %15 = OpConstantComposite %v3float %float_0_25 %float_0_25 %float_1")
 # 0.25 <= 0.5 passes, 0.75 <= 0.5 fails, ordinary sample of 0.375; the other 13 words are guards.
 EXPECTED = [0x3f800000, 0x00000000, 0x3ec00000] + [0xc5c5c5c5] * 13
+# Layer 1 of the arrayed textures: 0.25 <= 0.875 and 0.75 <= 0.875 both pass, ordinary sample of 0.3125.
+EXPECTED_LAYER1 = [0x3f800000, 0x3f800000, 0x3ea00000] + [0xc5c5c5c5] * 13
 
 
 def substitute(text, old, new):
@@ -135,8 +141,12 @@ def emit(directory, assembler, validator, cross):
     lowered = controls(directory)
     outputs = {}
     array_lowered = split_comparison_sampler(SHARED_ARRAY, ORDINARY_BINDING)[0]
+    assert SHARED_ARRAY_LAYER1 != SHARED_ARRAY
+    layer1_lowered, layer1_mapping = split_comparison_sampler(SHARED_ARRAY_LAYER1, ORDINARY_BINDING)
+    assert layer1_mapping["ordinary_binding"] == ORDINARY_BINDING, layer1_mapping
     for name, assembly in (("shared", SHARED), ("lowered", lowered),
-                           ("shared_array", SHARED_ARRAY), ("lowered_array", array_lowered)):
+                           ("shared_array", SHARED_ARRAY), ("lowered_array", array_lowered),
+                           ("lowered_array_layer1", layer1_lowered)):
         text = directory / f"{name}.spvasm"
         text.write_text(assembly, encoding="utf-8")
         module = directory / f"{name}.spv"
@@ -169,40 +179,66 @@ def compile_dxil(directory, dxc, outputs):
     if shared.returncode == 0 or "no matching member function for call to 'SampleLevel'" not in shared.stderr:
         raise AssertionError(f"Expected the shared-sampler DXC diagnostic\n{shared.stdout}\n{shared.stderr}")
     print("shared-sampler HLSL: DXC rejected SampleLevel as expected", flush=True)
-    dxil = directory / "lowered.dxil"
-    subprocess.run([dxc, "-T", "cs_6_0", "-E", "main", "-Fo", dxil, outputs["lowered"]], check=True)
+    # The unsplit arrayed module is rejected the same way.
+    shared = subprocess.run([dxc, "-T", "cs_6_0", "-E", "main", "-Fo", directory / "shared_array.dxil",
+                             outputs["shared_array"]], capture_output=True, text=True)
+    if shared.returncode == 0 or "no matching member function for call to 'SampleLevel'" not in shared.stderr:
+        raise AssertionError(f"Expected the arrayed shared-sampler DXC diagnostic\n{shared.stdout}\n{shared.stderr}")
+    print("arrayed shared-sampler HLSL: DXC rejected SampleLevel as expected", flush=True)
+    dxil = {}
+    for name in ("lowered", "lowered_array", "lowered_array_layer1"):
+        dxil[name] = directory / f"{name}.dxil"
+        subprocess.run([dxc, "-T", "cs_6_0", "-E", "main", "-Fo", dxil[name], outputs[name]], check=True)
+    print("DXC compiled the lowered module and both arrayed lowered modules (layers 0 and 1)", flush=True)
     return dxil
 
 
-def with_words(**words):
-    reference = EXPECTED.copy()
+def with_words(base=None, **words):
+    reference = (base or EXPECTED).copy()
     for index, value in words.items():
         reference[int(index[1:])] = value
     return reference
 
 
-# (name, descriptor variant, reference, mismatching words reported on stderr)
+# (name, module, descriptor variant, reference, mismatching words reported on stderr)
 DRAWS = [
-    ("baseline", "baseline", EXPECTED, []),
+    ("baseline", "lowered", "baseline", EXPECTED, []),
     # Wrong reference: claim the failing comparison passed.
-    ("wrong reference", "baseline", with_words(w1=0x3f800000), ["word=1 expected=3f800000 actual=00000000"]),
+    ("wrong reference", "lowered", "baseline", with_words(w1=0x3f800000),
+     ["word=1 expected=3f800000 actual=00000000"]),
     # s2 switched to GREATER: only the two comparison words change, against the baseline reference.
-    ("comparison descriptor vs baseline", "comparison-greater", EXPECTED,
+    ("comparison descriptor vs baseline", "lowered", "comparison-greater", EXPECTED,
      ["word=0 expected=3f800000 actual=00000000", "word=1 expected=00000000 actual=3f800000"]),
-    ("comparison descriptor", "comparison-greater", with_words(w0=0x00000000, w1=0x3f800000), []),
+    ("comparison descriptor", "lowered", "comparison-greater", with_words(w0=0x00000000, w1=0x3f800000), []),
     # Ordinary sampler clamped to MinLOD 1: only the ordinary word changes, to t1's 1x1 mip (0.625).
-    ("ordinary descriptor vs baseline", "ordinary-min-lod1", EXPECTED,
+    ("ordinary descriptor vs baseline", "lowered", "ordinary-min-lod1", EXPECTED,
      ["word=2 expected=3ec00000 actual=3f200000"]),
-    ("ordinary descriptor", "ordinary-min-lod1", with_words(w2=0x3f200000), []),
+    ("ordinary descriptor", "lowered", "ordinary-min-lod1", with_words(w2=0x3f200000), []),
+    # Texture2DArray: two-layer t0 and t1 whose layer 1 differs from layer 0 in each sampled texel.
+    ("array layer 0", "lowered_array", "array", EXPECTED, []),
+    ("array layer 1", "lowered_array_layer1", "array", EXPECTED_LAYER1, []),
+    # Layer 1 against layer 0's reference: the second comparison and the ordinary sample change.
+    ("array layer 1 vs layer 0", "lowered_array_layer1", "array", EXPECTED,
+     ["word=1 expected=00000000 actual=3f800000", "word=2 expected=3ec00000 actual=3ea00000"]),
+    # On layer 1, s2 switched to GREATER changes only the comparison words (0.875 is not below 0.25 or 0.75).
+    ("array comparison descriptor vs layer 1", "lowered_array_layer1", "array-comparison-greater", EXPECTED_LAYER1,
+     ["word=0 expected=3f800000 actual=00000000", "word=1 expected=3f800000 actual=00000000"]),
+    ("array comparison descriptor", "lowered_array_layer1", "array-comparison-greater",
+     with_words(EXPECTED_LAYER1, w0=0x00000000, w1=0x00000000), []),
+    # On layer 1, the ordinary sampler at MinLOD 1 reads layer 1's 1x1 mip (0.5625), not layer 0's (0.625).
+    ("array ordinary descriptor vs layer 1", "lowered_array_layer1", "array-ordinary-min-lod1", EXPECTED_LAYER1,
+     ["word=2 expected=3ea00000 actual=3f100000"]),
+    ("array ordinary descriptor", "lowered_array_layer1", "array-ordinary-min-lod1",
+     with_words(EXPECTED_LAYER1, w2=0x3f100000), []),
 ]
 
 
 def draw(directory, dxil, renderer, adapter):
     reference = directory / "reference.bin"
-    for name, variant, expected, mismatches in DRAWS:
+    for name, module, variant, expected, mismatches in DRAWS:
         reference.write_bytes(struct.pack("<16I", *expected))
-        run = subprocess.run([renderer, adapter, "--spirv-compare-sampler", dxil, str(ORDINARY_BINDING), reference,
-                              variant], capture_output=True, text=True)
+        run = subprocess.run([renderer, adapter, "--spirv-compare-sampler", dxil[module], str(ORDINARY_BINDING),
+                              reference, variant], capture_output=True, text=True)
         print(f"[{name}]", run.stdout, run.stderr, flush=True)
         if run.returncode == 77 and name == "baseline":
             return 77
@@ -213,6 +249,8 @@ def draw(directory, dxil, renderer, adapter):
             raise RuntimeError(f"Unexpected {name} readback")
     print("wrong reference fails only at word 1; s2 changes only words 0-1; "
           f"s{ORDINARY_BINDING} changes only word 2", flush=True)
+    print("Texture2DArray: layer 0 and layer 1 each read their own texels (layer 1 vs layer 0 differs at words 1-2); "
+          f"on layer 1, s2 changes only words 0-1 and s{ORDINARY_BINDING} only word 2 (layer 1's mip 1)", flush=True)
     return 0
 
 
