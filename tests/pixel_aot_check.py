@@ -2908,10 +2908,9 @@ def check_cmp64_controls():
                     == translate_int(cmp64_program([f"v_cmp_lt_u64_e64 vcc_lo, v[18:19], {token}"]))), token
         else:
             error(f"v_cmp_lt_u64 vcc_lo, v[18:19], {token}", invalid + token)
-    # The exec-writing forms and the other compare families stay refused.
+    # The exec-writing forms and the other compare families stay refused (binary64: check_cmpf64_controls).
     for line in ("v_cmpx_lt_i64_e32 v[18:19], v[20:21]", "v_cmpx_lt_u64_e64 v[18:19], v[20:21]",
-                 "v_cmpx_lt_i64_e64 s52, v[18:19], v[20:21]", "v_cmp_lt_f64_e64 s52, v[18:19], v[20:21]",
-                 "v_cmp_class_f64_e32 vcc_lo, v[18:19], v20", "v_cmp_lt_i64_sdwa vcc_lo, v[18:19], v[20:21]",
+                 "v_cmpx_lt_i64_e64 s52, v[18:19], v[20:21]", "v_cmp_lt_i64_sdwa vcc_lo, v[18:19], v[20:21]",
                  "v_cmp_lt_i64_dpp vcc_lo, v[18:19], v[20:21] quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
                  "v_cmp_ngt_i64_e64 s52, v[18:19], v[20:21]", "v_cmp_lg_u64_e64 s52, v[18:19], v[20:21]"):
         error(line, "Unsupported instruction")
@@ -3032,6 +3031,278 @@ def check_cmp64_draw(directory, compiler, renderer, backend):
              for line in program]
     assert moved != program and program[overlap].endswith("v[19:20]")
     mismatches(translate_int(moved), "overlapping pair read as v[20:21]")
+
+
+# binary64 comparisons (v_cmp_*_f64, v_cmp_class_f64). cmp64_prefix copies the constant words, so v[18:19] holds A =
+# (s44 low, s45 high) and v[20:21] holds B = (s46, s47). Group g has four channels; channel c tests predicate
+# CMPF64_PREDICATES[4g + c] on operand shape CMPF64_SHAPES[(c + g) % 4], and every channel selects 1.0 (v22) or 0.
+CMPF64_PREDICATES = tuple(pixel_aot.COMPARE)
+CMPF64_SHAPES = ("pairs", "sgpr", "mods", "inline")
+# Class channels: (source, mask). An e32 mask is a VGPR (v23 = the mask, written just before); e64 takes literals.
+CMPF64_CLASS = {"e32": (("v[18:19]", 0x001), ("v[18:19]", 0x090), ("v[20:21]", 0x204), ("v[20:21]", 0x060)),
+                "e64": (("v[18:19]", 0x002), ("s[44:45]", 0x108), ("v[20:21]", 0x050), ("v[20:21]", 0x228))}
+
+
+def translate_f64(instructions):
+    """translate_int() with the binary64 denormal-preserving entry state the f64 comparisons require."""
+    return lower(instructions, 20, 24, [1, 2, 3, 4], constant_descriptor=64, integer_export=True,
+                 half_denorm="preserve")
+
+
+def cmpf64_sources(shape, encoding):
+    """src0 and src1 of one shape. e32 takes no modifiers and a VGPR-pair src1, so it swaps the pairs instead."""
+    return {"pairs": ("v[18:19]", "v[20:21]"),
+            "sgpr": ("s[44:45]", "v[20:21]") if encoding == "e32" else ("v[18:19]", "s[46:47]"),
+            "mods": ("v[20:21]", "v[18:19]") if encoding == "e32" else ("-v[18:19]", "|v[20:21]|"),
+            "inline": ("-2.0", "v[20:21]") if encoding == "e32" else ("v[18:19]", "0.5")}[shape]
+
+
+def cmpf64_group(encoding, group):
+    dst = "vcc_lo" if encoding == "e32" else "s52"
+    body = []
+    for channel in range(4):
+        op = CMPF64_PREDICATES[4 * group + channel]
+        src0, src1 = cmpf64_sources(CMPF64_SHAPES[(channel + group) % 4], encoding)
+        body += [f"v_cmp_{op}_f64_{encoding} {dst}, {src0}, {src1}",
+                 f"v_cndmask_b32_{encoding} v{12 + channel}, 0, v22, {dst}"]
+    return cmp64_program(body)
+
+
+def cmpf64_class_group(encoding):
+    body = []
+    for channel, (source, classes) in enumerate(CMPF64_CLASS[encoding]):
+        if encoding == "e32":
+            body += [f"v_mov_b32_e32 v23, {classes}", f"v_cmp_class_f64_e32 vcc_lo, {source}, v23",
+                     f"v_cndmask_b32_e32 v{12 + channel}, 0, v22, vcc_lo"]
+        else:
+            body += [f"v_cmp_class_f64_e64 s52, {source}, {classes:#x}",
+                     f"v_cndmask_b32_e64 v{12 + channel}, 0, v22, s52"]
+    return cmp64_program(body)
+
+
+# (s44, s45, s46, s47) = A (low, high), B (low, high). Rows where the unsigned integer order of the words, a zero
+# test that ignores the sign, a denormal flush or a high-word-only NaN test would each give a different answer.
+CMPF64_WORDS = (
+    (0x00000000, 0x3ff00000, 0x00000000, 0x40000000),  # 1.0 against 2.0
+    (0x00000000, 0x3ff80000, 0x00000000, 0x3ff80000),  # 1.5 against 1.5
+    (0x00000001, 0x3ff00000, 0x00000002, 0x3ff00000),  # equal high words, the low words decide: A < B
+    (0x00000000, 0xbff00000, 0x00000000, 0xc0000000),  # -1.0 against -2.0: the integer order is reversed
+    (0x00000001, 0xbff00000, 0x00000002, 0xbff00000),  # negative, the low words decide: A > B
+    (0x00000000, 0x3ff00000, 0x00000000, 0xbff00000),  # 1.0 against -1.0
+    (0x00000000, 0x00000000, 0x00000000, 0x80000000),  # +0 against -0: equal
+    (0x00000001, 0x00000000, 0x00000000, 0x00000000),  # the smallest denormal against +0
+    (0x00000005, 0x80000000, 0x00000000, 0x00000000),  # a negative denormal against +0
+    (0x00000005, 0x80000000, 0x00000007, 0x80000000),  # two negative denormals: A > B
+    (0x00000000, 0x7ff80000, 0x00000000, 0x3ff00000),  # quiet NaN against 1.0
+    (0x00000001, 0x7ff00000, 0x00000000, 0x7ff00000),  # signaling NaN (low word only) against +inf
+    (0x00000000, 0xfff00000, 0xffffffff, 0xffefffff),  # -inf against the most negative finite value
+    (0x00000000, 0x7ff00000, 0xffffffff, 0x7fefffff),  # +inf against the largest finite value
+    (0x00000000, 0xfff80000, 0x00000000, 0xfff80000),  # two identical negative quiet NaNs
+    (0x00000000, 0xc0000000, 0x00000000, 0x3fe00000),  # A = -2.0 and B = 0.5, the inline constants of the groups
+)
+
+
+def f64_value(words):
+    return struct.unpack("<d", struct.pack("<II", *words))[0]
+
+
+def cmpf64_truth(op, left, right):
+    """The v_cmp_{op}_f64 result for two (low, high) word pairs; Python floats keep denormals and signed zeros."""
+    a, b = f64_value(left), f64_value(right)
+    unordered = math.isnan(a) or math.isnan(b)
+    return {"f": False, "tru": True, "lt": a < b, "eq": a == b, "le": a <= b, "gt": a > b, "lg": a < b or a > b,
+            "ge": a >= b, "o": not unordered, "u": unordered, "nge": not a >= b, "nlg": not (a < b or a > b),
+            "ngt": not a > b, "nle": not a <= b, "neq": not a == b, "nlt": not a < b}[op]
+
+
+def cmpf64_class(words):
+    """The class64 bit of one (low, high) pair, from the encoding."""
+    low, high = words
+    magnitude = high & 0x7fffffff
+    negative = high >> 31
+    if magnitude > 0x7ff00000 or (magnitude == 0x7ff00000 and low):
+        return 0x2 if high & 0x00080000 else 0x1
+    if magnitude == 0x7ff00000:
+        return 0x4 if negative else 0x200
+    if magnitude >= 0x00100000:
+        return 0x8 if negative else 0x100
+    if magnitude or low:
+        return 0x10 if negative else 0x80
+    return 0x20 if negative else 0x40
+
+
+def cmpf64_operand(token, words):
+    """The (low, high) pair a source token of cmpf64_sources reads from the constant words."""
+    if token in pixel_aot.F64_INLINE_HIGH:
+        return 0, pixel_aot.F64_INLINE_HIGH[token]
+    s44, s45, s46, s47 = words
+    raw = token.lstrip("-").strip("|")
+    low, high = {"v[18:19]": (s44, s45), "s[44:45]": (s44, s45), "v[20:21]": (s46, s47), "s[46:47]": (s46, s47)}[raw]
+    if "|" in token:
+        high &= 0x7fffffff
+    if token.startswith("-"):
+        high ^= 0x80000000
+    return low, high
+
+
+def cmpf64_expected(encoding, group, words):
+    channels = []
+    for channel in range(4):
+        if group == "class":
+            source, classes = CMPF64_CLASS[encoding][channel]
+            truth = bool(cmpf64_class(cmpf64_operand(source, words)) & classes)
+        else:
+            src0, src1 = cmpf64_sources(CMPF64_SHAPES[(channel + group) % 4], encoding)
+            truth = cmpf64_truth(CMPF64_PREDICATES[4 * group + channel], cmpf64_operand(src0, words),
+                                 cmpf64_operand(src1, words))
+        channels.append(as_float(0x3f800000 if truth else 0))
+    return tuple(channels)
+
+
+CMPF64_GROUPS = tuple((encoding, group) for encoding in ("e32", "e64") for group in (0, 1, 2, 3, "class"))
+
+
+def cmpf64_program(encoding, group):
+    return cmpf64_class_group(encoding) if group == "class" else cmpf64_group(encoding, group)
+
+
+def check_cmpf64_controls():
+    """binary64 comparisons: forms, the lowering, the entry-state requirement and the refused neighbours."""
+    forms = set()
+    for encoding, group in CMPF64_GROUPS:
+        program = cmpf64_program(encoding, group)
+        translate_f64(program)
+        forms.update(line.split()[0] for line in program if line.startswith("v_cmp_"))
+    assert forms == {f"v_cmp_{op}_f64_{enc}" for op in (*CMPF64_PREDICATES, "class") for enc in ("e32", "e64")}, forms
+    # The forms need the declared binary64 denormal state, because MODE[7:6] could flush denormal inputs.
+    for encoding, group in (("e32", 0), ("e64", "class")):
+        expect_value_error(translate_int, cmpf64_program(encoding, group), "binary64 denormal mode unknown at entry")
+
+    def error(line, message):
+        expect_value_error(translate_f64, cmp64_program([line]), message)
+
+    # The lowering: four raw words, num64 for both sources and key64 keys; modifiers act on the high word.
+    line = "v_cmp_nlt_f64_e64 s52, -|v[18:19]|, -2.0"
+    program = cmp64_program([line])
+    n = program.index(line)
+    movs = [program.index(f"v_mov_b32_e32 v{18 + k}, s{44 + k}") for k in range(4)]
+    source = translate_f64(program)
+    for text in (f"uint cmp{n}_l0 = asuint(alu{movs[0]});",
+                 f"uint cmp{n}_h0 = ((asuint(alu{movs[1]}) & 0x7fffffffu) ^ 0x80000000u);",
+                 f"uint cmp{n}_l1 = 0u;", f"uint cmp{n}_h1 = 3221225472u;",
+                 f"bool cmp{n}_o = num64(cmp{n}_l0, cmp{n}_h0) && num64(cmp{n}_l1, cmp{n}_h1);",
+                 f"uint2 cmp{n}_a = key64(cmp{n}_l0, cmp{n}_h0);", f"uint2 cmp{n}_b = key64(cmp{n}_l1, cmp{n}_h1);",
+                 f"bool cmp{n} = !(cmp{n}_o && lt64(cmp{n}_a, cmp{n}_b));"):
+        assert "    " + text + "\n" in source, text
+    assert source.count("uint2 key64(uint lo, uint hi)") == 1
+    assert not any("double" in text for text in source.splitlines() if not text.lstrip().startswith("//"))
+    for token, high in (("0", 0), ("0.5", 0x3fe00000), ("-0.5", 0xbfe00000), ("1.0", 0x3ff00000),
+                        ("-4.0", 0xc0100000)):
+        line = f"v_cmp_lt_f64_e64 s52, {token}, v[20:21]"
+        program = cmp64_program([line])
+        assert f"    uint cmp{program.index(line)}_h0 = {high}u;\n" in translate_f64(program), token
+    # Destinations and the sources each encoding takes.
+    for dst in ("vcc_lo", "vcc", "s0", "s105", "s[52:53]"):
+        translate_f64(cmp64_program([f"v_cmp_lg_f64_e64 {dst}, s[44:45], s[46:47]"]))
+    translate_f64(cmp64_program(["v_cmp_lg_f64_e32 vcc, 0, v[20:21]", "v_cmp_class_f64_e64 s52, 0, s44"]))
+    error("v_cmp_lt_f64_e32 s52, v[18:19], v[20:21]", "VOPC e32 destination must be vcc")
+    error("v_cmp_lt_f64_e64 s[45:46], v[18:19], v[20:21]", "Invalid 64-bit scalar register pair: s[45:46]")
+    src1 = "64-bit comparison e32 src1 must be a VGPR pair"
+    for token in ("s[46:47]", "1.0", "0", "v20"):
+        error(f"v_cmp_lt_f64_e32 vcc_lo, v[18:19], {token}", src1)
+    invalid = "Invalid 64-bit comparison operand: "
+    for token in ("-v[18:19]", "|v[18:19]|", "-|v[18:19]|"):
+        error(f"v_cmp_lt_f64_e32 vcc_lo, {token}, v[20:21]", invalid + token)
+        error(f"v_cmp_class_f64_e64 s52, {token}, 3", invalid + token)
+    for token in ("1", "-1", "64", "-16", "0x3ff00000", "0.15915494309189532", "3.0", "abs(v[18:19])", "v18",
+                  "v[18:20]", "s[45:46] clamp", "v[18:19] clamp"):
+        error(f"v_cmp_lt_f64_e64 s52, v[20:21], {token}", invalid + token)
+    error("v_cmp_class_f64_e32 vcc_lo, v[18:19], 3", "VOPC e32 src1 must be a VGPR")
+    error("v_cmp_class_f64_e64 s52, v[18:19], 1.0", "Unsupported class mask")
+    error("v_cmp_lt_f64_e64 s52, v[60:61], v[20:21]", "Untracked 64-bit comparison source: v[60:61]")
+    for line in ("v_cmp_lt_f64 vcc_lo, v[18:19], v[20:21]", "v_cmpx_lt_f64_e32 v[18:19], v[20:21]",
+                 "v_cmp_lt_f64_sdwa vcc_lo, v[18:19], v[20:21]", "v_cmp_lt_f64_e64 s52, v[18:19], v[20:21] clamp"):
+        error(line, invalid + "v[20:21] clamp" if line.endswith("clamp") else "Unsupported instruction")
+    # A masked region and a pending scalar load.
+    base = cmp64_program(["v_cmp_lt_f64_e64 s52, v[18:19], v[20:21]"])
+    masked = base.index("s_wqm_b64 exec, exec") + 1
+    expect_value_error(translate_f64, base[:masked] + ["v_cmp_lt_f64_e32 vcc_lo, 0, v[20:21]"] + base[masked:],
+                       "Invalid comparison")
+    early = base.index("s_waitcnt lgkmcnt(0)", base.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc"))
+    expect_value_error(translate_f64, base[:early] + ["v_cmp_lt_f64_e64 s52, s[44:45], 0"] + base[early:],
+                       "Constant read before load completion")
+
+    # Python pre-check: the word rows separate each wrong model from the reference.
+    rows = [(words[:2], words[2:]) for words in CMPF64_WORDS]
+
+    def integer_order(a, b):
+        return (a[1] << 32 | a[0]) < (b[1] << 32 | b[0])
+
+    def flushed(words):
+        return (0, words[1] & 0x80000000) if words[1] & 0x7ff00000 == 0 else words
+
+    for name, mutant, op in (("unsigned integer order", lambda a, b: integer_order(a, b), "lt"),
+                             ("signed zeros unequal", lambda a, b: a == b, "eq"),
+                             ("denormals flushed", lambda a, b: cmpf64_truth("eq", flushed(a), flushed(b)), "eq"),
+                             ("NaN from the high word only",
+                              lambda a, b: cmpf64_truth("u", (0, a[1]), (0, b[1])), "u")):
+        assert any(mutant(a, b) != cmpf64_truth(op, a, b) for a, b in rows), name
+    assert cmpf64_truth("eq", (0, 0), (0, 0x80000000)) and cmpf64_truth("lt", (5, 0x80000000), (0, 0))
+    assert cmpf64_truth("u", (1, 0x7ff00000), (0, 0)) and not cmpf64_truth("o", (0, 0xfff80000), (0, 0xfff80000))
+    assert {cmpf64_class(pair) for words in CMPF64_WORDS for pair in (words[:2], words[2:])} == {
+        0x1, 0x2, 0x4, 0x8, 0x10, 0x20, 0x40, 0x80, 0x100, 0x200}
+
+
+def check_cmpf64_draw(directory, compiler, renderer, backend):
+    """binary64 comparisons against the Python reference, then helper mutations that must mismatch.
+
+    The words travel through the constant buffer and v_mov_b32 copies like the 64-bit integer draw. The shader uses
+    no HLSL double. It pins the translator's model on the desktop adapter; it is not evidence for gfx1013.
+    """
+    source = directory / "cmpf64.hlsl"
+    shader = directory / "cmpf64.cso"
+
+    def write_cases(encoding, group, tag):
+        paths = []
+        for index, words in enumerate(CMPF64_WORDS):
+            constants = bytearray(256)
+            struct.pack_into("<4I", constants, 12, *words)
+            path = directory / f"cmpf64-{tag}-{index}.case"
+            write_case(path, bytes(constants), cmpf64_expected(encoding, group, words), integer_rt=True)
+            paths.append(path)
+        return paths
+
+    def build(text):
+        source.write_text(text, encoding="ascii")
+        compile_shader(compiler, source, shader)
+
+    for encoding, group in CMPF64_GROUPS:
+        tag = f"{encoding}-{group}"
+        build(translate_f64(cmpf64_program(encoding, group)))
+        try:
+            run_pixel_batch(renderer, backend, shader, [(path, "pass") for path in write_cases(encoding, group, tag)])
+        except AssertionError as error:
+            error.add_note(f"binary64 comparison draw on {backend}, {encoding} group {group}")
+            raise
+
+    # Helper mutations: each must fail the reference for the group it is applied to.
+    mutations = (
+        (0, "uint2 integer order", "return hi >= 0x80000000u ? uint2(~lo, ~hi) : uint2(lo, hi | 0x80000000u);",
+         "return uint2(lo, hi);"),
+        (0, "signed zeros unequal", "if (((hi & 0x7fffffffu) | lo) == 0u) return uint2(0u, 0x80000000u);", ""),
+        (0, "denormals flushed", "if (((hi & 0x7fffffffu) | lo) == 0u)", "if ((hi & 0x7ff00000u) == 0u)"),
+        (2, "NaN from the high word only",
+         "return magnitude < 0x7ff00000u || (magnitude == 0x7ff00000u && lo == 0u);",
+         "return magnitude <= 0x7ff00000u;"),
+        ("class", "quiet bit misplaced", "(hi & 0x00080000u) != 0u ? 0x2u : 0x1u", "(hi & 0x00040000u) != 0u ? 0x2u : 0x1u"),
+    )
+    for group, label, old, new in mutations:
+        lowered = translate_f64(cmpf64_program("e32", group))
+        assert lowered.count(old) == 1, label
+        build(lowered.replace(old, new))
+        statuses, _ = run_pixel_batch_statuses(renderer, backend, shader, write_cases("e32", group, "mutant"))
+        if "mismatch" not in statuses:
+            raise AssertionError(f"Mutating {label} escaped detection")
 
 
 # The SDWA comparisons with whole-dword selections repeat the 16-predicate draws, including NaN on either side.
@@ -13865,6 +14136,7 @@ def check_controls(directory):
     must_reject(translate, base16[:pos] + ["v_cmp_eq_i16_e32 vcc_lo, 0, 0"] + base16[pos:])
 
     check_cmp64_controls()
+    check_cmpf64_controls()
 
     f16_hlsl = translate_int(uncompressed_export(f16_compares()))
     assert "uint class16(uint bits)" in f16_hlsl and "float widen16(uint word)" in f16_hlsl
@@ -14367,6 +14639,7 @@ def check_binary(directory, assembler, objcopy, library):
                     for kind in ("i16", "u16") for encoding in ("e32", "e64") for group in (0, 1))
     fixtures.extend((cmp64_group(kind, encoding, group), translate_int)
                     for kind in ("i64", "u64") for encoding in ("e32", "e64") for group in (0, 1))
+    fixtures.extend((cmpf64_program(encoding, group), translate_f64) for encoding, group in CMPF64_GROUPS)
 
     fixtures.extend((int_minmax_pair(encoding), translate) for encoding in ("e32", "e64"))
     fixtures.extend((int_minmax_triple(kind), translate) for kind in ("i32", "u32"))
@@ -19437,7 +19710,7 @@ def main():
                     "draw-uncompressed-integer-export",
                     "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-cmpx-regions",
                     "draw-region-body", "draw-region-waits", "draw-region-scalar-alu", "draw-region-scalar-load", "draw-div-fmas",
-                    "draw-cmp64", "draw-shift64",
+                    "draw-cmp64", "draw-cmp-f64", "draw-shift64",
                     "draw-f16-arith", "draw-f16-round", "draw-f16-fmac-ldexp", "draw-f16-cvt-int16", "draw-f16-to-int16", "draw-flat-scratch", "draw-smem-pointers",
                     "draw-dpp-cvt", "draw-dpp-movrel", "draw-dpp-f16", "draw-dpp-extra", "draw-pk-fmac"):
             try:
@@ -19481,6 +19754,7 @@ def main():
                         "draw-region-scalar-load": check_region_scalar_load_draw,
                         "draw-div-fmas": check_valu_div_fmas_draw,
                         "draw-cmp64": check_cmp64_draw,
+                        "draw-cmp-f64": check_cmpf64_draw,
                         "draw-shift64": check_shift64_draw,
                         "draw-pk-fmac": check_pk_fmac_draw,
                         "draw-flat-scratch": check_flat_scratch_draws,
