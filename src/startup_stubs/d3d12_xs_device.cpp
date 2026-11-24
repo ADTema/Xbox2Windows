@@ -2041,6 +2041,8 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
     return S_OK;
 }
 
+#include "d3d12_memory_srv.inl"
+
 // The title exports __XMemAllocationHooks__ = {alloc(size, attributes), free(ptr, attributes), ...}.
 // Its alloc routine selects a hook chain by allocatorId (attribute bits 16-23). Around the creation
 // of its two display render targets the title pushes a bump allocator for allocatorId 0x80 that
@@ -2604,6 +2606,7 @@ void build_tables()
     (void)&device_adapter_luid;
     // Xbox order from here.
     tables[device_kind][48] = reinterpret_cast<void*>(&device_create_command_queue_x);
+    tables[device_kind][70] = reinterpret_cast<void*>(&device_memory_srv);
     tables[device_kind][73] = reinterpret_cast<void*>(&device_create_command_list_x);
     tables[device_kind][78] = reinterpret_cast<void*>(&device_frame_interval);
     tables[device_kind][79] = reinterpret_cast<void*>(&device_frame_event);

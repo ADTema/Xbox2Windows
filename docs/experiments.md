@@ -8255,3 +8255,22 @@ checked against LLVM 19.1.7 only, and that check skips itself when the LLVM in u
 Scope: decoding and scanner recognition only. None of these forms is lowered by a translator, and no
 measurement on hardware or in a Windows run backs the descriptions. `v_interp_p1_f32_e64` and `v_interp_p2_f32_e64`
 (0x200 and 0x201 on gfx1013) are not decoded by this change.
+
+
+### Publish a placed R8 texture SRV by its title address
+
+In the permissive Windows device wrapper, slot 70 takes a resource description, a
+texture SRV with an address at offset 0x28, and a destination view-heap CPU handle.
+The tested case uses a single-layer, single-mip R8_UNORM texture previously placed
+with slot 133. The address must uniquely identify a live texture with the same resource
+description. An invalid address or mismatched description leaves the old descriptor in place.
+
+`startup_address_srv_hardware` and `startup_address_srv_warp` compare 32 RGBA pixels
+each. Two 2×2 source-built textures have different values in both rows. The test switches
+between their addresses, compares an ordinary resource-object SRV, and tries zero,
+interior, and mismatched addresses after a successful publication.
+
+```powershell
+cmake --build --preset release --target startup_stream_consumer d3d12_xs_shim
+ctest --preset release --no-tests=error -R '^startup_address_srv_' -V
+```
