@@ -96,7 +96,7 @@ struct QueueWork {
     std::deque<Entry> failing;   // snapshot of waiting entries a Submit could not move, completed in order
     struct Unrecorded* deferred_head = nullptr;  // snapshot of unrecorded entries, in order; guarded by mutex
     struct Unrecorded* deferred_tail = nullptr;
-    std::mutex completion;       // one thread at a time completes snapshot entries, so they stay in order
+    bool completing = false;     // a thread owns completion of snapshot entries, so they stay in order; guarded by mutex
     std::condition_variable drained;  // signaled when the worker finishes an entry
     u64 submitted_total = 0;          // entries ever moved to `submitted`, guarded by mutex
     u64 finished_total = 0;           // entries the worker has finished running, guarded by mutex
@@ -927,7 +927,14 @@ void submit(Object* self)
 // every entry and by Submit, so nothing waits on a calling thread. Nothing allocates.
 void complete_deferred(Object* self, QueueWork* work)
 {
-    const std::lock_guard serial(work->completion);
+    // One owner completes at a time, but no lock is held while it does: a fence is a caller-supplied
+    // operation. A thread that finds an owner returns at once; the owner takes what it queued before
+    // it gives up ownership, so nothing is left behind and no Submit waits behind a fence.
+    {
+        const std::lock_guard guard(work->mutex);
+        if (work->completing) return;
+        work->completing = true;
+    }
     for (;;) {
         Entry entry{};
         Unrecorded* node = nullptr;
@@ -947,6 +954,7 @@ void complete_deferred(Object* self, QueueWork* work)
                 work->deferred_head = node->next;
                 if (!work->deferred_head) work->deferred_tail = nullptr;
             } else {
+                work->completing = false;
                 return;
             }
         }

@@ -47,11 +47,39 @@ struct MockFence {
     void** vtable;
     bool signaled = false;
     u64 value = 0;
+    HANDLE entered = nullptr;  // when set, signal() reports it was entered and then waits for `release`
+    HANDLE release = nullptr;
     static long __stdcall signal(void* self, u64 val)
     {
         auto* f = static_cast<MockFence*>(self);
+        if (f->entered) {
+            SetEvent(f->entered);
+            WaitForSingleObject(f->release, completion_timeout_ms);
+        }
         f->signaled = true;
         f->value = val;
+        return 0;
+    }
+};
+
+// Calls one queue function on its own thread, started before commit is exhausted (a thread cannot be created
+// afterwards). Waits for `go`, runs, then sets `done`.
+struct QueueCall {
+    Object* queue = nullptr;
+    Object* status = nullptr;
+    int enqueue_status_index = -1;  // when >= 0, the call first enqueues a status entry for that index
+    HANDLE go = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    static DWORD WINAPI run(void* parameter)
+    {
+        auto* self = static_cast<QueueCall*>(parameter);
+        WaitForSingleObject(self->go, completion_timeout_ms);
+        if (self->enqueue_status_index >= 0) {
+            reinterpret_cast<EnqueueStatusFn>(self->queue->vtable[4])(
+                self->queue, self->status, static_cast<unsigned>(self->enqueue_status_index));
+        }
+        reinterpret_cast<SubmitFn>(self->queue->vtable[6])(self->queue);
+        SetEvent(self->done);
         return 0;
     }
 };
@@ -201,13 +229,26 @@ int main(int argc, char** argv)
     Queue recovery_queue;
     void* status2_ptr = nullptr;
     void* queue2_ptr = nullptr;
-    if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 2, "Status2", nullptr, &status2_ptr) != 0 ||
+    if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 3, "Status2", nullptr, &status2_ptr) != 0 ||
         reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, description, nullptr, &queue2_ptr) != 0) {
         std::fprintf(stderr, "cannot create the recovery queue\n");
         return 1;
     }
     recovery_queue.status = static_cast<Object*>(status2_ptr);
     recovery_queue.queue = static_cast<Object*>(queue2_ptr);
+
+    // Two submitters that run while the fence is held: the first completes the failing entries and is inside the
+    // fence, the second must return without waiting for it.
+    QueueCall first_submit, second_submit;
+    first_submit.queue = second_submit.queue = recovery_queue.queue;
+    second_submit.status = recovery_queue.status;
+    second_submit.enqueue_status_index = 2;
+    HANDLE first_thread = CreateThread(nullptr, 0, QueueCall::run, &first_submit, 0, nullptr);
+    HANDLE second_thread = CreateThread(nullptr, 0, QueueCall::run, &second_submit, 0, nullptr);
+    if (!first_thread || !second_thread || !first_submit.go || !second_submit.go) {
+        std::fprintf(stderr, "cannot start the submit threads\n");
+        return 1;
+    }
 
     std::vector<unsigned char> during_exhaustion(plain.size(), 0xAA);
     std::vector<unsigned char> after_recovery(plain.size(), 0xAA);
@@ -232,6 +273,8 @@ int main(int argc, char** argv)
     void* fence_vtable[11] = {};
     fence_vtable[10] = reinterpret_cast<void*>(&MockFence::signal);
     MockFence fence{fence_vtable};
+    fence.entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    fence.release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
     unsigned char req[0x48] = {};
     *reinterpret_cast<u64*>(req + 0x00) = 1 | 0x400000;
@@ -244,15 +287,45 @@ int main(int argc, char** argv)
     reinterpret_cast<EnqueueRequestFn>(recovery_queue.queue->vtable[3])(recovery_queue.queue, req);
     reinterpret_cast<EnqueueStatusFn>(recovery_queue.queue->vtable[4])(recovery_queue.queue, recovery_queue.status, 0);
     reinterpret_cast<EnqueueSignalFn>(recovery_queue.queue->vtable[5])(recovery_queue.queue, &fence, 0x1234ull);
-    reinterpret_cast<SubmitFn>(recovery_queue.queue->vtable[6])(recovery_queue.queue);
+
+    // Submit on one thread; its failing entries complete on that thread and block in the fence. A second Submit
+    // with a new deferred entry must return while the fence is held (no queue lock across a fence), and its entry
+    // must complete after the fence returns.
+    SetEvent(first_submit.go);
+    const bool fence_entered = WaitForSingleObject(fence.entered, completion_timeout_ms) == WAIT_OBJECT_0;
+    bool second_returned = false;
+    if (fence_entered) {
+        SetEvent(second_submit.go);
+        second_returned = WaitForSingleObject(second_submit.done, 3000) == WAIT_OBJECT_0;
+    }
+    SetEvent(fence.release);
+    const bool first_returned = WaitForSingleObject(first_submit.done, completion_timeout_ms) == WAIT_OBJECT_0;
+    WaitForSingleObject(second_submit.done, completion_timeout_ms);
 
     const bool completed_immediately =
         reinterpret_cast<IsCompleteFn>(recovery_queue.status->vtable[3])(recovery_queue.status, 0);
     const long exhausted_hr =
         reinterpret_cast<GetHResultFn>(recovery_queue.status->vtable[4])(recovery_queue.status, 0);
+    const DWORD second_start = GetTickCount();
+    while (!reinterpret_cast<IsCompleteFn>(recovery_queue.status->vtable[3])(recovery_queue.status, 2) &&
+           GetTickCount() - second_start < completion_timeout_ms) {
+        Sleep(5);
+    }
+    const bool second_completed =
+        reinterpret_cast<IsCompleteFn>(recovery_queue.status->vtable[3])(recovery_queue.status, 2);
+    const long second_hr = reinterpret_cast<GetHResultFn>(recovery_queue.status->vtable[4])(recovery_queue.status, 2);
 
     for (void* p : held) VirtualFree(p, 0, MEM_RELEASE);
     held.clear();
+
+    if (!fence_entered || !second_returned || !first_returned || !second_completed || second_hr >= 0) {
+        std::fprintf(stderr,
+                     "fence held across the queue lock (entered=%d second_returned=%d first_returned=%d "
+                     "second_complete=%d second_hr=0x%08lx)\n",
+                     fence_entered ? 1 : 0, second_returned ? 1 : 0, first_returned ? 1 : 0, second_completed ? 1 : 0,
+                     static_cast<unsigned long>(second_hr));
+        return 1;
+    }
 
     if (!completed_immediately || exhausted_hr >= 0 || !fence.signaled || fence.value != 0x1234ull) {
         std::fprintf(stderr,
