@@ -5998,6 +5998,30 @@ translations that read the whole dword or zero-extend the byte must fail the dra
 and match their own plain-integer image. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_vopc_sdwa' -V`.
 `tests/startup_gfx2hlsl_vopc_sdwa_check.py binary <llvm-mc>` and `decode <libLLVM>` round-trip every accepted
 form through LLVM 15.
+
+**f32 lg and nlg compares with a NaN source (#1920).** `V_CMP_LG_F32` is less or greater: ordered and not equal,
+false when either source is NaN, and `V_CMP_NLG_F32` is its negation. `compare()` lowered them as `a != b` and
+`!(a != b)`, and HLSL `!=` is unordered, so both gave the opposite result on every NaN pair. They now read
+`(ORDERED && (a < b || a > b))` and its negation, where ORDERED tests both source words for NaN on their bits
+(`(w & 0x7fffffff) <= 0x7f800000`, before the neg/abs modifiers). The bit test is needed on hardware: DXC without
+`-Gis` marks the float compares `fast`, and on an RX 9070 XT (driver 32.0.31044.16) the DXC build of the plain
+less-or-greater in the `cmp` fixture below returned 1 for both lg and nlg on all 156 NaN pairs (its `v_cmpx`
+fixtures matched); FXC on both backends and DXC on WARP gave the ordered result.
+`startup_gfx2hlsl_f32_lg` decodes every f32 condition of the table (v_cmp and v_cmpx, e32 and e64 under every
+neg/abs combination, 510 forms), translates it and evaluates the HLSL over all 256 pairs of +-0, +-min denormal,
++-1.0, +-max finite, +-inf, +-quiet, signalling and payload NaN against a reference built from the ISA
+definitions on the bit patterns; the old `!=` text fails all 68 lg/nlg forms, and the f32 SDWA forms stay refused.
+The draws `startup_gfx2hlsl_f32_lg_{warp,hardware}` build one of those words from the pixel's x and one from its
+y, so 16 x 16 pixels cover every pair, and write `v_cmp_lg_f32_e32`, `v_cmp_nlg_f32_e64`, `v_cmp_lg_f32_e64` and
+`v_cmp_nlg_f32_e32` results or keep a pixel through `v_cmpx_lg/nlg_f32_e32/e64`, compiled with FXC `ps_5_1` and
+DXC `ps_6_0`. Every pixel matched on WARP and on the RX 9070 XT with both compilers: lg is 1 on unequal pairs and
+0 on equal and NaN pairs, nlg the opposite. Both backends flushed denormal compare sources to signed zero, which
+D3D allows; the draw accepts the image with denormals kept or flushed, the same choice for every fixture, and
+reports which. The old `!=` text fails each draw against both images (156 pixels differ against the flushed one)
+and matches its own image. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_f32_lg' -V`;
+`tests/startup_gfx2hlsl_f32_lg_check.py binary <llvm-mc>` and `decode <libLLVM>` round-trip the forms and the
+fixtures through LLVM 15.
+
 **Four half channels in a typed buffer load.** `BUF_FMT_16_16_16_16_FLOAT` stores x and y in the first
 dword and z and w in the second, and the typed-load format table had only the two-channel half-float
 form, so a load of this format was refused with `buffer format BUF_FMT_16_16_16_16_FLOAT` - 5 of the 29
