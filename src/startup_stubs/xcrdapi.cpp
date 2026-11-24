@@ -63,12 +63,6 @@ struct Entry {
     void* fence;
     u64 value;
 };
-struct QueueWork {
-    std::mutex mutex;
-    std::condition_variable wake;
-    std::deque<Entry> waiting, submitted;
-};
-
 struct CachedStream {
     u64 source = 0;
     u64 base_offset = 0;
@@ -76,43 +70,38 @@ struct CachedStream {
     std::vector<unsigned char> data;
 };
 
-struct StreamCache {
+struct QueueWork {
     std::mutex mutex;
-    static constexpr std::size_t max_entries = 16;
-    std::deque<CachedStream> entries;
+    std::condition_variable wake;
+    std::deque<Entry> waiting, submitted;
+    static constexpr std::size_t max_cached_streams = 16;
+    std::deque<CachedStream> cached_streams;
 
-    void put(u64 source, u64 base_offset, unsigned compressed_size, std::vector<unsigned char> data) {
-        const std::lock_guard guard(mutex);
-        for (auto it = entries.begin(); it != entries.end(); ++it) {
+    void put_stream(u64 source, u64 base_offset, unsigned compressed_size, std::vector<unsigned char> data)
+    {
+        for (auto it = cached_streams.begin(); it != cached_streams.end(); ++it) {
             if (it->source == source && it->base_offset == base_offset && it->compressed_size == compressed_size) {
-                entries.erase(it);
+                cached_streams.erase(it);
                 break;
             }
         }
-        if (entries.size() >= max_entries) {
-            entries.pop_front();
+        if (cached_streams.size() >= max_cached_streams) {
+            cached_streams.pop_front();
         }
-        entries.push_back({source, base_offset, compressed_size, std::move(data)});
-    }
-
-    bool get_slice(u64 source, u64 offset, unsigned compressed_size, unsigned need_bytes,
-                   std::vector<unsigned char>& out_slice) {
-        const std::lock_guard guard(mutex);
-        for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
-            if (it->source == source && it->compressed_size == compressed_size) {
-                if (offset >= it->base_offset) {
-                    const u64 delta = offset - it->base_offset;
-                    if (delta <= it->data.size() && need_bytes <= it->data.size() - delta) {
-                        out_slice.assign(it->data.begin() + delta, it->data.begin() + delta + need_bytes);
-                        return true;
-                    }
-                }
-            }
-        }
-        return false;
+        cached_streams.push_back({source, base_offset, compressed_size, std::move(data)});
     }
 };
-static StreamCache stream_cache;
+
+static bool has_zlib_header(const unsigned char* bytes, std::size_t size)
+{
+    if (!bytes || size < 2) return false;
+    const unsigned char cmf = bytes[0];
+    const unsigned char flg = bytes[1];
+    if ((cmf & 0x0F) != 8) return false;
+    if ((cmf >> 4) > 7) return false;
+    if ((static_cast<unsigned>(cmf) * 256 + flg) % 31 != 0) return false;
+    return true;
+}
 
 bool has_following_chunk(Object* self, u64 source, u64 offset, unsigned source_size, unsigned destination_size) {
     if (!self || !self->work) return false;
@@ -122,6 +111,7 @@ bool has_following_chunk(Object* self, u64 source, u64 offset, unsigned source_s
         if (e.type != Entry::request) return false;
         const u64 e_options = *reinterpret_cast<const u64*>(e.bytes);
         if (!(e_options & 1)) return false;
+        if (e_options & 0x400000) return false;
         const u64 e_source = *reinterpret_cast<const u64*>(e.bytes + 0x20);
         const u64 e_offset = *reinterpret_cast<const u64*>(e.bytes + 0x28);
         const unsigned e_source_size = *reinterpret_cast<const unsigned*>(e.bytes + 0x30);
@@ -352,12 +342,8 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     if (input) {
         data = input;
         if (zlib) {
-            // First check if this request is a piece of an already-inflated chunked stream (Refs #1136)
-            if (stream_cache.get_slice(source, offset, source_size, destination_size, output)) {
-                decode_length = destination_size;
-                data = output.data();
-                outcome = "inflated (slice from stream cache)";
-            } else {
+            bool direct_decoded = false;
+            if (has_zlib_header(input, source_size)) {
                 // With BCPack after it, the inflated size is not given; the destination size bounds it.
                 // DirectStorage provides UncompressedSize at request + 0x38. When destination is smaller
                 // than the stream (e.g. 64 KiB tile/page target), allocate for the full uncompressed stream
@@ -381,20 +367,17 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                         ok = true;
                     }
                 }
-                if (!ok) {
-                    outcome = "zlib failed";
-                    data = nullptr;
-                    static LONG diagnosed;
-                    if (InterlockedIncrement(&diagnosed) <= 12) {
-                        log("x2w-dstorage zlib failure: header %02x %02x %02x %02x (dest 0x%x, source 0x%x)",
-                            input[0], input[1], input[2], input[3], destination_size, source_size);
-                    }
-                } else {
+                if (ok) {
                     output.resize(produced);
                     // If the stream expanded beyond this request's destination and following chunks exist,
-                    // cache the uncompressed stream and serve slice 0 (Refs #1136).
-                    if (produced > destination_size && has_following_chunk(self, source, offset, source_size, destination_size)) {
-                        stream_cache.put(source, offset, source_size, output);
+                    // cache the uncompressed stream in the queue's work and serve slice 0 (Refs #1136).
+                    if (!memory_source && produced > destination_size &&
+                        has_following_chunk(self, source, offset, source_size, destination_size)) {
+                        if (self && self->work) {
+                            QueueWork& work = *self->work;
+                            const std::lock_guard guard(work.mutex);
+                            work.put_stream(source, offset, source_size, output);
+                        }
                         decode_length = destination_size;
                         data = output.data();
                         outcome = "inflated (chunked stream piece 0)";
@@ -403,6 +386,44 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                         data = output.data();
                         outcome = produced == destination_size || bcpack ? "inflated" : "inflated (larger/short)";
                     }
+                    direct_decoded = true;
+                }
+            }
+
+            // If not directly decoded from a standalone stream, check if this request is a continuation
+            // slice of an already-inflated chunked stream on this queue (Refs #1136, #1214).
+            // Memory requests stay strictly on direct decode.
+            if (!direct_decoded && !memory_source && self && self->work) {
+                auto* file_object = reinterpret_cast<Object*>(source);
+                if (file_object && file_object->kind == file && file_object->handle != INVALID_HANDLE_VALUE) {
+                    QueueWork& work = *self->work;
+                    const std::lock_guard guard(work.mutex);
+                    for (auto it = work.cached_streams.rbegin(); it != work.cached_streams.rend(); ++it) {
+                        if (it->source == source && it->compressed_size == source_size && offset > it->base_offset) {
+                            const u64 delta = offset - it->base_offset;
+                            if (destination_size > 0 && (delta % destination_size) == 0 &&
+                                delta <= it->data.size() && destination_size <= it->data.size() - delta) {
+                                output.assign(it->data.begin() + delta, it->data.begin() + delta + destination_size);
+                                decode_length = destination_size;
+                                data = output.data();
+                                outcome = "inflated (slice from stream cache)";
+                                direct_decoded = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!direct_decoded) {
+                outcome = "zlib failed";
+                data = nullptr;
+                static LONG diagnosed;
+                if (InterlockedIncrement(&diagnosed) <= 12) {
+                    unsigned h[4] = {};
+                    for (unsigned i = 0; i < 4 && i < source_size; ++i) h[i] = input[i];
+                    log("x2w-dstorage zlib failure: header %02x %02x %02x %02x (dest 0x%x, source 0x%x)",
+                        h[0], h[1], h[2], h[3], destination_size, source_size);
                 }
             }
         }

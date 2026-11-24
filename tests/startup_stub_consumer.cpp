@@ -83,6 +83,8 @@ using EnqueueStatusFn = void(__stdcall*)(void*, void*, unsigned);
 using SubmitFn = void(__stdcall*)(void*);
 using IsCompleteFn = bool(__stdcall*)(void*, unsigned);
 using GetHResultFn = long(__stdcall*)(void*, unsigned);
+using OpenFileFn = long(__stdcall*)(void*, const wchar_t*, const void*, void**);
+using CloseFileFn = void(__stdcall*)(void*);
 
 bool dstorage_checks() {
     _putenv("X2W_XMEM_PERMISSIVE=1");
@@ -198,7 +200,7 @@ bool dstorage_checks() {
         }
     }
 
-    // Test chunked streaming reads across 4 requests (Refs #1136)
+    // Test chunked streaming reads across 4 requests on a file source (Refs #1136)
     {
         const size_t total_chunks = 4;
         const size_t chunk_dest_size = 64 * 1024;
@@ -207,26 +209,54 @@ bool dstorage_checks() {
         for (size_t i = 0; i < total_plain_size; ++i) full_plain[i] = static_cast<unsigned char>((i % 239) ^ 0xa5);
         const auto full_comp = make_stored_zlib(full_plain.data(), total_plain_size);
 
-        void* status_ptr = nullptr;
-        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, static_cast<unsigned>(total_chunks), "ChunkedStatus", nullptr, &status_ptr) != 0 || !status_ptr)
+        wchar_t temp_dir[MAX_PATH];
+        if (!GetTempPathW(MAX_PATH, temp_dir)) return false;
+        wchar_t temp_file[MAX_PATH];
+        if (!GetTempFileNameW(temp_dir, L"x2w", 0, temp_file)) return false;
+
+        // Padded to 600 KiB so offset 500 KiB can read zeroes from file and test zlib continuation bounds
+        std::vector<unsigned char> file_bytes(600 * 1024, 0);
+        std::memcpy(file_bytes.data(), full_comp.data(), full_comp.size());
+
+        HANDLE h = CreateFileW(temp_file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        DWORD written = 0;
+        WriteFile(h, file_bytes.data(), static_cast<DWORD>(file_bytes.size()), &written, nullptr);
+        CloseHandle(h);
+
+        void* file_ptr = nullptr;
+        if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, temp_file, nullptr, &file_ptr) != 0 || !file_ptr) {
+            DeleteFileW(temp_file);
             return false;
+        }
+        auto* file_obj = static_cast<Object*>(file_ptr);
+
+        void* status_ptr = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, static_cast<unsigned>(total_chunks), "ChunkedStatus", nullptr, &status_ptr) != 0 || !status_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
         auto* status = static_cast<Object*>(status_ptr);
 
         void* queue_ptr = nullptr;
         unsigned char desc[0x20] = {};
         *reinterpret_cast<uint16_t*>(desc + 8) = 16;
-        if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &queue_ptr) != 0 || !queue_ptr)
+        if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &queue_ptr) != 0 || !queue_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
             return false;
+        }
         auto* queue = static_cast<Object*>(queue_ptr);
 
         std::vector<std::vector<unsigned char>> chunks(total_chunks, std::vector<unsigned char>(chunk_dest_size, 0));
         for (size_t k = 0; k < total_chunks; ++k) {
             unsigned char req[0x48] = {};
-            *reinterpret_cast<u64*>(req + 0x00) = 1 | 0x400000; // zlib | memory_source
+            *reinterpret_cast<u64*>(req + 0x00) = 1; // zlib file request
             *reinterpret_cast<void**>(req + 0x08) = chunks[k].data();
             *reinterpret_cast<u64*>(req + 0x10) = 0;
             *reinterpret_cast<unsigned*>(req + 0x18) = static_cast<unsigned>(chunk_dest_size);
-            *reinterpret_cast<const unsigned char**>(req + 0x20) = full_comp.data();
+            *reinterpret_cast<void**>(req + 0x20) = file_obj;
             *reinterpret_cast<u64*>(req + 0x28) = k * chunk_dest_size; // offset stepped by destination size
             *reinterpret_cast<unsigned*>(req + 0x30) = static_cast<unsigned>(full_comp.size());
             *reinterpret_cast<unsigned*>(req + 0x38) = static_cast<unsigned>(total_plain_size);
@@ -240,69 +270,169 @@ bool dstorage_checks() {
             if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, static_cast<unsigned>(total_chunks - 1))) break;
             Sleep(10);
         }
+        bool ok = true;
         for (size_t k = 0; k < total_chunks; ++k) {
-            if (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, static_cast<unsigned>(k))) return false;
+            if (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, static_cast<unsigned>(k))) ok = false;
             long hr = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, static_cast<unsigned>(k));
-            if (hr != 0) return false;
-            if (std::memcmp(chunks[k].data(), full_plain.data() + k * chunk_dest_size, chunk_dest_size) != 0) return false;
+            if (hr != 0) ok = false;
+            if (std::memcmp(chunks[k].data(), full_plain.data() + k * chunk_dest_size, chunk_dest_size) != 0) ok = false;
+        }
+        if (!ok) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+
+        // Negative control: chunk request with out-of-bounds or wrapping offset must fail and leave destination untouched
+        void* neg_status_ptr = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 2, "ChunkNegStatus", nullptr, &neg_status_ptr) != 0 || !neg_status_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* neg_status = static_cast<Object*>(neg_status_ptr);
+
+        std::vector<unsigned char> dest1(64 * 1024, 0xEE); // sentinel
+        std::vector<unsigned char> dest2(64 * 1024, 0xDD); // sentinel for wrap test
+
+        // Piece 1 with invalid offset (500 KiB > 256 KiB)
+        unsigned char req1[0x48] = {};
+        *reinterpret_cast<u64*>(req1 + 0x00) = 1;
+        *reinterpret_cast<void**>(req1 + 0x08) = dest1.data();
+        *reinterpret_cast<unsigned*>(req1 + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req1 + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req1 + 0x28) = 500 * 1024;
+        *reinterpret_cast<unsigned*>(req1 + 0x30) = static_cast<unsigned>(full_comp.size());
+        *reinterpret_cast<unsigned*>(req1 + 0x38) = static_cast<unsigned>(total_plain_size);
+
+        // Piece 2 with near-wrapping offset (UINT64_MAX - 0xFFFF)
+        unsigned char req2[0x48] = {};
+        *reinterpret_cast<u64*>(req2 + 0x00) = 1;
+        *reinterpret_cast<void**>(req2 + 0x08) = dest2.data();
+        *reinterpret_cast<unsigned*>(req2 + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req2 + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req2 + 0x28) = 0xFFFFFFFFFFFF0000ull;
+        *reinterpret_cast<unsigned*>(req2 + 0x30) = static_cast<unsigned>(full_comp.size());
+        *reinterpret_cast<unsigned*>(req2 + 0x38) = static_cast<unsigned>(total_plain_size);
+
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req1);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, neg_status, 0);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req2);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, neg_status, 1);
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+
+        for (int i = 0; i < 200; ++i) {
+            if (reinterpret_cast<IsCompleteFn>(neg_status->vtable[3])(neg_status, 1)) break;
+            Sleep(10);
+        }
+        if (!reinterpret_cast<IsCompleteFn>(neg_status->vtable[3])(neg_status, 0) ||
+            !reinterpret_cast<IsCompleteFn>(neg_status->vtable[3])(neg_status, 1)) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        long hr1 = reinterpret_cast<GetHResultFn>(neg_status->vtable[4])(neg_status, 0);
+        long hr2 = reinterpret_cast<GetHResultFn>(neg_status->vtable[4])(neg_status, 1);
+        reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+        DeleteFileW(temp_file);
+
+        if (hr1 == 0 || hr2 == 0) return false;
+        for (unsigned char b : dest1) {
+            if (b != 0xEE) return false;
+        }
+        for (unsigned char b : dest2) {
+            if (b != 0xDD) return false;
         }
     }
 
-    // Negative control: chunk request with out-of-bounds or wrapping offset must fail and leave destination untouched
+    // Control: standalone valid stream sharing cache-key fields decodes its own bytes (Refs #1214)
     {
-        const size_t total_plain_size = 128 * 1024;
-        std::vector<unsigned char> test_plain(total_plain_size, 0x55);
-        const auto test_comp = make_stored_zlib(test_plain.data(), total_plain_size);
+        const size_t stream1_plain_size = 64 * 1024;
+        const size_t stream2_plain_size = 64 * 1024;
+        std::vector<unsigned char> plain1(stream1_plain_size, 0x33);
+        std::vector<unsigned char> plain2(stream2_plain_size, 0x77);
+        const auto comp1 = make_stored_zlib(plain1.data(), stream1_plain_size);
+        const auto comp2 = make_stored_zlib(plain2.data(), stream2_plain_size);
+        const unsigned shared_compressed_size = static_cast<unsigned>(comp1.size());
+
+        wchar_t temp_dir[MAX_PATH];
+        if (!GetTempPathW(MAX_PATH, temp_dir)) return false;
+        wchar_t temp_file[MAX_PATH];
+        if (!GetTempFileNameW(temp_dir, L"x2w", 0, temp_file)) return false;
+
+        const size_t offset2 = 128 * 1024;
+        std::vector<unsigned char> file_bytes(offset2 + comp2.size(), 0);
+        std::memcpy(file_bytes.data(), comp1.data(), comp1.size());
+        std::memcpy(file_bytes.data() + offset2, comp2.data(), comp2.size());
+
+        HANDLE h = CreateFileW(temp_file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        DWORD written = 0;
+        WriteFile(h, file_bytes.data(), static_cast<DWORD>(file_bytes.size()), &written, nullptr);
+        CloseHandle(h);
+
+        void* file_ptr = nullptr;
+        if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, temp_file, nullptr, &file_ptr) != 0 || !file_ptr) {
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* file_obj = static_cast<Object*>(file_ptr);
 
         void* status_ptr = nullptr;
-        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 3, "ChunkNegStatus", nullptr, &status_ptr) != 0 || !status_ptr)
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 3, "SharedStatus", nullptr, &status_ptr) != 0 || !status_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
             return false;
+        }
         auto* status = static_cast<Object*>(status_ptr);
 
         void* queue_ptr = nullptr;
         unsigned char desc[0x20] = {};
         *reinterpret_cast<uint16_t*>(desc + 8) = 16;
-        if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &queue_ptr) != 0 || !queue_ptr)
+        if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &queue_ptr) != 0 || !queue_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
             return false;
+        }
         auto* queue = static_cast<Object*>(queue_ptr);
 
-        std::vector<unsigned char> dest0(64 * 1024, 0);
-        std::vector<unsigned char> dest1(64 * 1024, 0xEE); // sentinel
-        std::vector<unsigned char> dest2(64 * 1024, 0xDD); // sentinel for wrap test
+        std::vector<unsigned char> dest1_0(32 * 1024, 0);
+        std::vector<unsigned char> dest1_1(32 * 1024, 0);
+        std::vector<unsigned char> dest2(64 * 1024, 0);
 
-        // Piece 0
-        unsigned char req0[0x48] = {};
-        *reinterpret_cast<u64*>(req0 + 0x00) = 1 | 0x400000;
-        *reinterpret_cast<void**>(req0 + 0x08) = dest0.data();
-        *reinterpret_cast<unsigned*>(req0 + 0x18) = 64 * 1024;
-        *reinterpret_cast<const unsigned char**>(req0 + 0x20) = test_comp.data();
-        *reinterpret_cast<u64*>(req0 + 0x28) = 0;
-        *reinterpret_cast<unsigned*>(req0 + 0x30) = static_cast<unsigned>(test_comp.size());
-        *reinterpret_cast<unsigned*>(req0 + 0x38) = static_cast<unsigned>(total_plain_size);
+        // Stream 1 piece 0: offset 0, compressed size S, destination 32 KiB
+        unsigned char req1_0[0x48] = {};
+        *reinterpret_cast<u64*>(req1_0 + 0x00) = 1;
+        *reinterpret_cast<void**>(req1_0 + 0x08) = dest1_0.data();
+        *reinterpret_cast<unsigned*>(req1_0 + 0x18) = 32 * 1024;
+        *reinterpret_cast<void**>(req1_0 + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req1_0 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req1_0 + 0x30) = shared_compressed_size;
+        *reinterpret_cast<unsigned*>(req1_0 + 0x38) = static_cast<unsigned>(stream1_plain_size);
 
-        // Piece 1 with invalid offset (500 KiB > 128 KiB)
-        unsigned char req1[0x48] = {};
-        *reinterpret_cast<u64*>(req1 + 0x00) = 1 | 0x400000;
-        *reinterpret_cast<void**>(req1 + 0x08) = dest1.data();
-        *reinterpret_cast<unsigned*>(req1 + 0x18) = 64 * 1024;
-        *reinterpret_cast<const unsigned char**>(req1 + 0x20) = test_comp.data();
-        *reinterpret_cast<u64*>(req1 + 0x28) = 500 * 1024;
-        *reinterpret_cast<unsigned*>(req1 + 0x30) = static_cast<unsigned>(test_comp.size());
-        *reinterpret_cast<unsigned*>(req1 + 0x38) = static_cast<unsigned>(total_plain_size);
+        // Stream 1 piece 1: offset 32 KiB, compressed size S, destination 32 KiB
+        unsigned char req1_1[0x48] = {};
+        *reinterpret_cast<u64*>(req1_1 + 0x00) = 1;
+        *reinterpret_cast<void**>(req1_1 + 0x08) = dest1_1.data();
+        *reinterpret_cast<unsigned*>(req1_1 + 0x18) = 32 * 1024;
+        *reinterpret_cast<void**>(req1_1 + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req1_1 + 0x28) = 32 * 1024;
+        *reinterpret_cast<unsigned*>(req1_1 + 0x30) = shared_compressed_size;
+        *reinterpret_cast<unsigned*>(req1_1 + 0x38) = static_cast<unsigned>(stream1_plain_size);
 
-        // Piece 2 with near-wrapping offset (UINT64_MAX - 0x10000)
+        // Stream 2: offset 128 KiB, exact same compressed size S, destination 64 KiB
         unsigned char req2[0x48] = {};
-        *reinterpret_cast<u64*>(req2 + 0x00) = 1 | 0x400000;
+        *reinterpret_cast<u64*>(req2 + 0x00) = 1;
         *reinterpret_cast<void**>(req2 + 0x08) = dest2.data();
         *reinterpret_cast<unsigned*>(req2 + 0x18) = 64 * 1024;
-        *reinterpret_cast<const unsigned char**>(req2 + 0x20) = test_comp.data();
-        *reinterpret_cast<u64*>(req2 + 0x28) = 0xFFFFFFFFFFFF0000ull;
-        *reinterpret_cast<unsigned*>(req2 + 0x30) = static_cast<unsigned>(test_comp.size());
-        *reinterpret_cast<unsigned*>(req2 + 0x38) = static_cast<unsigned>(total_plain_size);
+        *reinterpret_cast<void**>(req2 + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req2 + 0x28) = offset2;
+        *reinterpret_cast<unsigned*>(req2 + 0x30) = shared_compressed_size;
+        *reinterpret_cast<unsigned*>(req2 + 0x38) = static_cast<unsigned>(stream2_plain_size);
 
-        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req0);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req1_0);
         reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 0);
-        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req1);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req1_1);
         reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 1);
         reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req2);
         reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 2);
@@ -312,16 +442,28 @@ bool dstorage_checks() {
             if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 2)) break;
             Sleep(10);
         }
-        if (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 1) ||
-            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 2)) return false;
+        if (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 0) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 1) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 2)) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        long hr0 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 0);
         long hr1 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 1);
         long hr2 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 2);
-        if (hr1 == 0 || hr2 == 0) return false;
-        for (unsigned char b : dest1) {
-            if (b != 0xEE) return false;
+        reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+        DeleteFileW(temp_file);
+
+        if (hr0 != 0 || hr1 != 0 || hr2 != 0) return false;
+        for (unsigned char b : dest1_0) {
+            if (b != 0x33) return false;
+        }
+        for (unsigned char b : dest1_1) {
+            if (b != 0x33) return false;
         }
         for (unsigned char b : dest2) {
-            if (b != 0xDD) return false;
+            if (b != 0x77) return false;
         }
     }
 
