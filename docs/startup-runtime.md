@@ -461,7 +461,10 @@ These are measured on one executable; treat them as hypotheses for others.
 `src/startup_stubs/audio_sink.{h,cpp}` is a desktop WASAPI shared-mode render sink. It opens the
 default render endpoint, takes the mix format from `GetMixFormat` (32-bit float or 16-bit PCM only),
 converts each submitted block (format, frame count, bytes) to it, and writes it through
-`IAudioRenderClient`. Consumed frames are the submitted frames minus `GetCurrentPadding`; the
+`IAudioRenderClient`. `convert_block` supports mono, stereo, 5.1, and 7.1 inputs (using ITU-R BS.775-1
+fold-down coefficients with clamping when downmixing to stereo or mono) and linear sample-rate
+resampling when the submitted rate differs from the endpoint mix rate (rejecting invalid rates,
+unsupported channel counts, or empty blocks as `Submit::Unsupported`). Consumed frames are the submitted frames minus `GetCurrentPadding`; the
 `IAudioClock` position is reported next to them. It records the first accepted block, the
 submitted format, per-block frame counts and peak amplitude, the drained interval (queue empty
 while the producer withholds data) and the recovery (resume until consumption advances). The
