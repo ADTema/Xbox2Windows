@@ -359,7 +359,7 @@ class Stage:
         if handler:
             return handler(ops, mods)
         if base.startswith('v_cmp'):
-            return self.compare(base, ops)
+            return self.compare(base, ops, mods)
         if base.endswith('_sdwa'):
             return self.sdwa(base[:-len('_sdwa')], ops, mods)
         if base in VEC_F:
@@ -936,7 +936,12 @@ class Stage:
     def op_v_cvt_pkrtz_f16_f32(self, ops, mods):
         self.set_v(reg_range(ops[0])[1], 'f32tof16(%s) | (f32tof16(%s) << 16)' % (self.f(ops[1]), self.f(ops[2])))
 
-    def compare(self, base, ops):
+    def compare(self, base, ops, mods=()):
+        # A comparison reads its two operands directly, so a modifier that arrives here is one this
+        # lowering does not model (op_sel selects a packed half, clamp/omod have no place in a compare):
+        # refuse it rather than emit a predicate computed from the unselected operands.
+        if mods:
+            raise Unsupported('%s with %s' % (base, mods))
         m = re.fullmatch(r'v_cmp(x?)_(\w+?)_(f32|u32|i32)(_sdwa)?', base)
         if not m or m.group(4):
             raise Unsupported(base)

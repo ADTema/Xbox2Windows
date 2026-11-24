@@ -70,6 +70,13 @@ def encode_vop1(op, vdst, src0, *, op_sel=(0, 0, 0, 0), abs_bits=(0, 0, 0)):
     return struct.pack('<II', _word0(VOP1_E64_BASE + op, vdst, op_sel=op_sel, abs_bits=abs_bits), src0 & 0x1FF)
 
 
+def encode_vopc(op, sdst, src0, src1, *, op_sel=(0, 0, 0, 0), clamp=0, omod=0):
+    """Encode a VOPC comparison in its VOP3A form; sdst is the scalar destination (vcc)."""
+    w0 = _word0(op, sdst, op_sel=op_sel, clamp=clamp)
+    w1 = ((src0 & 0x1FF) | ((src1 & 0x1FF) << 9) | ((omod & 0x3) << 27))
+    return struct.pack('<II', w0, w1)
+
+
 def encode_vop3a(op, vdst, srcs, *, op_sel=(0, 0, 0, 0), abs_bits=(0, 0, 0)):
     """Encode a native VOP3A instruction (three sources)."""
     w1 = 0
@@ -126,6 +133,20 @@ check('an op_sel on a conversion is refused',
       refused(encode_vop1(VOP1_CVT_F32_U32, 1, V1, op_sel=(0, 0, 1))))
 check('a source abs on a conversion is refused',
       refused(encode_vop1(VOP1_CVT_F32_UBYTE0, 1, V1, abs_bits=(1, 0, 0))))
+
+# The comparison path receives the modifiers too: an op_sel there would change which half is compared,
+# and the predicate would be computed from the unselected operands.
+VOPC_LT_F32 = 0x01
+VOPC_EQ_F32 = 0x02
+asm, emitted = translate(encode_vopc(VOPC_LT_F32, 106, V1, V2))
+check('a plain float compare still translates',
+      emitted == 'vcc = ((F(v1) < F(v2)) ? 1u : 0u);', emitted)
+check('an op_sel on a float compare is refused',
+      refused(encode_vopc(VOPC_LT_F32, 106, V1, V2, op_sel=(0, 0, 1, 0))))
+check('an op_sel on another float compare is refused',
+      refused(encode_vopc(VOPC_EQ_F32, 106, V1, V2, op_sel=(0, 0, 0, 1))))
+check('a clamp on a float compare is refused',
+      refused(encode_vopc(VOPC_LT_F32, 106, V1, V2, clamp=1)))
 
 # 3. The byte-extracting conversions keep their exact shift amounts and masks; moving one has to fail.
 expected = {
