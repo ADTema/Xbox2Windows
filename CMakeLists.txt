@@ -335,6 +335,12 @@ target_include_directories(startup_storage_file_range PRIVATE src)
 add_test(NAME startup_storage_file_range COMMAND startup_storage_file_range)
 target_compile_features(startup_stub_consumer PRIVATE cxx_std_17)
 target_link_libraries(startup_stub_consumer PRIVATE startup_stub_chad startup_stub_xg_xs xmem_shim d3d12_xs_shim)
+# APU heap stand-in: ApuFree reuse, coalescing, refused requests and concurrent callers (docs/startup-runtime.md).
+add_executable(startup_acphal_apu_free tests/startup_acphal_apu_free.cpp)
+target_compile_features(startup_acphal_apu_free PRIVATE cxx_std_17)
+add_dependencies(startup_acphal_apu_free startup_stub_acphal)
+add_test(NAME startup_acphal_apu_free COMMAND startup_acphal_apu_free "$<TARGET_FILE:startup_stub_acphal>")
+set_tests_properties(startup_acphal_apu_free PROPERTIES TIMEOUT 60)
 
 add_executable(startup_draw_bmp_check tests/startup_draw_bmp.cpp)
 add_test(NAME startup_draw_bmp COMMAND startup_draw_bmp_check)

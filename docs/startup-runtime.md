@@ -463,6 +463,29 @@ format and Windows build. A skip is neither a pass nor a failure. Every wait is 
 Not established: the layout of the console audio command queue (`xapu.cpp` is not decoded
 here), what is audible (no capture-path check), and any hardware or driver glitch count.
 
+## APU heap stand-in
+
+With `X2W_AUDIO_PERMISSIVE=1`, `AcpHal.dll` serves `ApuAlloc` from the heap that `ApuCreateHeap` commits. The
+heap is a first-fit free list in a static table of 4096 extents, guarded by one lock. `ApuFree` gives a
+block back and merges it with free neighbours, so streaming code that allocates and frees repeatedly no
+longer exhausts the heap. While nothing has been freed the offsets are the ones a bump allocator hands out.
+
+- A block is aligned in address (a power of two, 16 at least; 0 means 16). Size and alignment are 32 bits.
+- Null output is `E_POINTER`; size 0 or an alignment that is not a power of two is `E_INVALIDARG`; no
+  room, or a full extent table, is `E_OUTOFMEMORY`. A refused call leaves the heap and its outputs as they were.
+- A block that is reused is zeroed, as fresh heap memory is.
+- `ApuFree(NULL)` is `S_OK`. An address that does not start a live block (never allocated, inside a block,
+  already freed) is `E_INVALIDARG` and changes nothing.
+- `ApuIsVirtualAddressValid` and the two map calls still test the whole heap range, not live blocks.
+
+The shape-context allocation (`AcpHalAllocateShapeContexts`, types other than 4) is unchanged. The source-built
+check loads the stub, cycles 64 MiB through a 2 MiB heap, checks reuse, alignment, coalescing and every refused
+call, then runs 4 threads of 1000 rounds against an interval map of live blocks:
+
+```
+ctest --preset dev --no-tests=error -R '^startup_acphal_apu_free$' -V
+```
+
 ## Uniform first-lane reads
 
 The startup shader translator accepts `v_readfirstlane_b32` in straight-line code with the

@@ -6779,6 +6779,10 @@ On success the caller exits with `0x8AC`, also with `CPU_CRC_TEST_LIVE_WORKER=1`
 ctest --preset dev --no-tests=error -R '^cpu_native_acphal_hal$' -V
 ctest --preset release --no-tests=error -R '^cpu_native_acphal_hal$' -V
 
+### ApuFree in the AcpHal stand-in
+
+The desktop `AcpHal.dll` stand-in (not the fixture provider above) now returns `ApuAlloc` blocks on `ApuFree` through a first-fit free list with coalescing, so repeated allocate and free cycles no longer exhaust the heap. It is a stand-in contract only: the console's error codes, alignment limits and zero-size behaviour are not public, and the codes chosen are listed in [startup-runtime.md](startup-runtime.md#apu-heap-stand-in). The source-built check is `ctest --preset dev --no-tests=error -R '^startup_acphal_apu_free$' -V`.
+
 ### XApu command-queue caller and recorder
 
 A source-built caller ([`xapu_queue_caller.asm`](../tests/cpu/xapu_queue_caller.asm)) imports the five `xapu.dll` command-queue functions by name (`XApuConnect`, `XApuEnqueueCommand`, `XApuGetResultCount`, `XApuDequeueResult`, `XApuDisconnect`), plus `finish_exe` from `cpu_exe_io.dll`, and starts through [`exe_startup.asm`](../tests/cpu/exe_startup.asm). A test-only recording provider ([`xapu_queue_provider.cpp`](../tests/cpu/xapu_queue_provider.cpp)) serves the five names. This is not a production `xapu.dll`, and this change adds no binding.
