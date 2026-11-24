@@ -2,6 +2,24 @@ cmake_minimum_required(VERSION 3.21)
 project(Xbox2Windows LANGUAGES CXX)
 
 enable_testing()
+
+set(DSTORAGE_SDK_ROOT "" CACHE PATH "Extracted Microsoft.Direct3D.DirectStorage NuGet package")
+if(DSTORAGE_SDK_ROOT)
+    find_package(ZLIB 1.2.9 REQUIRED)
+    set(dstorage_native "${DSTORAGE_SDK_ROOT}/native")
+    add_executable(dstorage_rfc1950_check tests/dstorage_rfc1950_check.cpp src/dstorage_rfc1950.cpp)
+    target_compile_features(dstorage_rfc1950_check PRIVATE cxx_std_17)
+    target_include_directories(dstorage_rfc1950_check PRIVATE src "${dstorage_native}/include")
+    target_link_libraries(dstorage_rfc1950_check PRIVATE "${dstorage_native}/lib/x64/dstorage.lib" ZLIB::ZLIB)
+    add_custom_command(TARGET dstorage_rfc1950_check POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${dstorage_native}/bin/x64/dstorage.dll"
+            "${dstorage_native}/bin/x64/dstoragecore.dll" "$<TARGET_FILE_DIR:dstorage_rfc1950_check>"
+        VERBATIM)
+    foreach(scenario IN ITEMS success truncated checksum trailing oversize undersize)
+        add_test(NAME dstorage_rfc1950_${scenario} COMMAND dstorage_rfc1950_check ${scenario})
+        set_tests_properties(dstorage_rfc1950_${scenario} PROPERTIES TIMEOUT 30)
+    endforeach()
+endif()
 add_executable(guest_content_root_check tests/guest_content_root_check.cpp)
 target_compile_features(guest_content_root_check PRIVATE cxx_std_17)
 add_test(NAME startup_content_root COMMAND guest_content_root_check "${CMAKE_CURRENT_BINARY_DIR}")
@@ -186,6 +204,14 @@ add_test(NAME xgameruntime_pls_xpackage COMMAND xgameruntime_pls_xpackage_check
     "$<TARGET_FILE:xgameruntime_shim>" "$<TARGET_FILE_DIR:xgameruntime_shim>"
     "$<TARGET_FILE_DIR:xmem_shim>")
 set_tests_properties(xgameruntime_pls_xpackage PROPERTIES TIMEOUT 30)
+
+add_executable(xgameruntime_identity_check tests/xgameruntime_identity_check.cpp)
+add_dependencies(xgameruntime_identity_check xgameruntime_shim)
+target_compile_features(xgameruntime_identity_check PRIVATE cxx_std_17)
+add_test(NAME xgameruntime_identity COMMAND xgameruntime_identity_check
+    "$<TARGET_FILE:xgameruntime_shim>" "$<TARGET_FILE_DIR:xgameruntime_shim>"
+    "$<TARGET_FILE_DIR:xmem_shim>")
+set_tests_properties(xgameruntime_identity PROPERTIES TIMEOUT 30)
 
 # A real source-built EXE import fixture. The import library below only names
 # xgameruntime.dll; no build product or test package copies the fixture DLL.
@@ -1098,6 +1124,46 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_fuzz_frames>" "$<TARGET_FILE:cpu_fuzz_frames_lifted>" "${cpu_fuzz_frames_o2}"
         --area frames --mutant "$<TARGET_FILE:cpu_fuzz_frames_mutant>")
     set_tests_properties(cpu_aot_fuzz_frames PROPERTIES TIMEOUT 60)
+    # Direct calls and tail jumps to leaf and frame callees, shared callees and a planted call retarget.
+    set(CPU_FUZZ_CALLS_SEED "0xCA11" CACHE STRING "Seed for the CPU differential fuzz call test")
+    set(CPU_FUZZ_CALLS_FUNCTIONS "16" CACHE STRING "Number of generated callers in the CPU differential fuzz call test")
+    set(cpu_fuzz_calls_asm "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_calls.asm")
+    set(cpu_fuzz_calls_def "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_calls.def")
+    add_custom_command(OUTPUT "${cpu_fuzz_calls_asm}" "${cpu_fuzz_calls_def}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" emit
+            "${CPU_FUZZ_CALLS_SEED}" "${CPU_FUZZ_CALLS_FUNCTIONS}" "${cpu_fuzz_calls_asm}"
+            "${cpu_fuzz_calls_def}" --area calls
+        DEPENDS tools/fuzz_cpu.py VERBATIM)
+    add_library(cpu_fuzz_calls SHARED "${cpu_fuzz_calls_asm}" "${cpu_fuzz_calls_def}")
+    set_target_properties(cpu_fuzz_calls PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_fuzz_calls PRIVATE /NOENTRY /NODEFAULTLIB /INCREMENTAL:NO /OPT:NOICF)
+    set(cpu_fuzz_calls_lifted "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_calls_lifted.cpp")
+    set(cpu_fuzz_calls_mutant "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_calls_mutant.cpp")
+    foreach(variant lifted mutant)
+        set(mutant_flag "")
+        if(variant STREQUAL "mutant")
+            set(mutant_flag "--mutant")
+        endif()
+        add_custom_command(OUTPUT "${cpu_fuzz_calls_${variant}}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" translate
+                "${CPU_FUZZ_CALLS_SEED}" "${CPU_FUZZ_CALLS_FUNCTIONS}" "$<TARGET_FILE:cpu_fuzz_calls>"
+                "${cpu_fuzz_calls_${variant}}" --area calls ${mutant_flag}
+            DEPENDS cpu_fuzz_calls tools/fuzz_cpu.py tools/cpu_switch_aot.py tools/cpu_leaf_aot.py
+                tools/cpu_call_aot.py tools/cpu_ranges.py VERBATIM)
+        add_library(cpu_fuzz_calls_${variant} SHARED "${cpu_fuzz_calls_${variant}}")
+        target_compile_features(cpu_fuzz_calls_${variant} PRIVATE cxx_std_20)
+    endforeach()
+    set(cpu_fuzz_calls_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_calls_lifted_o2.dll")
+    add_custom_command(OUTPUT "${cpu_fuzz_calls_o2}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /LD "${cpu_fuzz_calls_lifted}"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_calls_lifted_o2.obj" "/Fe${cpu_fuzz_calls_o2}"
+        DEPENDS "${cpu_fuzz_calls_lifted}" VERBATIM)
+    add_custom_target(cpu_fuzz_calls_lifted_o2 ALL DEPENDS "${cpu_fuzz_calls_o2}")
+    add_test(NAME cpu_aot_fuzz_calls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" check "${CPU_FUZZ_CALLS_SEED}" "${CPU_FUZZ_CALLS_FUNCTIONS}"
+        "$<TARGET_FILE:cpu_fuzz_calls>" "$<TARGET_FILE:cpu_fuzz_calls_lifted>" "${cpu_fuzz_calls_o2}"
+        --area calls --mutant "$<TARGET_FILE:cpu_fuzz_calls_mutant>")
+    set_tests_properties(cpu_aot_fuzz_calls PROPERTIES TIMEOUT 60)
     cpu_asm_fixture(cpu_switch_addr32 switch_addr32)
     cpu_asm_fixture(cpu_switch_strings switch_strings)
     cpu_asm_fixture(cpu_string_probe string_probe)
@@ -3810,6 +3876,29 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_xmem_physical_original>" "$<TARGET_FILE:cpu_xmem_physical_full_count>"
         "$<TARGET_FILE:cpu_xmem_physical_skip_release>" "$<TARGET_FILE:xmem_shim>" "$<TARGET_FILE:cpu_exe_io>")
     set_tests_properties(cpu_native_xmem_physical_pair PROPERTIES TIMEOUT 120)
+    # An EXE that imports XMemVirtualAlloc by name and uses the three reserve+commit startup call shapes
+    # (#870), started by Windows and by pe_map. The six variants after original are negative controls.
+    foreach(variant IN ITEMS original reserve_only misaligned dirty accepted_refusal host_fit skip_release)
+        add_executable(cpu_xmem_pool_${variant} tests/cpu/xmem_pool_commit.asm tests/cpu/exe_startup.asm)
+        set_target_properties(cpu_xmem_pool_${variant} PROPERTIES LINKER_LANGUAGE CXX)
+        target_link_options(cpu_xmem_pool_${variant} PRIVATE /ENTRY:native_startup
+            /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE /INCREMENTAL:NO)
+        target_link_libraries(cpu_xmem_pool_${variant} PRIVATE xmem_shim cpu_exe_io kernel32)
+    endforeach()
+    target_compile_definitions(cpu_xmem_pool_reserve_only PRIVATE RESERVE_ONLY)
+    target_compile_definitions(cpu_xmem_pool_misaligned PRIVATE MISALIGNED)
+    target_compile_definitions(cpu_xmem_pool_dirty PRIVATE DIRTY)
+    target_compile_definitions(cpu_xmem_pool_accepted_refusal PRIVATE ACCEPTED_REFUSAL)
+    target_compile_definitions(cpu_xmem_pool_host_fit PRIVATE HOST_FIT)
+    target_compile_definitions(cpu_xmem_pool_skip_release PRIVATE SKIP_RELEASE)
+    add_test(NAME cpu_native_xmem_pool_commit COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/xmem_pool_commit_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_xmem_pool_original>" "$<TARGET_FILE:cpu_xmem_pool_reserve_only>"
+        "$<TARGET_FILE:cpu_xmem_pool_misaligned>"
+        "$<TARGET_FILE:cpu_xmem_pool_dirty>" "$<TARGET_FILE:cpu_xmem_pool_accepted_refusal>"
+        "$<TARGET_FILE:cpu_xmem_pool_host_fit>" "$<TARGET_FILE:cpu_xmem_pool_skip_release>"
+        "$<TARGET_FILE:xmem_shim>" "$<TARGET_FILE:cpu_exe_io>")
+    set_tests_properties(cpu_native_xmem_pool_commit PROPERTIES TIMEOUT 120)
     # An EXE that imports XMemAllocDefault and XMemFreeDefault by name (#875, exports from #879), started
     # by Windows and by pe_map. SKIP_GPU_FREE, SKIP_HEAP_FREE and UNINDUCED are negative controls.
     add_library(cpu_heap_probe SHARED tests/cpu/heap_probe.cpp)
@@ -4288,6 +4377,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/mesh_entry_check.py" draw-float "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(mesh_entry_float_draw_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME mesh_entry_cvt_minmax_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/mesh_entry_check.py" draw-cvt-minmax "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(mesh_entry_cvt_minmax_draw_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME compute_store_aot_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -4300,6 +4393,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-f32 "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(compute_store_aot_f32_${adapter} PROPERTIES TIMEOUT 60)
+        add_test(NAME compute_store_aot_mtbuf_load_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-mtbuf-load "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(compute_store_aot_mtbuf_load_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_mtbuf_load_${adapter}.txt")
         add_test(NAME compute_store_aot_ds_route_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-ds-route "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -4423,6 +4521,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_region_scalar_alu_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_region_scalar_alu_${adapter}.txt")
+        add_test(NAME pixel_aot_region_scalar_load_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-region-scalar-load "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_region_scalar_load_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_region_scalar_load_${adapter}.txt")
         add_test(NAME pixel_position_centers_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_position_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})

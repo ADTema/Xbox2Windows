@@ -655,7 +655,7 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^pixel_aot_region_body_(warp|hardware)$' -V
 ```
 
-Stage 1 of issue #987 admits, under either opener and with or without the skip, `s_nop` and the waits whose counters are already satisfied in the tracked state: `s_waitcnt` with any of `vmcnt`, `lgkmcnt` and `expcnt` (or `0`), and the gfx10 `s_waitcnt_vmcnt`, `_lgkmcnt`, `_expcnt` and `_vscnt` forms with `null`. These instructions ignore EXEC, so whether the whole wave runs or skips them must not matter; a wait is therefore admitted only if it resolves nothing. Outstanding loads leave the translator's state only through a wait, and overwriting an outstanding destination is refused, so a counter is satisfied when its tracked set is empty: no sample, title or scratch load for `vmcnt`, no scalar load for `lgkmcnt`. No export can be outstanding, because only `s_endpgm` may follow one. Scratch stores are not tracked on the store counter, so a `vscnt` wait is refused once any store has been lowered. A wait naming a busy counter is refused even when its count would not block, for example `vmcnt(3)` with one sample outstanding, because the translator does not track exact outstanding counts. Waits with an SGPR operand, `s_waitcnt_depctr`, other scheduling hints and scalar instructions outside the later bounded ALU stage stay refused; scalar loads stay outside regions, and the skip must still directly follow the opener. The admitted forms lower to nothing: the translation controls check that each form, and all of them together, placed before, between and after the region writes leaves the lowered HLSL unchanged apart from instruction-numbered temporaries. For the refusals, they open a region after the prologue's scalar buffer load (scalar load and sample outstanding) and after its `lgkmcnt(0)` wait (sample only), and require the message that names the busy counter. In the second position `lgkmcnt` waits are admitted while `vmcnt` and `s_waitcnt 0` are refused. A `vscnt` wait after a scratch store is also refused. `pixel_aot_region_waits_warp` and `_hardware` draw the ramp region with every admitted form under both openers, with and without the skip, on mixed, full and empty masks; a reference with the writes applied to every lane must mismatch. On Windows 11 build 26300.9974 with the D3D12 debug layer enabled, the four programs matched all 64 pixels in every case on WARP and on an AMD Radeon RX 9070 XT (driver 32.0.31044.16) in three runs each. Removing the translator change makes the controls fail at the first admitted form, and disabling either refusal makes them fail at the corresponding busy-counter or store-counter case. The LLVM 15 round trip covers the four programs, with the skip in label form.
+Stage 1 of issue #987 admits, under either opener and with or without the skip, `s_nop` and the waits whose counters are already satisfied in the tracked state: `s_waitcnt` with any of `vmcnt`, `lgkmcnt` and `expcnt` (or `0`), and the gfx10 `s_waitcnt_vmcnt`, `_lgkmcnt`, `_expcnt` and `_vscnt` forms with `null`. These instructions ignore EXEC, so whether the whole wave runs or skips them must not matter; stage 3 below lifts the earlier limit that a wait must resolve nothing. Outstanding loads leave the translator's state only through a wait, and overwriting an outstanding destination is refused, so a counter is satisfied when its tracked set is empty: no sample, title or scratch load for `vmcnt`, no scalar load for `lgkmcnt`. No export can be outstanding, because only `s_endpgm` may follow one. Scratch stores are not tracked on the store counter, so a `vscnt` wait is refused once any store has been lowered. A wait naming a busy counter is refused even when its count would not block, for example `vmcnt(3)` with one sample outstanding, because the translator does not track exact outstanding counts. Waits with an SGPR operand, `s_waitcnt_depctr`, other scheduling hints and scalar instructions outside the later bounded ALU stage stay refused; scalar loads stay outside regions, and the skip must still directly follow the opener. The admitted forms lower to nothing: the translation controls check that each form, and all of them together, placed before, between and after the region writes leaves the lowered HLSL unchanged apart from instruction-numbered temporaries. For the refusals, they open a region after the prologue's scalar buffer load (scalar load and sample outstanding) and after its `lgkmcnt(0)` wait (sample only), and require the message that names the busy counter. In the second position `lgkmcnt` waits are admitted while `vmcnt` and `s_waitcnt 0` are refused. A `vscnt` wait after a scratch store is also refused. `pixel_aot_region_waits_warp` and `_hardware` draw the ramp region with every admitted form under both openers, with and without the skip, on mixed, full and empty masks; a reference with the writes applied to every lane must mismatch. On Windows 11 build 26300.9974 with the D3D12 debug layer enabled, the four programs matched all 64 pixels in every case on WARP and on an AMD Radeon RX 9070 XT (driver 32.0.31044.16) in three runs each. Removing the translator change makes the controls fail at the first admitted form, and disabling either refusal makes them fail at the corresponding busy-counter or store-counter case. The LLVM 15 round trip covers the four programs, with the skip in label form.
 
 ```powershell
 cmake --build --preset dev --target offscreen_check
@@ -685,6 +685,15 @@ python -B tests/pixel_aot_check.py
 python -B tests/pixel_aot_check.py binary <llvm-mc> <llvm-objcopy> <LLVM-C.dll>
 cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^pixel_aot_region_scalar_alu_warp$' -V
+```
+
+Stage 3 of issue #987 admits, under either opener, waits that resolve outstanding `vm` or `lgkm` work and the scalar loads `s_load_dword`, `s_load_dwordx2`, `s_load_dwordx4`, `s_load_dwordx8`, `s_buffer_load_dword`, `s_buffer_load_dwordx2` and `s_buffer_load_dwordx4` that the translator already lowers outside regions. A wait and a scalar load ignore EXEC, so a wave that enters the region runs them and the wait resolves the work for real. The translator takes the state a wave that never enters the region (the optional `s_cbranch_execz` skip) would have: at the restore it puts back everything that was outstanding at the opener, so the first read after such a region needs a wait outside it, and a destination of an in-region load becomes conditional like a scalar ALU result. Without the skip no wave can bypass the region, so the loaded values and the resolved state carry on. A load may not overwrite the saved execution pair, keeps the existing checks of its address registers and binding, and is checked to change nothing besides its own destinations (which become outstanding). The earlier refusals of a busy-counter wait and of a scalar load in a region are replaced by these rules; the translation controls open regions with a buffer load and a sample outstanding and with the sample only, accept every wait form with and without the skip, and require the sample read after a skipped region to be refused until a wait runs. The load controls check the in-region read before a wait, the post-region read with and without the skip, the saved-pair overwrite, an unresolved base and an out-of-range offset. `pixel_aot_region_scalar_load_warp` and `_hardware` draw a program that loads constant words into SGPRs inside the region, waits, and writes them to VGPRs, under both openers with and without the skip and on mixed, full and empty masks. The expected pixels come from the constants the draw writes and the ramp, not from the translator. A reference with the writes on every lane and a reference using the wrong word of the two-dword load must each mismatch. The Windows draws were not run for this change: only the Linux translation controls and the LLVM 15-compatible round trip fixtures were exercised.
+
+```powershell
+python -B tests/pixel_aot_check.py
+python -B tests/pixel_aot_check.py binary <llvm-mc> <llvm-objcopy> <LLVM-C.dll>
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^pixel_aot_region_scalar_load_(warp|hardware)$' -V
 ```
 
 ### SPIR-V physical addresses in a D3D12 buffer window
@@ -734,6 +743,10 @@ The original SM 6.6 fixture was measured with SPIRV-Tools 2025.5 (`262bdab`), SP
 Both compute shaders now target SM 6.0. The compaction command requires SM 6.0 and WaveOps, and reports a capability skip (77) when either is unavailable. The 64-thread fixture also skips a reported 128-lane wave. A wrong lane index at a supported width fails the CPU comparison. Each negative control checks all 328 words, including guards, against its mutated reference before checking the first divergence from the original reference.
 
 On Windows 10 22H2 build 19045.6456, the GTX 1060 (32.0.15.6094) ran at 32 lanes, in-box WARP (10.0.19041.5794) ran at four, and app-local WARP 1.0.22 with Agility 1.620.2 ran at eight. Debug and Release each matched the CPU model in both shader paths for both masks on all three backends. Repeats were identical, both controls diverged at words 65 and 257 as expected, and every dispatch reported zero D3D12 debug warnings and errors. No 64-lane wave was observed, so the intra-wave 31/32 boundary remains untested in these runs. [Wave operations](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/shader-model-6-0) · [Original replay follow-up](https://github.com/R0Y00/Xbox2Windows/issues/768)
+
+An Intel Arc 140T (8086:7d51, driver 32.0.101.8132, Windows 11 build 26300.9974, DXC 1.8.2502.11, SPIRV-Tools 2025.5, SPIRV-Cross `57e4efc+`, debug layer enabled) fails this fixture differently: the first dispatch of a freshly compiled module reported 16 lanes and a repeat dispatch of the same module reported 32, so the repeat comparison reports `direct readback changed between identical dispatches`. A minimal probe reproduces it — one 64-thread group, no descriptors in the data path, four words per thread holding `WaveGetLaneIndex`, `WaveGetLaneCount`, `WavePrefixCountBits` and the low ballot word, dispatched through `--raw-uav-dump`. Two consecutive runs of one module differed in 192 of 256 words, and every difference was a width or ballot field: 16 lanes gave `0x8421`, 32 lanes gave `0x84218421`, each consistent with the width that run reported. Across four separately compiled modules the first dispatch reported 16 lanes for three and 32 for one; every later dispatch of those modules reported 32 (15 runs). The RTX 5080 Laptop reported 32 in every run and WARP 4. A forced `[WaveSize(32)]` pipeline on the same adapter reports 32 consistently, so forcing the width is stable where the compiler's own choice is not.
+
+The rest of the fixture agrees with the adapter: on the bridge path both deterministic masks compare 328 of 328 words with zero mismatches, and both negative controls are caught at words 65 and 257, in three consecutive full runs. The ballot, first/last lane, rank, selected lane and compacted payload therefore match an independent reference computed at the width the shader reported; what moves between dispatches is that reported width. In one of four attempts of the same driver a control's deliberately mutated module disagreed with its own mutated reference at a lane word (reference lane 19, device wrote 3) and three reruns of the identical command passed, which is the same shape and is recorded rather than explained. Whether the driver chooses the lane count per dispatch or recompiles the module is not established here.
 
 ```powershell
 .\tools\setup-spirv-tools.ps1
@@ -2281,6 +2294,8 @@ Run `ctest --preset dev --no-tests=error -R '^cpu_aot_fuzz_smoke$' -V`. `CPU_FUZ
 
 `cpu_aot_fuzz_frames` runs the same comparison on generated functions with fixed RSP frames (`--area frames`), from its own seed, so the leaf smoke above is unchanged. Each function saves one to three of RBX, RSI, RDI and R12 to R15 with `PUSH`, or saves RBX and RSI into home space with `MOV` before `PUSH RDI`, as MSVC does at `/O2`. It then allocates 16 to 40 bytes with `SUB RSP` and keeps RSP 16-byte aligned. The prologue carries the matching `.pushreg`, `.savereg` and `.allocstack` directives. Each saved register is overwritten from RCX and RDX before it is used, because the translator rejects any read of a nonvolatile register's entry value. A 16-byte region of the allocation is filled by a random sequence of 8-, 4-, 2- and 1-byte stores from registers or immediates. Some functions then add a register to a piece of the region in place, or overwrite one or two bytes on either side of a branch. Four to six reloads read 1, 2, 4 or 8 bytes at an offset within the region, zero- or sign-extended. The first is placed across a boundary between two stores. Every reloaded value goes to the output buffer and into RAX. The function restores the saved registers with `MOV` or `POP` and releases the frame with `ADD RSP`. The default run uses seed `0xF4A3` and 16 functions: 5 home-space saves, 90 stores into the regions and 82 reloads, of which 19 are 8-byte, 23 are 4-byte, 24 are 2-byte and 16 are 1-byte. Of the reloads, 44 span two or more stores (at least one in each function), 33 read part of one store and 5 read one store exactly. Nine functions have a branch and 9 have an in-place add. It makes 10,016 native, default and `/O2` comparisons in about 0.3 s. A planted translator fault must be detected: `--mutant` translates the same exports with every frame reload narrower than 8 bytes moved one byte higher in the frame array. The test fails unless that build differs from native. At the default seed, 4,945 of 5,008 calls differed, in all 16 functions. Passing the clean translation as `--mutant` fails with `the planted translator fault was not detected`, and passing the mutant as the translation fails at the first mismatch with the reproduction command. A dropped register restore would not serve as the planted fault, because the generated locals are not the physical registers (see `cpu_aot_stack_frames`). `CPU_FUZZ_FRAMES_SEED` and `CPU_FUZZ_FRAMES_FUNCTIONS` select a longer run. Seeds `0x1`, `0x2`, `0xBEEF` and `0xCCD1` at 128 functions each made 80,128 comparisons per seed in about 1.2 s, with no refusal and no mismatch; 1,450 of their 2,578 reloads span two or more stores. The generator does not use an RBP frame pointer, `LEAVE`, a mid-body RSP change or calls. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_fuzz_frames$' -V`.
 
+`cpu_aot_fuzz_calls` (`--area calls`) generates callers that make direct calls and tail jumps to callees taken from the two generators above, from its own seed, in one DLL and one translation; the leaf smoke and `cpu_aot_fuzz_frames` are unchanged. There are half as many callees as callers, alternating leaf functions sampled from the leaf generator and functions from the frame generator. Every callee is also exported and compared on its own. Each caller saves three of RBX, RSI, RDI and R12 to R15 with `PUSH` and allocates 32 or 48 bytes, so RSP is 8 mod 16 from entry at each call and the callee's home space lies below the return address. It keeps its output pointer and two running values in the saved registers. Before each of one to three calls it defines RCX, RDX and R8 again from them, or from RAX after a call. After a call it reads only RAX, because the translator treats the other volatile registers and the flags as undefined there. Every callee may overwrite the volatile registers, and a frame callee also overwrites the nonvolatile registers it saves, which are often the caller's own. Each generated callee is the first call of one or two callers, and a later call may repeat the previous callee with its result as an argument. RDX gets a displacement that is unique in the program, so callers that share a callee pass it different arguments. Some callers keep a spill above the callee's home space across their calls. Half end with a tail jump after releasing the frame and popping the saved registers. Each call writes its callee's output into its own 48-byte segment of the buffer, and the caller stores RAX after each call. Whatever the seed, the first two callers instead start by calling `fuzz_clobber` with different values. That callee overwrites every volatile general-purpose register (RAX, RCX, RDX and R8 to R11) with values derived from its arguments and writes each one to its output segment before the next replaces it, so the expected clobbers are compared through memory and RAX. Two negative controls in the same DLL, `fuzz_clobber_read_r10` and `fuzz_clobber_read_rcx`, read R10 or RCX after calling it. They are not run; the test translates each one alone and fails unless it is refused with `undefined register r10` or `undefined register rcx`. The default run uses seed `0xCA11` with 16 callers and 9 callees (`fuzz_clobber`, 4 leaf, 4 frame). It has 35 calls and 6 tail jumps; 19 of these reach a frame callee, 14 of them one that saves a register the caller keeps a value in. Six calls repeat the previous callee, 17 arguments are derived from RAX, and 4 callers keep a spill across their calls. It makes 15,650 native, default and `/O2` comparisons over the 25 exports in about 0.5 s. The planted translator fault, `--mutant`, translates the first call of the first caller to the next callee in the generated order. At the default seed it changed all 313 results of that caller (313 of 7,825 mutant comparisons), and the test fails unless the mutant differs from native. Passing the clean translation as `--mutant` fails with `the planted translator fault was not detected`. Passing the mutant as the translation fails at the first mismatch, printing the caller's and its callees' MASM and the reproduction command. `CPU_FUZZ_CALLS_SEED` and `CPU_FUZZ_CALLS_FUNCTIONS` (the number of callers) select a longer run. Seeds `0x1`, `0x2`, `0xBEEF` and `0xCCD1` at 128 callers each made 120,818 comparisons per seed in about 2.5 s, with no refusal and no mismatch; together they have 1,014 calls and 245 tail jumps. The generator does not use recursion, call chains deeper than one level, indirect calls, mid-body RSP changes or fault equivalence. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_fuzz_calls$' -V`.
+
 ## Mesh draw fallback
 
 The bounded mesh translator can emit `cs_6_0` entry `main` and `vs_6_0` entry
@@ -2619,6 +2634,7 @@ primitive index order and guard bytes.
 python3 -B tests/mesh_entry_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ctest --preset dev --no-tests=error -R "^mesh_entry_draw_" -V
 ctest --preset dev --no-tests=error -R "^mesh_entry_float_draw_" -V
+ctest --preset dev --no-tests=error -R "^mesh_entry_cvt_minmax_draw_" -V
 ```
 
 The per-lane binary32 forms of the translator now also include `v_add_f32_e64`,
@@ -2634,6 +2650,23 @@ subrev, add for mul and so on) must give a different depth. The draw
 with that reference, and a depth one unit in the last place off, or any sibling
 opcode, must report `Mesh export trace mismatch`. The draw is written for
 Windows and has not been run on Linux; denormal handling is not exercised.
+
+The per-lane binary32 forms of the translator also include `v_cvt_f32_u32`,
+`v_cvt_f32_i32`, `v_min_f32` and `v_max_f32` (`_e32` and `_e64`). A
+conversion takes a concrete integer word and lowers to `float(0x...u)` or
+`float(asint(0x...u))`; a float expression as its source is refused. Min and
+max lower to HLSL `min` and `max`. Source modifiers, `clamp` and output
+modifiers are refused. One program converts four exact words and clamps each
+with a min or a max, so reading a word as signed instead of unsigned, or a min
+where a max belongs, moves the depth by many orders of magnitude. The binary
+mode evaluates the emitted expressions in binary32 and compares the depth with
+an independent hand calculation (0.8125), and each of the eight opcodes swapped
+for its sibling must give a different depth. The draw `mesh_entry_cvt_minmax_draw_*`
+(`draw-cvt-minmax`) compares the exported position words with that reference;
+a depth one unit in the last place off in the last vertex, or any sibling
+opcode, must report `Mesh export trace mismatch`. The draw is written for
+Windows and has not been run on Linux. NaN operands, signed zeros and
+conversions that need rounding are not exercised.
 
 A local scan based on main `933cbad` selected the shortest validated native
 stream among 9,282 MS records (832 bytes, 153 instructions). For the tested
@@ -2656,6 +2689,33 @@ python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLV
 ```
 
 Build the emitted source with `dxc -T cs_6_0 -E main`. The Windows fixture reads back all 320 words, including gaps between records and the untouched tail, after one and three indexed groups. A wrong stored word and a wrong guard word must both fail. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_'`.
+
+### Indexed gfx1030 typed-buffer reads
+
+The `gfx1030` compute store profile lowers `tbuffer_load_format_x` with
+instruction format `BUF_FMT_32_UINT` to one 32-bit `ByteAddressBuffer.Load`
+from `t0`. The format describes an unsigned 32-bit X component, so it
+requires no numeric conversion. The accepted address is `idxen` with a
+verified dispatch-thread index, zero scalar offset, and a DWORD-aligned
+instruction offset inside an explicit `--source-stride`. Both descriptor
+and vector load waits must complete before the corresponding registers are
+used. Other formats, address modes, and modifiers are not accepted.
+
+The binding assumes a valid, unswizzled native descriptor and stable,
+in-range source bytes disjoint from the output. It does not emulate native
+descriptor bounds checks or unbound descriptors. The source-built wave32
+fixture reads byte 4 of each 12-byte source record and copies it to byte 4
+of each 8-byte output record. A CPU reference compares all 320 output words,
+including the gaps and tail, for one and three groups. With the source
+stride deliberately changed to 8, word 3 must mismatch on both backends.
+The LLVM 15 binary check also verifies the decoded instruction and the
+CLI's generated HLSL. These are desktop DXIL executions, not native runs
+of the assembled gfx1030 program.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mtbuf_load_(warp|hardware)$' -V
+```
 
 ### Bounded gfx1030 DS lane routing
 
@@ -2856,6 +2916,14 @@ require `--lds-f64-mode normal`, which guarantees normal values or positive
 zero when comparing. Under this contract bitwise equality of the two dwords
 implements numeric equality. Fixtures cover each binary64 dword matching
 independently and export the original pair in the returning form.
+
+Binary64 min and max use the same normal-value contract as binary64
+compare-and-store. The comparison orders sign bits first and reverses the
+magnitude comparison for two negative inputs. The fixtures exercise both
+signs and low-dword ordering and copy the old pair on the returning forms.
+The paired qword write-exchange captures both old qwords and both inputs
+before any write. Its fixtures compare the returned dwords and read back
+the updated LDS record in separate variants.
 
 The source-built wave32 fixture reads the full word and both halves after
 reassigning the source VGPR. It compares 320 UAV words for dispatches of one
@@ -5254,6 +5322,25 @@ cmake --build --preset dev --target xmem_committed_memory_check
 ctest --preset dev --no-tests=error -R '^xmem_committed_memory$' -V
 ```
 
+### Reserve and commit startup blocks
+
+The [startup investigation in #870](https://github.com/R0Y00/Xbox2Windows/issues/870) identified a need for reserve-and-commit allocations in addition to the existing reserve-only profile. The source-built fixture below exercises the supported request forms independently of that workload.
+
+The desktop `XMemVirtualAlloc` accepts these three configurations: a null address, a nonzero size that is a multiple of 64 KiB, and type `0x20003000` with `0x183`/`0x22004` or `0x283`/`0x2404`, or type `0x20403000` with `0x181`/`PAGE_READWRITE`. It commits a fresh private, zero-filled `PAGE_READWRITE` block of exactly the requested size, without rounding, which the caller releases with `VirtualFree`. If Windows cannot commit the block, the call returns NULL with the Windows error. This is a proposed desktop policy: no independent reference describes these attribute words.
+
+Base alignment follows the page-size bits in the type. The Windows SDK (`winnt.h`, 10.0.26100) defines `MEM_LARGE_PAGES` as `0x20000000` and `MEM_64K_PAGES` as `MEM_LARGE_PAGES | MEM_PHYSICAL` (`0x20400000`, `era_physical::mem_64k_pages` here). So the pool type `0x20003000` asks for `MEM_LARGE_PAGES`, and `0x20403000` asks for 64 KiB pages. The large-page type gets a 2 MiB-aligned base (the x64 large-page size) from `VirtualAlloc2` with an address requirement. The 64 KiB type keeps the 64 KiB allocation granularity of `VirtualAlloc`. The size remains an exact multiple of 64 KiB. The source-built 2 MiB + 64 KiB case below distinguishes the allocation alignment from rounding the size. A size that is not a multiple of 64 KiB is refused rather than rounded to host pages. Treating `MEM_LARGE_PAGES` as a 2 MiB alignment requirement is an assumption taken from the desktop definition; the console's own alignment for this type is not established. Large pages themselves are not used, the console protection bits above `PAGE_READWRITE` (`0x2000`, `0x20000`, and write-combining `0x400` in the second pair) and whatever GPU visibility they request are not reproduced. Every other argument set keeps the existing `ERROR_INVALID_PARAMETER` refusal.
+
+[`tests/cpu/xmem_pool_commit.asm`](../tests/cpu/xmem_pool_commit.asm) imports `XMemVirtualAlloc` by name and starts through `exe_startup.asm`, so the same body runs under the Windows loader and from `pe_map_run`. It commits one block per configuration: 4 MiB, 2 MiB + 64 KiB and 1 MiB + 192 KiB. For each block it checks the base alignment (2 MiB for the two large-page blocks, 64 KiB for the 64 KiB-page block), the `VirtualQuery` base, allocation base, state, protection and type, a region size equal to the requested size, and that the byte just past the block belongs to no part of the same allocation. The 2 MiB + 64 KiB block shows that the reservation is not rounded up to 2 MiB. It checks the zero fill of every byte and writes a block-specific pattern to the first and last QWORD of every 64 KiB page, including the block's own first and last QWORD, and reads it back. Ten calls each change one variable of an accepted call and must return NULL with `87`: the two types without `MEM_COMMIT`, the two pool pairs crossed, each type with a pair from the other, protection `0x2004` with `0x183`, `PAGE_READONLY` with `0x181`, the live first block as the address, size 0, and a size that is not a multiple of 64 KiB. The cases without `MEM_COMMIT` and the address case are refused by the reserve-only validator, the others by the commit profile. A host allocation failure uses the first configuration with a 128 TiB size and must return NULL with a Windows error other than `87`; on Windows 10 19045 it is `ERROR_NOT_ENOUGH_MEMORY` (`8`). All three blocks keep their patterns through these calls, and each is released and then reads as `MEM_FREE`.
+
+| CTest case | Inputs and checks |
+|---|---|
+| `cpu_native_xmem_pool_commit` | The EXE returns `0x870` under both loaders. Controls with a known failing step, under both loaders: the first block taken from the reserve-only call fails the commit check (`0xF02`), the 2 MiB check applied to the first block's base plus 64 KiB (64 KiB aligned, not 2 MiB aligned) fails (`0xF02`), one nonzero QWORD at the end of the first block fails the zero fill (`0xF03`), the accepted pair in place of the crossed one fails the refusal (`0xF0F`), a size that fits in place of the host failure is accepted and fails that step (`0xF17`), and skipping the release of the first block fails the free check (`0xF19`). A provider without `XMemVirtualAlloc` stops `pe_map` at that import before entry. |
+
+```powershell
+cmake --build --preset dev
+ctest --preset dev --no-tests=error -R '^cpu_native_xmem_pool_commit$' -V
+```
+
 ### Second commit and protection comparison
 
 `xmem_commit_protection` ([`tests/xmem_commit_protection_check.cpp`](../tests/xmem_commit_protection_check.cpp)) is a source-built x64 check for [#870](https://github.com/R0Y00/Xbox2Windows/issues/870) using synthetic 64 KiB page patterns. Its scope is separate from the first-commit alignment/zero-fill/rounding check (`xmem_committed_memory`), the reserve-only profile in [#888](https://github.com/R0Y00/Xbox2Windows/pull/888), and the device/queue work in [#874](https://github.com/R0Y00/Xbox2Windows/issues/874).
@@ -5262,7 +5349,7 @@ The fixture compares two proposed desktop policies on Windows 10 Pro (build 1904
 
 - **Ordinary committed pages (`MEM_PRIVATE` via `VirtualAlloc`)**: CPU read/write and `VirtualProtect` transitions (`PAGE_READWRITE` -> `PAGE_READONLY` -> `PAGE_NOACCESS` -> `PAGE_READWRITE`) work across 64 KiB pages. Negative controls verify that writes to `PAGE_READONLY` and reads/writes to `PAGE_NOACCESS` raise `EXCEPTION_ACCESS_VIOLATION` via SEH while leaving stored bytes unchanged. Invalid protection flags (`0`, `PAGE_READWRITE | PAGE_READONLY`, error `87`), cross-boundary protection into an uncommitted page (error `487`), and over-committing past the reservation boundary (error `487`) all fail while leaving the committed page's bytes and protection intact. `VirtualAlloc(..., MEM_COMMIT, PAGE_READWRITE)` is idempotent, and `VirtualFree(..., MEM_DECOMMIT)` returns the page to `MEM_RESERVE`. A second private commit at another VA (a placeholder replaced with `VirtualAlloc2(..., MEM_REPLACE_PLACEHOLDER)`) is zero-filled, does not show the first page's bytes, and writes through it do not reach the first page. The fixture does not try to map the first page itself at a second VA: Win32 aliases memory only through section objects (`MapViewOfFile*`), and no call takes an existing `MEM_PRIVATE` range as a mapping source. That is a statement about the API surface, not a measurement.
 - **Live shared-page view (`MEM_MAPPED` via `xmem.dll` `XMemAllocatePhysicalPages` and `XMemMapPhysicalPages` / `XMemMapPhysicalPagesScatter`)**: two aliased views of one 64 KiB physical grant share bytes live, with per-view `VirtualProtect` isolation. Protecting view 1 to `PAGE_READONLY` blocks writes through view 1 (`EXCEPTION_ACCESS_VIOLATION`) while view 2 remains `PAGE_READWRITE` and writes live updates visible through view 1; protecting view 1 to `PAGE_NOACCESS` faults reads and writes on view 1 while view 2 stays accessible. Failed reprotection (error `87` for `0`, error `487` across an unmapped placeholder), refused remap over a live view (`87`), and refused `XMemFreePhysicalPages` while mapped (`87`) all leave both live views, their bytes, and their protections intact. The remap and free refusals depend on page state: the same calls succeed after both views are unmapped. Bytes survive unmapping both views and remapping the grant.
-- **Second commit through `XMemVirtualAlloc`: not reachable through the current shim.** The desktop `XMemVirtualAlloc` accepts only the [#888](https://github.com/R0Y00/Xbox2Windows/pull/888) reserve-only profile (null address, 16 or 24 GiB, type `0x20402000`, attribute/protection `0x21`/`PAGE_READWRITE` or `3`/`0x801`) and refuses everything else with `ERROR_INVALID_PARAMETER` (`87`) before it looks at memory. The fixture starts from the accepted call (16 GiB, `0x21`, `PAGE_READWRITE`), confirms that it reserves address space in the same run, and changes one variable per case: adding `MEM_COMMIT` to the type (`87`), switching the protection to `PAGE_READONLY` (`87`), and passing an address, once while that address is a live reservation and once after it is released (`87` both times). Because the paired accepted call succeeds and the live and free targets are refused the same way, each refusal comes from argument validation. None of them is a second-commit result.
+- **Second commit through `XMemVirtualAlloc`: not reachable through the current shim.** The desktop `XMemVirtualAlloc` accepts the [#888](https://github.com/R0Y00/Xbox2Windows/pull/888) reserve-only profile (null address, 16 or 24 GiB, type `0x20402000`, attribute/protection `0x21`/`PAGE_READWRITE` or `3`/`0x801`) and the [startup commit profile](#reserve-and-commit-startup-blocks), which only commits a fresh block at a null address. It refuses everything else with `ERROR_INVALID_PARAMETER` (`87`) before it looks at memory. The fixture starts from the accepted call (16 GiB, `0x21`, `PAGE_READWRITE`), confirms that it reserves address space in the same run, and changes one variable per case: adding `MEM_COMMIT` to the type (`87`), switching the protection to `PAGE_READONLY` (`87`), and passing an address, once while that address is a live reservation and once after it is released (`87` both times). Because the paired accepted call succeeds and the live and free targets are refused the same way, each refusal comes from argument validation. None of them is a second-commit result.
 - **First observable discrepancy**: the fixture prints this line only from measured values, and only when every check that measures one of its fields passed. Otherwise it prints `not printed; failing_fields=...`. Measured here: ordinary committed pages report type `0x20000` (`MEM_PRIVATE`), `MEM_DECOMMIT` succeeds, and a second-VA commit is independent; the live shared-page view reports type `0x40000` (`MEM_MAPPED`), refuses `MEM_DECOMMIT` with `87` without disturbing either view, aliases live through the second view with per-view protection, and keeps its bytes across unmap/remap. Whether a console caller requires a live shared-page view or ordinary committed pages for a given second-commit site remains a console-side question.
 - **Mutation controls**: `xmem_commit_protection_mutate_*` runs the same binary with `--mutate <name>`, which flips one expected value. Each control passes only when the check that owns that expectation prints `check_failed: <check>` and the run does not report `PASS`; the three that feed the discrepancy line also require `failing_fields=<field>`. The controls cover the accepted pair (`xva_positive_refused`), the commit bit (`xva_commit_accepted`), the protection (`xva_readonly_accepted`), the live/free address comparison (`xva_state_dependent`), second-VA independence (`private_second_va_aliases`), the private page type (`private_type_mapped`), and the mapped decommit refusal (`mapped_decommit_succeeds`). An unknown mutation name fails.
 
@@ -5539,6 +5626,33 @@ ctest --preset release --no-tests=error -R '^cpu_native_gameinput$' -V
 ```
 
 ### DirectStorage factory and queue adapter
+
+#### Windows file-to-memory RFC 1950 requests
+
+The optional desktop fixture submits a local file slice through a DirectStorage
+file queue. Its custom format zero carries one RFC 1950 stream. A CPU worker
+dequeues the job and returns its result using the same request ID. The queue
+event and status become complete after that result. The fixture verifies
+output bytes and guards, compressed bytes consumed, uncompressed bytes
+produced and the status HRESULT.
+
+With DirectStorage 1.3.0 and zlib 1.3.1, the generated 116-byte stream
+produced 768 bytes. Truncation, bad checksum, trailing bytes and mismatched
+destination sizes in both directions returned `0x8007000d` and preserved the
+destination. All six cases passed on Windows build 26200.
+
+Extract the [DirectStorage NuGet package](https://www.nuget.org/packages/Microsoft.Direct3D.DirectStorage/1.3.0)
+under `out/dstorage-sdk` and install a static x64 build of
+[zlib 1.3.1](https://github.com/madler/zlib/releases/tag/v1.3.1) under
+`out/zlib-install`. From the x64 developer environment run
+
+```powershell
+cmake --preset release "-DDSTORAGE_SDK_ROOT=$PWD/out/dstorage-sdk" "-DZLIB_ROOT=$PWD/out/zlib-install" "-DZLIB_LIBRARY_RELEASE=$PWD/out/zlib-install/lib/zlibstatic.lib"
+cmake --build --preset release --target dstorage_rfc1950_check
+ctest --preset release --no-tests=error -R '^dstorage_rfc1950_' -V
+```
+
+#### Factory and staging controls
 
 This fixture exercises the DirectStorage initialization sequence and submission controls. The source-built caller ([`dstorage_caller.asm`](../tests/cpu/dstorage_caller.asm)) imports `DStorageGetFactory` by name from `xcrdapi.dll` and `finish_exe` from `cpu_exe_io.dll`, starting through [`exe_startup.asm`](../tests/cpu/exe_startup.asm). Under a controlled adapter provider ([`dstorage_provider.cpp`](../tests/cpu/dstorage_provider.cpp)), it verifies factory acquisition, staging buffer configuration, queue creation, delayed submission, and exact readback:
 
@@ -7155,18 +7269,46 @@ manifest. `XPackageMountWithUiAsync` remains an explicit stub, as do
 `XUserAddAsync` and `XGameSaveInitializeProviderAsync`, because the
 `XAsyncBlock` completion contract is not modeled without GDK headers.
 
+The same fixture adds the synchronous XSystem and XGame identity subset.
+`XSystemGetConsoleId` reports the fixed 38-character console ID
+`58325731.00000000.00000000.00000000.01`, which keeps the documented
+`XXXXXXXX.XXXXXXXX.XXXXXXXX.XXXXXXXX.XX` shape and the 39-byte
+`XSystemConsoleIdBytes` requirement. The docs name that constant but print only
+the 38-character default value; its 39-byte value is also published by the
+public Microsoft XBOX-GDK-dotnet interop constants. A buffer smaller than
+39 bytes returns `HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)`, a null
+buffer returns `E_POINTER`, and the optional used-size output may be null. A
+second call returns the same bytes and size. `XSystemGetDeviceType` returns
+`XSystemDeviceType::Pc` (0x01), the documented value for a PC process, and has
+no error state; repeated calls return the same value. `XGameGetXboxTitleId`
+returns the fixed 32-bit title ID `0x58325731` (`X2W1` in ASCII) and
+`E_POINTER` for a null output; a second call returns the same value. The shim
+always models a configured title, so the documented `ERROR_NOT_FOUND` case for
+a missing MicrosoftGame.config TitleID is not exercised. The public
+XSystem member list documents no `XSystemGetConsoleType`, and the public XGame
+member list documents no `XGameGetXboxTitleIdEx`, so the fixture does not invent
+either name. There is consequently no public field selector on which to test
+an unsupported-field HRESULT; the null outputs are the negative controls. The
+fixture also does not model a console mode switch: it always reports the PC
+device type.
+
 `xgameruntime_pls_xpackage` calls every implemented PLS and XPackage function,
 checks repeated path and space values, writes and removes a PLS marker, verifies
 the package mount directory, checks the unmounted `E_HANDLE` status, and asserts
 that no implemented call logged `E_NOTIMPL`. Its negative controls are
-`XPackageMountWithUiAsync` and `XSystemGetConsoleId`, which must both log
-`E_NOTIMPL`. `xgameruntime_contracts` exercises the synchronous subset and
-checks that no XUser/XGameSave call logs
-`E_NOTIMPL`; it then calls XPackage and XGame stubs as negative controls. The
-DLL remains under `out/build/dev/fixture-shims/` and is loaded by explicit path.
+`XPackageMountWithUiAsync` and `XUserAddAsync`, which must both log
+`E_NOTIMPL`. `xgameruntime_contracts` exercises the XUser/XGameSave subset and
+checks that no XUser/XGameSave call logs `E_NOTIMPL`; it then calls the
+`XPackageMountWithUiAsync` stub as a negative control. `xgameruntime_identity`
+calls `XSystemGetConsoleId`, `XSystemGetDeviceType`, and `XGameGetXboxTitleId`,
+repeats each call for stability, checks the short-buffer and null-pointer errors,
+and asserts that `XUserAddAsync` still logs `E_NOTIMPL`. The DLL remains under
+`out/build/dev/fixture-shims/` and is loaded by explicit path. The exact CTest
+names are `xgameruntime_thunks`, `xgameruntime_contracts`,
+`xgameruntime_pls_xpackage`, and `xgameruntime_identity`.
 
 ```powershell
-cmake --build --preset dev --target xgameruntime_shim xgameruntime_shim_check xgameruntime_contracts_check xgameruntime_pls_xpackage_check
+cmake --build --preset dev --target xgameruntime_shim xgameruntime_shim_check xgameruntime_contracts_check xgameruntime_pls_xpackage_check xgameruntime_identity_check
 ctest --preset dev --no-tests=error -R '^xgameruntime_' -V
 python -B tests/xgameruntime_table_check.py
 ```
@@ -7600,3 +7742,33 @@ python3 -B tests/rdna2_tools_check.py
 
 Scope: decoding and scanner recognition only. None of these forms is lowered by a translator, and no
 measurement on hardware or in a Windows run backs the descriptions.
+
+## gfx1013 VOP3 and MUBUF decoding: integer multiply, quad SAD, interpolation move, high-half format buffer ops
+
+`tools/disasm_rdna2.py` decodes six more gfx1013 forms (issue #938): the VOP3 opcodes `v_mul_lo_i32` (0x16b),
+`v_qsad_pk_u16_u8` (0x172), `v_mqsad_pk_u16_u8` (0x173) and `v_interp_mov_f32_e64` (0x202), and the MUBUF
+opcodes `buffer_load_format_d16_hi_x` (0x26) and `buffer_store_format_d16_hi_x` (0x27). `v_interp_mov_f32_e64` is
+printed with its parameter selector and attribute (`p10`, `p20` or `p0`, then `attrN.x` to `.w`), as llvm-mc prints it.
+`tools/scan_unsupported_shaders.py` recognizes the mnemonics so they are not reported as unknown.
+
+The decoder follows the modifier grammar llvm-mc accepts for these ops. Abs and neg bits are refused on all four
+VOP3 forms, clamp is refused on `v_mul_lo_i32`, an output modifier is refused on all but `v_interp_mov_f32_e64`, and a
+set src2 field is refused on the two-source forms. The op_sel bits are ignored, as they are by the assembler.
+A refused word becomes an eight-byte `..._unsupported` record, so the next instruction keeps its offset. The two
+MUBUF ops refuse the lds bit and a `tfe` status dword past v255, and print the status dword in the vdata range
+when `tfe` is set. A `v_interp_mov_f32_e64` parameter selector of 3 is refused here, where llvm-mc prints it as
+`invalid_param_3`.
+
+```sh
+python3 -B tests/rdna2_tools_check.py
+LLVM_LIB=libLLVM-15.so.1 LLVM_MC=llvm-mc-15 LLVM_OBJCOPY=llvm-objcopy-15 python3 -B tests/rdna2_tools_check.py
+```
+
+Measured: with LLVM 15.0.6 all 118 checks pass, including a grid of every abs, neg, clamp, omod and op_sel
+combination on the four VOP3 ops (4096 words) that must be accepted or refused as LLVM does. LLVM 15 does not decode the
+two MUBUF opcodes for gfx1013 (`instruction not supported on this GPU`), so their spelling and modifier bits are
+checked against LLVM 19.1.7 only, and that check skips itself when the LLVM in use is the older one.
+
+Scope: decoding and scanner recognition only. None of these forms is lowered by a translator, and no
+measurement on hardware or in a Windows run backs the descriptions. `v_interp_p1_f32_e64` and `v_interp_p2_f32_e64`
+(0x200 and 0x201 on gfx1013) are not decoded by this change.
