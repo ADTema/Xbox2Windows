@@ -633,6 +633,18 @@ foreach(adapter IN ITEMS warp hardware)
     add_test(NAME startup_plane_size_device_${adapter} COMMAND startup_plane_size_device_check ${adapter})
 endforeach()
 set_tests_properties(startup_plane_size_device_hardware PROPERTIES SKIP_RETURN_CODE 77)
+# Descriptor heaps whose desktop CPU start is not an address get plain memory as the start the
+# executable sees (src/startup_stubs/title_heap_memory.h); the mutated run is the negative control.
+add_executable(startup_title_heap_check tests/startup_title_heap_check.cpp)
+target_compile_features(startup_title_heap_check PRIVATE cxx_std_17)
+target_link_libraries(startup_title_heap_check PRIVATE d3d12_xs_shim d3d12 dxgi)
+add_test(NAME startup_title_heap COMMAND startup_title_heap_check)
+add_test(NAME startup_title_heap_tags_control COMMAND startup_title_heap_check --mutate tags)
+set_tests_properties(startup_title_heap_tags_control PROPERTIES WILL_FAIL TRUE)
+foreach(adapter IN ITEMS warp hardware)
+    add_test(NAME startup_title_heap_device_${adapter} COMMAND startup_title_heap_check ${adapter})
+endforeach()
+set_tests_properties(startup_title_heap_device_hardware PROPERTIES SKIP_RETURN_CODE 77)
 # Blend state of slot 57 pipelines from state block A (src/startup_stubs/state_block_blend.h, #1216).
 add_executable(startup_state_block_blend_check tests/startup_state_block_blend_check.cpp)
 target_include_directories(startup_state_block_blend_check PRIVATE src)
