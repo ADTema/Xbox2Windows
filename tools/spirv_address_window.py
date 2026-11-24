@@ -27,7 +27,9 @@ WORD_ATOMIC_OPERANDS = {
 
 
 def word_pointer(dst, base, index):
-    """Select the last DWORD offset for an unaligned or unrepresentable address."""
+    """Select the last DWORD offset for an unaligned or unrepresentable address.
+
+    Returns the lines and the ID of the boolean that is true only for an aligned, in-window address."""
     # Keep address temporaries separate from the generated x2w_ballot_ IDs.
     name = "%x2w_address_" + dst[1:]
     lines = []
@@ -58,7 +60,7 @@ def word_pointer(dst, base, index):
         f"{name}_selected = OpSelect %uint {valid} {name}_word %x2w_invalid",
         f"{dst} = OpAccessChain %_ptr_PSB_uint %x2w_heap %c0 {name}_selected",
     ])
-    return lines
+    return lines, valid
 
 
 def merge_pointer_types(lines):
@@ -109,6 +111,8 @@ def lower(assembly):
                     "%x2w_invalid = OpConstant %uint 1073741823"]
     output = []
     arrays = {}
+    valid_of = {}
+    label = None
     physical_words = set()
     for line in lines:
         cast = CAST.fullmatch(line)
@@ -130,15 +134,20 @@ def lower(assembly):
             if kind == "arr":
                 arrays[dst] = addr
             else:
-                output.extend(word_pointer(dst, addr, None))
+                new, valid_of[dst] = word_pointer(dst, addr, None)
+                output.extend(new)
             continue
         if access := ACCESS.fullmatch(line):
             dst, pointer, index = access.groups()
             if pointer not in arrays:
                 raise ValueError("unknown physical array pointer")
-            output.extend(word_pointer(dst, arrays[pointer], index))
+            new, valid_of[dst] = word_pointer(dst, arrays[pointer], index)
+            output.extend(new)
             continue
+        if opened := re.fullmatch(rf"({ID}) = OpLabel", line):
+            label = opened[1]
         used = set(re.findall(ID, line)) & physical_words
+        atomic_word = False
         if used:
             fields = line.split()
             reads_word = fields[1:4] == ["=", "OpLoad", "%uint"] and fields[4] in used
@@ -149,6 +158,22 @@ def lower(assembly):
                            and fields[4] in used and WORD_ATOMIC_OPERANDS.get(fields[2]) == len(fields) - 4)
             if not (reads_word or writes_word or atomic_word) or len(used) != 1:
                 raise ValueError("unhandled physical word pointer use")
+        if atomic_word:
+            # An address outside the window must not issue an atomic at the substitute index, so the atomic runs
+            # only in a branch taken for a valid address; otherwise the result is zero and nothing is written.
+            result = fields[0]
+            stem = "%x2w_atomic_" + result[1:]
+            output.extend([
+                f"OpSelectionMerge {stem}_merge None",
+                f"OpBranchConditional {valid_of[fields[4]]} {stem}_issue {stem}_merge",
+                f"{stem}_issue = OpLabel",
+                " ".join([f"{stem}_old", *fields[1:]]),
+                f"OpBranch {stem}_merge",
+                f"{stem}_merge = OpLabel",
+                f"{result} = OpPhi %uint {stem}_old {stem}_issue %c0 {label}",
+            ])
+            label = stem + "_merge"
+            continue
         if line == model:
             line = "OpMemoryModel Logical GLSL450"
         elif line.startswith("OpEntryPoint "):

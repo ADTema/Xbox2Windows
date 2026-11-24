@@ -117,5 +117,19 @@ with tempfile.TemporaryDirectory() as directory:
         assert any(line.startswith(f"%{pointer} = OpAccessChain ")
                    and line.endswith(f"%x2w_heap %c0 %x2w_address_{pointer}_selected")
                    for line in lowered_atomics)
-    assert [line for line in lowered_atomics if " = OpAtomic" in line] == list(atomic_instructions)
+    # Each atomic keeps its operands, scope and semantics, but issues only in a branch taken for a valid address; the
+    # result is a phi of that atomic's old value and zero, so an invalid address issues nothing.
+    issued = [line for line in lowered_atomics if " = OpAtomic" in line]
+    assert len(issued) == len(atomic_instructions)
+    for line, original_line in zip(issued, atomic_instructions):
+        result, rest = original_line.split(" = ", 1)
+        stem = "%x2w_atomic_" + result[1:]
+        assert line == f"{stem}_old = {rest}", line
+        at = lowered_atomics.index(line)
+        pointer = original_line.split()[4]
+        assert lowered_atomics[at - 1] == f"{stem}_issue = OpLabel"
+        assert lowered_atomics[at - 2].startswith("OpBranchConditional %x2w_address_" + pointer[1:])
+        assert lowered_atomics[at - 3] == f"OpSelectionMerge {stem}_merge None"
+        assert lowered_atomics[at + 1] == f"OpBranch {stem}_merge"
+        assert lowered_atomics[at + 3].startswith(f"{result} = OpPhi %uint {stem}_old {stem}_issue %c0 ")
 print("physical, logical and combined SPIR-V validated; 8 atomics and rejection cases passed")
