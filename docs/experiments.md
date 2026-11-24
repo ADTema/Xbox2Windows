@@ -10022,7 +10022,7 @@ cmake --build --preset release --target startup_stream_consumer startup_placemen
 ctest --preset release --no-tests=error --output-on-failure -R '^startup_(placement_alloc|placed_vertex_)'
 ```
 
-`startup_placement_alloc` fails each allocation made while adding a second buffer. It checks that the operation returns `E_OUTOFMEMORY`, the existing resource and index remain intact, the lock can be reacquired, and registration at the same address succeeds on retry.
+`startup_placement_alloc` fails each allocation made while adding a second buffer. It checks that the operation returns `E_OUTOFMEMORY`, the existing resource and index remain intact, the lock can be reacquired, and registration at the same address succeeds on retry. `ctest --preset dev --no-tests=error -R '^startup_placement_publish(_shrink_control)?$' -V` checks `src/startup_stubs/placement_publish.h` without a device: each record is copied in while the lock is held exclusively, and the group's `max_width` stays at the widest record when a narrower one follows, because lookup starts at the address minus `max_width` plus one. The control expects the narrower width and must fail.
 
 ### Nine-mip BC5/BC7 tile queries
 
