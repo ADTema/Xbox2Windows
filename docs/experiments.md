@@ -2804,6 +2804,51 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^compute_store_aot_mtbuf_load_(warp|hardware)$' -V
 ```
 
+### gfx1030 2D image loads
+
+The `gfx1030` compute store profile lowers one typed MIMG form:
+`image_load vD, v[x:y], s[A:A+7] dmask:0x1|0x3|0x7|0xf
+dim:SQ_RSRC_IMG_2D`, with the `unorm` flag optional. The lowering is one
+`Texture2D<uint4>.Load(int3(x, y, 0))` from `t0`; the DMASK-selected leading
+components are written to consecutive destination VGPRs in ascending channel
+order and stored to the output UAV. The accepted form requires a `gfx1030`
+target, `dim:SQ_RSRC_IMG_2D`, two consecutive known address VGPRs (x then y),
+and a contiguous DMASK. `a16`, `d16`, `tfe`, `glc`, `slc`, `dlc`, `r128` and
+the NSA address spelling are refused. The eight descriptor words must come
+from one tracked `s_load_dwordx8` at `--image-descriptor`, its scalar load
+must complete before the image load, and the loaded registers may only be
+read after `s_waitcnt vmcnt(0)`.
+
+The 8-dword image resource descriptor (T#) is runtime data. The caller
+guarantees through `--image-format R32G32B32A32_UINT` that its 9-bit GFX10
+format field (DW1[28:20]) is `32_32_32_32_UINT`, that its type (DW3[31:28])
+is `SQ_RSRC_IMG_2D`, that its swizzle mode (DW3[24:20]) is linear, that
+resource level (DW2[31]) is 1, that base and last mip are zero, and that the
+selected channels use the identity destination selects. The translator
+checks where the eight words were loaded from, not those fields. The binding
+assumes an unswizzled, in-range, single-layer image and does not emulate
+native descriptor bounds, tiling or DCC. D3D returns zero for an
+out-of-bounds typed load; the fixture keeps every coordinate in range, so
+that behavior is not measured here.
+
+The source-built wave32 fixture uses an 8x8 thread group and a 32x8
+`R32G32B32A32_UINT` source texture whose words are carried in the case file.
+Dispatches of four, two, one and one groups exercise `dmask:0x1`, `0x3`,
+`0x7` and `0xf` and fill the 320-word output UAV. The independent CPU
+reference recomputes every written word and expects the sentinel in the
+untouched words. A single flipped written word (`word=0`) and a single
+flipped untouched word (`word=300`) must both be reported. Two mutated
+translations must each differ at a named word: reordering the emitted
+components fails at word 0, and swapping the two address registers fails at
+word 4. The LLVM 15 binary check assembles and decodes each DMASK form and
+lowers the decoded program through the CLI. These are desktop DXIL
+executions, not native runs of the assembled gfx1030 program.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mimg_load_(warp|hardware)$' -V
+```
+
 ### Bounded gfx1030 DS lane routing
 
 The `gfx1030` compute profile lowers `ds_bpermute_b32` (gather) and
