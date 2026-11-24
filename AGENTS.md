@@ -39,6 +39,11 @@ The full build, Windows runtime tests, D3D12 tests, MASM fixtures and GPU tests
 require x64 Windows with Visual Studio's Desktop development with C++ workload,
 the Windows SDK, CMake/Ninja, DXC and Python 3.11 or newer.
 
+`dxc_compile_time_gvn` measures pass attribution through `-ftime-report`, which
+arrived in DXC 1.7.2212 (December 2022). The 1.6 build that ships with Windows
+SDK 10.0.22621 has no such flag, so that test reports a capability skip (77)
+instead of failing.
+
 The Ubuntu CI job assembles and translates gfx1013 fixtures with LLVM 15. The
 pure-Python checks listed below also run on Linux and macOS. Do not stub D3D12,
 MASM or `cl` to make the CMake configure succeed on another platform.
