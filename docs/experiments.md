@@ -2755,7 +2755,10 @@ copy, and draw share one direct command list. The test reads back the final
 Two independently generated palettes match their CPU references. In the
 stale-binding control, both producers run but the draw binds the first texture
 while expecting the second. All 276 covered pixels differ while the mesh
-export trace and all 748 clear pixels match.
+export trace and all 748 clear pixels match. On Windows 11 build 26300.9974, the
+Intel Arc 140T (32.0.101.8132) matched both palettes over all 1,024 pixels and
+reported the same 276 differing pixels for the stale SRV, with zero D3D12 debug
+errors and warnings.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^compute_mesh_texture_(warp|hardware)$' -V
