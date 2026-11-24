@@ -141,26 +141,20 @@ def compute_profiles(code, group_size, llvm, emit):
 
 
 def classify(blob, sections, stage, llvm, emit):
-    if isinstance(stage, bool) or not isinstance(stage, int) or stage not in STAGES:
+    if isinstance(stage, bool) or not isinstance(stage, int) or stage < 0:
         raise ValueError(f"Unknown shader stage: {stage}")
     if stage not in (0, 5, 13):
         return [], "no stage profile"
     if not isinstance(sections, Mapping):
         raise ValueError("Missing container sections")
-    dxil = sections.get(b"DXIL")
-    if not isinstance(dxil, (bytes, bytearray, memoryview)) or len(dxil) < 24:
-        raise ValueError("Missing or truncated DXIL section")
+    dxil = _require_bytes(sections.get(b"DXIL"), "DXIL section")
     group_size = None
     if stage in (5, 13):
-        psv = sections.get(b"PSV0")
-        if not isinstance(psv, (bytes, bytearray, memoryview)) or not psv:
-            raise ValueError("Missing PSV0 section")
-        if len(psv) < 52:
-            raise ValueError("Truncated PSV0 section")
+        psv = _require_bytes(sections.get(b"PSV0"), "PSV0 section")
         if stage == 5:
             group_size = compute_store_aot.group_size(psv)
         else:
-            psv_size = struct.unpack_from("<I", psv)[0]
+            psv_size = struct.unpack_from("<I", psv)[0] if len(psv) >= 4 else 0
             if not 48 <= psv_size <= len(psv) - 4 or psv[28] != 13:
                 raise ValueError("Invalid mesh PSV0 section")
             if not isinstance(blob, (bytes, bytearray, memoryview)) or len(blob) < 32:
@@ -192,8 +186,7 @@ def classify(blob, sections, stage, llvm, emit):
 
 
 def cb_diagnostic(program, llvm):
-    if not isinstance(program, (bytes, bytearray, memoryview)) or len(program) < 24:
-        raise ValueError("Missing or truncated DXIL section")
+    _require_bytes(program, "DXIL section")
     code = pixel_aot.container_code(program, stage=0, llvm=llvm)
     lines = pixel_aot.disassemble(code, llvm)
     if not isinstance(lines, list):

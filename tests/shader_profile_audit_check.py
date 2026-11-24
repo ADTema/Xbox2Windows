@@ -394,11 +394,12 @@ class ShaderProfileAuditChecks(unittest.TestCase):
             self.assertEqual(profiles, ["indexed mesh"])
             self.assertIn("vertexData.Load(", ms_idx_emitted["indexed-mesh"])
 
-            vs_blob = make_shader_blob(1, PS_GENERAL_TAG)
-            self.assertEqual(
-                shader_profile_audit.classify(vs_blob, parts(vs_blob), 1, None, None),
-                ([], "no stage profile"),
-            )
+            for non_profile_stage in (1, 3, 4, 99):
+                stage_blob = make_shader_blob(non_profile_stage, PS_GENERAL_TAG)
+                self.assertEqual(
+                    shader_profile_audit.classify(stage_blob, parts(stage_blob), non_profile_stage, None, None),
+                    ([], "no stage profile"),
+                )
 
     def test_scan_source_dir_cb_diagnostic_and_cli(self):
         ps_ok = make_shader_blob(0, PS_GENERAL_TAG, marker=1)
@@ -407,6 +408,7 @@ class ShaderProfileAuditChecks(unittest.TestCase):
         cs_ok = make_shader_blob(5, CS_STORE_TAG, psv_group=(4, 1, 8), marker=4)
         ms_ok = make_shader_blob(13, MS_POINT_TAG, code_bytes=832, psv_group=(128, 1, 1), marker=5)
         vs_skip = make_shader_blob(1, PS_GENERAL_TAG, marker=6)
+        hs_skip = make_shader_blob(3, PS_GENERAL_TAG, marker=7)
         archive = (
             rpf_record(ps_ok, "ps_ok")
             + rpf_record(ps_cb, "ps_cb")
@@ -414,6 +416,7 @@ class ShaderProfileAuditChecks(unittest.TestCase):
             + rpf_record(cs_ok, "cs_ok")
             + rpf_record(ms_ok, "ms_ok")
             + rpf_record(vs_skip, "vs_skip")
+            + rpf_record(hs_skip, "hs_skip")
         )
 
         with (patch.object(shader_profile_audit.pixel_aot, "disassemble", side_effect=stub_disassemble),
@@ -443,11 +446,12 @@ class ShaderProfileAuditChecks(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 source_dir = Path(directory) / "hlsl"
                 result = shader_profile_audit.scan(archive, None, source_dir, cb_reads=True)
-                self.assertEqual(dict(result["records"]), {"PS": 3, "CS": 1, "MS": 1, "VS": 1})
+                self.assertEqual(dict(result["records"]), {"PS": 3, "CS": 1, "MS": 1, "VS": 1, "3": 1})
                 self.assertEqual(dict(result["hlsl_records"]), {"PS": 1, "CS": 1, "MS": 1})
                 self.assertEqual(dict(result["profiles"]["PS"]), {"general": 1})
                 self.assertEqual(dict(result["profiles"]["CS"]), {"store": 1})
                 self.assertEqual(dict(result["profiles"]["MS"]), {"point mesh": 1})
+                self.assertEqual(result["first_stops"]["3"], [("no stage profile", 1)])
                 self.assertIn(("pixel lowering / first general profile: unsupported v_bad_op", 1),
                               result["first_stops"]["PS"])
                 self.assertEqual(result["cb_reads"]["first_descriptor"], [("entry s9 + 0x0", 1)])
@@ -479,7 +483,7 @@ class ShaderProfileAuditChecks(unittest.TestCase):
                     check=True, capture_output=True, text=True,
                 )
                 cli_json = json.loads(proc.stdout)
-                self.assertEqual(cli_json["records"], {"PS": 3, "CS": 1, "MS": 1, "VS": 1})
+                self.assertEqual(cli_json["records"], {"PS": 3, "CS": 1, "MS": 1, "VS": 1, "3": 1})
                 self.assertEqual(cli_json["hlsl_records"], {"PS": 1, "CS": 1, "MS": 1})
                 self.assertTrue((cli_source / "s9-slot0-read-probe.hlsl").is_file())
 
@@ -499,13 +503,20 @@ class ShaderProfileAuditChecks(unittest.TestCase):
         # Missing or invalid/truncated PSV0 for CS and MS.
         for stage, blob in ((5, cs_blob), (13, ms_blob)):
             base = {b"DXIL": parts(blob)[b"DXIL"]}
-            for bad_psv in (None, b"", b"\x30\x00\x00\x00" + bytes(16), psv0_section(99)):
+            oversized_psv = struct.pack("<I", 52) + psv0_section(stage)[4:]
+            for bad_psv in (None, b"", b"\x01", b"\x30\x00\x00\x00" + bytes(16), oversized_psv, psv0_section(99)):
                 sections = dict(base)
                 if bad_psv is not None:
                     sections[b"PSV0"] = bad_psv
                 with self.subTest(stage=stage, psv_len=None if bad_psv is None else len(bad_psv)):
                     with self.assertRaises(ValueError):
                         shader_profile_audit.classify(blob, sections, stage, None, None)
+
+        # Truncated or non-bytes mesh container payload.
+        ms_sections = {b"DXIL": parts(ms_blob)[b"DXIL"], b"PSV0": parts(ms_blob)[b"PSV0"]}
+        for bad_blob in (None, b"short"):
+            with self.subTest(bad_blob=bad_blob), self.assertRaises(ValueError):
+                shader_profile_audit.classify(bad_blob, ms_sections, 13, None, None)
 
         # Malformed code / group_size in pixel_profiles and compute_profiles.
         for bad_code in (None, b"\x01\x02\x03"):
@@ -525,8 +536,8 @@ class ShaderProfileAuditChecks(unittest.TestCase):
             self.assertEqual(profiles, [])
             self.assertEqual(reason, "pixel lowering / first general profile: unsupported v_bad_op")
 
-        # Unknown shader stage.
-        for unknown_stage in (-1, 99, True):
+        # Unknown shader stage (negative or non-int).
+        for unknown_stage in (-1, True, "PS"):
             with self.subTest(stage=unknown_stage), self.assertRaises(ValueError):
                 shader_profile_audit.classify(ps_blob, parts(ps_blob), unknown_stage, None, None)
 
