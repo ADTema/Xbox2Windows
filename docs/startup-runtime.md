@@ -162,7 +162,34 @@ These are measured on one executable; treat them as hypotheses for others.
   support, MIN/MAX with factors other than ONE). Its draws match a CPU model of the register fields
   (`ctest --preset release --no-tests=error -R "^startup_cb_blend"`). Where those registers sit in the
   state block is not measured yet, so the draw path doesn't call it.
-- Audio produces no output.
+- Audio produces no output from the console audio path. A separate desktop render sink exists
+  (see "Audio output"); nothing connects the console path to it yet.
+
+## Audio output
+
+`src/startup_stubs/audio_sink.{h,cpp}` is a desktop WASAPI shared-mode render sink. It opens the
+default render endpoint, takes the mix format from `GetMixFormat` (32-bit float or 16-bit PCM only),
+converts each submitted block (format, frame count, bytes) to it, and writes it through
+`IAudioRenderClient`. Consumed frames are the submitted frames minus `GetCurrentPadding`; the
+`IAudioClock` position is reported next to them. It records the first accepted block, the
+submitted format, per-block frame counts and peak amplitude, the drained interval (queue empty
+while the producer withholds data) and the recovery (resume until consumption advances). The
+render API reports no discontinuity flag, so the glitch count is "not available" and is kept
+apart from both intervals.
+
+```powershell
+cmake --build --preset release --target startup_audio_output
+ctest --preset release --no-tests=error -R '^startup_audio_output$' -V
+```
+
+The fixture runs three cases: no submission (nothing accepted or consumed); a stream of eight
+generated 40 ms tone blocks with distinct amplitudes, one of them all zeros (accepted, counted,
+peak 0); and starvation (drain to padding 0, hold 300 ms, resume, consumption recovers). Exit
+code 77 means no usable render endpoint (or an unsupported mix format). It prints the endpoint,
+format and Windows build. A skip is neither a pass nor a failure. Every wait is bounded.
+
+Not established: the layout of the console audio command queue (`xapu.cpp` is not decoded
+here), what is audible (no capture-path check), and any hardware or driver glitch count.
 
 ## Uniform first-lane reads
 
