@@ -5,9 +5,11 @@ check covers a batch that spans two sections, holes punched into it, pages moved
 VirtualQuery reports before and after a run is split, two views of the same pages, failures while
 a run is being taken apart, and a reader on a page whose neighbour is unmapped again and again.
 
-usage: xmem_page_runs_check.py <xmem.dll> [pages]
-Two cases have to end in an access violation. They run in a child process (--child ...), and the
-parent requires exactly that outcome after the child has announced the step it is about to take.
+usage: xmem_page_runs_check.py <xmem.dll> <xmem.dll built with its test controls> [pages]
+The deployed shim has no test switches. The cases that refuse a step of an unmap, or run without
+the fault handler, load the second build (X2W_XMEM_TEST_CONTROLS). Cases that have to end in an
+access violation, and the lifetime cases, run in a child process (--child ...) whose outcome the
+parent checks after the child has announced the step it is about to take.
 """
 import ctypes as C
 import os
@@ -58,16 +60,15 @@ class Shim:
     def close(self):
         self.free(self.whole, 0, WIN_RELEASE)
 
-    def unload(self):
-        """Frees the reservation and the module; the module must be gone afterwards."""
-        self.close()
+    def free_library(self, release_reservation=True):
+        """FreeLibrary on the shim. Returns True when the module is gone afterwards."""
+        if release_reservation:
+            self.close()
         kernel32 = C.WinDLL("kernel32", use_last_error=True)
         free_library = bind(kernel32, "FreeLibrary", [C.c_void_p], C.c_int)
         loaded = bind(kernel32, "GetModuleHandleW", [C.c_wchar_p], C.c_void_p)
-        handle = self.library._handle
-        del self.library
-        assert free_library(handle), C.get_last_error()
-        assert loaded(self.name) is None, "the module is still loaded after FreeLibrary"
+        assert free_library(self.library._handle), C.get_last_error()
+        return loaded(self.name) is None
 
     def pages(self, count):
         got, tokens = self.number(count), (self.number * count)()
@@ -286,36 +287,99 @@ def handled_exception():
     return False
 
 
-def unload_and_reload(path):
-    """Use the shim so that its fault handler is registered, unload it, take an unrelated handled
-    exception, load it again and use the handler, unload it again."""
+def lifetime(path):
+    """The handler's lifetime. Until a mapping call needs it the shim unloads like any DLL. From
+    then on the module is pinned: FreeLibrary leaves it loaded, an unrelated handled exception is
+    still delivered to its own handler, and the shim and its handler keep working."""
+    shim = Shim(path)
+    assert shim.free_library(), "a shim that never mapped a page stayed loaded after FreeLibrary"
+    assert handled_exception(), "the access violation was not delivered after an unused shim was unloaded"
+    print("child: unused shim unloaded", flush=True)
+
     shim = Shim(path)
     base = shim.whole + PAGE
     tokens = shim.pages(16)
-    assert shim.contiguous(base, 16, tokens) == base and shim.unmap([base + 5 * PAGE])
+    assert shim.contiguous(base, 16, tokens) == base and shim.query(base)[2] == 16 * PAGE, "pages do not share a view"
+    assert shim.unmap([base + 5 * PAGE])
     assert shim.scatter((shim.pointer * 1)(base + 5 * PAGE), 1, (shim.number * 1)(tokens[5]))
-    assert shim.contiguous(base, 16, None) == base and shim.release(16, tokens)
-    shim.unload()
-    print("child: unloaded", flush=True)
+    for attempt in range(3):
+        assert not shim.free_library(release_reservation=False), "the shim was unloaded with its fault handler registered"
+    print("child: FreeLibrary left the pinned shim loaded", flush=True)
     assert handled_exception(), "the access violation was not delivered to its handler"
     print("child: handled exception delivered", flush=True)
-    shim = Shim(path)
-    toggles, reads = reader_while_toggling(shim, shim.whole + PAGE, 0.5)
+    # Still the same shim: the views are there, and the handler still covers a split.
+    mark(base, 16, 0x55550000)
+    assert shim.contiguous(base, 16, None) == base and shim.release(16, tokens)
+    toggles, reads = reader_while_toggling(shim, base, 0.5)
     assert toggles > 0 and reads > 0
-    shim.unload()
-    assert handled_exception(), "the access violation was not delivered after the second unload"
-    print("child: reloaded, used and unloaded again", flush=True)
+    assert handled_exception()
+    print("child: shim and handler work after FreeLibrary", flush=True)
+
+
+def concurrent_shutdown(path, exit_while_running):
+    """FreeLibrary from the main thread, again and again, while one thread reads a page and another
+    unmaps and maps its neighbour: nobody may fault for good or see wrong bytes. With
+    exit_while_running the process then ends with both threads still at it."""
+    shim = Shim(path)
+    base = shim.whole + PAGE
+    tokens = shim.pages(64)
+    assert shim.contiguous(base, 64, tokens) == base
+    mark(base, 64, 0x66660000)
+    stop, reads, toggles, wrong, errors = threading.Event(), [0], [0], [0], []
+
+    def read_loop():
+        at = base + 20 * PAGE
+        try:
+            while not stop.is_set():
+                if word(at).value != 0x66660000 + 20:
+                    wrong[0] += 1
+                reads[0] += 1
+        except Exception as error:  # noqa: BLE001
+            errors.append(error)
+
+    def toggle_loop():
+        one_address, one_page = (shim.pointer * 1)(base + 21 * PAGE), (shim.number * 1)(tokens[21])
+        try:
+            while not stop.is_set():
+                assert shim.scatter(one_address, 1, None) and shim.scatter(one_address, 1, one_page)
+                toggles[0] += 1
+        except Exception as error:  # noqa: BLE001
+            errors.append(error)
+
+    threads = [threading.Thread(target=read_loop, daemon=True), threading.Thread(target=toggle_loop, daemon=True)]
+    for thread in threads:
+        thread.start()
+    print("child: threads running", flush=True)
+    frees, deadline = 0, time.perf_counter() + 1.5
+    while time.perf_counter() < deadline:
+        assert not shim.free_library(release_reservation=False), "the shim was unloaded under running threads"
+        frees += 1
+    assert not errors and wrong[0] == 0 and reads[0] > 0 and toggles[0] > 0, (errors, wrong[0], reads[0], toggles[0])
+    print(f"child: {frees} FreeLibrary calls under {reads[0]} reads and {toggles[0]} toggles", flush=True)
+    if exit_while_running:
+        print("child: exiting with threads running", flush=True)
+        sys.stdout.flush()
+        sys.exit(0)  # the daemon threads are still reading and toggling when the process ends
+    stop.set()
+    for thread in threads:
+        thread.join(10)
+    assert not any(thread.is_alive() for thread in threads) and not errors and wrong[0] == 0
+    assert marked(base, 64, 0x66660000)
+    print("child: threads stopped cleanly", flush=True)
 
 
 def child(path, mode):
-    if mode == "unload-reload":
-        unload_and_reload(path)
+    if mode == "lifetime":
+        lifetime(path)
+        return 0
+    if mode in ("concurrent-shutdown", "concurrent-exit"):
+        concurrent_shutdown(path, mode == "concurrent-exit")
         return 0
     shim = Shim(path)
     base = shim.whole + PAGE
     if mode == "reader-without-retry":
         # The parent set X2W_XMEM_NO_FAULT_RETRY=1: the reader's first fault ends the process.
-        reader_while_toggling(shim, base, 20.0, announce="child: reader starts")
+        reader_while_toggling(shim, base, 3.0, announce="child: reader starts")
         print("child: reader survived", flush=True)
     elif mode == "read-forgotten":
         # A page inside the range of the last break that the shim has forgotten: the handler must
@@ -343,38 +407,52 @@ def expect_access_violation(path, mode, marker, environment=()):
     assert code == ACCESS_VIOLATION, f"{mode}: exit code {code:#x}, expected an access violation: {result.stderr[-400:]!r}"
 
 
-def main(path, total=6000):
+def expect_clean(path, mode, marker):
+    result = run_child(path, mode)
+    assert result.returncode == 0 and marker in result.stdout, (
+        f"{mode}: exit code {result.returncode & 0xFFFFFFFF:#x}: {result.stdout!r} {result.stderr[-600:]!r}")
+
+
+def main(path, controls, total=6000):
     shim = Shim(path)
     base = shim.whole + PAGE
     try:
         mapped_in, holes = large_batch(shim, base, total)
         query_before_and_after_split(shim, base)
         two_views(shim, base)
-        failures(shim, base + 256 * PAGE)
         toggles, reads = reader_while_toggling(shim, base, 2.0)
+        # The deployed shim ignores the test switches: with one set, the unmap below must succeed.
+        a, b, ta, tb = two_runs(shim, base + 256 * PAGE, 0x77770000)
+        os.environ["X2W_XMEM_TEST_FAULT"] = "1:0"
+        assert shim.unmap([a + 3 * PAGE]), "the deployed shim honoured X2W_XMEM_TEST_FAULT"
+        del os.environ["X2W_XMEM_TEST_FAULT"]
+        assert marked(a, 8, 0x77770000, skip={3}) and marked(b, 8, 0x77770100)
     finally:
         shim.close()
-    # Controls that must end in an access violation, each in a child process.
-    expect_access_violation(path, "reader-without-retry", "child: reader starts", {"X2W_XMEM_NO_FAULT_RETRY": "1"})
-    expect_access_violation(path, "read-forgotten", "child: reading a forgotten page")
-    # Unload and reload in a process of its own: the handler is removed with the module, an unrelated
-    # handled exception is delivered normally afterwards, and the handler works again after a reload.
-    result = run_child(path, "unload-reload")
-    assert result.returncode == 0 and "child: reloaded, used and unloaded again" in result.stdout, (
-        f"unload-reload: exit code {result.returncode & 0xFFFFFFFF:#x}: {result.stdout!r} {result.stderr[-600:]!r}")
-    # Control: with the removal skipped, the registration outlives the module and the same exception
-    # is dispatched into unloaded code.
-    # How that ends is not defined (the dispatcher calls an address that is no longer code), so this
-    # control requires only that the child got as far as unloading, never saw its exception
-    # delivered, and did not exit normally.
-    result = run_child(path, "unload-reload", {"X2W_XMEM_KEEP_FAULT_RETRY": "1"})
-    assert "child: unloaded" in result.stdout and "delivered" not in result.stdout and result.returncode != 0, (
-        f"stale-handler control: exit code {result.returncode & 0xFFFFFFFF:#x}: {result.stdout!r}")
+    # Refused steps of an unmap, in the build that has the control.
+    test_shim = Shim(controls)
+    try:
+        failures(test_shim, test_shim.whole + PAGE)
+    finally:
+        test_shim.close()
+    # Controls that must end in an access violation, each in a child process, on the test build:
+    # shared views without the handler, and a read of a page the shim has forgotten.
+    expect_access_violation(controls, "reader-without-retry", "child: reader starts", {"X2W_XMEM_NO_FAULT_RETRY": "1"})
+    expect_access_violation(controls, "read-forgotten", "child: reading a forgotten page")
+    # The deployed shim ignores X2W_XMEM_NO_FAULT_RETRY: the same reader survives there.
+    result = run_child(path, "reader-without-retry", {"X2W_XMEM_NO_FAULT_RETRY": "1"})
+    assert result.returncode == 0 and "child: reader survived" in result.stdout, (
+        f"the deployed shim honoured X2W_XMEM_NO_FAULT_RETRY: {result.returncode & 0xFFFFFFFF:#x} {result.stdout!r}")
+    # Lifetime of the handler, on the deployed shim, each in a process of its own.
+    expect_clean(path, "lifetime", "child: shim and handler work after FreeLibrary")
+    expect_clean(path, "concurrent-shutdown", "child: threads stopped cleanly")
+    expect_clean(path, "concurrent-exit", "child: exiting with threads running")
     print(f"xmem_page_runs: PASS ({total} pages mapped in {mapped_in * 1000:.0f} ms, {holes} holes, VirtualQuery before and "
-          f"after a split, two views, 3 refused steps, {toggles} neighbour toggles under {reads} reads, unload and reload with its stale-handler control, 2 access-violation controls)")
+          f"after a split, two views, 3 refused steps, {toggles} neighbour toggles under {reads} reads, pinned lifetime, "
+          f"FreeLibrary and process exit under running threads, 2 access-violation controls)")
 
 
 if __name__ == "__main__":
     if sys.argv[1] == "--child":
         sys.exit(child(sys.argv[3], sys.argv[2]))
-    main(sys.argv[1], *(int(a) for a in sys.argv[2:3]))
+    main(sys.argv[1], sys.argv[2], *(int(a) for a in sys.argv[3:4]))

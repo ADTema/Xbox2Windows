@@ -112,6 +112,21 @@ target_compile_features(xmem_shim PRIVATE cxx_std_20)
 # Delay-loaded: only XMemGetWorkingSetStatistics uses DXGI and D3DKMT (gdi32).
 target_link_libraries(xmem_shim PRIVATE dxgi gdi32 delayimp OneCore)
 target_link_options(xmem_shim PRIVATE /DELAYLOAD:dxgi.dll /DELAYLOAD:gdi32.dll)
+# The same shim with its test controls compiled in (X2W_XMEM_TEST_CONTROLS): refusing one step of an
+# unmap, and shared views without the fault handler. tests/xmem_page_runs_check.py loads it for the
+# cases that need a control; the deployed xmem.dll has neither switch.
+get_target_property(xmem_shim_sources xmem_shim SOURCES)
+add_library(xmem_shim_test_controls SHARED ${xmem_shim_sources})
+set_target_properties(xmem_shim_test_controls PROPERTIES OUTPUT_NAME xmem
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/xmem-test-controls"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/xmem-test-controls"
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/xmem-test-controls"
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+target_compile_definitions(xmem_shim_test_controls PRIVATE X2W_XMEM_TEST_CONTROLS)
+target_include_directories(xmem_shim_test_controls PRIVATE src)
+target_compile_features(xmem_shim_test_controls PRIVATE cxx_std_20)
+target_link_libraries(xmem_shim_test_controls PRIVATE dxgi gdi32 delayimp OneCore)
+target_link_options(xmem_shim_test_controls PRIVATE /DELAYLOAD:dxgi.dll /DELAYLOAD:gdi32.dll)
 add_executable(xmem_shim_check tests/xmem_shim_check.cpp src/adapter_identity.cpp)
 # D3D12 and DXGI are delay-loaded so the exports scenario can check that xmem.dll loads neither.
 target_link_libraries(xmem_shim_check PRIVATE xmem_shim d3d12 dxgi gdi32 delayimp)
@@ -1256,7 +1271,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/xmem_mapped_pages_check.py" "$<TARGET_FILE:xmem_shim>")
     # Large batches: pages as slots of shared sections, adjacent pages in one view.
     add_test(NAME xmem_shim_page_runs COMMAND "${INTAKE_PYTHON}" -B
-        "${CMAKE_SOURCE_DIR}/tests/xmem_page_runs_check.py" "$<TARGET_FILE:xmem_shim>")
+        "${CMAKE_SOURCE_DIR}/tests/xmem_page_runs_check.py" "$<TARGET_FILE:xmem_shim>"
+        "$<TARGET_FILE:xmem_shim_test_controls>")
     set_tests_properties(xmem_shim_page_runs PROPERTIES TIMEOUT 300)
     add_test(NAME docs_links COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/docs_links_check.py")

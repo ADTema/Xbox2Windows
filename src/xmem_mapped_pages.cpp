@@ -205,13 +205,8 @@ void end_break()
 // page for this break. Everything else is passed on, so a fault that is not the transient one is
 // reported after at most one retry.
 thread_local bool mapping_thread = false;
-volatile LONG fault_retry_in_flight;  // callbacks currently inside retry_remapped_page
 LONG CALLBACK retry_remapped_page(EXCEPTION_POINTERS* e)
 {
-    struct InFlight {
-        InFlight() { InterlockedIncrement(&fault_retry_in_flight); }
-        ~InFlight() { InterlockedDecrement(&fault_retry_in_flight); }
-    } const in_flight;
     const EXCEPTION_RECORD* record = e->ExceptionRecord;
     if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2 || mapping_thread)
         return EXCEPTION_CONTINUE_SEARCH;
@@ -244,51 +239,52 @@ struct MappingThread {
     ~MappingThread() { mapping_thread = false; }
 };
 
-// The handler's registration lasts from the first mapping call to the unloading of this module.
-// Windows keeps a vectored handler registered after FreeLibrary, so it is removed here, in a
-// static destructor that runs before `memory` goes away, and the removal waits for callbacks
-// that are still inside the handler: they use this module's code and state.
+// The handler is process-wide and Windows offers no way to remove one that also waits for every
+// dispatch already under way, so it is never removed. Instead the module is pinned when the handler
+// is registered: from then on FreeLibrary leaves xmem.dll, the handler's code and this state in
+// place until the process ends, and a callback can never run in unloaded code. Nothing is waited
+// for and nothing is torn down at DLL detach.
 //
-// X2W_XMEM_NO_FAULT_RETRY=1 leaves the handler out, and X2W_XMEM_KEEP_FAULT_RETRY=1 skips the
-// removal; tests/xmem_page_runs_check.py uses both as controls.
+// Shared views exist only under that guarantee. If the handler cannot be registered or the module
+// cannot be pinned, every page gets a view of its own (the layout before views were shared), where
+// unmapping one page never takes a neighbour away and no handler is needed.
 struct FaultRetry {
     SRWLOCK lock = SRWLOCK_INIT;
-    void* handle = nullptr;
     bool tried = false;
+    bool guaranteed = false;  // handler registered and module pinned: shared views may be created
 
-    void add()
+    bool ready()
     {
         AcquireSRWLockExclusive(&lock);
         if (!tried) {
             tried = true;
-            if (!x2w_local::env_on("X2W_XMEM_NO_FAULT_RETRY")) handle = AddVectoredExceptionHandler(1, retry_remapped_page);
+#ifdef X2W_XMEM_TEST_CONTROLS
+            // Test build only: shared views without the handler, to show that a reader then faults.
+            if (x2w_local::env_on("X2W_XMEM_NO_FAULT_RETRY")) {
+                guaranteed = true;
+                ReleaseSRWLockExclusive(&lock);
+                return true;
+            }
+#endif
+            HMODULE pinned = nullptr;
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                                   reinterpret_cast<LPCWSTR>(&retry_remapped_page), &pinned) &&
+                AddVectoredExceptionHandler(1, retry_remapped_page))
+                guaranteed = true;
+            else
+                x2w_local::logf("x2w-xmem shared views are off: the fault handler could not be set up (error %lu)", GetLastError());
         }
+        const bool result = guaranteed;
         ReleaseSRWLockExclusive(&lock);
+        return result;
     }
-    void remove()
-    {
-        AcquireSRWLockExclusive(&lock);
-        void* const registered = handle;
-        handle = nullptr;
-        tried = false;
-        ReleaseSRWLockExclusive(&lock);
-        if (!registered || x2w_local::env_on("X2W_XMEM_KEEP_FAULT_RETRY")) return;
-        RemoveVectoredExceptionHandler(registered);
-        // During process termination the other threads are already gone; one of them may have
-        // been stopped inside the handler, and nothing can call it any more.
-        using ShutdownInProgress = BOOLEAN (NTAPI*)();
-        const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-        const auto shutting_down = ntdll ? reinterpret_cast<ShutdownInProgress>(GetProcAddress(ntdll, "RtlDllShutdownInProgress")) : nullptr;
-        if (shutting_down && shutting_down()) return;
-        while (InterlockedCompareExchange(&fault_retry_in_flight, 0, 0) != 0) SwitchToThread();
-    }
-    ~FaultRetry() { remove(); }
 };
 FaultRetry fault_retry;
 
-// Test control (tests/xmem_page_runs_check.py): X2W_XMEM_TEST_FAULT=<stage>:<skip> makes one step of
+// Test build only (X2W_XMEM_TEST_CONTROLS; tests/xmem_page_runs_check.py): X2W_XMEM_TEST_FAULT=<stage>:<skip> makes one step of
 // the next unmap fail as if Windows had refused it, after skipping <skip> such steps. Stage 1 is
 // unmapping a run, stage 2 mapping surviving pages again, stage 3 both the unmap and the restore.
+#ifdef X2W_XMEM_TEST_CONTROLS
 struct TestFault {
     unsigned stage = 0, skip = 0;
     TestFault()
@@ -311,6 +307,12 @@ struct TestFault {
         return true;
     }
 };
+#else
+struct TestFault {
+    unsigned stage = 0;
+    bool hit(unsigned) { return false; }
+};
+#endif
 
 // Drops a page that has no view any more from the registry, so that the registry never names a
 // page Windows does not show.
@@ -371,7 +373,7 @@ BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& addres
     if (!count || count > era_physical::capacity_pages)
         return physical_result(era_physical::Status::invalid);
     try {
-        fault_retry.add();
+        const bool share_views = fault_retry.ready();
         const MappingThread marker;
         const std::lock_guard guard(memory.mutex);
         std::map<ULONG_PTR, ULONG_PTR> batch;
@@ -397,7 +399,7 @@ BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& addres
                 const Backing& head = memory.backings.at(first->second);
                 SIZE_T bytes = page_bytes;
                 auto last = std::next(first);
-                for (; last != batch.end(); ++last, bytes += page_bytes) {
+                for (; share_views && last != batch.end(); ++last, bytes += page_bytes) {
                     const Backing& b = memory.backings.at(last->second);
                     if (last->first != first->first + bytes || b.section != head.section || b.offset != head.offset + bytes) break;
                 }
