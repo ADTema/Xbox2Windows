@@ -69,6 +69,73 @@ struct QueueWork {
     std::deque<Entry> waiting, submitted;
 };
 
+struct CachedStream {
+    u64 source = 0;
+    u64 base_offset = 0;
+    unsigned compressed_size = 0;
+    std::vector<unsigned char> data;
+};
+
+struct StreamCache {
+    std::mutex mutex;
+    static constexpr std::size_t max_entries = 16;
+    std::deque<CachedStream> entries;
+
+    void put(u64 source, u64 base_offset, unsigned compressed_size, std::vector<unsigned char> data) {
+        const std::lock_guard guard(mutex);
+        for (auto it = entries.begin(); it != entries.end(); ++it) {
+            if (it->source == source && it->base_offset == base_offset && it->compressed_size == compressed_size) {
+                entries.erase(it);
+                break;
+            }
+        }
+        if (entries.size() >= max_entries) {
+            entries.pop_front();
+        }
+        entries.push_back({source, base_offset, compressed_size, std::move(data)});
+    }
+
+    bool get_slice(u64 source, u64 offset, unsigned compressed_size, unsigned need_bytes,
+                   std::vector<unsigned char>& out_slice) {
+        const std::lock_guard guard(mutex);
+        for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
+            if (it->source == source && it->compressed_size == compressed_size) {
+                if (offset >= it->base_offset) {
+                    const u64 delta = offset - it->base_offset;
+                    if (delta + need_bytes <= it->data.size()) {
+                        out_slice.assign(it->data.begin() + delta, it->data.begin() + delta + need_bytes);
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+};
+static StreamCache stream_cache;
+
+bool has_following_chunk(Object* self, u64 source, u64 offset, unsigned source_size, unsigned destination_size) {
+    if (!self || !self->work) return false;
+    QueueWork& work = *self->work;
+    const std::lock_guard guard(work.mutex);
+    auto check = [&](const Entry& e) {
+        if (e.type != Entry::request) return false;
+        const u64 e_options = *reinterpret_cast<const u64*>(e.bytes);
+        if (!(e_options & 1)) return false;
+        const u64 e_source = *reinterpret_cast<const u64*>(e.bytes + 0x20);
+        const u64 e_offset = *reinterpret_cast<const u64*>(e.bytes + 0x28);
+        const unsigned e_source_size = *reinterpret_cast<const unsigned*>(e.bytes + 0x30);
+        return e_source == source && e_source_size == source_size && e_offset == offset + destination_size;
+    };
+    for (const auto& e : work.submitted) {
+        if (check(e)) return true;
+    }
+    for (const auto& e : work.waiting) {
+        if (check(e)) return true;
+    }
+    return false;
+}
+
 void log(const char* format, ...)
 {
     char line[1024];
@@ -246,7 +313,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
         for (int i = 0; i < 0x40; ++i) std::snprintf(bytes + 3 * i, 4, "%02x ", request[i]);
         log("x2w-dstorage Queue::EnqueueRequest [%s]", bytes);
     }
-    // Option bits (matched against the requests one executable makes): bit 0
+    // Option bits (from the reference projects' notes, matched against this title's requests): bit 0
     // zlib, bits 1-4 a BCPack BC format number, bit 21 a destination given as 64 KiB physical page
     // tokens (+0x10 low 16 bits: offset into the first page), bit 22 a memory source.
     const bool zlib = (options & 1) != 0;
@@ -276,30 +343,66 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
         else
             outcome = "read failed";
     }
+    const unsigned char* data = nullptr;
+    std::size_t decode_length = source_size;
+    const std::size_t destination_capacity = destination_size;
+    bool written = false;
+
     if (input) {
-        const unsigned char* data = input;
-        std::size_t size = source_size;
+        data = input;
         if (zlib) {
-            // With BCPack after it, the inflated size is not given; the destination size bounds it.
-            output.resize(bcpack ? std::size_t{destination_size} * 2 + 0x10000 : destination_size);
-            std::size_t produced = 0;
-            if (!x2w_inflate::inflate_zlib(input, source_size, output.data(), output.size(), &produced)) {
-                outcome = "zlib failed";
-                data = nullptr;
-                static LONG diagnosed;
-                if (destination_size <= (16u << 20) && InterlockedIncrement(&diagnosed) <= 12) {
-                    std::vector<unsigned char> big(std::size_t{destination_size} * 8 + 0x40000);
-                    std::size_t big_produced = 0;
-                    const bool big_ok = x2w_inflate::inflate_zlib(input, source_size, big.data(), big.size(), &big_produced);
-                    log("x2w-dstorage zlib failure: header %02x %02x %02x %02x, larger buffer -> %s produced=0x%zx (dest 0x%x, source 0x%x)",
-                        input[0], input[1], input[2], input[3], big_ok ? "ok" : "still failed", big_produced, destination_size, source_size);
-                }
-            } else {
-                output.resize(produced);
+            // First check if this request is a piece of an already-inflated chunked stream (Refs #1136)
+            if (stream_cache.get_slice(source, offset, source_size, destination_size, output)) {
+                decode_length = destination_size;
                 data = output.data();
-                size = produced;
-                outcome = produced == destination_size || bcpack ? "inflated" : "inflated (short)";
-                InterlockedIncrement(&requests_compressed);
+                outcome = "inflated (slice from stream cache)";
+            } else {
+                // With BCPack after it, the inflated size is not given; the destination size bounds it.
+                // DirectStorage provides UncompressedSize at request + 0x38. When destination is smaller
+                // than the stream (e.g. 64 KiB tile/page target), allocate for the full uncompressed stream
+                // so single-pass inflate succeeds and verifies Adler32, then check capacity before writing.
+                const unsigned uncompressed_size = *reinterpret_cast<const unsigned*>(request + 0x38);
+                std::size_t target_size = (uncompressed_size > destination_size) ? uncompressed_size : destination_size;
+                if (bcpack) target_size = target_size * 2 + 0x10000;
+                output.resize(target_size);
+                std::size_t produced = 0;
+                bool ok = x2w_inflate::inflate_zlib(input, source_size, output.data(), output.size(), &produced);
+                if (!ok && output.size() < 0x80000) {
+                    // If destination_size was smaller than the uncompressed stream and uncompressed_size was unset,
+                    // expand up to 512 KiB to accommodate larger chunks.
+                    std::size_t big_size = std::size_t{destination_size} * 8 + 0x40000;
+                    if (big_size < 0x80000) big_size = 0x80000;
+                    std::vector<unsigned char> big(big_size);
+                    std::size_t big_produced = 0;
+                    if (x2w_inflate::inflate_zlib(input, source_size, big.data(), big.size(), &big_produced)) {
+                        output = std::move(big);
+                        produced = big_produced;
+                        ok = true;
+                    }
+                }
+                if (!ok) {
+                    outcome = "zlib failed";
+                    data = nullptr;
+                    static LONG diagnosed;
+                    if (InterlockedIncrement(&diagnosed) <= 12) {
+                        log("x2w-dstorage zlib failure: header %02x %02x %02x %02x (dest 0x%x, source 0x%x)",
+                            input[0], input[1], input[2], input[3], destination_size, source_size);
+                    }
+                } else {
+                    output.resize(produced);
+                    // If the stream expanded beyond this request's destination and following chunks exist,
+                    // cache the uncompressed stream and serve slice 0 (Refs #1136).
+                    if (produced > destination_size && has_following_chunk(self, source, offset, source_size, destination_size)) {
+                        stream_cache.put(source, offset, source_size, output);
+                        decode_length = destination_size;
+                        data = output.data();
+                        outcome = "inflated (chunked stream piece 0)";
+                    } else {
+                        decode_length = produced;
+                        data = output.data();
+                        outcome = produced == destination_size || bcpack ? "inflated" : "inflated (larger/short)";
+                    }
+                }
             }
         }
         if (data && bcpack) {
@@ -307,30 +410,66 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
             // title's loading continues. Counted as bcpack_blank.
             output.assign(destination_size, 0);
             data = output.data();
-            size = destination_size;
+            decode_length = destination_size;
             outcome = "BCPack not decoded: zero-filled";
-            InterlockedIncrement(&requests_bcpack_blank);
         }
         if (data) {
-            if (size > destination_size) size = destination_size;
-            bool written = true;
+            // Track decode length and destination capacity as separate values (Refs #1144).
+            // A short destination or missing/insufficient page grant must fail the request
+            // and leave the destination memory completely unchanged.
+            if (decode_length > destination_capacity) {
+                outcome = "destination capacity exceeded";
+                data = nullptr;
+            } else if (page_destination) {
+                const ULONG_PTR needed_pages = (page_offset + decode_length + 0xFFFF) / 0x10000;
+                const ULONG_PTR granted_pages = (page_offset + destination_capacity + 0xFFFF) / 0x10000;
+                if (needed_pages > granted_pages) {
+                    outcome = "insufficient page grants";
+                    data = nullptr;
+                } else if (!tokens) {
+                    outcome = "missing page tokens";
+                    data = nullptr;
+                } else {
+                    for (ULONG_PTR i = 0; i < needed_pages; ++i) {
+                        if (!tokens[i]) {
+                            outcome = "missing page grant token";
+                            data = nullptr;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (data) {
+            written = true;
             if (page_destination) {
                 using WritePhysical = BOOL(WINAPI*)(const ULONG_PTR*, ULONG_PTR, SIZE_T, const void*, SIZE_T);
                 static const WritePhysical write_physical = [] {
                     const HMODULE xmem = GetModuleHandleW(L"xmem.dll");
                     return xmem ? reinterpret_cast<WritePhysical>(GetProcAddress(xmem, "x2w_xmem_write_physical")) : nullptr;
                 }();
-                const ULONG_PTR pages = (page_offset + size + 0xFFFF) / 0x10000;
-                written = write_physical && tokens && write_physical(tokens, pages, page_offset, data, size);
-                if (!written) outcome = "page destination write failed";
+                const ULONG_PTR pages = (page_offset + decode_length + 0xFFFF) / 0x10000;
+                written = write_physical && write_physical(tokens, pages, page_offset, data, decode_length);
+                if (!written) {
+                    outcome = "page destination write failed";
+                    data = nullptr;
+                }
             } else if (data != destination) {
-                std::memcpy(destination, data, size);
+                std::memcpy(destination, data, decode_length);
             }
-            if (written && !zlib && !bcpack) InterlockedIncrement(&requests_done);
+            if (written) {
+                if (bcpack) {
+                    InterlockedIncrement(&requests_bcpack_blank);
+                } else if (zlib) {
+                    InterlockedIncrement(&requests_compressed);
+                } else {
+                    InterlockedIncrement(&requests_done);
+                }
+            }
         }
     }
-    if (outcome[0] == 'r' || outcome[0] == 'z' || outcome[0] == 'u' || outcome[0] == 'p') InterlockedIncrement(&requests_failed);
-    const bool failed = outcome[0] == 'r' || outcome[0] == 'z' || outcome[0] == 'u' || outcome[0] == 'p';  // read, zlib, unknown, page write
+    const bool failed = (data == nullptr || !written) && std::strcmp(outcome, "empty") != 0;
+    if (failed) InterlockedIncrement(&requests_failed);
     if (failed && self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
     static LONG summaries, failures;
     if (InterlockedIncrement(&summaries) <= 12 || (failed && InterlockedIncrement(&failures) <= 12))
@@ -428,9 +567,9 @@ void __stdcall queue_enqueue_request(Object* self, const unsigned char* request)
     const u64 options = *reinterpret_cast<const u64*>(request);
     if (options & (1ull << 21)) {
         const auto* title = *reinterpret_cast<const ULONG_PTR* const*>(request + 0x08);
-        const unsigned size = *reinterpret_cast<const unsigned*>(request + 0x18);
+        const unsigned destination_size = *reinterpret_cast<const unsigned*>(request + 0x18);
         const unsigned page_offset = static_cast<unsigned>(*reinterpret_cast<const u64*>(request + 0x10) & 0xFFFF);
-        const std::size_t pages = (std::size_t{page_offset} + size + 0xFFFF) / 0x10000;
+        const std::size_t pages = (std::size_t{page_offset} + destination_size + 0xFFFF) / 0x10000;
         if (title && pages && x2w_local::readable(title, pages * sizeof(ULONG_PTR))) {
             entry.tokens.assign(title, title + pages);
             for (ULONG_PTR token : entry.tokens)
