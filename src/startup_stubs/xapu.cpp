@@ -5,9 +5,8 @@
 #include "startup_stubs/trap.h"
 #include "startup_stubs/local_log.h"
 #include <timeapi.h>
-#include <algorithm>
 #include <cstring>
-#include <vector>
+#include <new>
 
 // Experimental (docs/startup-runtime.md). With X2W_AUDIO_PERMISSIVE=1 the exports
 // stand in for the audio command queue; otherwise they trap. Call shapes from the title:
@@ -25,31 +24,26 @@ constexpr long hr_ok = 0;
 constexpr long hr_pointer = static_cast<long>(0x80004003);  // E_POINTER
 constexpr long hr_fail = static_cast<long>(0x80004005);     // E_FAIL
 constexpr long hr_handle = static_cast<long>(0x80070006);   // E_HANDLE
+constexpr long hr_out_of_memory = static_cast<long>(0x8007000E); // E_OUTOFMEMORY
 constexpr std::size_t result_size = 0x58;
 
 bool permissive() noexcept { return x2w_local::env_on("X2W_AUDIO_PERMISSIVE"); }
 
 struct Connection {
+    Connection* next = nullptr;
     u64 handle = 0;
     std::uint64_t pending_results = 0;
 };
 
 SRWLOCK connection_lock = SRWLOCK_INIT;
+Connection* connections = nullptr;
 u64 next_handle = 0x5841500000000001ULL;
-unsigned long long connection_count = 0;
 bool timer_active = false;
-
-std::vector<Connection>& connections()
-{
-    static auto* list = new std::vector<Connection>();
-    return *list;
-}
 
 Connection* find_connection(u64 handle) noexcept
 {
-    if (!handle) return nullptr;
-    for (auto& conn : connections()) {
-        if (conn.handle == handle) return &conn;
+    for (auto* conn = connections; conn; conn = conn->next) {
+        if (conn->handle == handle) return conn;
     }
     return nullptr;
 }
@@ -75,11 +69,15 @@ extern "C" __declspec(noinline) long XApuConnect(u64 rcx, u64 rdx, u64 r8, u64 r
         x2w_local::logf("x2w-audio XApuConnect input=[%s] output(before)=[%s] -> E_POINTER", input, output);
         return hr_pointer;
     }
+    auto* conn = new (std::nothrow) Connection;
+    if (!conn) return hr_out_of_memory;
     AcquireSRWLockExclusive(&connection_lock);
     const u64 handle = next_handle++;
     if (next_handle == 0) next_handle = 0x5841500000000001ULL;
-    connections().push_back({handle, 0});
-    if (connection_count++ == 0) {
+    conn->handle = handle;
+    conn->next = connections;
+    connections = conn;
+    if (!conn->next) {
         // The mix worker sleeps for 2 ms between refills. A coarse Windows tick can
         // stretch that wait beyond the time represented by the queued samples.
         timer_active = timeBeginPeriod(1) == TIMERR_NOERROR;
@@ -165,19 +163,20 @@ extern "C" __declspec(noinline) long XApuDisconnect(u64 rcx, u64 rdx, u64 r8, u6
     if (!permissive())
         x2w_trap::fire(X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, "XApuDisconnect", 2, rcx, rdx, r8, r9, _ReturnAddress());
     AcquireSRWLockExclusive(&connection_lock);
-    auto& list = connections();
-    auto it = std::find_if(list.begin(), list.end(), [rcx](const Connection& conn) { return conn.handle == rcx; });
-    if (it != list.end()) {
-        list.erase(it);
-        if (connection_count && --connection_count == 0 && timer_active) {
-            timeEndPeriod(1);
-            timer_active = false;
-        }
-        ReleaseSRWLockExclusive(&connection_lock);
-        x2w_local::logf("x2w-audio XApuDisconnect handle=0x%llx -> S_OK", rcx);
-        return hr_ok;
+    Connection** slot = &connections;
+    while (*slot && (*slot)->handle != rcx) slot = &(*slot)->next;
+    Connection* conn = *slot;
+    if (conn) *slot = conn->next;
+    if (conn && !connections && timer_active) {
+        timeEndPeriod(1);
+        timer_active = false;
     }
     ReleaseSRWLockExclusive(&connection_lock);
-    x2w_local::logf("x2w-audio XApuDisconnect handle=0x%llx -> E_HANDLE", rcx);
-    return hr_handle;
+    if (!conn) {
+        x2w_local::logf("x2w-audio XApuDisconnect handle=0x%llx -> E_HANDLE", rcx);
+        return hr_handle;
+    }
+    delete conn;
+    x2w_local::logf("x2w-audio XApuDisconnect handle=0x%llx -> S_OK", rcx);
+    return hr_ok;
 }
