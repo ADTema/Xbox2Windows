@@ -83,6 +83,7 @@ struct WrapperOwn {
     bool list_open;   // CommandList (render mode): recording between reset and close
     bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
     bool list_ready;  // CommandList (render mode): closed with recorded work, not yet submitted
+    volatile LONG queue_wait_seen; // CommandQueue: publish later signals only after GPU completion.
     void* pass;       // CommandList (render mode): recording state (Pass)
     Wrapper* list_device;    // CommandList: wrapper that created this list.
 };
@@ -1674,18 +1675,6 @@ HRESULT __stdcall queue_timestamp_frequency(Wrapper* self, UINT64* frequency)
     return hr;
 }
 
-// Queues that have been given a Wait (slot 17). A later Signal on such a queue completes only when
-// the desktop GPU reaches it, as in render mode, so the title cannot see it before the wait ends.
-SRWLOCK waiting_queues_lock = SRWLOCK_INIT;
-std::vector<Wrapper*> waiting_queues;
-bool queue_has_waited(Wrapper* queue)
-{
-    AcquireSRWLockShared(&waiting_queues_lock);
-    const bool found = std::find(waiting_queues.begin(), waiting_queues.end(), queue) != waiting_queues.end();
-    ReleaseSRWLockShared(&waiting_queues_lock);
-    return found;
-}
-
 // Queue slots whose Xbox meaning is unknown, dispatched by argument shape:
 // - (fence wrapper, value): Signal on the desktop queue. Slot 17 (Wait) has the same shape and is
 //   handled by queue_wait below; on other slots a wait would complete the fence early.
@@ -1699,8 +1688,12 @@ __declspec(noinline) u64 queue_dynamic(Wrapper* self, u64 rdx, u64 r8, u64 r9)
     const bool log_it = first_calls(calls, 2);
     if (Wrapper* fence = as_wrapper(reinterpret_cast<void*>(rdx)); fence && fence->own().kind == fence_kind) {
         const HRESULT hr = static_cast<ID3D12CommandQueue*>(self->own().real)->Signal(static_cast<ID3D12Fence*>(fence->own().real), r8);
-        if ((render_mode() || queue_has_waited(self)) && SUCCEEDED(hr)) complete_when_reached(fence, r8);
-        else fence_reached(fence, r8);
+        if (SUCCEEDED(hr)) {
+            if (render_mode() || InterlockedCompareExchange(&self->own().queue_wait_seen, 0, 0))
+                complete_when_reached(fence, r8);
+            else
+                fence_reached(fence, r8);
+        }
         if (log_it)
             log("x2w-d3d12 CommandQueue::slot%d(fence=%p, value=0x%llx) -> Signal 0x%08lx", N, static_cast<void*>(fence), r8,
                 static_cast<unsigned long>(hr));
@@ -1742,9 +1735,7 @@ u64 __stdcall queue_wait(Wrapper* self, u64 rdx, u64 r8, u64 r9)
 {
     Wrapper* fence = as_wrapper(reinterpret_cast<void*>(rdx));
     if (!fence || fence->own().kind != fence_kind) return queue_dynamic<17>(self, rdx, r8, r9);
-    AcquireSRWLockExclusive(&waiting_queues_lock);
-    if (std::find(waiting_queues.begin(), waiting_queues.end(), self) == waiting_queues.end()) waiting_queues.push_back(self);
-    ReleaseSRWLockExclusive(&waiting_queues_lock);
+    InterlockedExchange(&self->own().queue_wait_seen, 1);
     const HRESULT hr = static_cast<ID3D12CommandQueue*>(self->own().real)->Wait(static_cast<ID3D12Fence*>(fence->own().real), r8);
     static LONG calls;
     if (first_calls(calls, 2))
