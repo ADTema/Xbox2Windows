@@ -1683,7 +1683,7 @@ the XSTATE_BV subsets above. The native comparison accepts extra initialized leg
 components and an unwritten or written `MXCSR` when SSE is not in use, because those are
 implementation choices; `ALTER_OP` (standard `xsave64` instead of `xsavec64`, request mask
 ignored) and header/word mutations must fail. The harness has not run on Windows yet: run
-`ctest --preset dev -R cpu_xsave_state` (Debug and `/O2`), which is outside `--preset pr`.
+`ctest --preset dev -R '^cpu_aot_xsave_state$'` (Debug and `/O2`), which is outside `--preset pr`.
 
 Not covered by this experiment: supervisor formats (`xsaves*`, `xrstors*`), compacted
 `xrstor`, components beyond x87/SSE/AVX (so no packed offsets or 64-byte component alignment),
