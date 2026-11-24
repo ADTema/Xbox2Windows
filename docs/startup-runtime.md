@@ -30,6 +30,10 @@ records. The control expects the first blend patch to win and must fail.
 ## Output window and fallback diagnostics
 
 The desktop swap chain has its own top-level window, class `X2WOutputWindow`.
+The presenter only samples non-empty single-sample 2D surfaces without
+`D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE` and with a supported view format
+(`src/startup_stubs/present_view_format.h`), and marks itself failed if
+closing its command list fails.
 When a present cannot show its surface, the GDI fallback selects a visible,
 unowned guest window in the same process. If only the presenter is visible,
 the fallback leaves it alone. To exercise both z-orders with source-built
