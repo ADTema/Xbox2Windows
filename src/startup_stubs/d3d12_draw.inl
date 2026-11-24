@@ -150,7 +150,11 @@ void load_translation(Translation& tr, const void* a, std::size_t a_bytes, const
 Translation* cached_translation(const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes,
                                 const std::vector<unsigned char>& root_blob)
 {
-    const u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes)));
+    // Keep pre-fix desktop bytecode and manifests out of this ABI's cache.
+    // tools/startup/gfx2hlsl.py hashes the same bytes, without a trailing NUL.
+    constexpr char revision[] = "x2w-startup-srv-2";
+    const u64 seed = fnv_bytes(revision, sizeof(revision) - 1);
+    const u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes, seed)));
     auto& entry = translation_by_key()[key];
     if (!entry) {
         entry = new Translation;
@@ -217,17 +221,22 @@ BoundPipeline* translation_for(Wrapper* pipeline)
     Translation*& result = bound->translation;
     const PipelineInfo* info = pipeline_info(pipeline);
     const PipelineInfo* own = info;
-    for (int depth = 0; info && info->path == 55 && info->base && depth < 8; ++depth) info = pipeline_info(info->base);
     {
         // The pipeline's own description first (a derived pipeline overrides state), then its base's state block.
         std::size_t where = 0;
         const char* from = "none";
-        if (own && own != info && find_blend(own->desc, &bound->blend, &where)) from = "derived description";
-        else if (info && info->has_stream_blend) {
+        for (int depth = 0; info && info->path == 55 && info->base && depth < 8; ++depth) {
+            if (!bound->has_blend && x2w_derived_blend::last_blend(info->desc.data(), info->desc.size(), bound->blend, where)) {
+                from = "derived blend patch";
+                bound->has_blend = true;
+            }
+            info = pipeline_info(info->base);
+        }
+        if (!bound->has_blend && info && info->has_stream_blend) {
             from = "stream blend subobject";
             bound->blend = info->stream_blend;
-        } else if (info && find_blend(info->state_a, &bound->blend, &where)) from = "state block A";
-        else if (info && find_blend(info->state_b, &bound->blend, &where)) from = "state block B";
+        } else if (!bound->has_blend && info && find_blend(info->state_a, &bound->blend, &where)) from = "state block A";
+        else if (!bound->has_blend && info && find_blend(info->state_b, &bound->blend, &where)) from = "state block B";
         bound->has_blend = from[0] != 'n';
         static LONG logged;
         if (first_calls(logged, 24)) {
@@ -440,15 +449,17 @@ void buffer_view(D3D12_CPU_DESCRIPTOR_HANDLE dest, bool have, u64 offset, std::s
     if (!have) InterlockedIncrement(&null_bindings);
 }
 
-// Texture contents. The XG stand-in reports the desktop copyable-footprint layout to the title
-// (mip footprints from GetCopyableFootprints, array slices every 64 KiB-aligned slice size), so a
-// texture's title memory is already in a layout CopyTextureRegion can read: each subresource is
-// copied through the upload ring as a placed footprint. A texture is uploaded on its first bind and
+// Texture contents. Linear backing uses desktop copyable footprints; an announced BC7 4 KiB
+// surface must be detiled into the footprint first. A texture is uploaded on its first bind and
 // again when its memory changed: XG copies announce themselves (x2w_d3d12_texture_written), and
 // CPU-backed textures up to 32 MiB are also re-hashed for writes the title makes on its own.
 // Recheck single-mip R8 planes on their first bind each frame and other textures every 15 frames.
 // Targets and UAVs are GPU-written and never uploaded.
-struct TextureUpload { u64 hash = 0; u64 generation = ~0ull; LONG checked_frame = -1000; bool done = false; };
+struct TextureUpload {
+    u64 hash = 0, generation = ~0ull;
+    LONG checked_frame = -1000;
+    bool done = false, tiled = false;
+};
 std::unordered_map<ID3D12Resource*, TextureUpload>& texture_uploads() { static std::unordered_map<ID3D12Resource*, TextureUpload> m; return m; }
 LONG textures_uploaded, texture_bytes_uploaded, textures_unreadable;
 u64 hash_memory(const unsigned char* data, std::size_t bytes)
@@ -484,15 +495,33 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     const UINT64 slice_total = plan.size;
     if (slice_total == ~0ull || !slice_total) return;
     const u64 stride = (slice_total + 0xFFFF) & ~u64{0xFFFF};
-    const u64 total = slices > 1 ? stride * (slices - 1) + slice_total : slice_total;
     TextureUpload& state = texture_uploads()[texture];
-    u64 generation = 0;
+    TextureWrite written;
     AcquireSRWLockShared(&written_lock);
-    if (const auto found = written_textures().find(reinterpret_cast<u64>(memory)); found != written_textures().end()) generation = found->second;
+    if (const auto found = written_textures().find(reinterpret_cast<u64>(memory)); found != written_textures().end())
+        written = found->second;
     ReleaseSRWLockShared(&written_lock);
+    const bool tiled_address = resource->own().tiled_address_srv;
+    const bool tiled_bc7 = !tiled_address && written.bc7_width != 0;
+    const bool tiled = tiled_bc7 || tiled_address;
+    const auto generation = written.generation;
+    const x2w_startup::Bc16Surface surface(tiled_bc7 ? written.bc7_width : static_cast<UINT>(desc.Width),
+                                         tiled_bc7 ? written.bc7_height : desc.Height);
+    if (tiled_bc7) {
+        const auto* original = resource_info(resource);
+        if (!original || !x2w_startup::supports_bc7_4k_s(original->console) ||
+            original->console.Width != written.bc7_width || original->console.Height != written.bc7_height ||
+            desc.Format != DXGI_FORMAT_BC7_UNORM || desc.Width != surface.columns * surface.block_texels ||
+            desc.Height != surface.rows * surface.block_texels) return;
+    }
+    if (tiled && (plan.count != 1 || plan.rows[0] != surface.rows ||
+                  plan.row_bytes[0] != u64{surface.columns} * surface.block_bytes)) return;
+    const u64 total = tiled ? surface.size() : stride * (slices - 1) + slice_total;
     const bool announced = state.generation != generation;
     const UINT elapsed = static_cast<UINT>(frame_number) - static_cast<UINT>(state.checked_frame);
-    if (state.done && !announced && !x2w_startup::recheck_cpu_texture(desc, total, elapsed)) return;
+    const bool recheck = tiled_address ? elapsed != 0
+        : x2w_startup::recheck_cpu_texture(desc, total, elapsed);
+    if (state.done && !announced && !recheck) return;
     if (readable_window(reinterpret_cast<u64>(memory), static_cast<std::size_t>(total)) < total) {
         if (!state.done) InterlockedIncrement(&textures_unreadable);
         state.done = true;
@@ -501,24 +530,38 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     }
     state.checked_frame = frame_number;
     const u64 hash = hash_memory(memory, static_cast<std::size_t>(total));
-    if (state.done && hash == state.hash) {
+    if (state.done && hash == state.hash && state.tiled == tiled) {
         state.generation = generation;
         return;
     }
     require_state(self, texture, D3D12_RESOURCE_STATE_COPY_DEST);
-    for (UINT s = 0; s < slices; ++s)
-        for (UINT i = 0; i < plan.count; ++i) {
-            const auto& fp = plan.placed[i];
-            const u64 bytes = plan.bytes(i);
-            u64 offset = 0;
-            if (!ring_copy(reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes), &offset)) {
-                state.done = false;
-                return;
-            }
-            plan.upload(list, texture, upload_ring, mips, slices, s, i, offset);
+    if (tiled) {
+        u64 offset = 0;
+        const auto bytes = plan.bytes(0);
+        auto* rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset);
+        if (!rows) {
+            state.done = false;
+            return;
         }
+        std::memset(rows, 0, static_cast<std::size_t>(bytes));
+        surface.detile(memory, rows, plan.placed[0].Footprint.RowPitch);
+        plan.upload(list, texture, upload_ring, 1, 1, 0, 0, offset);
+    } else {
+        for (UINT s = 0; s < slices; ++s)
+            for (UINT i = 0; i < plan.count; ++i) {
+                const auto& fp = plan.placed[i];
+                const u64 bytes = plan.bytes(i);
+                u64 offset = 0;
+                if (!ring_copy(reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes), &offset)) {
+                    state.done = false;
+                    return;
+                }
+                plan.upload(list, texture, upload_ring, mips, slices, s, i, offset);
+            }
+    }
     state.hash = hash;
     state.generation = generation;
+    state.tiled = tiled;
     state.done = true;
     InterlockedIncrement(&textures_uploaded);
     InterlockedExchangeAdd(&texture_bytes_uploaded, static_cast<LONG>(total >> 10));
@@ -670,7 +713,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             address = pass.root_address[srv.a];
             bytes = readable_window(address, 0x10000);
         }
-        const u64 entry = srv.source == 0 && srv.a < 16 && pass.table_address[srv.a] ? pass.table_address[srv.a] + static_cast<u64>(srv.b) : 0;
+        const u64 entry = srv.source == 0 && srv.a >= 0 && srv.a < 16 && srv.b >= 0 ?
+            pass.view_tables[srv.a].record(static_cast<u64>(srv.b), 32) : 0;
         std::uint32_t words[8] = {};
         if (entry && x2w_local::readable(reinterpret_cast<const void*>(entry), 32)) std::memcpy(words, reinterpret_cast<const void*>(entry), 32);
         if (srv.kind == 1 || srv.kind == 3) {
@@ -689,7 +733,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             desc.ViewDimension = srv.kind == 3 ? D3D12_SRV_DIMENSION_TEXTURE3D : D3D12_SRV_DIMENSION_TEXTURE2D;
             desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             desc.Texture2D.MipLevels = 1;  // same offset as Texture3D.MipLevels
-            ID3D12Resource* texture = resource && resource->own().kind == resource_kind ? static_cast<ID3D12Resource*>(resource->own().real) : nullptr;
+            ID3D12Resource* texture = sampled_address_texture(resource);
             if (texture && record.desc_bytes >= 40) {
                 std::memcpy(&desc, record.desc, 40);
                 desc.Format = desktop_format(desc.Format);
@@ -821,10 +865,15 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
 void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const* heaps)
 {
     x2w_startup::SamplerSource source;
+    u64 view_heap = 0;
     if (count && count <= 4 && x2w_local::readable(heaps, std::size_t{count} * sizeof(*heaps))) {
         AcquireSRWLockShared(&note_lock);
         for (UINT i = 0; i < count; ++i) {
             for (const HeapInfo& heap : heap_infos()) {
+                if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
+                    heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+                    heap.logical_count > heap.count)
+                    view_heap = heap.wrapper;
                 if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
                     heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER && heap.desktop_gpu)
                     source = {static_cast<std::uintptr_t>(heap.title_sampler_cpu), heap.count};
@@ -832,7 +881,11 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
         }
         ReleaseSRWLockShared(&note_lock);
     }
-    pass_of(self).title_samplers = source;
+    auto& pass = pass_of(self);
+    if (pass.source_view_heap != view_heap)
+        for (auto& table : pass.view_tables) table = {};
+    pass.source_view_heap = view_heap;
+    pass.title_samplers = source;
 }
 
 // List slot 36 (desktop 32 + 4), SetGraphicsRootDescriptorTable(parameter, GPU handle): the table's
@@ -840,13 +893,18 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
 void __stdcall list_table(Wrapper* self, UINT parameter, u64 gpu_handle)
 {
     if (parameter >= 16) return;
-    u64 address = 0;
+    auto& pass = pass_of(self);
+    x2w_startup::ViewTable table;
     AcquireSRWLockShared(&note_lock);
-    for (const HeapInfo& heap : heap_infos())
-        if (heap.desktop_gpu && heap.title_cpu && gpu_handle >= heap.desktop_gpu && gpu_handle < heap.desktop_gpu + u64{heap.count} * heap.increment)
-            address = heap.title_cpu + (gpu_handle - heap.desktop_gpu);
+    for (const HeapInfo& heap : heap_infos()) {
+        if (heap.type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) continue;
+        if (pass.source_view_heap && heap.wrapper != pass.source_view_heap) continue;
+        if (!pass.source_view_heap && heap.logical_count > heap.count) continue;
+        table = x2w_startup::resolve_view_table(heap.desktop_gpu, heap.title_cpu, heap.logical_count, heap.increment, gpu_handle);
+        if (table.address) break;
+    }
     ReleaseSRWLockShared(&note_lock);
-    pass_of(self).table_address[parameter] = address;
+    pass.view_tables[parameter] = table;
 }
 // List slot 40 (desktop 36 + 4), SetGraphicsRoot32BitConstants(parameter, count, data, offset).
 void __stdcall list_root_constants(Wrapper* self, UINT parameter, UINT count, const std::uint32_t* data, UINT offset)

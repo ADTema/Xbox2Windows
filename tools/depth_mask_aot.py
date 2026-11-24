@@ -167,7 +167,10 @@ def lower(decoded, tables):
             elif op == "v_fmac_f32_e32" and len(args) == 3:
                 expr = f"mad({fp(args[1])}, {fp(args[2])}, {vector[dest]})"
             elif op == "v_fract_f32_e32" and len(args) == 2:
-                expr = f"min(frac({fp(args[1])}), asfloat(0x3f7fffffu))"
+                # D3D min returns the other operand for a NaN, so a min cap would turn a NaN input
+                # into the finite cap; a comparison fails for NaN and passes it through.
+                frac = f"frac({fp(args[1])})"
+                expr = f"({frac} >= 1.0f ? asfloat(0x3f7fffffu) : {frac})"
             else:
                 raise ValueError(f"Unsupported depth instruction: {op}")
             vector[dest] = f"value{index}"

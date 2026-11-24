@@ -8,6 +8,19 @@ This is not a port and not an emulator. No executable is playable. Every stand-i
 most answers are shortcuts that are logged as such. The open problems are tracked in the issues
 whose titles start with `startup-runtime:`.
 
+## Derived pipeline blend state
+
+Device slot 55 accepts up to 64 fixed-size derived pipeline patches. The translated graphics
+path reads the blend descriptor from part 2 of a 332-byte patch. Within one derivation the last
+blend patch wins. A further derivation inherits that state until it supplies another blend patch.
+Other patch parts are outside this blend implementation. The record layout can also be compared
+with [XCL's implementation at 64b3f35](https://github.com/ivall/xcl/blob/64b3f35599bb7102f55d640e1a791e7d6dd3b175/crates/xcl/src/hle/d3d12x/device_x.rs#L501-L515).
+
+Run `ctest --preset dev --no-tests=error -R "^startup_stream_draw_(hardware|warp)$" -V` after
+building `startup_stream_consumer`. The source-built shader writes to half of an 8×4 target.
+On A8 the parent preserves the zero clear and the child writes alpha 255. R8 records red 0 or
+255 according to the input shader. The untouched half stays zero in all four cases.
+
 ## Output window and fallback diagnostics
 
 The desktop swap chain has its own top-level window, class `X2WOutputWindow`.
@@ -110,9 +123,17 @@ ctest --preset release --no-tests=error -R '^startup_launch$' -V
 | `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses (0x4 = A); keyboard and XInput pad 0 also work |
 | `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into `SamplerState qh[2048] : register(s0, space1)` and writes `smpheap 2048 1 fallback 2047`. The stand-in uses entries 0 to 2046 for the bound heap and reserves entry 2047 for unaligned or out-of-range offsets. It also accepts the original `smpheap 2048 1` manifest with all 2,048 entries available. [#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143) |
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
-| `X2W_XG_BC7_4K_S_LAYOUT=1` | enables the BC7 tiled layout and diagnostic copy when `X2W_D3D12_PERMISSIVE=1` |
+| `X2W_XG_BC7_4K_S_LAYOUT=1` | enables the BC7 tiled layout, copy and draw upload when `X2W_D3D12_PERMISSIVE=1` |
 | `X2W_TRAP_CONTINUE=<exports>` | lets listed trap exports return 0 instead of ending the process |
 | `X2W_HOST_CPU=1` (`run.ps1 -HostCpu`) | the startup debugger rewrites main-image instructions the host processor lacks at their first fault: see [Host processors without the console's instructions](#host-processors-without-the-consoles-instructions) |
+
+The startup shader cache key includes the translator revision. After updating from
+the earlier wide-descriptor translation, run the recording build once to emit
+requests, run `python tools/startup/gfx2hlsl.py --pending <cache-directory>`,
+then start the build again. The new key keeps the former bytecode and manifest
+together under their original name. A 16-dword table load can contain two
+independent image descriptors at offsets 0 and 32 from the load address.
+
 
 ## Findings
 
@@ -153,18 +174,23 @@ These are measured on one executable; treat them as hypotheses for others.
   id, the source, the compressed size and the destination chunk size. A later independent
   request at a matching offset still decodes its own bytes or fails without touching its
   destination.
+- **DirectStorage file ranges.** A nonempty file request checks its byte offset and length against
+  the current file size before allocating the staging buffer. A range ending at EOF is valid.
+  An overrun or short read fails the queue request and preserves the destination.
 
 ## Shortcuts that are known to be wrong
 
 - A shader-visible CBV/SRV/UAV heap larger than the adapter accepts is created at the limit the
   adapter does take (measured once, then bisected) and the title's full-size memory stays the heap's
-  CPU side, so a title handle keeps its linear mapping and recorded view ids stay distinct. Views and
-  descriptor copies whose desktop handle falls past the end of the desktop heap are reported, not
-  translated, and a sparse or paged mapping remains the complete answer. Drivers refuse the request
+  CPU side. Desktop descriptor writes and copies use a CPU-only heap for the remainder. Translated
+  graphics draws resolve their root tables against the bound logical heap and publish the requested
+  records into the draw's private shader-visible heap. Changing the bound heap invalidates its
+  tables, and a record extending beyond the logical end supplies a null view. This covers translated
+  graphics draws; other consumers need their own binding path. Drivers refuse the request
   with different codes for the same condition (`E_INVALIDARG` on a GTX 1660 SUPER, `E_OUTOFMEMORY` on
   an RTX 3060), so any failure of an oversized shader-visible view heap takes this path. The measured
   limits so far are 1,000,000 descriptors on both adapters. Reproduce with
-  `ctest --preset release --no-tests=error -R '^startup_view_heap_' -V`, which skips (77) on an
+  `ctest --preset release --no-tests=error -R '^startup_(view_heap|logical_view)_' -V`, which skips (77) on an
   adapter that accepts the full request.
 - BCPack requests are completed with zero-filled destinations (blank textures).
 - The XG stand-in normally uses desktop copyable footprints. Its opt-in BC7 diagnostic
@@ -172,9 +198,11 @@ These are measured on one executable; treat them as hypotheses for others.
   `BC7_UNORM` 2D texture with an unknown layout, default alignment, and no resource flags.
   The diagnostic selects the profile explicitly. Native XG selector values still need
   independent evidence. `CopyIntoSubresource` writes the visible BC7 blocks from pitched source rows
-  and preserves tile padding. With `X2W_D3D12_RENDER=1`, it returns `E_NOTIMPL` pending a detiler for
-  the upload path. The reported pitch describes the padded block-row extent of the surface.
-  The synthetic copy check runs with `ctest --preset dev --no-tests=error -R '^startup_xg_bc7_layout$' -V`.
+  and preserves tile padding. In render mode, a successful copy marks the backing so the D3D12
+  stand-in can detile BC7 blocks into the desktop upload footprint. The companion D3D12
+  stand-in must be loaded for render-mode copies. The reported pitch describes the padded
+  block-row extent of the surface. Synthetic copy and draw checks run with
+  `ctest --preset dev --no-tests=error -R '^startup_xg_bc7_' -V`.
 - The default translator uses a static default sampler for a dynamically indexed sampler-heap load.
   With the sampler-heap opt-in, translated draws snapshot the bound heap's 16-byte sampler entries and
   bind a private desktop table beside the static samplers. Missing, out-of-range, or unreadable entries
@@ -237,6 +265,13 @@ entry mask when its active VGPR holds an integer conversion of a fixed-offset sc
 value. Run `python -B tests/startup_uniform_lane_check.py` to check the producer and the
 varying-source, register-clobber, mask and branch controls.
 
+## Frame capture reader
+
+`tools/startup/capture.py` reads the `capture.bin` the frame capture writes. A truncated file, a chunk
+with a short header, or an unknown tag raises a `ValueError` that names the tag and offset.
+`ctest --preset dev --no-tests=error -R '^startup_capture$' -V` checks every chunk layout against a
+synthetic file.
+
 ## NV12 plane upload
 
 For a single-mip, single-sample, even-sized 2D NV12 image the desktop stand-in
@@ -280,3 +315,23 @@ the unpatched functions are compared as well. It exits 77 on a host that is not 
 Measured so far on one host without these instructions; the rewrites of `EXTRQ` have only run in
 the check. A thread that is executing inside the bytes of a jump site while another thread faults
 on it is not handled.
+
+## Startup memory accounting
+
+The DirectStorage heartbeat (`x2w-dstorage heartbeat <n> s:` in `stderr.txt`) reports this
+process's peak and current commit charge in MiB and the number of live 64 KiB physical-page
+sections, so runs that stop at different points can be compared by memory spent rather than by
+elapsed time. A physical-page section exists from a page's first use (a mapping or a DirectStorage
+write) until its grant is released; `xmem.dll` publishes that count through the experimental
+`x2w_xmem_page_stats` export. The heartbeat also prints while the request counters are unchanged
+when either memory value changed, so the cost of a stalled load is visible.
+
+```powershell
+cmake --build --preset release --target xmem_shim startup_stub_xcrdapi
+ctest --preset release --no-tests=error -R '^(xmem_page_stats|startup_heartbeat_commit)$' -V
+```
+
+The `startup_heartbeat_commit` check starts the heartbeat before loading the page provider, then
+maps two synthetic sections and compares the reported values with `GetProcessMemoryInfo` in the
+same process. It releases a separate commit allocation to check that a current-only change
+produces another report.
