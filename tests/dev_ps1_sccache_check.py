@@ -44,8 +44,9 @@ def run_block(pwsh, block, env_value, with_sccache, work):
             fake.write_text("#!/bin/sh\nexit 0\n")
             fake.chmod(0o755)
     env = {k: v for k, v in os.environ.items() if k != "X2W_USE_SCCACHE"}
-    # Only the stub directory and pwsh itself: a real sccache must not leak in.
-    env["PATH"] = os.pathsep.join([str(bindir), os.path.dirname(pwsh)] +
+    # Only the stub directory (plus System32 on Windows): pwsh is started by
+    # absolute path, and its own directory may also hold a real sccache.
+    env["PATH"] = os.pathsep.join([str(bindir)] +
                                   ([os.path.join(os.environ["SystemRoot"], "System32")] if os.name == "nt" else []))
     if env_value is not None:
         env["X2W_USE_SCCACHE"] = env_value
