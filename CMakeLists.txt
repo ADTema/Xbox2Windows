@@ -2004,6 +2004,19 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_avx_int_ymm_minmax>"
         "$<TARGET_FILE:cpu_avx_int_ymm_minmax_lifted>")
     set_tests_properties(cpu_aot_avx_int_ymm_minmax PROPERTIES SKIP_RETURN_CODE 77)
+    set(cpu_avx_int_ymm_abs_sign_shuf_exports
+        "op_vpabsb_ymm,op_vpabsw_ymm,op_vpabsd_ymm,op_vpsignb_ymm,op_vpsignw_ymm,op_vpsignd_ymm,"
+        "op_vpshufhw_ymm_1b,op_vpshufhw_ymm_93,op_vpshuflw_ymm_1b,op_vpshuflw_ymm_93,"
+        "op_vpabsd_ymm_dst_src1,op_vpsignw_ymm_dst_src2,op_vpsignb_ymm_all,op_vpshufhw_ymm_dst_src1,"
+        "op_vpabsb_ymm_then_xmm_vpsignb")
+    string(CONCAT cpu_avx_int_ymm_abs_sign_shuf_exports ${cpu_avx_int_ymm_abs_sign_shuf_exports})
+    cpu_asm_fixture(cpu_avx_int_ymm_abs_sign_shuf avx_int_ymm_abs_sign_shuf)
+    cpu_translation(cpu_avx_int_ymm_abs_sign_shuf cpu_avx_int_aot "${cpu_avx_int_ymm_abs_sign_shuf_exports}")
+    add_test(NAME cpu_aot_avx_int_ymm_abs_sign_shuf COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/avx_int_ymm_abs_sign_shuf_check.py"
+        "$<TARGET_FILE:cpu_avx_int_ymm_abs_sign_shuf>"
+        "$<TARGET_FILE:cpu_avx_int_ymm_abs_sign_shuf_lifted>")
+    set_tests_properties(cpu_aot_avx_int_ymm_abs_sign_shuf PROPERTIES SKIP_RETURN_CODE 77)
     set(cpu_avx_move_exports
         "op_andpd_xmm,op_andpd_ymm,op_andps_xmm,op_andps_ymm,op_andnpd_xmm,op_andnpd_ymm,"
         "op_andnps_xmm,op_andnps_ymm,op_orpd_xmm,op_orpd_ymm,op_orps_xmm,op_orps_ymm,"
