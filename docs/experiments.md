@@ -2,6 +2,19 @@
 
 Run commands from the repository root. Start with the [project overview](../README.md) and [contribution guide](../CONTRIBUTING.md). Package-specific observations below used local inputs. Community regression tests use fixtures built from this repository.
 
+## Offline store context forwarding
+
+The fake-user runtime creates an offline store context token. Unimplemented methods receiving
+that token in any of their first four arguments return `E_FAIL` before entering the desktop
+runtime, which cannot interpret the token as an object. This does not implement store services.
+The `startup_stubs` source-built control uses a desktop method returning a sentinel: all four
+token positions must be refused, while a different value must reach that method unchanged.
+
+```powershell
+cmake --build --preset dev --target startup_stub_consumer startup_stub_acphal startup_stub_xapu startup_stub_xcrdapi startup_stub_gameinput
+ctest --preset dev --no-tests=error -R '^startup_stubs$' --output-on-failure
+```
+
 ## UTF-8 persistent storage root
 
 The runtime proxy reads `X2W_STORAGE_PATH` with `GetEnvironmentVariableW` and converts it to
