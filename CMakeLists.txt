@@ -2091,6 +2091,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # +-0, denormals, +-1, +-max, +-inf and NaNs against the ISA reference; the old != lowering must fail.
     add_test(NAME startup_gfx2hlsl_f32_lg COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_f32_lg_check.py")
+    # f32 nlt/nle/ngt/nge, o and u hold under FXC's and DXC's rewrites of float compares without -Gis (#1936).
+    add_test(NAME startup_gfx2hlsl_f32_nan COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_f32_nan_check.py")
     # A negated source on the vector select flips that source's sign bit (#1709).
     add_test(NAME startup_gfx2hlsl_cndmask_neg COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_cndmask_neg_check.py")
@@ -2214,6 +2217,14 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_f32_lg_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_f32_lg_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    endforeach()
+    # Every lowered f32 condition but lg/nlg decides 16 x 16 pixels with FXC and DXC, checked pixel by pixel (#1936);
+    # the text before #1936 must fail on the compiler that rewrote it and match that rewrite's image.
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_f32_nan_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_f32_nan_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_gfx2hlsl_f32_nan_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     endforeach()
     add_test(NAME startup_gfx2hlsl_mad_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_mad_check.py")
