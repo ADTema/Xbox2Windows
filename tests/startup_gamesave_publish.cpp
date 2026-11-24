@@ -18,6 +18,19 @@
 namespace fs = std::filesystem;
 using x2w_save::Status;
 
+const char* status_name(Status status)
+{
+    switch (status) {
+    case Status::ok: return "ok";
+    case Status::bad_name: return "bad_name";
+    case Status::too_large: return "too_large";
+    case Status::not_found: return "not_found";
+    case Status::io_error: return "io_error";
+    case Status::busy: return "busy";
+    }
+    return "unknown";
+}
+
 namespace {
 constexpr int exit_old = 20, exit_new = 21, exit_mixed = 22, exit_busy = 23, exit_other = 24;
 constexpr auto handshake_deadline = std::chrono::seconds(30);
@@ -56,6 +69,7 @@ int reader(const char* root, const char* dir, const char* timeout_ms)
     const x2w_save::Store store(root, std::chrono::milliseconds(std::atoi(timeout_ms)));
     std::vector<std::vector<unsigned char>> blobs;
     const Status status = store.read_blobs("slot-p", {"a.dat", "b.dat"}, blobs);
+    std::fprintf(stderr, "reader (timeout %s ms): status %s\n", timeout_ms, status_name(status));
     if (status == Status::busy) return exit_busy;
     if (status == Status::not_found) return exit_mixed;  // a blob of the generation is missing
     if (status != Status::ok) return exit_other;
@@ -138,7 +152,7 @@ void paused_publication(const std::string& self, const fs::path& base, unsigned 
         // While the publication is half done another process must not see half of it.
         const int during = read_code(self, dir, 150);
         if (during == exit_mixed) std::fprintf(stderr, "FAIL: reader saw a mixed generation or a missing blob at %s\n", label.c_str());
-        expect(during == exit_busy, (label + ": a reader that cannot wait is refused, not shown a partial state").c_str());
+        expect(during == exit_busy, (label + ": a reader that cannot wait is refused, not shown a partial state (reader exit code " + std::to_string(during) + ", expected " + std::to_string(exit_busy) + ": 20 old, 21 new, 22 mixed, 23 busy, 24 other status)").c_str());
         std::thread read_thread([&] { waiting_reader = read_code(self, dir, 20000); });
         expect(wait_for(dir / "sync" / "started-20000"), "the waiting reader started");
         touch(dir / "sync" / "go");
@@ -182,9 +196,18 @@ void holder_that_dies(const std::string& self, const fs::path& base)
     std::thread hold_thread([&] { holder_code = run_child(self, "hold " + quoted(dir / "store") + " " + quoted(dir / "sync")); });
     if (wait_for(dir / "sync" / "held")) {
         std::vector<unsigned char> bytes;
-        expect(store.commit("slot-p", generation(2)) == Status::busy, "a commit gives up with busy while the lock is held elsewhere");
-        expect(store.read_blob("slot-p", "a.dat", bytes) == Status::busy, "a read gives up with busy while the lock is held elsewhere");
-        expect(store.delete_blob("slot-p", "a.dat") == Status::busy, "a delete gives up with busy while the lock is held elsewhere");
+        const Status commit = store.commit("slot-p", generation(2));
+        const Status read = store.read_blob("slot-p", "a.dat", bytes);
+        const Status del = store.delete_blob("slot-p", "a.dat");
+        const std::string got = std::string(" (got ") + status_name(commit) + "/" + status_name(read) + "/" + status_name(del) + " for commit/read/delete)";
+        expect(commit == Status::busy, ("a commit gives up with busy while the lock is held elsewhere" + got).c_str());
+        expect(read == Status::busy, ("a read gives up with busy while the lock is held elsewhere" + got).c_str());
+        expect(del == Status::busy, ("a delete gives up with busy while the lock is held elsewhere" + got).c_str());
+        // The same attempt on the bare lock: the result and the system error code say why.
+        x2w_save::FileLock probe;
+        const x2w_save::LockResult direct = probe.acquire(dir / "store" / ("slot-p" + std::string(x2w_save::lock_suffix)), false, std::chrono::milliseconds(0));
+        expect(direct == x2w_save::LockResult::timeout,
+               ("a lock request that cannot wait ends in timeout (LockResult " + std::to_string(static_cast<int>(direct)) + ", system error " + std::to_string(probe.last_error()) + ")").c_str());
     } else {
         expect(false, "the holder took the lock");
     }

@@ -9,6 +9,7 @@
 #include <chrono>
 #include <filesystem>
 #include <thread>
+#include <cstdint>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -28,6 +29,20 @@ namespace x2w_save {
 
 enum class LockResult { locked, timeout, error };
 
+// Win32 codes (winerror.h values, repeated here so the mapping builds and is tested on every platform).
+constexpr std::uint32_t win_error_sharing_violation = 32;
+constexpr std::uint32_t win_error_lock_violation = 33;
+constexpr std::uint32_t win_error_io_pending = 997;
+
+// Whether a failed LockFileEx(LOCKFILE_FAIL_IMMEDIATELY) means "another holder has it, try again
+// later" rather than a real failure. ERROR_LOCK_VIOLATION is the documented answer; a sharing
+// violation or ERROR_IO_PENDING (the request was not granted at once) mean the same thing and must
+// not be reported as an I/O error.
+constexpr bool win_lock_error_is_busy(std::uint32_t code)
+{
+    return code == win_error_lock_violation || code == win_error_sharing_violation || code == win_error_io_pending;
+}
+
 class FileLock {
 public:
     FileLock() = default;
@@ -43,6 +58,7 @@ public:
         if (!open(file)) return LockResult::error;
         const auto deadline = std::chrono::steady_clock::now() + timeout;
         for (int pause = 1;; pause = pause < 16 ? pause * 2 : pause) {
+            last_error_ = 0;
             const Attempt attempt = try_lock_once(exclusive);
             if (attempt == Attempt::locked) return LockResult::locked;
             if (attempt == Attempt::error) break;
@@ -55,6 +71,10 @@ public:
         release();
         return LockResult::error;
     }
+
+    // The system error (GetLastError, or errno) of the last failed lock attempt; 0 when none failed.
+    // Kept for diagnostics: it says why a lock ended in busy or error.
+    std::uint32_t last_error() const noexcept { return last_error_; }
 
     void release() noexcept
     {
@@ -89,13 +109,24 @@ private:
         OVERLAPPED where{};
         const DWORD flags = LOCKFILE_FAIL_IMMEDIATELY | (exclusive ? LOCKFILE_EXCLUSIVE_LOCK : 0);
         if (LockFileEx(handle_, flags, 0, 1, 0, &where)) return Attempt::locked;
-        return GetLastError() == ERROR_LOCK_VIOLATION ? Attempt::busy : Attempt::error;
+        last_error_ = GetLastError();
+        if (!win_lock_error_is_busy(last_error_)) return Attempt::error;
+        if (last_error_ == win_error_io_pending) {
+            // The request may still be queued: withdraw it and wait for that to finish, because
+            // `where` is about to go out of scope.
+            CancelIoEx(handle_, &where);
+            DWORD ignored = 0;
+            GetOverlappedResult(handle_, &where, &ignored, TRUE);
+        }
+        return Attempt::busy;
 #else
         if (flock(fd_, (exclusive ? LOCK_EX : LOCK_SH) | LOCK_NB) == 0) return Attempt::locked;
+        last_error_ = static_cast<std::uint32_t>(errno);
         return errno == EWOULDBLOCK ? Attempt::busy : Attempt::error;
 #endif
     }
 
+    std::uint32_t last_error_ = 0;
 #ifdef _WIN32
     HANDLE handle_ = INVALID_HANDLE_VALUE;
 #else
