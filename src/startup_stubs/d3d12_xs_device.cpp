@@ -1812,10 +1812,11 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
     // A console view heap can be larger than the driver accepts. Measure the accepted maximum, create
     // the desktop heap at it, and keep the title's own full-size memory; descriptors past the desktop
     // heap stay in title memory and any use of them is reported by desktop_cpu_handle.
+    // The refusal code differs between drivers (E_INVALIDARG on a GTX 1660 SUPER, E_OUTOFMEMORY on an
+    // RTX 3060), so any failure of an oversized shader-visible view heap takes the same path.
     D3D12_DESCRIPTOR_HEAP_DESC clamped = *desc;
     bool did_clamp = false;
-    if (FAILED(hr) && hr == E_INVALIDARG
-        && (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
+    if (FAILED(hr) && (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
         && desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
         && desc->NumDescriptors > view_heap_probe_floor) {
         const std::uint64_t limit = accepted_view_heap_descriptors(device_of(self), desc->NodeMask);
@@ -1823,9 +1824,11 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
             clamped.NumDescriptors = static_cast<UINT>(limit);
             did_clamp = true;
             hr = device_of(self)->CreateDescriptorHeap(&clamped, IID_PPV_ARGS(&heap));
-            log("x2w-d3d12 Device::CreateDescriptorHeap: shortcut - title asked for %u shader-visible "
-                "view descriptors, this driver accepts %u; the rest stay in title memory",
-                desc->NumDescriptors, clamped.NumDescriptors);
+            static LONG shortcuts;
+            if (SUCCEEDED(hr) && first_calls(shortcuts, 1))
+                log("x2w-d3d12 Device::CreateDescriptorHeap: shortcut - title asked for %u shader-visible "
+                    "view descriptors, this driver accepts %u; the rest stay in title memory",
+                    desc->NumDescriptors, clamped.NumDescriptors);
         }
     }
     const D3D12_DESCRIPTOR_HEAP_DESC* request = did_clamp ? &clamped : desc;

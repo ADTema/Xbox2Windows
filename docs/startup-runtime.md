@@ -118,6 +118,16 @@ These are measured on one executable; treat them as hypotheses for others.
 
 ## Shortcuts that are known to be wrong
 
+- A shader-visible CBV/SRV/UAV heap larger than the adapter accepts is created at the limit the
+  adapter does take (measured once, then bisected) and the title's full-size memory stays the heap's
+  CPU side, so a title handle keeps its linear mapping and recorded view ids stay distinct. Views and
+  descriptor copies whose desktop handle falls past the end of the desktop heap are reported, not
+  translated, and a sparse or paged mapping remains the complete answer. Drivers refuse the request
+  with different codes for the same condition (`E_INVALIDARG` on a GTX 1660 SUPER, `E_OUTOFMEMORY` on
+  an RTX 3060), so any failure of an oversized shader-visible view heap takes this path. The measured
+  limits so far are 1,000,000 descriptors on both adapters. Reproduce with
+  `ctest --preset release --no-tests=error -R '^startup_view_heap_' -V`, which skips (77) on an
+  adapter that accepts the full request.
 - BCPack requests are completed with zero-filled destinations (blank textures).
 - The XG stand-in normally uses desktop copyable footprints. Its opt-in BC7 diagnostic
   reports standard GFX10 4 KiB tiled geometry for a single-slice, single-mip, non-MSAA
