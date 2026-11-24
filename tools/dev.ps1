@@ -33,3 +33,24 @@ if (Test-Path -LiteralPath (Join-Path $bin 'xbdepends.exe')) {
     $bin = (Resolve-Path -LiteralPath $bin).Path
     if ($bin -notin ($env:Path -split ';')) { $env:Path = "$bin;$env:Path" }
 }
+
+# Opt-in compiler cache. With X2W_USE_SCCACHE=1 and sccache on PATH, the global
+# $X2wSccacheCmakeArgs holds the extra configure arguments; pass them as
+# "cmake --preset dev @X2wSccacheCmakeArgs". Embedded debug information (/Z7)
+# lets sccache cache Debug objects; CMP0141 must be NEW for CMake to honor it.
+# Otherwise the variable is removed and every command line stays as it was.
+# x2w-sccache-begin
+Remove-Variable -Name X2wSccacheCmakeArgs -Scope Global -ErrorAction SilentlyContinue
+if ($env:X2W_USE_SCCACHE -eq '1') {
+    if (Get-Command sccache -CommandType Application -ErrorAction SilentlyContinue) {
+        $global:X2wSccacheCmakeArgs = @(
+            '-DCMAKE_C_COMPILER_LAUNCHER=sccache',
+            '-DCMAKE_CXX_COMPILER_LAUNCHER=sccache',
+            '-DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded',
+            '-DCMAKE_POLICY_DEFAULT_CMP0141=NEW'
+        )
+    } else {
+        Write-Warning 'X2W_USE_SCCACHE=1 but sccache is not on PATH; configuring without a compiler launcher.'
+    }
+}
+# x2w-sccache-end
