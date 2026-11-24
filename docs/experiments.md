@@ -6297,6 +6297,8 @@ Because reserve-only ranges and addresses inside an allocation cannot be opened,
 
 Run `ctest --preset dev --no-tests=error -R '^vm_translation_' -V`.
 
+Those cases see only the window sizes of their adapter and spans that cross a window edge by four bytes, so `ctest --preset dev --no-tests=error -R '^d3d12_xs_range' -V` checks the range without a device. A fake device reports 17, 32 or 40 GPU virtual address bits per resource, and a fake `CreateWindowFn` hands out counted windows with distinct GPU addresses. The test checks the requested window widths, including a last window of 192 KiB, and the GPU address of spans that end at a window edge or cross it by one byte. It also checks spans that end at the range end or one byte past it, and 0-byte spans. It checks window references through `GetWindow` and `Close()`, refusals before any window is requested, and failures at each of three windows. The `d3d12_xs_range_full_last_window_control` run expects the last window at the full window size and must fail.
+
 #### Ordering a tile remap across D3D12 queues (#874)
 
 `tests/vm_copy_queue_check.cpp` maps two tiles in a reserved buffer and uploads a distinct 64 KiB pattern to each on a COPY queue. A DIRECT queue waits for the upload fence and reads the first pattern. The COPY queue waits for this read, remaps the first virtual tile to the second physical tile, and signals a new fence value. The DIRECT queue waits for that value and reads the second pattern from the same virtual address. The CPU waits only for the final readback.
