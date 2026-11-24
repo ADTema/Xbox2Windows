@@ -2519,6 +2519,11 @@ class TestRdna2Disasm(unittest.TestCase):
         ("0c8075d56ed22004", "v_mqsad_u32_u8 v[12:15], ttmp[2:3], s105, v[8:11] clamp"),
     )
 
+    # The vectors that LLVM 15's assembler also accepts (it needs no clamp, literal, null or trap-temporary operand here):
+    # the rest are checked against the golden strings only.
+    VOP3_MQSAD_U32_U8_ROUND_TRIP_VECTORS = (VOP3_MQSAD_U32_U8_VECTORS[0], VOP3_MQSAD_U32_U8_VECTORS[2],
+                                                VOP3_MQSAD_U32_U8_VECTORS[3], VOP3_MQSAD_U32_U8_VECTORS[6])
+
     VOP3_MUL_QSAD_INTERP_VECTORS = (
         # Encoded and printed by llvm-mc 15.0.6 and 19.1.7 for gfx1013 (v_qsad and v_mqsad need a destination that
         # does not overlap a source on LLVM 15).
@@ -2615,8 +2620,10 @@ class TestRdna2Disasm(unittest.TestCase):
         objcopy = resolve_tool("LLVM_OBJCOPY", ["llvm-objcopy-15", "llvm-objcopy"])
         if not assembler or not objcopy:
             self.fail(f"VOP3 round trip requires llvm-mc and llvm-objcopy (assembler={assembler}, objcopy={objcopy})")
-        source = [assembly for _, assembly in self.VOP3_MUL_QSAD_INTERP_VECTORS]
-        expected = bytes.fromhex("".join(encoding for encoding, _ in self.VOP3_MUL_QSAD_INTERP_VECTORS))
+        vectors = tuple(vector for vector in self.VOP3_MUL_QSAD_INTERP_VECTORS
+                        if vector not in self.VOP3_MQSAD_U32_U8_VECTORS) + self.VOP3_MQSAD_U32_U8_ROUND_TRIP_VECTORS
+        source = [assembly for _, assembly in vectors]
+        expected = bytes.fromhex("".join(encoding for encoding, _ in vectors))
         emitted = assemble_with_llvm_mc(source, assembler, objcopy)
         self.assertEqual(emitted, expected)
         decoded = [record["assembly"] for record in disasm_rdna2(emitted)]
