@@ -270,6 +270,35 @@ class ProbeRootDevicesNegativeTests(unittest.TestCase):
                     probe_root_devices.main(argv)
         return exc.exception.code, stderr.getvalue()
 
+    def test_failed_report_replace_preserves_previous_report_without_temp_file(self):
+        def fake_ok(cmd, *, input, stdout, check, timeout):
+            return subprocess.CompletedProcess(
+                cmd, 0, (json.dumps(_ok_row(warp_only=True)) + "\n").encode("utf-8")
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            calls = repo / "out" / "calls"
+            calls.mkdir(parents=True)
+            inventory = {name: {"containers": []} for name in probe_root_devices.NAMES}
+            (calls / "six-apis.json").write_text(json.dumps(inventory), encoding="utf-8")
+            report = calls / "root-devices-warp.json"
+            report.write_text("previous report", encoding="utf-8")
+            build_dir = base / "build"
+            build_dir.mkdir()
+            bin_dir = base / "bin"
+            _setup_controls(bin_dir)
+            with patch.object(Path, "replace", side_effect=PermissionError("destination locked")):
+                code, err = self._run_main(
+                    [str(build_dir), "--warp-only", "--bin", str(bin_dir)], repo, fake_run=fake_ok
+                )
+
+            self.assertEqual(code, 1)
+            self.assertIn("destination locked", err)
+            self.assertEqual(report.read_text(encoding="utf-8"), "previous report")
+            self.assertEqual({file.name for file in calls.iterdir()}, {"six-apis.json", report.name})
+
     def test_control_failures_exit_1_cleanly(self):
         bad_rows = [
             {"cleared": 1, "remaining_flags": 0, "serialize": "0x00000000", "warp": "0x00000000", "hardware": "0x00000000"},

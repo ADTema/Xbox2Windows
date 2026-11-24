@@ -69,15 +69,17 @@ def main(argv=None):
             result["images"][name] = {"sha256": entry["sha256"], "layouts": layouts}
             print(f"{name}: {len(layouts)} distinct layouts")
         dest.parent.mkdir(parents=True, exist_ok=True)
-        with NamedTemporaryFile(mode="w", dir=dest.parent, delete=False, encoding="utf-8") as stream:
-            try:
+        temporary = None
+        try:
+            with NamedTemporaryFile(mode="w", dir=dest.parent, delete=False, encoding="utf-8") as stream:
+                temporary = Path(stream.name)
                 json.dump(result, stream, indent=2)
                 stream.write("\n")
-            except BaseException:
-                stream.close()
-                Path(stream.name).unlink(missing_ok=True)
-                raise
-        Path(stream.name).replace(dest)
+            temporary.replace(dest)
+            temporary = None
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
         print(dest)
     except (OSError, ValueError, KeyError, TypeError, struct.error, pefile.PEFormatError,
             subprocess.SubprocessError) as exc:
