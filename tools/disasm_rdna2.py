@@ -2727,6 +2727,9 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         elif op not in MIMG_DERIV_OPS:
             deriv_addrs = 0
         addr_count = base_addrs + extra_addrs + deriv_addrs
+        a16 = (w1 >> 30) & 1
+        if a16 and op_name == "image_load" and dim_name == "SQ_RSRC_IMG_2D":
+            addr_count = 1  # The two unsigned coordinates share a VGPR.
         d16 = (w1 >> 31) & 1
         # A gather returns the four texels of the selected component whatever the one-hot mask is.
         n_data = 4 if op_name.startswith("image_gather4") else max(1, bin(dmask).count("1"))
@@ -2765,7 +2768,7 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             mods.append("tfe")
         if (w0 >> 17) & 1:
             mods.append("lwe")
-        if (w1 >> 30) & 1:
+        if a16:
             mods.append("a16")
         if d16:
             mods.append("d16")

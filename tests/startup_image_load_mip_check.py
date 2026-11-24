@@ -36,6 +36,38 @@ def shader(image):
     return G.Pipeline(VS_WORDS, PREFIX_WORDS + image + SUFFIX_WORDS, root_blob())
 
 
+def check_plain_load_layouts(llvm_mc):
+    # Pack x=1 and y=2 into v0. v1=63 distinguishes the packed and full-width forms.
+    prefix = PREFIX.replace('v_mov_b32 v0, 0', 'v_mov_b32 v0, 0x20001').replace(
+        'v_mov_b32 v1, 0', 'v_mov_b32 v1, 63')
+    prefix_words = PREFIX_WORDS.replace(bytes.fromhex('8002007e 8002027e'),
+                                        bytes.fromhex('ff02007e 01000200 bf02027e'))
+    a16 = bytes.fromhex('080f00f000040440')
+    if llvm_mc:
+        source = prefix + 'image_load v[4:7], v0, s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D a16\n' + SUFFIX
+        assert assemble(llvm_mc, source) == prefix_words + a16 + SUFFIX_WORDS
+    ps_code = prefix_words + a16 + SUFFIX_WORDS
+    root = root_blob()
+    pipe = G.Pipeline(VS_WORDS, ps_code, root)
+    ps = pipe.hlsl_ps()
+    assert 'r0.Load(int3(v0 & 0xffffu, v0 >> 16, 0))' in ps, ps
+    assert 'srv 0 tex2d table 0 0' in pipe.manifest()
+    assert 'r0.Load(int3(v0, v1, 0))' in shader(bytes.fromhex('882f00f000040400')).hlsl_ps()
+
+    old_key = G.fnv(root, G.fnv(ps_code, G.fnv(VS_WORDS, G.fnv(b'x2w-startup-shader-4'))))
+    assert G.pipeline_key(VS_WORDS, ps_code, root) != old_key, 'cached pre-fix shader would be reused'
+
+    for flag, encoded in (('d16', '080f00f000040480'), ('tfe', '080f01f000040400'),
+                          ('a16', '100f00f000040440')):
+        try:
+            shader(bytes.fromhex(encoded))
+        except G.Unsupported as error:
+            assert 'image_load' in str(error) and flag in str(error), error
+        else:
+            raise AssertionError(f'{flag} image load accepted with unsupported layout')
+    print('plain 2D load: packed A16 coordinates, cache policy unchanged, unsupported layouts refused')
+
+
 def check(llvm_mc):
     for name, instruction, encoded, address, kind in CASES:
         image = bytes.fromhex(encoded)
@@ -57,6 +89,7 @@ def check(llvm_mc):
             assert 'image_load_mip' in str(error) and flag in str(error), error
         else:
             raise AssertionError(f'{flag} image load accepted')
+    check_plain_load_layouts(llvm_mc)
 
 
 def draw(dxc, renderer, adapter):
