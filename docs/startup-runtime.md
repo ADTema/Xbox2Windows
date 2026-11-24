@@ -34,7 +34,7 @@ draw therefore covers the whole first render target (its width and height, depth
 set no viewport, and the same rectangle as scissor when it set no scissor. Each default applies on its own,
 and a viewport or scissor the title did set is never replaced. A list reset starts without either. A call
 with no viewports or no rectangles changes nothing. A draw with no render target bound, for example
-depth only, gets no default.
+depth only, gets no default. The default uses the size of mip 0 of the resource; the render target view's mip slice is not tracked.
 
 Run `ctest --preset dev --no-tests=error -R "^startup_stream_viewport_(hardware|warp)$" -V` after building
 `startup_stream_consumer`. On an 8×4 target the cases draw with neither call, inside a 4×2 rectangle (the
