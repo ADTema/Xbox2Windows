@@ -309,6 +309,10 @@ target_link_libraries(startup_stub_consumer PRIVATE startup_stub_chad startup_st
 
 add_executable(startup_draw_bmp_check tests/startup_draw_bmp.cpp)
 add_test(NAME startup_draw_bmp COMMAND startup_draw_bmp_check)
+# Game-save stand-in storage (src/startup_stubs/save_store.h): a blob written by one process is read by a second.
+add_executable(startup_gamesave_persist tests/startup_gamesave_persist.cpp)
+target_compile_features(startup_gamesave_persist PRIVATE cxx_std_17)
+add_test(NAME startup_gamesave_persist COMMAND startup_gamesave_persist)
 
 # Input for the launcher containment check (docs/startup-runtime.md): writes known bytes to both
 # streams and the trap log, reports a known exit code, or holds memory, spawns a child or stays

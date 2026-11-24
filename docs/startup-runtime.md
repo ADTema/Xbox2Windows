@@ -120,6 +120,20 @@ then start the build again. The new key keeps the former bytecode and manifest
 together under their original name. A 16-dword table load can contain two
 independent image descriptors at offsets 0 and 32 from the load address.
 
+## Game saves
+
+With `X2W_FAKE_USER=1`, the game-save stand-in keeps containers and blobs below
+`X2W_STORAGE_PATH`, in `x2w-gamesave`: one directory per container, one file per blob
+([#1200](https://github.com/R0Y00/Xbox2Windows/issues/1200)). Opening a container whose directory
+exists succeeds. Names must be one plain path component of at most 128 bytes (no separators, `:`,
+`..`, control characters or device names) and a blob is at most 64 MiB, so nothing is created
+outside that folder. The slot numbers and argument layouts follow the public header order and stay a
+hypothesis. Persisted: create container (16), delete container (10, 11), create and close update
+(23, 24), and blob write and delete through an open update (25, 26, applied at once, so submit is a
+no-op). Not yet persisted, because their argument layout is not established: blob reads (20 to 22)
+still report no blob, and the enumerations and queries (12 to 15, 18, 19) still report nothing.
+`ctest --preset dev --no-tests=error -R '^startup_gamesave_persist$' -V` writes a blob in one
+process and reads it back in a second. It tests the storage code the slots call, not the slots.
 
 ## Findings
 

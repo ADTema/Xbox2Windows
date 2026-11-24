@@ -8,11 +8,13 @@
 //
 // X2W_FAKE_USER=1 additionally answers the user API for one local user (see fake_user below).
 #include "startup_stubs/local_log.h"
+#include "startup_stubs/save_store.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <intrin.h>
+#include <string>
 #include <utility>
 
 namespace {
@@ -65,6 +67,7 @@ bool save_call(int slot, u64* args, u64* result);
 bool area_call(unsigned long provider, int slot, u64* args, u64* result);
 u64 complete_async(u64 async_block);
 void* storage_object();
+const char* storage_path();
 constexpr unsigned long save_provider_data1 = 0x704c3f58;  // hypothesis: the game-save API (first seen: slot 4 with the user handle)
 
 template <int N>
@@ -289,13 +292,67 @@ bool user_call(int slot, u64* args, u64* result)
 
 // ---- local game saves -----------------------------------------------------------------------
 // Slot numbers follow the order of the public XGameSave.h (hypothesis, checked against the logged
-// argument shapes). There are no stored saves: enumerations report nothing, reads find nothing,
-// writes are accepted and dropped. Asynchronous calls are completed by starting the real
+// argument shapes). Containers and blob writes are kept on disk (save_store.h, below
+// storage_path()/x2w-gamesave); enumerations and reads still report nothing and the calls whose
+// argument layout is not known are accepted and dropped. Asynchronous calls are completed by starting the real
 // "add default user silently" operation on the caller's async block: it fails quickly inside the
 // runtime and runs the caller's completion callback on its task queue; the matching Result call is
 // then answered here.
 constexpr u64 save_provider_handle = 0x58325753'00000001ull, save_container_handle = 0x58325743'00000001ull,
               save_update_handle = 0x58325755'50000001ull;
+// Container and update handles keep their fixed base; the low bits count from 1 and index these tables.
+// Reopening a container name returns the same handle, so the table stays small.
+constexpr std::size_t max_save_handles = 64;
+constexpr u64 e_invalidarg = 0x80070057, e_outofmemory = 0x8007000E, e_fail = 0x80004005;
+std::string save_containers[max_save_handles];
+std::size_t save_container_count;
+int save_updates[max_save_handles];  // container index + 1 of an open update, 0 = free
+SRWLOCK save_lock = SRWLOCK_INIT;
+x2w_save::Store save_store() { return x2w_save::Store(std::filesystem::path(storage_path()) / "x2w-gamesave"); }
+// A NUL-terminated name of at most x2w_save::max_name_bytes in readable memory.
+bool read_save_name(u64 pointer, std::string& name)
+{
+    const std::size_t readable = x2w_local::probe_readable(static_cast<std::uintptr_t>(pointer), x2w_save::max_name_bytes + 1);
+    const char* text = reinterpret_cast<const char*>(pointer);
+    const std::size_t length = readable ? strnlen(text, readable) : 0;
+    if (!readable || length == readable) return false;
+    name.assign(text, length);
+    return true;
+}
+u64 save_status(x2w_save::Status status)
+{
+    using x2w_save::Status;
+    switch (status) {
+    case Status::ok: return 0;
+    case Status::bad_name: case Status::too_large: return e_invalidarg;
+    case Status::not_found: return 0x80830008;
+    default: return e_fail;
+    }
+}
+u64 open_container(const std::string& name, u64* handle)
+{
+    const x2w_save::Status status = save_store().create_container(name);
+    if (status != x2w_save::Status::ok) return save_status(status);
+    AcquireSRWLockExclusive(&save_lock);
+    std::size_t index = 0;
+    while (index < save_container_count && save_containers[index] != name) ++index;
+    const bool full = index == save_container_count && save_container_count == max_save_handles;
+    if (index == save_container_count && !full) save_containers[save_container_count++] = name;
+    ReleaseSRWLockExclusive(&save_lock);
+    if (full) return e_outofmemory;
+    *handle = save_container_handle + index;
+    return 0;
+}
+// The container name behind an update handle, or empty when it is not an open update.
+std::string update_container(u64 update)
+{
+    std::string name;
+    AcquireSRWLockShared(&save_lock);
+    const u64 index = update - save_update_handle;
+    if (update >= save_update_handle && index < max_save_handles && save_updates[index]) name = save_containers[save_updates[index] - 1];
+    ReleaseSRWLockShared(&save_lock);
+    return name;
+}
 u64 complete_async(u64 async_block)
 {
     Proxy* user = user_provider >= 0 ? proxies[user_provider] : nullptr;
@@ -320,7 +377,12 @@ bool save_call(int slot, u64* args, u64* result)
     case 5:  // XGameSaveInitializeProviderResult(async, &provider)
         if (out(args[1], 8)) *reinterpret_cast<u64*>(args[1]) = save_provider_handle;
         return true;
-    case 6: case 17: case 24:  // close provider / container / update
+    case 6: case 17:  // close provider / container
+        return true;
+    case 24:  // XGameSaveCloseUpdate(update)
+        AcquireSRWLockExclusive(&save_lock);
+        if (args[0] >= save_update_handle && args[0] - save_update_handle < max_save_handles) save_updates[args[0] - save_update_handle] = 0;
+        ReleaseSRWLockExclusive(&save_lock);
         return true;
     case 7:  // XGameSaveGetRemainingQuota(provider, &bytes)
         if (out(args[1], 8)) *reinterpret_cast<std::int64_t*>(args[1]) = 256ll << 20;
@@ -331,14 +393,22 @@ bool save_call(int slot, u64* args, u64* result)
     case 9:  // XGameSaveGetRemainingQuotaResult(async, &bytes)
         if (out(args[1], 8)) *reinterpret_cast<std::int64_t*>(args[1]) = 256ll << 20;
         return true;
-    case 10: case 12: case 13: case 14: case 15: case 18: case 19:  // delete, container/blob queries: nothing stored
+    case 12: case 13: case 14: case 15: case 18: case 19:  // container/blob queries: layout unknown, nothing reported
         return true;
-    case 11:  // XGameSaveDeleteContainerAsync(provider, name, async)
-        *result = complete_async(args[2]);
+    case 10: case 11: {  // XGameSaveDeleteContainer(provider, name), ...Async(provider, name, async)
+        std::string name;
+        if (read_save_name(args[1], name)) save_store().delete_container(name);
+        if (slot == 11) *result = complete_async(args[2]);
         return true;
-    case 16:  // XGameSaveCreateContainer(provider, name, &container)
-        if (out(args[2], 8)) *reinterpret_cast<u64*>(args[2]) = save_container_handle;
+    }
+    case 16: {  // XGameSaveCreateContainer(provider, name, &container)
+        std::string name;
+        u64 handle = 0;
+        if (!read_save_name(args[1], name)) *result = e_invalidarg;
+        else *result = open_container(name, &handle);
+        if (!*result && out(args[2], 8)) *reinterpret_cast<u64*>(args[2]) = handle;
         return true;
+    }
     case 20:  // XGameSaveReadBlobData(container, blobs, &count, size, data)
         *result = blob_not_found;
         return true;
@@ -348,10 +418,43 @@ bool save_call(int slot, u64* args, u64* result)
     case 22:  // XGameSaveReadBlobDataResult(async, size, data, &count)
         *result = blob_not_found;
         return true;
-    case 23:  // XGameSaveCreateUpdate(container, display name, &update)
-        if (out(args[2], 8)) *reinterpret_cast<u64*>(args[2]) = save_update_handle;
+    case 23: {  // XGameSaveCreateUpdate(container, display name, &update)
+        const u64 container = args[0] - save_container_handle;
+        u64 handle = 0;
+        AcquireSRWLockExclusive(&save_lock);
+        if (args[0] >= save_container_handle && container < save_container_count)
+            for (std::size_t i = 0; i < max_save_handles && !handle; ++i)
+                if (!save_updates[i]) {
+                    save_updates[i] = static_cast<int>(container) + 1;
+                    handle = save_update_handle + i;
+                }
+        ReleaseSRWLockExclusive(&save_lock);
+        if (!handle) *result = e_outofmemory;
+        else if (out(args[2], 8)) *reinterpret_cast<u64*>(args[2]) = handle;
         return true;
-    case 25: case 26: case 27: case 29:  // blob write / delete, submit, submit result: accepted
+    }
+    case 25: case 26: {
+        // Hypothesis (public header order): SubmitBlobWrite(update, blob name, data, size) and
+        // SubmitBlobDelete(update, blob name), applied at once. Only an open update is acted on;
+        // any other argument is accepted and dropped as before.
+        const std::string container = update_container(args[0]);
+        std::string blob;
+        if (container.empty() || !read_save_name(args[1], blob)) return true;
+        if (slot == 26) {
+            save_store().delete_blob(container, blob);
+            return true;
+        }
+        const std::size_t size = static_cast<std::size_t>(args[3]);
+        if (size > x2w_save::max_blob_bytes || (size && x2w_local::probe_readable(static_cast<std::uintptr_t>(args[2]), size) != size)) {
+            *result = e_invalidarg;
+            return true;
+        }
+        const x2w_save::Status status = save_store().write_blob(container, blob, reinterpret_cast<const void*>(args[2]), size);
+        *result = save_status(status);
+        if (status != x2w_save::Status::ok) x2w_local::logf("x2w-runtime game save: blob write refused (status %d)", static_cast<int>(status));
+        return true;
+    }
+    case 27: case 29:  // submit update, submit result: accepted (writes were applied already)
         return true;
     case 28:  // XGameSaveSubmitUpdateAsync(update, async)
         *result = complete_async(args[1]);
