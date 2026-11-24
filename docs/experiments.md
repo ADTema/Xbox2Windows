@@ -2,6 +2,17 @@
 
 Run commands from the repository root. Start with the [project overview](../README.md) and [contribution guide](../CONTRIBUTING.md). Package-specific observations below used local inputs. Community regression tests use fixtures built from this repository.
 
+## CPU-written R8 planes across frames
+
+The startup draw uploader checks a single-mip, single-slice R8_UNORM texture of up to 32 MiB
+on its first bind in each new frame. The texture may change through direct CPU stores between
+uses of the same decoder buffer. Unchanged bytes reuse the desktop copy. Other formats retain
+the existing 15-frame polling interval and explicit XG write notifications still trigger a check.
+
+Build `startup_plane_refresh` and run `ctest --preset release --no-tests=error -R '^startup_plane_refresh_' -V`.
+The fixture rotates three 17×3 desktop R8 textures through six CPU images. Each adapter must read
+back all 306 current pixels. Suppressing the refresh on the second rotation leaves exactly 153 stale pixels.
+
 ## Counted cache-line zero loops
 
 `cpu_switch_aot.py` accepts the three-byte CLZERO with full-width RAX addressing for 64-byte guest cache lines. A translated instruction zeroes the aligned line containing RAX. It preserves RAX and flags. The original function controls advancement and termination with ADD, CMP and JB. The supported memory domain is ordinary writable host-backed storage; this test checks final memory, registers and conditions on a single thread.
