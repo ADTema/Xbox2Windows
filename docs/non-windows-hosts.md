@@ -7,7 +7,7 @@ Xbox2Windows targets x64 Windows for its C++, HLSL, MASM, D3D12, WARP, and GPU t
 | Work or check | macOS / Linux | x64 Windows | Notes |
 |---|---|---|---|
 | Documentation edits | Yes | Yes | Markdown, diff hygiene, and link checks (`tests/docs_links_check.py`). |
-| Platform-independent Python checks | Yes | Yes | The commands below cover the [Linux CI workflow](../.github/workflows/windows.yml), the BC7 block reference and the GPU report formatter. |
+| Platform-independent Python checks | Yes | Yes | The quick starts below run a subset of checks. See the `python-linux` job in the [Linux CI workflow](../.github/workflows/windows.yml) for the full CI list. |
 | LLVM 15 `gfx1013` translation checks | Yes | No (via CI / separate LLVM) | `tests/pixel_aot_check.py binary`, `tests/ffx_dispatch_aot_check.py`, and `tests/rdna2_tools_check.py` (with `LLVM_LIB`, `LLVM_MC`, `LLVM_OBJCOPY`) verify assembling, disassembling, and lowering only. |
 | `cmake --preset dev` build (MSVC `cl` + Ninja) | No | Yes | `CMakePresets.json` selects `cl`. |
 | MASM fixtures (`tests/cpu/*.asm`) and `cpu_*` tests | No | Yes | Assembled and built by the Windows toolchain. |

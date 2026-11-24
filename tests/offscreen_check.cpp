@@ -992,6 +992,17 @@ OperationResult run_wave64_emulate(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// --startup-cb-blend: decoded colour-blend registers match the model in every draw case.
+// --startup-cb-blend-swapped: with source and destination factors exchanged, at least one differs.
+template<bool Swapped>
+OperationResult run_startup_cb_blend(const OperationContext& ctx)
+{
+    const int mismatches = check_startup_cb_blend(ctx.device, Swapped);
+    if (Swapped ? mismatches == 0 : mismatches != 0)
+        return {OutcomeKind::fail, Swapped ? "swapped factors still matched the model" : "blend differs from the register model"};
+    return {OutcomeKind::pass, nullptr};
+}
+
 template<bool Swapped>
 OperationResult run_startup_sampler_x(const OperationContext& ctx)
 {
@@ -1171,6 +1182,8 @@ const OperationSpec kOperations[] = {
     {"--descriptor-heap-paging-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_heap_paging<true>},
     {"--startup-sampler-x", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<false>},
     {"--startup-sampler-x-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<true>},
+    {"--startup-cb-blend", 3, 3, nullptr, kNoGate, run_startup_cb_blend<false>},
+    {"--startup-cb-blend-swapped", 3, 3, nullptr, kNoGate, run_startup_cb_blend<true>},
     {"--wave-shuffle", 3, 3, nullptr, kGateWaveShuffle, run_wave_shuffle},
     {"--wave64-emulate", 3, 3, nullptr, kNoGate, run_wave64_emulate},
     {"--shader-wave", 3, 3, nullptr, kGateShaderWave, run_shader_wave},
