@@ -4203,8 +4203,8 @@ The discard compare may be any of `v_cmpx_lt_f32_e32`, `v_cmpx_le_f32_e32`,
 `v_cmpx_gt_f32_e32` and `v_cmpx_ge_f32_e32` (scalar first source, VGPR second
 source); a lane is discarded when `src0 OP vsrc1` holds. These are the ordered
 binary32 compares, false when either operand is NaN like the HLSL operators; the
-unordered `n*` forms, other widths, integer compares and e64 forms reject
-translation. `depth_mask_cmpx_draw_*` draws each compare at two seeds with
+unordered `n*` forms, other widths, integer compares and the `v_cmp_*_e64`
+compares with a scalar mask destination reject translation. `depth_mask_cmpx_draw_*` draws each compare at two seeds with
 thresholds that equal one row's value exactly, against a CPU reference written
 with Python operators, so lt and le (and gt and ge) differ in one row of 32 pixels
 and the lt/gt pair in 992 or more. Every other compare's reference must fail on
@@ -4217,8 +4217,8 @@ The program may also apply the one-source binary32 forms `v_rcp_f32_e32`,
 `v_rsq_f32_e32`, `v_sqrt_f32_e32`, `v_floor_f32_e32`, `v_trunc_f32_e32` and
 `v_rndne_f32_e32` (VGPR destination; constant, scalar word or VGPR source). They
 lower to `1.0f / x`, `rsqrt`, `sqrt`, `floor`, `trunc` and `round` (half to
-even). Source modifiers, `clamp`, output modifiers, a second source and the e64
-encodings reject translation. The precision of reciprocal, reciprocal square root
+even). Source modifiers, `clamp`, output modifiers and a second source reject
+translation. The precision of reciprocal, reciprocal square root
 and square root is not claimed, since D3D allows each an error, and a zero or
 negative operand of the last two, NaN, infinity, denormals and signed zero are not
 exercised. `depth_mask_unary_draw_*` (`unary` mode) therefore feeds the three
@@ -4233,6 +4233,30 @@ translates it through the CLI, pins the lowered line, and changing that one
 instruction word to each of the other five forms must change the line. On a Linux
 host only the LLVM part (LLVM 19; LLVM 15 was not run) and the reference pictures
 were run; no WARP readback of these six forms exists yet.
+
+Every form above also has a plain VOP3 spelling that translates: `v_add_f32_e64`
+and the other five binary32 operations, the six one-source forms, `v_fract_f32_e64`,
+`v_mul_legacy_f32_e64`, `v_fmac_f32_e64` and the four `v_cmpx_*_f32_e64`
+compares (the destination of a VOP3 `v_cmpx` is the implicit EXEC; LLVM 19 prints
+`v_cmpx_lt_f32_e64 s31, v7`). The translator rewrites the spelling to its e32 form
+after checking that every operand is a plain register, scalar word or constant, so
+both spellings give the same HLSL and the same operand rules, including a VGPR
+second source for the binary32 operations and compares even though VOP3 would allow
+a scalar there. `clamp`, output modifiers (`mul:2`, `div:2`), absolute value, negation
+(`|v1|`, `-v1`, `neg(v1)`), any other suffix, other `_e64` instructions and the
+`v_cmp_*_e64` compares with a scalar mask destination reject translation.
+`tests/depth_mask_check.py` assembles every fixture program with llvm-mc, once with
+each e32 form and once with all of them spelled e64, and requires the translator's
+output from the real machine code to equal the e32 lowering byte for byte. It also
+respells each instruction alone and requires the same text, refuses every modified
+spelling (clamp, `mul:2`, `div:2`, `mul:4`, abs, neg on each register source) of
+every instruction, and refuses the unlisted forms. A mutation control swaps in a
+normaliser that silently drops each modifier and requires the same refusals to be
+accepted, and so detected. The draw fixtures are unchanged: the HLSL of an e64
+spelling is identical to the one they draw, and `source`, `op_source`,
+`cmpx_source` and `unary_source`, which the draw modes call, now also assert that
+identity. On a Linux host only the LLVM part (llvm-mc 19) was run; no WARP readback
+was run for this change.
 
 The Windows fixture binds distinct seeds and thresholds, changes each separately,
 then exchanges the two root CBV addresses. It checks all 1,024 D32_FLOAT
