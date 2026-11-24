@@ -4377,12 +4377,12 @@ def sdwa_cmp_instruction(entry, dst):
 
 def sdwa_cmp_body():
     """Every one of the 46 forms, each folded into bit i of the two exported uint words."""
-    body = ["v_mov_b32_e32 v18, s45", "v_mov_b32_e32 v12, 0", "v_mov_b32_e32 v13, 0",
-            "v_mov_b32_e32 v14, 0", "v_mov_b32_e32 v15, 0"]
+    body = ["v_mov_b32_e32 v18, s45", "v_mov_b32_e32 v21, 1", "v_mov_b32_e32 v12, 0",
+            "v_mov_b32_e32 v13, 0", "v_mov_b32_e32 v14, 0", "v_mov_b32_e32 v15, 0"]
     for index, entry in enumerate(SDWA_CMP_FORMS):
         dst = "s52" if index % 7 == 3 else "vcc_lo"
         body.append(sdwa_cmp_instruction(entry, dst))
-        body.append(f"v_cndmask_b32_{'e64' if dst.startswith('s') else 'e32'} v20, 0, 1, {dst}")
+        body.append(f"v_cndmask_b32_{'e64' if dst.startswith('s') else 'e32'} v20, 0, v21, {dst}")
         body.append(f"v_lshlrev_b32_e32 v20, {index % 32}, v20")
         body.append(f"v_or_b32_e32 v{12 + index // 32}, v{12 + index // 32}, v20")
     return body
@@ -4487,11 +4487,11 @@ def sdwa_cmp_expected_words(word0, word1, *, select=None, signed=None, sext=True
 
 def sdwa_cmp_destination_body():
     """Two comparisons to different lane masks, both consumed after the second is written."""
-    return ["v_mov_b32_e32 v18, s45",
+    return ["v_mov_b32_e32 v18, s45", "v_mov_b32_e32 v21, 1",
             "v_cmp_eq_u32_sdwa s52, s44, v18 src0_sel:BYTE_0 src1_sel:DWORD",
             "v_cmp_eq_u32_sdwa vcc_lo, s44, v18 src0_sel:BYTE_0 src1_sel:WORD_1",
-            "v_cndmask_b32_e64 v12, 0, 1, s52",
-            "v_cndmask_b32_e32 v13, 0, 1, vcc_lo",
+            "v_cndmask_b32_e64 v12, 0, v21, s52",
+            "v_cndmask_b32_e32 v13, 0, v21, vcc_lo",
             "v_mov_b32_e32 v14, 0", "v_mov_b32_e32 v15, 0"]
 
 
@@ -17594,6 +17594,8 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((int_minmax_pair(encoding), translate) for encoding in ("e32", "e64"))
     fixtures.extend((int_minmax_triple(kind), translate) for kind in ("i32", "u32"))
     fixtures.extend((predicate_group(first, sdwa=True), translate) for first in range(0, 16, 4))
+    fixtures.append((uncompressed_export(sdwa_cmp_body()), translate_int))
+    fixtures.append((uncompressed_export(sdwa_cmp_destination_body()), translate_int))
     fixtures.extend((cvt_int_fixture(encoding), translate) for encoding in ("e32", "e64"))
     fixtures.append((cvt_int_literals(), translate))
     fixtures.append((with_constants(CUBE_BODY), translate))
