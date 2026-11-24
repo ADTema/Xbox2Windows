@@ -26,6 +26,23 @@ using Microsoft::WRL::ComPtr;
 namespace {
 constexpr UINT entry_constants = 4;  // ud0..ud3 of the fixture's manifest
 constexpr UINT side = 2;
+// The mip fixture: a 4x4 array of two slices with three mip levels (4x4, 2x2, 1x1).
+constexpr UINT mip_base = 4;
+constexpr UINT max_levels = 3;
+
+// The value at texel (x, y) of slice s and mip level m. One level keeps the 2x2x2 fixture's values. With
+// several levels every (slice, mip, x, y) cell is distinct: the red channel is a dyadic fraction and
+// alpha is s + 2m, so exchanging slice and mip, or reading another level, changes the colour.
+void texel_value(UINT x, UINT y, UINT s, UINT m, UINT levels, float out[4])
+{
+    if (levels == 1) {
+        const float one[4] = {(1.0f + x + 2.0f * y + 4.0f * s) / 8.0f, float(x), float(y), float(s)};
+        std::memcpy(out, one, sizeof(one));
+        return;
+    }
+    const float many[4] = {(1.0f + x + 4.0f * y + 16.0f * s + 32.0f * m) / 128.0f, float(x), float(y), float(s + 2 * m)};
+    std::memcpy(out, many, sizeof(many));
+}
 
 std::vector<char> read_blob(const char* path)
 {
@@ -49,10 +66,14 @@ ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const char* sample
 }  // namespace
 
 // array: the same eight texels as two slices of a 2D array (dim:SQ_RSRC_IMG_2D_ARRAY); the default
-// view of a two-slice texture is a Texture2DArray over both.
+// view of a two-slice texture is a Texture2DArray over both. levels (array only, 1 or 3): the array is
+// 4x4 with that many mip levels, and the default view spans all of them.
 void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
-                            float color[4], const char* sampler_line, bool array)
+                            float color[4], const char* sampler_line, bool array, UINT levels)
 {
+    if (levels < 1 || levels > max_levels || (levels > 1 && !array))
+        throw std::runtime_error("Unsupported image mip level count");
+    const UINT base = levels > 1 ? mip_base : side;
     const auto vs = read_blob(vertex_path);
     const auto ps = read_blob(pixel_path);
     const auto root = create_root(device, sampler_line);
@@ -75,16 +96,17 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
 
     D3D12_RESOURCE_DESC td{};
     td.Dimension = array ? D3D12_RESOURCE_DIMENSION_TEXTURE2D : D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-    td.Width = side;
-    td.Height = side;
+    td.Width = base;
+    td.Height = base;
     td.DepthOrArraySize = side;
-    td.MipLevels = 1;
+    td.MipLevels = levels;
     td.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
     td.SampleDesc.Count = 1;
     const auto texture = resource(device, td, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
     // A volume is one subresource of two slices; an array is two subresources of one slice each.
-    const UINT subresources = array ? side : 1;
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[side]{};
+    // The subresource of slice s and mip m is m + s * levels.
+    const UINT subresources = array ? side * levels : 1;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[side * max_levels]{};
     UINT64 upload_size = 0;
     device->GetCopyableFootprints(&td, 0, subresources, 0, footprints, nullptr, nullptr, &upload_size);
     const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint = footprints[0];
@@ -95,12 +117,17 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     auto* const start = static_cast<std::uint8_t*>(mapped);
     const UINT slice_pitch = footprint.Footprint.RowPitch * footprint.Footprint.Height;
     for (UINT tz = 0; tz < side; ++tz)
-        for (UINT ty = 0; ty < side; ++ty)
-            for (UINT tx = 0; tx < side; ++tx) {
-                const float texel[4] = {(1.0f + tx + 2.0f * ty + 4.0f * tz) / 8.0f, float(tx), float(ty), float(tz)};
-                auto* const slice = array ? start + footprints[tz].Offset : start + footprint.Offset + tz * slice_pitch;
-                std::memcpy(slice + ty * footprint.Footprint.RowPitch + tx * sizeof(texel), texel, sizeof(texel));
-            }
+        for (UINT level = 0; level < levels; ++level) {
+            const UINT extent = base >> level;
+            const auto& place = array ? footprints[level + tz * levels] : footprint;
+            for (UINT ty = 0; ty < extent; ++ty)
+                for (UINT tx = 0; tx < extent; ++tx) {
+                    float texel[4];
+                    texel_value(tx, ty, tz, level, levels, texel);
+                    auto* const slice = array ? start + place.Offset : start + place.Offset + tz * slice_pitch;
+                    std::memcpy(slice + ty * place.Footprint.RowPitch + tx * sizeof(texel), texel, sizeof(texel));
+                }
+        }
     upload->Unmap(0, nullptr);
 
     D3D12_RESOURCE_DESC rd{};
