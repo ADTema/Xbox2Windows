@@ -7295,6 +7295,21 @@ only words 0 and 1, and clamping the ordinary sampler to `MinLOD` 1 changes only
 guard words stay unchanged in every readback. Not run here: that Windows GPU stage
 (`spirv_compare_sampler_warp`).
 
+Gathers keep their sampler kind. An `OpImageGather` counts as an ordinary use and moves to the plain sampler;
+an `OpImageDrefGather` is a comparison use and stays on the comparison sampler. Both are accepted only in the
+form with no image operands (Offset, ConstOffset, ConstOffsets, Lod, Bias, Grad, Sample and MinLod are refused),
+only on 2D, 2D array, cube and cube array images (a 1D or 3D gathered image is refused), and the component of an
+`OpImageGather` must be an integer `OpConstant` from 0 to 3. A sampled type other than float32 is still outside
+the profile. On Linux the test splits a module with two comparison samples and an ordinary gather (component 1)
+and checks with `spirv-val` and `spirv-cross` that the gather reads the plain sampler at s5 as `GatherGreen`
+while both `SampleCmpLevelZero` calls stay on s2; components 0 to 3 give `GatherRed`, `GatherGreen`,
+`GatherBlue` and `GatherAlpha`. A module with a comparison `OpImageDrefGather` and an ordinary sample is split
+for the sample only (`GatherCmp` stays on s2), and one with no ordinary use is returned unchanged. The same
+gather left on the comparison sampler (the unsplit module) is rejected by the HLSL check, and the refusals above
+each have a negative control. Not run here: the Windows stage. The WARP draw does not read gathered texels: the
+existing fixture's textures are not extended, so a gather that read the wrong component or texel would not be
+caught by it; DXC acceptance of the gather calls is not checked either (`spirv_compare_sampler_warp`).
+
 The Linux check `python3 -B tests/spirv_window/check.py` generates four more
 variants, `Texture1D`, `Texture1DArray`, `TextureCube` and `TextureCubeArray`.
 It validates each before and after the split for Vulkan 1.2 and checks that only

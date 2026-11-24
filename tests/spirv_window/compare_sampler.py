@@ -66,6 +66,42 @@ SHARED_VOLUME_LOD1 = substitute(substitute(SHARED_VOLUME, "%float_0 = OpConstant
                                 "%43 = OpImageSampleExplicitLod %v4float %42 %uv3 Lod %float_0",
                                 "%43 = OpImageSampleExplicitLod %v4float %42 %uv3 Lod %float_1")
 EXPECTED_LOD1 = [0x3f800000, 0x00000000, 0x3f200000] + [0xc5c5c5c5] * 13
+# Gathers (no image operands). The extra constants give components 0..3, an out-of-range and a negative one,
+# a float constant and a constant offset; the module is otherwise the base module.
+GATHER_TYPES = ("%type_sampled_image = OpTypeSampledImage %type_2d_image\n"
+                "%int_1 = OpConstant %int 1\n%int_2 = OpConstant %int 2\n%int_3 = OpConstant %int 3\n"
+                "%int_4 = OpConstant %int 4\n%int_m1 = OpConstant %int -1\n"
+                "%v2int = OpTypeVector %int 2\n%offset = OpConstantComposite %v2int %int_0 %int_0\n")
+ORDINARY_SAMPLE = "%43 = OpImageSampleExplicitLod %v4float %42 %15 Lod %float_0"
+# A depth-comparison gather on the comparison sampler, added before the ordinary part of the base module.
+DREF_GATHER = ("%g1 = OpSampledImage %type_sampled_image %32 %33\n"
+               "%g2 = OpImageDrefGather %v4float %g1 %15 %float_0_25\n"
+               "%g3 = OpCompositeExtract %float %g2 0\n"
+               "%g4 = OpAccessChain %_ptr_StorageBuffer_float %results %int_0 %uint_3\n"
+               "OpStore %g4 %g3\n")
+
+
+def gather_module(operation, base=SHARED):
+    """The base module with its ordinary sample replaced by the given instruction text."""
+    return substitute(substitute(base, "%type_sampled_image = OpTypeSampledImage %type_2d_image\n", GATHER_TYPES),
+                      ORDINARY_SAMPLE, operation)
+
+
+# The ordinary sample becomes an OpImageGather of component 1 on the value texture, and the base module's
+# comparison samples stay. A second module also gathers from the depth texture with OpImageDrefGather.
+SHARED_GATHER = gather_module("%43 = OpImageGather %v4float %42 %15 %int_1")
+SHARED_DREF_GATHER = substitute(substitute(SHARED, "%type_sampled_image = OpTypeSampledImage %type_2d_image\n",
+                                           "%type_sampled_image = OpTypeSampledImage %type_2d_image\n"
+                                           "%uint_3 = OpConstant %uint 3\n"),
+                                "%40 = OpLoad %type_2d_image %valueTexture",
+                                DREF_GATHER + "%40 = OpLoad %type_2d_image %valueTexture")
+# Both gathers with the ordinary sample's sampler loaded from the plain sampler: nothing is shared, so
+# nothing is split and the OpImageDrefGather stays on the comparison sampler.
+DREF_GATHER_ONLY = substitute(SHARED_DREF_GATHER, "%41 = OpLoad %type_sampler %cmpSampler",
+                              "%41 = OpLoad %type_sampler %plainSampler")
+# The only ordinary use is a gather and the comparison uses are samples and a gather: still one mixed sampler.
+SHARED_GATHER_BOTH = substitute(SHARED_DREF_GATHER, ORDINARY_SAMPLE, "%43 = OpImageGather %v4float %42 %15 %int_0")
+GATHER_NAMES = ("GatherRed", "GatherGreen", "GatherBlue", "GatherAlpha")
 # Two mixed samplers (cmpA at binding 2, cmpB at 6): word 0 SampleCmp(cmpA, ref 0.25 vs 0.5) = 1, word 1
 # SampleCmp(cmpB, ref 0.875 vs 0.75) = 0, word 2 ordinary A 0.375, word 3 ordinary B 0.875; 12 guards.
 SHARED_MULTI = Path(__file__).with_name("shared_sampler_multi.spvasm").read_text(encoding="utf-8")
@@ -172,7 +208,77 @@ def multi_controls(directory):
     return lowered, swapped
 
 
+def with_image_dim(module, sampled_image, dim):
+    """Point one OpSampledImage line at a float32 image of another dimension (for negative controls only)."""
+    old = "%type_sampled_image = OpTypeSampledImage %type_2d_image\n"
+    types = (f"{old}%type_image_{dim} = OpTypeImage %float {dim} 2 0 0 1 Unknown\n"
+             f"%type_sampled_image_{dim} = OpTypeSampledImage %type_image_{dim}\n")
+    return substitute(substitute(module, old, types), sampled_image,
+                      sampled_image.replace("%type_sampled_image ", f"%type_sampled_image_{dim} "))
+
+
+def gather_controls():
+    mapping = {"descriptor_set": 0, "comparison_binding": 2, "ordinary_binding": ORDINARY_BINDING}
+    # The ordinary gather moves to the plain sampler like an ordinary sample: one new load, the comparison
+    # sampler keeps its two loads, and the module still has the gather on the sampled image built from it.
+    lowered, got = split_comparison_sampler(SHARED_GATHER, ORDINARY_BINDING)
+    assert got == mapping, got
+    lines = lowered.splitlines()
+    assert "%x2w_plain_sampler_0 = OpLoad %type_sampler %x2w_plain_sampler" in lines
+    assert "%42 = OpSampledImage %type_sampled_image %40 %x2w_plain_sampler_0" in lines
+    assert sum(line.endswith("%type_sampler %cmpSampler") for line in lines) == 2  # both depth loads
+    assert "%43 = OpImageGather %v4float %42 %15 %int_1" in [line.strip() for line in lines]
+    # Every component constant from 0 to 3 is accepted, signed or unsigned.
+    for component in ("%int_0", "%int_1", "%int_2", "%int_3", "%uint_1"):
+        assert split_comparison_sampler(gather_module(f"%43 = OpImageGather %v4float %42 %15 {component}"),
+                                        ORDINARY_BINDING)[1] == mapping, component
+    # The comparison gather stays on the comparison sampler: a module that also has an ordinary sample is
+    # split for that sample only, and one without an ordinary use is returned unchanged.
+    dref_lowered, got = split_comparison_sampler(SHARED_DREF_GATHER, ORDINARY_BINDING)
+    assert got == mapping, got
+    dref_lines = [line.strip() for line in dref_lowered.splitlines()]
+    assert "%g1 = OpSampledImage %type_sampled_image %32 %33" in dref_lines
+    assert "%42 = OpSampledImage %type_sampled_image %40 %x2w_plain_sampler_0" in dref_lines
+    assert split_comparison_sampler(DREF_GATHER_ONLY, ORDINARY_BINDING) == (DREF_GATHER_ONLY, None)
+    # Both kinds together on one sampler: an ordinary gather plus a comparison gather is a mixed sampler.
+    assert split_comparison_sampler(SHARED_GATHER_BOTH, ORDINARY_BINDING)[1] == mapping
+
+    # Refusals, each with its own message. Image operands of any kind are refused on either gather.
+    for operands in ("ConstOffset %offset", "Offset %offset", "Lod %float_0", "Bias %float_0", "Sample %int_0",
+                     "MinLod %float_0", "Grad %15 %15"):
+        rejected(gather_module(f"%43 = OpImageGather %v4float %42 %15 %int_1 {operands}"), ORDINARY_BINDING,
+                 "OpImageGather with image operands is not supported")
+        rejected(substitute(SHARED_DREF_GATHER, "%g2 = OpImageDrefGather %v4float %g1 %15 %float_0_25",
+                            f"%g2 = OpImageDrefGather %v4float %g1 %15 %float_0_25 {operands}"),
+                 ORDINARY_BINDING, "OpImageDrefGather with image operands is not supported")
+    # A gather is only the D3D12 forms: a 1D or 3D gathered image is refused, ordinary or comparison. Only
+    # the gathered sampled image gets the other dimension, so the gather is what is refused.
+    gather_only = "only supported on Texture2D, Texture2DArray, TextureCube and TextureCubeArray"
+    for dim in ("1D", "3D"):
+        rejected(with_image_dim(SHARED_GATHER, "%42 = OpSampledImage %type_sampled_image %40 %41", dim),
+                 ORDINARY_BINDING, "OpImageGather is " + gather_only)
+        rejected(with_image_dim(SHARED_DREF_GATHER, "%g1 = OpSampledImage %type_sampled_image %32 %33", dim),
+                 ORDINARY_BINDING, "OpImageDrefGather is " + gather_only)
+    # A non-float32 sampled type is outside the profile for a gather as for any other sampling.
+    rejected(substitute(SHARED_GATHER, "OpTypeImage %float 2D 2 0 0 1 Unknown", "OpTypeImage %uint 2D 2 0 0 1 Unknown"),
+             ORDINARY_BINDING, "only float32 Texture1D")
+    # The component must be an integer OpConstant from 0 to 3: out of range, negative, computed, float, undefined.
+    component = "OpImageGather requires an integer constant component from 0 to 3"
+    for operand in ("%int_4", "%int_m1", "%float_0", "%undefined_component", "%component"):
+        text = gather_module(f"%43 = OpImageGather %v4float %42 %15 {operand}")
+        if operand == "%component":
+            text = substitute(text, "%43 = OpImageGather", "%component = OpIAdd %int %int_0 %int_1\n"
+                                                           "%43 = OpImageGather")
+        rejected(text, ORDINARY_BINDING, component)
+    # One sampled image may not hold both kinds (a gather and a comparison sample on %42).
+    rejected(substitute(SHARED_GATHER, "%43 = OpImageGather %v4float %42 %15 %int_1",
+                        "%43 = OpImageGather %v4float %42 %15 %int_1\n"
+                        "%dup = OpImageSampleDrefExplicitLod %float %42 %15 %float_0_25 Lod %float_0"),
+             ORDINARY_BINDING, "one sampled image is used for both sampling kinds")
+
+
 def controls(directory):
+    gather_controls()
     lowered, mapping = split_comparison_sampler(SHARED, ORDINARY_BINDING)
     assert mapping == {"descriptor_set": 0, "comparison_binding": 2, "ordinary_binding": ORDINARY_BINDING}, mapping
     # A Texture3D value image with a float3 coordinate splits like the 2D module: same mapping, only the
@@ -288,10 +394,31 @@ def controls(directory):
     return lowered
 
 
+def check_gather_hlsl(source, gather, comparison_gather=None):
+    """The ordinary gather reads the plain sampler at s5; the comparison calls stay on the one at s2."""
+    comparison = re.search(r"SamplerComparisonState\s+(\w+)\s*:\s*register\(s2\b", source)
+    ordinary = re.search(rf"SamplerState\s+(\w+)\s*:\s*register\(s{ORDINARY_BINDING}\b", source)
+    assert comparison and ordinary, source
+    assert source.count(f"SampleCmpLevelZero({comparison[1]},") == 2, source
+    assert source.count(f"{gather}({ordinary[1]},") == 1, source
+    assert not re.search(rf"Gather(Red|Green|Blue|Alpha)\({comparison[1]},", source), source
+    if comparison_gather:
+        assert source.count(f"GatherCmp({comparison[1]},") == 1 and "GatherCmp(" + ordinary[1] not in source, source
+
+
+def detected(check, *arguments):
+    try:
+        check(*arguments)
+    except AssertionError:
+        return
+    raise AssertionError("a gather left on the comparison sampler was not detected")
+
+
 def emit(directory, assembler, validator, cross):
     lowered = controls(directory)
     multi_lowered, multi_swapped = multi_controls(directory)
     outputs = {}
+    gathers = [(f"gather_{n}", gather_module(f"%43 = OpImageGather %v4float %42 %15 %int_{n}")) for n in range(4)]
     array_lowered = split_comparison_sampler(SHARED_ARRAY, ORDINARY_BINDING)[0]
     assert SHARED_ARRAY_LAYER1 != SHARED_ARRAY
     layer1_lowered, layer1_mapping = split_comparison_sampler(SHARED_ARRAY_LAYER1, ORDINARY_BINDING)
@@ -306,7 +433,14 @@ def emit(directory, assembler, validator, cross):
                            ("shared_array", SHARED_ARRAY), ("lowered_array", array_lowered),
                            ("lowered_array_layer1", layer1_lowered),
                            ("shared_multi", SHARED_MULTI), ("lowered_multi", multi_lowered),
-                           ("lowered_multi_swapped", multi_swapped)):
+                           ("lowered_multi_swapped", multi_swapped),
+                           ("shared_gather", SHARED_GATHER),
+                           ("lowered_gather", split_comparison_sampler(SHARED_GATHER, ORDINARY_BINDING)[0]),
+                           ("lowered_dref_gather", split_comparison_sampler(SHARED_DREF_GATHER, ORDINARY_BINDING)[0]),
+                           ("lowered_gather_both", split_comparison_sampler(SHARED_GATHER_BOTH, ORDINARY_BINDING)[0]),
+                           ("unsplit_dref_gather", DREF_GATHER_ONLY),
+                           *((f"lowered_{name}", split_comparison_sampler(module, ORDINARY_BINDING)[0])
+                             for name, module in gathers)):
         text = directory / f"{name}.spvasm"
         text.write_text(assembly, encoding="utf-8")
         module = directory / f"{name}.spv"
@@ -344,6 +478,19 @@ def emit(directory, assembler, validator, cross):
         assert re.search(rf"{kind}\s+\w+\s*:\s*register\(s{register}\b", multi_source), (register, multi_source)
     assert len(re.findall(r"SamplerState\s+\w+\s*:\s*register", multi_source)) == 2, multi_source
     assert multi_source.count("SampleCmpLevelZero(") == 2 and multi_source.count("SampleLevel(") == 2, multi_source
+    # Gathers: component 1 reads GatherGreen on the plain sampler; the comparison gather stays on the
+    # comparison sampler (GatherCmp); the other three components give Red, Blue and Alpha.
+    check_gather_hlsl(outputs["lowered_gather"].read_text(encoding="utf-8"), "GatherGreen")
+    check_gather_hlsl(outputs["lowered_dref_gather"].read_text(encoding="utf-8"), "SampleLevel", comparison_gather=True)
+    check_gather_hlsl(outputs["lowered_gather_both"].read_text(encoding="utf-8"), "GatherRed", comparison_gather=True)
+    for n, name in enumerate(GATHER_NAMES):
+        check_gather_hlsl(outputs[f"lowered_gather_{n}"].read_text(encoding="utf-8"), name)
+    # Not split: the same gather on the comparison sampler is what the check rejects, and a module with no
+    # ordinary use keeps its comparison gather and plain sample untouched.
+    detected(check_gather_hlsl, outputs["shared_gather"].read_text(encoding="utf-8"), "GatherGreen")
+    unsplit = outputs["unsplit_dref_gather"].read_text(encoding="utf-8")
+    assert re.search(r"SamplerComparisonState\s+(\w+)\s*:\s*register\(s2\b", unsplit), unsplit
+    assert unsplit.count("GatherCmp(cmpSampler,") == 1 and unsplit.count("SampleLevel(plainSampler,") == 1, unsplit
     print(f"shared and lowered SPIR-V validated; comparison s2, ordinary s{ORDINARY_BINDING}; controls passed",
           flush=True)
     return outputs
