@@ -10705,3 +10705,12 @@ Command-list slot 42 records the address of a root parameter declared as a CBV, 
 cmake --build --preset dev --target startup_stream_consumer
 ctest --preset dev --no-tests=error -R "^startup_root_cbv_(warp|hardware)$" -V
 ```
+
+## Startup heap-indexed root signatures
+
+Command-list slot 34 no longer sets a title root signature flagged `CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED` or `SAMPLER_HEAP_DIRECTLY_INDEXED` on the desktop list, because the title's heaps are not forwarded there (debug layer message ID 1419). Real draws under such a root are refused with a specific reason. The decision matrix (`tests/startup_heap_indexed_root_check.cpp`) runs without a device; its two mutated runs must fail. The draw fixture (`tests/startup_root_heap_check.py`) is synthetic only and reuses the root CBV draw with the debug layer on; a plain desktop list with the same root signature must first report ID 1419 for each flag, or the run is a capability skip. Details are in [startup-runtime.md](startup-runtime.md#heap-indexed-root-signatures).
+
+```powershell
+cmake --build --preset dev --target startup_stream_consumer startup_heap_indexed_root_check
+ctest --preset dev --no-tests=error -R "^startup_(heap_indexed_root.*|root_heap_(warp|hardware))$" -V
+```
