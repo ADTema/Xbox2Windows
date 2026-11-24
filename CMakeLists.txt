@@ -4302,6 +4302,31 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:cpu_shim_startup>" "${shim_startup_cpp}"
         DEPENDS cpu_shim_startup tests/cpu/translate_shim_startup.py tools/cpu_switch_aot.py
             tools/cpu_call_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+    add_library(cpu_placed_dxr_provider SHARED tests/cpu/placed_dxr_provider.cpp tests/dxr_check.cpp
+        tests/desktop_gpu.cpp src/era_title_va.cpp src/startup_stubs/d3d12_xs_device.cpp
+        "${ray_header}" "${ray_pipeline_header}" "${candidates_header}" "${candidates_pipeline_header}")
+    target_include_directories(cpu_placed_dxr_provider PRIVATE tests src "${CMAKE_CURRENT_BINARY_DIR}")
+    target_link_libraries(cpu_placed_dxr_provider PRIVATE d3d12 dxgi dxguid d3dcompiler user32 gdi32)
+    target_compile_features(cpu_placed_dxr_provider PRIVATE cxx_std_17)
+    add_executable(cpu_placed_dxr tests/cpu/placed_dxr.asm tests/cpu/exe_startup.asm)
+    set_target_properties(cpu_placed_dxr PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_placed_dxr PRIVATE /ENTRY:native_startup /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+    target_link_libraries(cpu_placed_dxr PRIVATE cpu_placed_dxr_provider cpu_exe_io)
+    set(placed_dxr_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_placed_dxr_lifted.cpp")
+    add_custom_command(OUTPUT "${placed_dxr_cpp}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/translate_placed_dxr.py"
+            "$<TARGET_FILE:cpu_placed_dxr>" "${placed_dxr_cpp}"
+        DEPENDS cpu_placed_dxr tests/cpu/translate_placed_dxr.py tests/cpu/translate_shim_startup.py tools/cpu_switch_aot.py)
+    add_executable(cpu_placed_dxr_lifted "${placed_dxr_cpp}")
+    target_compile_features(cpu_placed_dxr_lifted PRIVATE cxx_std_17)
+    target_link_libraries(cpu_placed_dxr_lifted PRIVATE cpu_placed_dxr_provider cpu_exe_io)
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME cpu_placed_dxr_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/placed_dxr_check.py" ${adapter} "$<TARGET_FILE:pe_map>"
+            "$<TARGET_FILE:cpu_placed_dxr>" "$<TARGET_FILE:cpu_placed_dxr_lifted>"
+            "$<TARGET_FILE:cpu_placed_dxr_provider>" "$<TARGET_FILE:cpu_exe_io>")
+        set_tests_properties(cpu_placed_dxr_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
     add_library(cpu_placed_provider SHARED tests/cpu/placed_draw_provider.cpp tests/startup_stream_setup.cpp)
     target_compile_features(cpu_placed_provider PRIVATE cxx_std_17)
     target_link_libraries(cpu_placed_provider PRIVATE d3d12_xs_shim d3d12 dxgi)

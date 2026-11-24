@@ -8217,6 +8217,34 @@ Python-only controls check explicit reference words and translator acceptance.
 Those controls do not establish GPU execution; the command above must pass on
 the named backend before recording readback evidence.
 
+### Placed BLAS and TLAS requests from a source-built EXE
+
+`cpu_placed_dxr_warp` and `cpu_placed_dxr_hardware` use a fixture-specific import
+that takes two records, each holding a 64-bit guest destination and scratch address.
+The source-built EXE writes the records in BLAS/TLAS order. Its machine code adds
+512 bytes to each destination base and 768 bytes to each scratch base. The
+provider supplies the bases and applies `x2w_startup::resolve_placed_build` to
+both records with the device's prebuild sizes before recording either build.
+The provider compiles the runtime's placement implementation into the fixture DLL.
+
+The Windows loader and `pe_map` run the same PE. The test checks that PE's hash
+against the compiled AOT executable's exported source hash. For every runner
+the successful batch builds one triangle and one instance, dispatches three
+rays, and reads 12 DWORDs. A separately built scene on the same device uses
+direct desktop addresses. Both must yield instance 7 at distance 1, a miss and
+a mask-filtered miss. The successful guest exits with 42.
+
+Two controls change the second scratch address. One selects a resource whose
+last required byte falls beyond its registered extent. The other supplies an
+unregistered address. The fixture checks `E_INVALIDARG` at index 1, zero recorded
+builds and zero completed submissions, no published output, five released
+placements and exit 22. A device without DXR pipeline support returns 77.
+
+```powershell
+cmake --build --preset release --target cpu_placed_dxr_lifted pe_map
+ctest --preset release --no-tests=error -R '^cpu_placed_dxr_(warp|hardware)$' -V
+```
+
 ### Placed vertex buffer draw from a source-built EXE
 
 `cpu_placed_draw_warp` and `cpu_placed_draw_hardware` compare the Windows loader,
