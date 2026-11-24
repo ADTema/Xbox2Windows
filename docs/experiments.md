@@ -133,6 +133,19 @@ Four wrong references (omitting `voffset` or `soffset`) and four translation mut
 ctest --preset dev --no-tests=error -R '^startup_buffer_address_(controls|warp|hardware)$' -V
 ```
 
+## Startup translator: SMEM combined register and immediate offsets
+
+In RDNA 2 SMEM instructions (`s_load_dword*` and `s_buffer_load_dword*`), a scalar register `SOFFSET` (`s0`..`s105` or `m0`) and a non-zero 21-bit signed immediate `OFFSET` (`w1[20:0]`) can be active at the same time: [`tools/disasm_rdna2.py`](../tools/disasm_rdna2.py) prints the register in `ops[2]` and `offset:0x...` in `mods`. Previously, `Stage.op_s_buffer_load_dword()` and `Stage.op_s_load_dwordx4()` in [`tools/startup/gfx2hlsl.py`](../tools/startup/gfx2hlsl.py) ignored `mods`, silently dropping `offset:0x...` on register-addressed buffer and dynamic sampler-heap loads, accepting unknown modifiers, reading negative 21-bit signed encodings (`0x100000`..`0x1fffff`) as `+1`..`2` MiB, and overwriting a runtime SGPR `soffset` mid-load when a multi-dword `s_buffer_load_dwordx*` wrote into that register first.
+
+`gfx2hlsl.py` now parses and validates SMEM modifiers (`glc`, `dlc` and at most one non-negative 21-bit signed `offset:` up to `0xfffff`), adds the immediate byte offset to register-addressed `s_buffer_load_dword*` and opt-in sampler-heap `s_load_dwordx4` loads, saves an overlapping runtime SGPR `soffset` into `a` before writing destination registers, and validates non-SGPR/`m0` `soffset` operands (`vcc_lo`, `exec_lo`, `ttmp*`, VGPRs, register ranges, or descriptor-holding SGPRs) across `s_buffer_load_dword*` and both sampler-heap modes of `s_load_dwordx4`. Negative 21-bit signed immediates (`0x100000`..`0x1fffff` or negative literals) — which hardware `s_load_*` sign-extends — remain an unlowered translator gap and are refused by name rather than silently reading at `+1`..`2` MiB.
+
+[`tests/startup_smem_address_check.py`](../tests/startup_smem_address_check.py) checks `llvm-mc` encoding parity, pure-Python controls, two 16-vertex buffer-load readback cases (`s_buffer_load_dwordx4` with `SGPR` + `offset:0x18` at two runtime offsets, plus `m0` + `offset:0x14 dlc`, constant-SGPR + `offset:0x08` and destination-overlapping `s[20:21]` + `offset:0x1c glc`) and a full-screen dynamic sampler-heap pixel draw (`s_load_dwordx4` with `s9` + `offset:0x10` under both DXC and FXC). Wrong references and translation mutations (including the pre-fix dropped-`offset:` form and reading the clobbered `s20` word instead of `a`) must fail readback. Verified with zero mismatches and zero D3D12 debug-layer errors or warnings on Windows 11 26H2 (build 26300.9974) across WARP 10.0.26100.9818 and an AMD Radeon RX 9070 XT (driver 32.0.32029.2010).
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_smem_address_(controls|warp|hardware)$' -V
+python -B tests/startup_smem_address_check.py binary llvm-mc-15
+```
+
 ## Packed render targets: 5-6-5 and arrays
 
 `packed_target_stand_in` now also covers B5G6R5_UNORM and 2D arrays of 2 to 2048 slices (a cube map is six). When the adapter lacks render-target (or typed UAV) support for the packed format and has it for R8G8B8A8_UNORM, the texture is created as R8G8B8A8_UNORM with the same slice and mip counts. Zero slices, more than 2048, 3D, buffers and multisampled textures keep their format. The stand-in has 8 bits a channel and an alpha channel that B5G6R5 lacks. Texels the executable writes in the 16-bit layout are not converted. The device-free check covers 61 rows against adapters described by their support bits, and four mutated runs (wrong stand-in format, arrays left alone, B5G6R5 left alone, view kept packed) must fail. The WARP and hardware readback draws a B5G6R5 target; an array target is not drawn.
@@ -1766,6 +1779,8 @@ The profile also accepts `ffreep st(0)` on a nonempty stack: it tags ST(0) empty
 
 `ffree st(i)` is accepted when ST(i) is known to be empty at translation time, that is when `i` is at least the depth. It then changes neither occupancy nor TOP, and C0 to C3 become undefined. `ffree` of an occupied register stays outside the profile: freeing the deepest one would keep TOP while the stack shrinks, and freeing another would leave a hole. A seventh export, `ffree_empty`, runs `ffree st(0)` and `ffree st(7)` at depth 0, `ffree st(1)`, `st(4)` and `st(7)` at depth 1, and `ffree st(7)` at depth 7 followed by one more push. It records TOP after each group, and from depth 8 stores the pushed 0.0, the 1.0 below it and the input at the bottom. The check now has 7 exports and 884 cases. On Windows 11 build 26100 the native run gave TOP 0, 7 and 0, the final push did not overflow, and every stored value matched, as in the translation. Two more controls must mismatch. One frees ST(0) instead of ST(7) at depth 7, which gave 34 mismatches. The other moves TOP as a pop does, so the status word at depth 1 reads TOP 0; it gave 68 mismatches, because `ffreep_top` also reads TOP 7 at depth 1. Translation rejects a reader of C0 after `ffree` of an empty register, and `ffree st(0)` and `ffree st(1)` of occupied registers. The rejection cases `ffree st(1)` at depth 1 in `cpu_aot_x87_add` and `cpu_aot_x87_moves` freed an empty register, so they now use `ffree st(0)`.
 
+`fstsw ax` assembles as `wait` and `fnstsw ax`, and the `wait` leaves C0 to C3 undefined, so only TOP is known after it. An eighth export, `fstsw_top`, reads it at depth 0, at depth 1 after loading the input, and at depth 2 after `fld1` and `ftst`, each time with AH masked to TOP, and then stores the input. The check now has 8 exports and 918 cases. On an AMD Ryzen 5 5500 (Windows 11 build 26300) the native run gave TOP 0, 7 and 6 and the input unchanged, as the translation does. A ninth control, which makes each `fnstsw ax` that follows a `wait` read TOP 0, gave 34 mismatches. The TOP controls of `ffreep_top` and `ffree_empty` now also change the depth-2 and depth-1 reads of `fstsw_top` and gave 68 and 102 mismatches. Translation rejects a reader of C0 after `ftst` and `fstsw ax`. `fstsw` with an m16 operand has no accepted fixture: its `wait` makes C0 to C3 unknown even right after `fninit`, so the translation rejects it, as the `cpu_aot_x87_fldcw` rejection cases show.
+
 `lower(..., x87=x87_lower.Checked(reject))` is the checked entry of the profile. It also accepts `fldcw m16`, and keeps the control word in a local of the lowered function, `fninit` and `finit`, which load `0x037F`, clear C0 to C3 and empty every register, `fbld` (`cpu_aot_x87_bcd`), and `fprem` and `fprem1` (`cpu_aot_x87_fprem`). The arithmetic, `fsqrt`, `fscale`, `frndint`, `fist` and `fistp`, the m32 and m64 stores, `fnstcw` and the five inexact constant loads all follow that word. The precision control applies only to the arithmetic and `fsqrt`. `fldcw` accepts a word with all six exceptions masked and precision control 00, 10 or 11 (24, 53 or 64 bits). It keeps the word as `fnstcw` reads it back: bit 6 reads as 1, bits 7 and 13 to 15 as 0, and bit 12 is kept. The lowered function leaves through the caller's `reject` statement with a status in these cases:
 
 - status 1, at an `fldcw` whose word unmasks an exception;
@@ -3230,6 +3245,53 @@ source-built visible triangle filled all 1,024 pixels, while altering a
 reference index caused the comparison to fail. Tested on Windows build
 26200.9974, RTX 4060 Laptop driver 32.0.16.1656 and WARP 10.0.26100.9818,
 with the debug layer enabled.
+
+## Runtime mesh geometry input fixture
+
+The source-built `tests/mesh_dynamic_geometry.s` computes a triangle or quad
+from two geometry buffer words. One word packs the vertex and primitive counts
+for `GS_ALLOC_REQ`. The other supplies the second primitive's indices. The
+CPU check runs the same instructions with six inputs and compares the
+allocation, vertex positions, attributes and complete index triples. Zero
+counts, a count above the declared maximum and an out-of-range index produce
+an empty allocation. Replacing the last index of the second triangle changes
+the exported triple and keeps the two-primitive allocation.
+
+```text
+python3 -B tests/mesh_dynamic_geometry_check.py
+python3 -B tests/mesh_dynamic_geometry_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+ctest --preset dev --no-tests=error -R "^mesh_dynamic_geometry_cpu$" -V
+```
+
+The binary check compares the LLVM-assembled bytes with the embedded fixture
+and compares the normalized Python and LLVM instruction listings. Both modes
+exercise the existing CPU wave model.
+
+### Bounded runtime mesh geometry lowering
+
+[`tools/mesh_dynamic_aot.py`](../tools/mesh_dynamic_aot.py) emits one desktop
+mesh shader for a two-wave64 triangle entry. It splits runtime input cases
+at scalar equality tests and reruns the existing wave model for each case.
+Each case must prove its allocation, primitive indices and vertex exports.
+The generated shader loads the geometry words from raw SRV `t0`, selects the
+applicable case and executes one `SetMeshOutputCounts`. The caller declares
+the minimum buffer size in DWORDs and keeps its contents stable during the draw.
+The translator refuses backward branches, unproven uses of geometry words,
+and programs with more than 32 input cases.
+
+```text
+python3 -B tools/mesh_dynamic_aot.py source-built.dxbc --geometry-word-count 2 --llvm libLLVM-15.so.1 --output out/mesh.hlsl
+python3 -B tests/mesh_dynamic_aot_check.py
+cmake --build --preset release --target offscreen_check
+ctest --preset release --no-tests=error -R "^mesh_dynamic_aot_draw_(warp|hardware)$" -V
+```
+
+The same compiled shader runs six inputs, including zero allocation and two
+out-of-range cases. A separate mesh program with one changed compare operand
+adds two controls. Windows WARP with the D3D12 debug layer enabled matched
+all 1,024 pixels for each of the eight cases. Physical hardware and startup
+pipeline integration remain open in [#1760](https://github.com/R0Y00/Xbox2Windows/issues/1760).
+[Windows verification](https://github.com/avt0m4t48/Xbox2Windows/actions/runs/45485172952)
 
 ## Amplification and mesh pipeline forms
 
@@ -4838,6 +4900,14 @@ The fixture is a guarded read-compute-write kernel with the read bindings and `c
 
 The Windows readback uses the read harness and its three dispatches (no lane passes, a split wave, five groups with 150 active lanes) and compares all 320 words, so every word past the bound must stay at its sentinel. Each of these must fail at the first word where it differs: a reference with `sub` and `subrev` exchanged, `subrev` alone exchanged, an add for the multiply, a subtract for the final add, or the sign of `-4.0` dropped; a changed sentinel word at the bound and at word 319. So must recompiled HLSL with `add` as subtract, the subtract operands exchanged, `mul` as add, the cap read from `params[0].z`, the literal off by one bit, the inline sign flipped, the inline `1.0` replaced by `2.0`, or the guard `>` made `>=` so lane 150 writes. A separate translation check evaluates the lowered expression with numpy binary32 on all 167 active lanes of the three dispatches and finds no difference from the model; it is not part of the test. The translation controls lower the fixture exactly, check that a program using one operation carries only its helper, that `sub` and `subrev` differ, and refuse each form, operand and value listed above. Replacing the `subrev` template with `sub`, the multiply with an add, dropping `precise`, or dropping the NaN or denormal refusal each fails them. The LLVM 15 round trip assembles and disassembles the fixture as for the other forms. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_f32_(warp|hardware)$' -V`.
 
+#### Float-to-uint32 conversion
+
+`v_cvt_u32_f32_e32 vD, S0` (VOP1 opcode `0x06`) converts a binary32 source to an unsigned 32-bit integer with RDNA2 saturation: NaN and values at or below zero produce `0`, values at or above `2^32` (including `+inf`) produce `0xffffffff`, and values in `(0, 2^32)` truncate toward zero. The lowering emits the `cvt_u32_f32` helper only when called, clamping finite inputs to `4294967040.0f` (`2^32 - 256`, the largest binary32 below `2^32`) before `uint()` so even speculatively evaluated casts stay in range.
+
+`S0` accepts a VGPR holding a known word, a ready SGPR, a 32-bit literal, an integer inline constant or an inline float constant (`FLOAT_INLINE`). Unlike `FALU`, NaN, infinity and denormal constants are accepted because `v_cvt_u32_f32` defines their results. Unknown or pending sources, unaccepted float literals, destinations past `v255`, `_e64` and bare spellings, `clamp`, `omod` and input modifiers (`-`, `|...|`) are refused.
+
+The source-built 32-thread fixture stores four words per thread (`128` words active, `128..319` sentinel) covering `0.75`, `1.5`, `3.0..3*2^29`, `2^32 - 256`, `2^32`, `> 2^32`, `FLT_MAX`, `+inf`, `sNaN`, `qNaN`, `-0.0`, `-denorm`, `-inf`, `-1.0`, `4.0` and an SGPR `5.0`, checked against an independent Python model. Reference controls with rounding instead of truncation (word `4`), wrapping at `2^32` (word `65`), NaN saturating to `0xffffffff` (word `3`) and a flipped sentinel (word `128`) each fail at their stated word; recompiled HLSL with the NaN check dropped, `2^32` saturation dropped, negative clamp dropped or `4.0` replaced by `2.0` each fail on the device. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_cvt_u32_f32_(warp|hardware)$' -V`.
+
 #### Three-input XOR
 
 `v_xor3_b32 vD, a, b, c` is the VOP3 operation `D = a ^ b ^ c` of the RDNA2 instruction set. It lowers to `(a ^ b ^ c)` with the sources in operand order. Each source is a VGPR, an SGPR that holds a known word, an integer inline constant or a 32-bit literal, as for the integer forms above, and the result is data only. `v_or3_b32`, `v_xad_u32`, the `_e64` spelling, source modifiers (`-v`, `|v|`, `neg()`), `clamp`, a register range, a fourth source and a source that is not a known word stop the lowering at the instruction. A destination past `v255` is refused with `Unverified ALU operand`.
@@ -4889,6 +4959,22 @@ The fixture runs one group of 64 threads with `wave_size=32`, where each thread 
 The LLVM 15 round trip assembles and disassembles the fixture as for the other forms.
 
 Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_bcnt_exec_(warp|hardware)$' -V`.
+
+#### First active lane of a full wave
+
+`s_ff1_i32_b64 sD, exec` and `s_ff1_i32_b32 sD, exec_lo` return the index of the lowest set bit of `exec` (64-bit) or `exec_lo` (32-bit) in the single 32-bit SGPR `sD`, preserving `SCC`. Outside a guarded region, lane 0 of every wave is active for any group of at least 1 thread (and for wave32 the high half of `exec` is 0), so both forms fold to the known scalar word `0`. Uses inside a guarded region (`s_and_saveexec_b32` through `exec` restore), any other source (`vcc`, `exec_hi`, SGPRs, literals, or mismatched width), and invalid or pending destinations (`s106`, `s12`, or an SGPR pair) are refused.
+
+The fixture runs one 64-thread group storing `(tid.x << 8) + s4 + s5`, where `s4` comes from `s_ff1_i32_b64 s4, exec` and `s5` from `s_ff1_i32_b32 s5, exec_lo`. All 320 words are compared against a Python reference. Reference controls must fail for: the result taken as `1` (word 0), the result taken as the lane index (word 1), and a changed sentinel past the group (word 64). Recompiled HLSL must also fail on the device with `1` in place of `0`.
+
+Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_ff1_exec_(warp|hardware)$' -V`.
+
+#### Writing one lane of a vector register
+
+`v_writelane_b32 vD, sS, lane` writes the uniform scalar `sS` to lane `lane & 31` of `vD` and leaves the other lanes unchanged, ignoring `exec`. gfx10 numbers lanes by `SV_GroupIndex` modulo the wave size, so per thread it lowers to `((gindex & 31u) == (lane & 31u)) ? sS : old_vD` under `wave_size=32`, where the lane is masked to 5 bits. A group of at most 32 threads is accepted without `wave_size=32` only when the lane is a known constant below 32 (since wave64 selects `lane[5:0]`, not `lane[4:0]`); larger groups require `wave_size=32`. Refused, each with its own control: an unknown or pending scalar source, an unknown or pending lane (or a lane not known to be `< 32` without `wave_size=32`), an unknown old `vD`, a use inside a guarded region, a group larger than 32 without `wave_size=32`, and `vD` above `v255`.
+
+The fixture runs one group of 64 threads with `wave_size=32`. Each thread starts with `v4 = tid.x + 1`, then `v_writelane_b32` writes `0x11223344` to lane 3 (via SGPR `s4` and inline constant `3`) and `0x55667788` to lane 31 (via literal `0x55667788` and SGPR `s5`). Both wave32 waves receive the writes, and all 320 words are compared against a Python reference. Reference controls must fail for: `gindex` without `& 31` (word 35), lane off by one (word 3), the scalar not written (word 3), and a changed sentinel past the group (word 64). Recompiled HLSL must also fail on the device with `gindex` without `& 31u`, `!=` for `==`, and `0` in place of the old `vD`.
+
+Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_writelane_(warp|hardware)$' -V`.
 
 ### Scalar ALU on known words
 
@@ -5896,6 +5982,22 @@ The SDWA forms of those conversions read the same table: after the split, `sdwa(
 uint-result table, so every `v_cvt_f32_*_sdwa` was refused until it was pointed at both (#1727). The
 restored path keeps the source selection, the `dst_sel`/`dst_unused` write and the `U(...)` wrapper, and a
 conversion's output modifier inside an SDWA form is still refused rather than dropped.
+
+**VOPC SDWA compares (#1906).** `compare()` refused every `v_cmp*_sdwa` and `v_cmpx*_sdwa`. It now lowers the
+SDWA forms of its 32-bit table. An i32 or u32 source reads its `src0_sel`/`src1_sel` field through `sdwa_source`,
+sign-extended under `sext()`, and the compare reads that 32-bit value as its type. f32 compares stay refused
+in their SDWA form until their predicates are verified for NaN independently of the non-SDWA text (#1920). The
+destination is `vcc_lo`, the SGPR the decoder prints, or EXEC for `v_cmpx` with the same EXEC masking as before.
+Class compares, f32 compares, a missing or repeated select and any other SDWA modifier
+(`clamp`, `dst_sel`, an output modifier) are refused. `startup_gfx2hlsl_vopc_sdwa` evaluates the emitted HLSL of
+all 32 integer compares (v_cmp into `vcc_lo` and into an SGPR, v_cmpx into EXEC) times every select and `sext()`
+on both sources, 9408 forms, over 64 source pairs each, against a plain integer reference. The draws
+`startup_gfx2hlsl_vopc_sdwa_{warp,hardware}` keep or discard each of 16 x 16 pixels with
+`v_cmpx_le_i32_sdwa -16, sext(v1) src0_sel:DWORD src1_sel:BYTE_1`, compiled with FXC `ps_5_1` and DXC `ps_6_0`;
+translations that read the whole dword or zero-extend the byte must fail the draw (120 and 96 differing pixels)
+and match their own plain-integer image. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_vopc_sdwa' -V`.
+`tests/startup_gfx2hlsl_vopc_sdwa_check.py binary <llvm-mc>` and `decode <libLLVM>` round-trip every accepted
+form through LLVM 15.
 **Four half channels in a typed buffer load.** `BUF_FMT_16_16_16_16_FLOAT` stores x and y in the first
 dword and z and w in the second, and the typed-load format table had only the two-channel half-float
 form, so a load of this format was refused with `buffer format BUF_FMT_16_16_16_16_FLOAT` - 5 of the 29
@@ -5947,6 +6049,8 @@ python3 -B tests/pixel_aot_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15
 ```
 
 `tools/pixel_aot.py` extracts one named pixel program from a local archive, decodes gfx1013 instructions with LLVM and emits HLSL. DXC compiles the result to desktop DXIL before the draw. The lowerer tracks register writes across whole-quad interpolation of attribute 0, a scalar texture-descriptor load, a 2D RGBA sample, packed round-toward-zero binary16 conversions and one compressed color export, or an uncompressed export of four distinct computed or sampled registers whose result may instead be returned as `uint4` for a lossless integer readback. Unknown instructions, mismatched bindings and reads before the required wait cause translation to fail. [LLVM disassembler API](https://llvm.org/docs/doxygen/group__LLVMCDisassembler.html) · [Leonida public format reference](https://github.com/ItsNotRexed/Leonida/blob/56f023a10a726da20702d4e121656ceda2391d93/tools/fssm_unpack.py)
+
+A sampled program can also read attr0.z/w, as plain values from a P1/P2 pair in the entry mask, with the four-component TEXCOORD0 of the unsampled path. Its sample coordinates must still come from attr0.x/y, either the interpolated values or whole-quad values built from them, so a coordinate can never depend on z or w. Interpolating z or w in whole-quad mode, whole-quad arithmetic on them and attr1 are refused. Three source-built programs sample an 8×8 float texture at attr0.xy and scale red by z, green by w and blue by z·w: two with an implicit-LOD sample in whole-quad mode (`image_sample`, and `image_sample_b` with a zero bias ahead of the coordinates), one with `image_sample_lz`. A CPU reference checks all 64 pixels bit for bit, and the program with z and w exchanged must fail at the predicted first pixel. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_attribute_sampled_'`.
 
 The integer readback profile declares the primary constant buffer as `uint4`. Integer consumers read its words directly, and floating-point consumers reinterpret the same bits. The byte layout is unchanged. The constant-index bitset draw checks copying `0xffffffff` through a VGPR and overwriting the destination with a floating-point result. On RTX 4060 Laptop (driver 32.0.16.1656), the previous float-typed load returned `0x7fffffff` for the immediate-index-31 copy; the integer load preserves `0xffffffff`. [Original report and independent reproduction](https://github.com/R0Y00/Xbox2Windows/pull/680#issuecomment-7099515543)
 
@@ -6393,9 +6497,9 @@ General quad permutations combine constant-index quad reads with integer masks. 
 
 Quad-local `DPP16` (`quad_perm` with `row_mask:0xf` and `bank_mask:0xf`) and quad-local `DPP8` (`dpp8` repeating the same 2×2 quad permutation on lanes 0–3 and 4–7) forms for all four relative VGPR-indexing moves (`v_movreld_b32_dpp`, `v_movrels_b32_dpp`, `v_movrelsd_b32_dpp`, `v_movrelsd_2_b32_dpp`) reuse the shared quad routing helpers (`parse_dpp`, `emit_quad_swizzle_u32`) combined with `m0` offset tracking. Static `m0` immediates resolve directly; dynamic `m0` offsets proven bounded through `s_bfe_u32` or `s_and_b64`/`s_or_b64`/`s_lshl_b64`/`s_lshr_b64` bitmasks (with `TrackedScalar` clearing masks on any scalar overwrite) lower to conditional VGPR selects (`m0[9:0]` for source and `m0[25:16]` for destination on `v_movrelsd_2_b32_dpp`). Unbounded or non-numeric `m0` (`interp_base`), overwritten scalar masks, out-of-range or uninitialized indexed VGPRs, source modifiers, unproved `bound_ctrl:`/`fi:`, cross-quad or non-repeated `DPP8`, `row_*`/`wave_*`, partial masks, WQM, and `vmcnt` hazards are refused. `DPP_MOVREL_BODY` covers all four forms across both `DPP16` and `DPP8` with static and runtime-dynamic `m0` values on two constant sets plus negative mutations, and is round-tripped through LLVM 15 `check_binary`. Reproduce with `ctest --preset dev --no-tests=error -R "^pixel_aot_dpp_movrel_" -V`, or `python -B tests/pixel_aot_check.py draw-dpp-movrel <dxc> <offscreen_check> <hardware|warp>`.
 
-The plain VOP1 (`_e32`) and VOP3 (`_e64`) encodings of the same four moves (`v_movreld_b32`, `v_movrels_b32`, `v_movrelsd_b32`, `v_movrelsd_2_b32`), which LLVM 15 prints with two VGPR operands for gfx1013 and gfx1030 alike, lower through the same `m0` indexing without a quad swizzle: each lane reads and writes its own VGPRs. The indexing follows the [AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture): `v_movrels` reads VGPR[src + m0], `v_movreld` writes VGPR[dst + m0], `v_movrelsd` does both with the same offset, and `v_movrelsd_2` reads with `m0[9:0]` and writes with `m0[25:16]`. The static and bounded-dynamic `m0` rules, the source-before-destination reads for overlapping banks, the entry-mask requirement and the refusals are the DPP forms' code path. The plain-form controls exercise an `interp_base` `m0`, an unbounded dynamic `m0`, a static offset past v255, an indexed VGPR past v255 and an undefined indexed source; the mask and outstanding-sample refusals are shared with the DPP forms and not repeated here. The SDWA forms and the scalar `s_movrel*` stay outside; `v_swaprel_b32` is described below. `PLAIN_MOVREL_BODY` runs each move once with a dynamic `m0` (from `s_bfe_u32`, or `s_and_b64` with `0x30003` for `v_movrelsd_2`) and once with a static one, and the check draws it twice: as written (`_e32` dynamic, `_e64` static) and with the two spellings exchanged, so all eight forms run with both kinds of `m0`. Both use the two `DPP_MOVREL_SETS` constant sets, whose four channel results (60, 133, 805, 193 and 80, 84, 233, 165) differ. On WARP (driver 10.0.26100.8972) and an NVIDIA Quadro M1000M (driver 32.0.15.7371) on Windows 11 build 26100, with the debug layer unavailable, all 4096 pixels matched the reference with zero error for both sets and both variants. Four mutations per variant must produce a pixel mismatch, and did on both adapters: a dynamic `m0` replaced by 0 for each of `v_movrels`, `v_movreld` and `v_movrelsd`, and swapped static `m0[9:0]`/`m0[25:16]` halves for `v_movrelsd_2`. The translation controls check the bounded selects, an overlapping `v_movrelsd_2` bank and the five refusals above. Both variants are also in the `check_binary` round trip through LLVM 15. Reproduce with `ctest --preset dev --no-tests=error -R "^pixel_aot_plain_movrel_" -V`.
+The plain VOP1 (`_e32`) and VOP3 (`_e64`) encodings of the same four moves (`v_movreld_b32`, `v_movrels_b32`, `v_movrelsd_b32`, `v_movrelsd_2_b32`), which LLVM 15 prints with two VGPR operands for gfx1013 and gfx1030 alike, lower through the same `m0` indexing without a quad swizzle: each lane reads and writes its own VGPRs. The indexing follows the [AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture): `v_movrels` reads VGPR[src + m0], `v_movreld` writes VGPR[dst + m0], `v_movrelsd` does both with the same offset, and `v_movrelsd_2` reads with `m0[9:0]` and writes with `m0[25:16]`. The static and bounded-dynamic `m0` rules, the source-before-destination reads for overlapping banks, the entry-mask requirement and the refusals are the DPP forms' code path. The plain-form controls exercise an `interp_base` `m0`, an unbounded dynamic `m0`, a static offset past v255, an indexed VGPR past v255, an undefined indexed source, and the plain branch's own entry-mask refusal (`v_movrels_b32_e32` and `v_movreld_b32_e64` in the whole-quad region); the outstanding-sample refusal is shared with the DPP forms and not repeated here. The SDWA forms and the scalar `s_movrel*` stay outside; `v_swaprel_b32` is described below. `PLAIN_MOVREL_BODY` runs each move once with a dynamic `m0` (from `s_bfe_u32`, or `s_and_b64` with `0x30003` for `v_movrelsd_2`) and once with a static one, and the check draws it twice: as written (`_e32` dynamic, `_e64` static) and with the two spellings exchanged, so all eight forms run with both kinds of `m0`. Both use the two `DPP_MOVREL_SETS` constant sets, whose four channel results (60, 133, 805, 193 and 80, 84, 233, 165) differ. On WARP (driver 10.0.26100.8972) and an NVIDIA Quadro M1000M (driver 32.0.15.7371) on Windows 11 build 26100, with the debug layer unavailable, all 4096 pixels matched the reference with zero error for both sets and both variants. Four mutations per variant must produce a pixel mismatch, and did on both adapters: a dynamic `m0` replaced by 0 for each of `v_movrels`, `v_movreld` and `v_movrelsd`, and swapped static `m0[9:0]`/`m0[25:16]` halves for `v_movrelsd_2`. The translation controls check the bounded selects, an overlapping `v_movrelsd_2` bank and the five refusals above. Both variants are also in the `check_binary` round trip through LLVM 15. Reproduce with `ctest --preset dev --no-tests=error -R "^pixel_aot_plain_movrel_" -V`.
 
-`v_swaprel_b32` (VOP1 only, `7e18d118` decodes as `v_swaprel_b32 v12, v24` for gfx1013 and gfx1030) exchanges VGPR[vdst + `m0[25:16]`] and VGPR[vsrc + `m0[9:0]`], the same split as `v_movrelsd_2_b32` (#1795). That reading follows the RDNA 2 naming and LLVM's definition; it has not been measured on RDNA hardware. The lowering uses the movrel `m0` rules (static, or dynamic with a proven bit mask; the same refusals). It reads both reachable sides before writing, and then gives each reachable register the source value when the destination offset selects it, the old destination value when the source offset selects it, and its old value otherwise, so a swap of a register with itself changes nothing. `SWAPREL_BODY` runs a dynamic swap between two banks (`m0` = word 3 & `0x30003`, which differs between the two `DPP_MOVREL_SETS`), then, in a second pair of banks, an overlapping swap inside one bank (`m0` = `0x30001`), a swap of a register with itself (`0x20002`) and a static swap between the banks (`0x20001`). The four bank sums (816, 117, 338, 125 and 218, 128, 338, 125) come from an independent list-swap reference. On WARP (driver 10.0.26100.8972) and an NVIDIA Quadro M1000M (driver 32.0.15.7371) on Windows 11 build 26100, with the debug layer unavailable, all 4096 pixels matched with zero error for both sets. Three controls must mismatch, and did on both adapters: a one-way `v_movrelsd_2_b32_e32` in place of the dynamic swap, swapped static `m0` halves, and the dynamic `m0` replaced by 0. The translation controls check five refusals. Reproduce with `ctest --preset dev --no-tests=error -R "^pixel_aot_swaprel_" -V`.
+`v_swaprel_b32` (VOP1 only, `7e18d118` decodes as `v_swaprel_b32 v12, v24` for gfx1013 and gfx1030) exchanges VGPR[vdst + `m0[25:16]`] and VGPR[vsrc + `m0[9:0]`], the same split as `v_movrelsd_2_b32` (#1795). That reading follows the RDNA 2 naming and LLVM's definition; it has not been measured on RDNA hardware. The lowering uses the movrel `m0` rules (static, or dynamic with a proven bit mask; the same refusals). It reads both reachable sides before writing, and then gives each reachable register the source value when the destination offset selects it, the old destination value when the source offset selects it, and its old value otherwise, so a swap of a register with itself changes nothing. `SWAPREL_BODY` runs a dynamic swap between two banks (`m0` = word 3 & `0x30003`, which differs between the two `DPP_MOVREL_SETS`), then, in a second pair of banks, an overlapping swap inside one bank (`m0` = `0x30001`), a swap of a register with itself (`0x20002`) and a static swap between the banks (`0x20001`). The four bank sums (816, 117, 338, 125 and 218, 128, 338, 125) come from an independent list-swap reference. On WARP (driver 10.0.26100.8972) and an NVIDIA Quadro M1000M (driver 32.0.15.7371) on Windows 11 build 26100, with the debug layer unavailable, all 4096 pixels matched with zero error for both sets. Three controls must mismatch, and did on both adapters: a one-way `v_movrelsd_2_b32_e32` in place of the dynamic swap, swapped static `m0` halves, and the dynamic `m0` replaced by 0. The translation controls check five refusals. They also pin the generated selects without a GPU: for a static swap of v25 and v26, and for a dynamic swap with `m0` masked to `0x30001`, the swap lines must match an expected text with the temporaries renamed in order of appearance. So swapped `m0` halves, a source side that reads the wrong old value, source offsets taken from the wrong half, or a missing destination select each fail `python -B tests/pixel_aot_check.py`, not only the draw. Reproduce with `ctest --preset dev --no-tests=error -R "^pixel_aot_swaprel_" -V`.
 
 The scalar relative moves `s_movrels_b32`, `s_movrels_b64`, `s_movreld_b32`, `s_movreld_b64` and `s_movrelsd_2_b32` (SOP1; LLVM 15 decodes `be942e28` as `s_movrels_b32 s20, s40` and the others alike for gfx1013 and gfx1030) lower with the same `m0` split as the vector forms (#1882): `s_movrels` reads SGPR[src + m0], `s_movreld` writes SGPR[dst + m0], and `s_movrelsd_2_b32` reads with `m0[9:0]` and writes with `m0[25:16]`; `_b64` moves a pair, with `m0` counted in dwords. That reading follows the RDNA 2 naming and the vector forms; it has not been measured on RDNA hardware. With a static `m0` the move is an `s_mov` from or to the indexed SGPR, so its tracked value (constant, expression, descriptor or pointer word) and bit mask carry over: moving the texture descriptor pointer with `s_movrels_b64 s[72:73], s[16:17]` and `m0` = 4 translates exactly like two `s_mov_b32`. A dynamic `m0` with a proven bit mask becomes a bounded select, and only over plain numeric SGPRs, so no resource depends on a runtime index; for `s_movreld` each reachable destination keeps its old value unless selected. An unbounded or non-numeric `m0`, an index past s105, a write into an outstanding scalar load, a symbolic source or destination under a dynamic `m0` and a `_b64` pair base that could be odd (a static odd offset, or a dynamic mask that allows bit 0) are refused. Every source is read before any destination is written: self-moves, overlapping pairs and a dynamic `s_movreld` whose source lies in its own destination bank are pinned by the exported constants or the generated selects. `SMOVREL_BODY` moves cbuffer-indexed words with each form, static and dynamic, and exports weighted sums (60, 67, 805, 193 and 80, 63, 244, 165 on the two `DPP_MOVREL_SETS`) from an independent reference. On WARP (driver 10.0.26100.8972) and an NVIDIA Quadro M1000M (driver 32.0.15.7371) on Windows 11 build 26100, with the debug layer unavailable, all 4096 pixels matched with zero error for both sets. Four controls must mismatch, and did on both adapters: the dynamic `m0` replaced by 0 for `s_movrels_b32`, `s_movreld_b32` and `s_movreld_b64`, and swapped static halves for `s_movrelsd_2_b32`. The translation controls check the descriptor move, the overlaps and ten refusals. Reproduce with `ctest --preset dev --no-tests=error -R "^pixel_aot_smovrel_" -V`.
 
@@ -6991,8 +7095,65 @@ enabled) painted the specified four pixels for each writer and left all pixels
 at the clear color in the three refusal and omitted-writer cases. Both argument
 guards survived every case. The upstream runtime and a build that dropped the
 index-buffer offset both left the first case at the clear color and failed the
-pixel comparison. Physical adapter coverage for the indexed path is pending.
+pixel comparison. The maintainer separately passed the indexed and compute
+dispatch cases in Release on WARP and an RTX 4060 Laptop, four passes with no skips.
 [Windows verification](https://github.com/avt0m4t48/Xbox2Windows/actions/runs/45478647954)
+[Maintainer's adapter results](https://github.com/R0Y00/Xbox2Windows/issues/1759#issuecomment-7143863805)
+
+#### GPU-written indirect draw arguments
+
+Slot 61 also accepts a single rootless desktop `DRAW` record with the exact
+four-word stride. It uses the same desktop graphics pipeline and target
+requirements as `DRAW_INDEXED`. The vertex shader generates vertices from
+`SV_VertexID` without an index or vertex buffer. The wrapper checks the placed
+argument buffer and transitions it to `INDIRECT_ARGUMENT` before execution.
+
+The same fixture executable has a `draw` mode. Its GPU writer selects three
+or six vertices, covering the left half or both halves of the render target.
+The test compares all eight pixels and all argument words, including the
+guards. The omitted writer, short argument range, and missing viewport cases
+expect a clear target.
+
+```powershell
+cmake --build --preset release --target startup_indirect_draw_indexed
+ctest --preset release --no-tests=error -R '^startup_indirect_draw_(warp|hardware)$' -V
+```
+
+On Windows build 26100, WARP (Microsoft Basic Render Driver 10.0.26100.33648
+with the debug layer enabled) passed Draw, DrawIndexed, and Dispatch. The
+unmodified runtime left the first Draw target clear instead of painting its
+left half. Physical adapter coverage for this Draw path is pending.
+[Candidate run](https://github.com/avt0m4t48/Xbox2Windows/actions/runs/45484934665)
+[Negative control](https://github.com/avt0m4t48/Xbox2Windows/actions/runs/45484385924)
+
+#### GPU-written indirect mesh dispatch arguments
+
+The same slot 61 accepts one rootless `DISPATCH_MESH` record with three group
+counts. It requires a direct list and a desktop mesh and pixel pipeline using
+an empty root signature, one matching single-sample color target, a viewport,
+and a scissor. Producers that bypass wrapper state tracking return the argument
+buffer to `COMMON` before slot 61. The mesh path uses the record's group counts
+without binding an input assembler topology or an index buffer. Amplification
+and console shader pipelines are tracked in
+[#1759](https://github.com/R0Y00/Xbox2Windows/issues/1759) and
+[#1760](https://github.com/R0Y00/Xbox2Windows/issues/1760).
+
+The fixture writes its group counts at byte offset four on the GPU and checks
+all eight pixels and the surrounding argument words. One group paints the
+left half. Two groups paint both halves. An omitted writer, a short argument
+range, and a missing viewport each leave the target clear. Adapters without
+mesh shader support report a capability skip.
+
+```powershell
+cmake --build --preset release --target startup_indirect_draw_indexed
+ctest --preset release --no-tests=error -R '^startup_indirect_mesh_(warp|hardware)$' -V
+```
+
+On Windows build 26100, WARP 10.0.26100.33648 with the debug layer enabled
+passed all four indirect fixtures. The baseline rejected the mesh shader stream
+and left the first mesh case clear. Physical adapter coverage is pending.
+[Candidate run](https://github.com/avt0m4t48/Xbox2Windows/actions/runs/45487176129)
+[Negative control](https://github.com/avt0m4t48/Xbox2Windows/actions/runs/45486140968)
 
 #### D3D12.X graphics command list (XCL-12)
 
@@ -11039,6 +11200,19 @@ python -B tests/startup_gfx2hlsl_mad_check.py binary llvm-mc-15
 | anything else (`null`, `OFF`, `offset`, ...) | refused (`operand '...'`) | refused |
 
 `off` names no offset at all, so it is translated exactly as the literal 0: the same emitted HLSL, the same descriptor offset for a table load, and the same fixed-word marking of an `s_buffer_load` result. Before this change, `s_buffer_load_dword s0, s[4:7], off` was refused with `operand 'off'`, and the `s_load` form with the misleading register-offset message. `tests/startup_gfx2hlsl_smem_offset_check.py` drives each load handler on a scalar symbol state with no machine code. It compares the `off` form of `s_buffer_load_dword`, `_dwordx2` and `_dwordx4`, of `s_load_dword` and `_dwordx2` from a root buffer and of `s_load_dwordx8` from a descriptor table with the literal 0, keeps the literal and `m0` behaviour above, and requires five other operand spellings to be refused by both kinds of load. With the `off` handling removed in-process, both `off` forms must be refused again. Test: `startup_gfx2hlsl_smem_offset`. Not covered here: whether the full set of locally refused shaders now translates, which needs local inputs.
+
+### Scalar writes to and symbolic tracking of `m0`
+
+`Stage.scalar()` in [`tools/startup/gfx2hlsl.py`](../tools/startup/gfx2hlsl.py) previously returned `None` whenever `dname == 'm0'`, dropping every scalar ALU write (and its `SCC` update) to `m0` even though `Stage.u('m0')` and `Stage.op_s_buffer_load_dword()` read `m0` as a runtime `uint` variable. In addition, `scalar_select()`, `op_s_bfm_b32()`, `op_s_and_saveexec_b64()` and `op_s_andn2_wrexec_b64()` subscripted `reg_range(ops[0])` directly, raising `TypeError` on `m0`, and 64-bit scalar operations (`*_b64`, where `decode_s_reg64(124)` prints `m0`) silently vanished or raised `TypeError`.
+
+32-bit scalar ALU instructions (`Stage.scalar()`, `s_cselect_b32`, `s_bfm_b32`) now emit assignments to `m0` (plus `scc` when defined by `SCA`), while 64-bit scalar operations and `saveexec`/`wrexec` destinations refuse `m0` with `Unsupported`. Because a pixel shader's `s_mov_b32 m0, sN` interpolation prologue can name a register slot that `setup_entry()` populated with an unused root pointer, moving a pointer or descriptor symbol into `m0` is recorded symbolically in `self.sym['m0']` without failing unless `m0` is subsequently read as a numeric value (or combined in an `SCC`-setting operation), and overwritten cleanly when `m0` receives a numeric value.
+
+[`tests/startup_gfx2hlsl_scalar_m0_check.py`](../tests/startup_gfx2hlsl_scalar_m0_check.py) checks `llvm-mc` encoding parity, pure-Python controls (including symbolic pointer propagation/clearing and an in-process monkeypatch restoring the dropped-`m0` bug), and two 16-vertex buffer-load readback cases (`s_lshl_b32 m0` -> `scc` -> `s_cselect_b32 m0` -> `s_add_u32 m0` -> `s_buffer_load_dwordx4` at `s8 = 0` and `s8 = 2`, plus `s_movk_i32 m0` and runtime `s_bfm_b32 m0` -> `s_buffer_load_dwordx2`, compiled with both DXC and FXC). Verified with zero mismatches and zero D3D12 debug-layer errors or warnings on Windows 11 26H2 (build 26300.9974) across WARP 10.0.26100.9818 and an AMD Radeon RX 9070 XT (driver 32.0.32029.2010).
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_scalar_m0_(controls|warp|hardware)$' -V
+python -B tests/startup_gfx2hlsl_scalar_m0_check.py binary llvm-mc-15
+```
 
 ## Desktop audio render sink
 
