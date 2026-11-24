@@ -7398,6 +7398,51 @@ Run `cmake --build --preset dev --target vm_copy_queue_check` and `ctest --prese
 
 On Windows 11 build 26300.9974, the Intel Arc 140T (device `7d51`, driver 32.0.101.8132) reproduced these numbers in the four cases above: the deliberately early read differed from all 16,384 remapped words while both ordered reads matched, `vm_page_provenance` reported 0 of 1,024 mismatches in each of its three cases, `vm_raw_srv` reported 0 cross-page and 0 shifted mismatches with its negative control at 1,024 of 1,024, and `vm_raw_uav` changed 5 of 2,048 words with 5 of 5 intended words kept when the two windows were swapped and refused 11 stores.
 
+#### One linear buffer through sharing, copying and refused sharing (#1914)
+
+The #1914 decision starts the hybrid model with one ordinary linear buffer that the CPU writes and the GPU reads. `tests/unified_buffer_paths_check.cpp` runs that buffer through the same cases on four test-side paths before any production change. It reuses the #874 controls: root-UAV dispatches from `tests/vm_translation.hlsl`, heaps opened from a pagefile section as in `vm_page_provenance_*` and `vm_translation_range_*`, and a queue `Wait` on a fence the CPU signals later, as in `vm_copy_queue_*`. The fixture changes no production backing.
+
+Title memory follows XMem (`src/xmem_mapped_pages.cpp`). The section pool is one 256 MiB pagefile section of 64 KiB slots. Each allocation takes two slots and maps them as two page views on a placeholder split at the page boundary, so the 4 KiB region the GPU reads straddles two views. The private pool is one committed 1 MiB `VirtualAlloc` range, the only kind that slot 133 aliases. In both pools, slots 0-2 hold neighbouring data. Every case first runs a previous user (D) on slots 3-4 through the same path and frees it. The buffer under test therefore lands at heap offset `0x30000` on a reused slot, which must read zero before the title fills it. A freed slot stays retired until the fence of its last submission.
+
+| Path | Backing |
+|---|---|
+| `share` | The pool is opened once as a heap: `OpenExistingHeapFromFileMapping` for the section, or `OpenExistingHeapFromAddress` on the allocation base for the private range, after `D3D12_FEATURE_EXISTING_HEAPS`. A cross-adapter buffer is placed at the slot offset. Nothing is copied. |
+| `copy` | A default buffer fed from a two-slot upload ring. The ring wraps like `reserve_upload_ring`, but refuses a slot whose fence has not completed (`DXGI_ERROR_WAS_STILL_DRAWING`). Title memory is copied into the ring at one named copy point: `bind` (as `upload_from_title`), `record` (as `frame_copy`) or `submit`, just before `ExecuteCommandLists`. The ring slot is copied into the buffer at the start of the submission. When a use declares GPU writes, the buffer is copied to readback at the end, and completion of that fence copies readback to title memory. |
+| `fallback` | Sharing is forced to fail: the section through a `FILE_MAP_READ` handle, or an interior address of the private range. The fixture records the HRESULT. The path falls back to `copy` only when the copy can keep the guarantees. A GPU-written use with no completion point is refused with the sharing HRESULT. |
+| `slot133` | A model of slot 133's fallback. A non-`MEM_PRIVATE` address is refused before D3D12 with `E_INVALIDARG`, and a committed default buffer stands in with `S_OK` and no copy. A private range is aliased through its allocation base. |
+
+| Case | Sequence and oracle |
+|---|---|
+| a | Bind with A in memory. After the list is recorded and before `ExecuteCommandLists`, the CPU writes B. The GPU must read B in all 1,024 words; on the copy paths the copy point is `submit`. |
+| b | The GPU writes G ^ key into a second region. After the fence, the CPU alias must hold it, the read region must keep A, and all 30,720 filler words must be unchanged. |
+| c | X's submission waits on a gate fence. The title frees X and allocates Y (C), whose submission is also held. On the copy paths, a third allocation then wraps the ring onto X's in-flight slot. Y must not get X's slots and the wrap must be refused. The held submissions must read B and C, and after the fence X's slots (zero-filled) and ring slot are handed out again. |
+| d1b, d1r | As case a with the `bind` or `record` copy point. The copy paths must read A in every word; sharing reads B. |
+| d2 | As case b, held on the gate. Because the queue waits on the gate before the dispatch, the early query is ordered before the GPU write. Before the gate opens, completion must return `DXGI_ERROR_WAS_STILL_DRAWING` (the oracle) and the alias must still hold P. After the fence it must hold G ^ key. |
+| e | Fallback only. A GPU-written use with no completion point is refused with the sharing HRESULT, and no resource is created. A GPU-read use without one falls back to `copy`. |
+
+On Windows 11 build 26300 at `82f0db65` plus this fixture, with and without the D3D12 debug layer (`X2W_TEST_DEBUG_LAYER=1`), the same result appeared on in-box WARP (driver 10.0.26100.9818) and an AMD Radeon RX 9070 XT (`1002:7550`, driver 32.0.31044.16). Both report `D3D12_FEATURE_EXISTING_HEAPS`. Every case passes on `share`, `copy` and `fallback` for both pools, for 40 passes with no skips. Both `slot133` section rows are caught, and the debug layer reports no errors outside the deliberate refusals.
+
+| Path | Pool | Backing | Sharing HRESULT | Bytes per case: title → ring / GPU copies / readback → title | Results |
+|---|---|---|---|---|---|
+| `share` | section, private | title memory at heap offset `0x30000` | `S_OK` | 0 / 0 / 0 | a B; b G ^ key; c B, C; d1b and d1r B; d2 `0x887A000A` then G ^ key |
+| `copy` | section, private | default buffer and ring slot 1 | n/a | a 131,072 / 131,072 / 0; b 131,072 / 262,144 / 131,072; c 262,144 / 262,144 / 0 | a B; b G ^ key; c B, C, wrap refused `0x887A000A`; d1b and d1r A; d2 `0x887A000A` then G ^ key |
+| `fallback` | section | as `copy` | `0x80070057` (`FILE_MAP_READ` handle) | as `copy` | as `copy`; e refused with `0x80070057`, read-only use falls back |
+| `fallback` | private | as `copy` | `0x80070057` (interior address) | as `copy` | as `copy`; e as above |
+| `slot133` | section | committed default buffer, not aliased | `E_INVALIDARG` before D3D12 | 0 / 0 / 0 | a reads zero in all words; b leaves P; both `S_OK`, both caught |
+| `slot133` | private | aliased through the allocation base | `S_OK` | 0 / 0 / 0 | a and b pass, as `share` |
+
+The paths agree on bytes and lifetime at the points the contract names. They differ where the contract does not cover them. A copy refreshed at `bind` or `record` gives the GPU the stale A, while sharing gives B. A bind-time copy therefore cannot stand in for sharing when the title writes between bind and `ExecuteCommandLists`. The slot 133 stand-in reports success while its backing holds neither the title's bytes nor a refusal.
+
+The run also probes the boundaries the fallback relies on, and reports three findings without asserting them:
+- Refusals, asserted, `0x80070057` on both adapters: `OpenExistingHeapFromAddress` on an interior address or a reserve-only range, `OpenExistingHeapFromFileMapping` through a `FILE_MAP_READ` handle, and buffers placed at a non-64 KiB offset or past the end of the 256 MiB heap.
+- On both adapters, `OpenExistingHeapFromAddress` accepts a 128 KiB view of the section at `+0x30000`, which is `MEM_MAPPED`. A buffer placed on that heap read the view's CPU writes in all 1,024 words, and its GPU writes appeared through the split run. Slot 133 refuses this case before calling D3D12.
+- `OpenExistingHeapFromAddress` on the first view of a split run opens a 64 KiB heap. A 128 KiB buffer across the split is refused (`0x80070057`).
+- After a private range is opened as a heap, the heap is kept as slot 133's cache keeps it. `VirtualFree` with `MEM_RELEASE` and with `MEM_DECOMMIT` then both fail with error 87 on both adapters, so the range cannot be recommitted at the same base. Once the heap is released, `VirtualFree` succeeds. With a cache that is never cleared, the title's free of that range fails, rather than a later allocation reading a stale heap.
+
+The negative controls each remove one guarantee and must fail every case that it protects. On both adapters, `--mutate skip-refresh` uses the `bind` copy point and makes copy and fallback case a read A, failing 4 of 4 cases. `--mutate skip-copy-back` leaves P in the alias for copy and fallback cases b and d2, failing 8 of 8. `--mutate reuse-early` drops the fence checks on slots and the ring. Sharing case c then gives Y X's slots and the held read returns C, and the copy paths take X's ring slot and read E, failing 6 of 6.
+
+Run `cmake --build --preset dev --target unified_buffer_paths_check` and `ctest --preset dev --no-tests=error -R '^unified_buffer_paths_' -V`. Set `XBOX2WINDOWS_ADAPTER` to select a hardware adapter and `X2W_TEST_DEBUG_LAYER=1` to enable the debug layer. The hardware case skips (77) without an `ID3D12Device3` adapter or without sharing support. The controls run on WARP as `WILL_FAIL` tests and skip if a targeted case could not run. Unsynchronized concurrent CPU and GPU writes are outside the contract and not exercised. Textures, render targets and acceleration structures are outside this slice.
+
 #### Xbox frame events and token wait semantics (#874)
 
 The source-built frame events fixture (`tests/cpu/frame_events_caller.asm`, `tests/cpu/frame_events_provider.cpp`, `tests/cpu/frame_events_check.py`, CTest `cpu_native_frame_events`) models the scheduling and wait semantics of the Xbox frame-pacing extensions in `d3d12_xs.dll`:

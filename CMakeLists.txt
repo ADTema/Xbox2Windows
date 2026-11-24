@@ -1684,6 +1684,23 @@ foreach(adapter IN ITEMS warp hardware)
         set_tests_properties(vm_translation_${scenario}_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     endforeach()
 endforeach()
+# One linear CPU-written, GPU-read buffer of title-style memory through real sharing, forced copying
+# and forced sharing failure (#1914). Test-only. Each mutated run removes one guarantee (submit-time
+# refresh, copy-back after the fence, fence-gated reuse) and must fail every case it protects.
+add_executable(unified_buffer_paths_check tests/unified_buffer_paths_check.cpp "${vm_translation_header}")
+target_include_directories(unified_buffer_paths_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" tests)
+target_compile_features(unified_buffer_paths_check PRIVATE cxx_std_17)
+target_link_libraries(unified_buffer_paths_check PRIVATE d3d12 dxgi OneCore)
+foreach(adapter IN ITEMS warp hardware)
+    add_test(NAME unified_buffer_paths_${adapter} COMMAND unified_buffer_paths_check ${adapter})
+    set_tests_properties(unified_buffer_paths_${adapter} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+endforeach()
+foreach(mutant IN ITEMS skip_refresh skip_copy_back reuse_early)
+    string(REPLACE "_" "-" flag "${mutant}")
+    add_test(NAME unified_buffer_paths_${mutant}_control COMMAND unified_buffer_paths_check --mutate ${flag} warp)
+    set_tests_properties(unified_buffer_paths_${mutant}_control PROPERTIES WILL_FAIL TRUE TIMEOUT 90
+        SKIP_RETURN_CODE 77)
+endforeach()
 # The configured range's windows and GPU addresses (src/d3d12_xs_range.h) with a fake device and fake
 # windows. The mutated run is the negative control.
 add_executable(d3d12_xs_range_check tests/d3d12_xs_range_check.cpp src/d3d12_xs_range.cpp)
