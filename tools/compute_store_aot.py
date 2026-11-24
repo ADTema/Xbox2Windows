@@ -50,6 +50,8 @@ ALU = {
 # shift of src0 by src1[4:0].
 SALU = {
     "s_add_u32": "({0} + {1})",
+    # |S0.i - S1.i| on the 32-bit wrapped difference, so 0x80000000 stays 0x80000000; SCC = result != 0, unread.
+    "s_absdiff_i32": "asuint(abs(asint({0} - {1})))",
     "s_sub_u32": "({0} - {1})",
     "s_and_b32": "({0} & {1})",
     "s_or_b32": "({0} | {1})",
@@ -507,7 +509,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 if not -(1 << 31) <= value <= 0xffffffff:
                     raise ValueError("Invalid scalar immediate")
                 scalar[dst] = value & 0xffffffff
-        elif m := re.fullmatch(rf"(s_(?:add_u32|sub_u32|and_b32|or_b32|xor_b32|lshr_b32)) s(\d+), {SALU_SOURCE}, {SALU_SOURCE}",
+        elif m := re.fullmatch(rf"(s_(?:add_u32|sub_u32|and_b32|or_b32|xor_b32|lshr_b32|absdiff_i32)) s(\d+), {SALU_SOURCE}, {SALU_SOURCE}",
                                line):
             op, dst = m[1], int(m[2])
             words = [alu_word(token, scalar, vector, pending) for token in m.groups()[2:]]
@@ -524,6 +526,35 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 raise ValueError("Invalid scalar destination or movk immediate")
             signed = value - 0x10000 if value >= 0x8000 else value
             scalar[dst] = signed & 0xffffffff
+        elif m := re.fullmatch(r"s_bitreplicate_b64_b32 s\[(\d+):(\d+)\], (\S+)", line):
+            # Each source bit fills two adjacent bits of the pair: D[2i] = D[2i + 1] = S0[i]. With an immediate
+            # source both halves are known words; the low one replicates bits 0-15 and the high one bits 16-31.
+            dst, high, src = int(m[1]), int(m[2]), m[3]
+            if dst % 2 or high != dst + 1 or high > 105 or {dst, high} & pending:
+                raise ValueError("Invalid lane mask destination")
+            if not re.fullmatch(r"-?\d+|0x[0-9a-f]+", src) or not -(1 << 31) <= int(src, 0) <= 0xffffffff:
+                raise ValueError("Unverified lane mask source")
+            pair = sum(((int(src, 0) >> (bit // 2)) & 1) << bit for bit in range(64))
+            scalar[dst], scalar[high] = pair & 0xffffffff, pair >> 32
+        elif m := re.fullmatch(rf"v_cndmask_b32_e64 v(\d+), {ALU_SOURCE}, {ALU_SOURCE}, s(\d+)", line):
+            # D = mask[lane] ? src1 : src0, with the wave32 mask in one SGPR that holds a statically known word.
+            # In a one-dimensional group of at most 32 threads the group is one wave at either wave size and the
+            # lane is local X. Past lane 31 the same encoding reads the high mask word in wave64, which the
+            # translator cannot tell from the code, so larger and multi-dimensional groups are refused.
+            dst, reg = int(m[1]), int(m[4])
+            if dims[1:] != (1, 1) or dims[0] > 32:
+                raise ValueError("Lane mask select requires a one-dimensional group of at most 32 threads")
+            mask = scalar.get(reg) if reg <= 105 and reg not in pending else None
+            if not isinstance(mask, int):
+                raise ValueError("Unverified lane mask")
+            words = [alu_word(token, scalar, vector, pending) for token in (m[2], m[3])]
+            if dst > 255 or None in words:
+                raise ValueError("Unverified ALU operand")
+            expression = (f"(((0x{mask:08x}u >> (tid.x % {dims[0]}u)) & 1u) != 0u ? {hlsl_word(words[1])}"
+                          f" : {hlsl_word(words[0])})")
+            if len(expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            vector[dst] = ("alu", expression)
         elif m := re.fullmatch(r"s_lshl_b32 s(\d+), s(\d+), (\d+)", line):
             dst, group, shift = map(int, m.groups())
             tag = scalar.get(group)

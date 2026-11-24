@@ -420,9 +420,14 @@ class Stage:
                 fields[key] = value
             else:
                 raise Unsupported('%s with SDWA modifier %s' % (base, m))
-        if base not in VEC_U:
+        if base in VEC_U_TO_F:
+            arity, text = VEC_U_TO_F[base]
+            float_result = True
+        elif base in VEC_U:
+            arity, text = VEC_U[base]
+            float_result = False
+        else:
             raise Unsupported('SDWA form of %s' % base)
-        arity, text = VEC_U[base]
         sources = []
         for index in range(arity):
             token = ops[1 + index]
@@ -434,6 +439,9 @@ class Stage:
                 raise Unsupported('%s SDWA without src%d_sel' % (base, index))
             sources.append(sdwa_source(self.u(token), selection, sext))
         result = text.format(*sources)
+        if float_result:
+            # The table holds the float value; the destination selection writes its bit pattern.
+            result = 'U(%s)' % result
         select = fields.get('dst_sel')
         if not select:
             raise Unsupported('%s SDWA without dst_sel' % base)
