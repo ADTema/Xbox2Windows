@@ -78,6 +78,7 @@ struct Entry {
     u64 value;
     u64 id = 0;
     u64 submission_id = 0;
+    u64 after = 0;  // failing: entries the worker must have finished before this one completes
 };
 struct CachedStream {
     u64 source = 0;
@@ -92,6 +93,10 @@ struct QueueWork {
     std::mutex mutex;
     std::condition_variable wake;
     std::deque<Entry> waiting, submitted;
+    std::deque<Entry> failing;   // snapshot of waiting entries a Submit could not move, completed in order
+    struct Unrecorded* deferred_head = nullptr;  // snapshot of unrecorded entries, in order; guarded by mutex
+    struct Unrecorded* deferred_tail = nullptr;
+    std::mutex completion;       // one thread at a time completes snapshot entries, so they stay in order
     std::condition_variable drained;  // signaled when the worker finishes an entry
     u64 submitted_total = 0;          // entries ever moved to `submitted`, guarded by mutex
     u64 finished_total = 0;           // entries the worker has finished running, guarded by mutex
@@ -642,6 +647,8 @@ void fail_entry(Object* self, const Entry& entry, const char* reason) noexcept
 
 thread_local bool on_queue_worker = false;  // Submit from a worker must not wait for itself
 
+void complete_deferred(Object* self, QueueWork* work);
+
 DWORD WINAPI queue_worker(void* parameter)
 {
     on_queue_worker = true;
@@ -683,6 +690,7 @@ DWORD WINAPI queue_worker(void* parameter)
             ++work.finished_total;
         }
         work.drained.notify_all();
+        complete_deferred(self, &work);
     }
 }
 
@@ -737,6 +745,8 @@ bool start_worker(Object* self, QueueWork* work)
 // request only counts as failed.
 struct Unrecorded {
     Unrecorded* next;
+    u64 submission_id;
+    u64 after;
     Entry::Type type;
     Object* array;
     unsigned index;
@@ -773,8 +783,9 @@ void fail_unstarted(Object* self, Entry::Type type, Object* array, unsigned inde
 // deferred, every later entry until the next Submit is deferred too, even if it could be stored:
 // the stored entries (`waiting`) are an in-order prefix and the deferred ones an in-order suffix.
 // Submit handles the prefix first (moves it to the worker, or fails it), then fails the suffix.
-// When the prefix runs on the worker, Submit waits for the worker to finish it before it fails the
-// suffix, so suffix completions are visible in queue order and see the prefix's failures. After the first allocation failure the rest of the batch fails with E_OUTOFMEMORY even if
+// Submit snapshots the failing entries at its cutoff and the worker completes that snapshot right after
+// it finishes the prefix, so suffix completions are visible in queue order and see the prefix's failures,
+// a later batch cannot be completed by this Submit, and Submit never waits for the prefix. After the first allocation failure the rest of the batch fails with E_OUTOFMEMORY even if
 // memory has recovered, which is acceptable under out-of-memory and preferable to reordering.
 bool has_unrecorded(Object* self)
 {
@@ -784,7 +795,7 @@ bool has_unrecorded(Object* self)
 
 void defer_unrecorded(Object* self, const Entry& entry)
 {
-    auto* node = new (std::nothrow) Unrecorded{nullptr, entry.type, entry.array, entry.index, entry.fence, entry.value};
+    auto* node = new (std::nothrow) Unrecorded{nullptr, 0, 0, entry.type, entry.array, entry.index, entry.fence, entry.value};
     if (!node) {
         fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value);
         return;
@@ -844,6 +855,8 @@ void submit(Object* self)
         return;
     }
     bool all_moved = true;
+    bool snapshot_ok = true;
+    bool snapshotted = false;
     u64 prefix_end = 0;
     {
         const std::lock_guard guard(work->mutex);
@@ -861,18 +874,89 @@ void submit(Object* self)
             all_moved = false;
         }
         prefix_end = work->submitted_total;
+        // The cutoff: the entries that fail are snapshotted here, under the same lock, so a batch enqueued
+        // later cannot be completed by this Submit. The snapshot completes on the worker right after it
+        // finishes the prefix (see complete_deferred), so this call never waits for the prefix.
+        try {
+            while (!work->waiting.empty()) {
+                Entry& entry = work->waiting.front();
+                entry.submission_id = submission_id;
+                entry.after = prefix_end;
+                work->failing.push_back(std::move(entry));
+                work->waiting.pop_front();
+                snapshotted = true;
+            }
+        } catch (const std::bad_alloc&) {
+            snapshot_ok = false;
+        }
+        if (snapshot_ok) {
+            Unrecorded* node;
+            {
+                const std::lock_guard setup(setup_mutex());
+                node = self->unrecorded_head;
+                self->unrecorded_head = self->unrecorded_tail = nullptr;
+            }
+            for (Unrecorded* n = node; n; n = n->next) {
+                n->submission_id = submission_id;
+                n->after = prefix_end;
+                if (!n->next) {
+                    (work->deferred_tail ? work->deferred_tail->next : work->deferred_head) = node;
+                    work->deferred_tail = n;
+                }
+                snapshotted = true;
+            }
+        }
     }
     work->wake.notify_one();
-    // Entries completed here (the rest of `waiting`, the suffix) come after the prefix on the worker, so
-    // they wait until the worker has finished that prefix: a status entry or fence then cannot complete
-    // ahead of an earlier request, and cannot consume the pending failure before the worker reports it.
-    // Nothing allocates, and nothing waits when there is nothing to complete here.
-    if ((!all_moved || has_unrecorded(self)) && !on_queue_worker) {
-        std::unique_lock lock(work->mutex);
-        work->drained.wait(lock, [&] { return work->finished_total >= prefix_end; });
+    if (!snapshot_ok) {
+        // Last resort when even the snapshot could not grow: wait for the prefix as before, then fail in order.
+        if (!on_queue_worker) {
+            std::unique_lock lock(work->mutex);
+            work->drained.wait(lock, [&] { return work->finished_total >= prefix_end; });
+        }
+        complete_deferred(self, work);
+        fail_waiting(self, work);
+        fail_unrecorded(self);
+        return;
     }
-    if (!all_moved) fail_waiting(self, work);
-    fail_unrecorded(self);
+    if (snapshotted) complete_deferred(self, work);
+}
+
+// Completes the snapshot entries (failed entries of earlier Submits) whose prefix the worker has finished,
+// in Submit order and, within one Submit, stored entries before unrecorded ones. Called by the worker after
+// every entry and by Submit, so nothing waits on a calling thread. Nothing allocates.
+void complete_deferred(Object* self, QueueWork* work)
+{
+    const std::lock_guard serial(work->completion);
+    for (;;) {
+        Entry entry{};
+        Unrecorded* node = nullptr;
+        {
+            const std::lock_guard guard(work->mutex);
+            bool take_entry = !work->failing.empty() && work->failing.front().after <= work->finished_total;
+            bool take_node = work->deferred_head && work->deferred_head->after <= work->finished_total;
+            if (take_entry && take_node) {
+                if (work->failing.front().submission_id <= work->deferred_head->submission_id) take_node = false;
+                else take_entry = false;
+            }
+            if (take_entry) {
+                entry = std::move(work->failing.front());
+                work->failing.pop_front();
+            } else if (take_node) {
+                node = work->deferred_head;
+                work->deferred_head = node->next;
+                if (!work->deferred_head) work->deferred_tail = nullptr;
+            } else {
+                return;
+            }
+        }
+        if (node) {
+            fail_unstarted(self, node->type, node->array, node->index, node->fence, node->value);
+            delete node;
+        } else {
+            fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value);
+        }
+    }
 }
 
 // Enqueue only records the entry, whether or not a worker runs; nothing completes before Submit.

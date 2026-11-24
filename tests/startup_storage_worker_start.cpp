@@ -635,17 +635,35 @@ bool suffix_waits_for_prefix(Fixture& f)
         HANDLE thread = CreateThread(nullptr, 0, SubmitThread::run, &submitter, 0, nullptr);
         if (!thread) return fail("cannot start the Submit thread");
         const bool held = WaitForSingleObject(hold_entered, completion_timeout_ms) == WAIT_OBJECT_0;
-        if (held) Sleep(200);  // time for a Submit that does not wait to complete the suffix
-        const bool early = f.complete(q, 0) || suffix_fence.signals != 0;
+        // Submit snapshots the batch and returns without waiting for the held prefix.
+        const bool submit_returned = held && WaitForSingleObject(thread, completion_timeout_ms) == WAIT_OBJECT_0;
+        // A second batch enqueued and submitted while the first prefix is held: its status and fence must
+        // stay pending, and the first Submit must not have completed them.
+        HoldFence second_fence;
+        second_fence.vtable = hold_vtable;
+        bool early = false;
+        if (submit_returned) {
+            reinterpret_cast<EnqueueSignalFn>(q.queue->vtable[5])(q.queue, &second_fence, 3);
+            f.status_entry(q, 1);
+            f.submit(q);
+            Sleep(200);  // time for a Submit that completes ahead of the held prefix
+            early = f.complete(q, 0) || f.complete(q, 1) || suffix_fence.signals != 0 || second_fence.signals != 0;
+        }
         SetEvent(hold_release);
         WaitForSingleObject(thread, completion_timeout_ms);
         CloseHandle(thread);
         hold_prefix = false;
+        if (held && !submit_returned) return fail("Submit waited for the held prefix on the calling thread");
         if (!held) return fail("the worker never reached the held prefix fence");
         if (early) return fail("a status entry or fence of the failed suffix completed before the held prefix");
-        if (!f.complete(q, 0) || prefix_fence.signals != 1 || suffix_fence.signals != 1)
-            return fail("the prefix and the suffix did not both complete");
-        if (prefix_fence.order >= suffix_fence.order) return fail("the suffix fence was signaled before the prefix fence");
+        {
+            const DWORD start = GetTickCount();
+            while ((!f.complete(q, 1) || second_fence.signals == 0) && GetTickCount() - start < completion_timeout_ms) Sleep(1);
+        }
+        if (!f.complete(q, 0) || prefix_fence.signals != 1 || suffix_fence.signals != 1 || second_fence.signals != 1)
+            return fail("the prefix, the suffix and the second batch did not all complete");
+        if (prefix_fence.order >= suffix_fence.order || suffix_fence.order >= second_fence.order)
+            return fail("the fences were not signaled in queue order");
     }
     CloseHandle(hold_entered);
     CloseHandle(hold_release);
