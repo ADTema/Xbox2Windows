@@ -736,6 +736,36 @@ set_tests_properties(bvh_reads_hardware bvh_waves_hardware bvh_hits_hardware PRO
 # The cs_6_5 fixtures skip on a WARP below SM 6.5. The Windows 10 in-box WARP reports SM 6.2.
 set_tests_properties(bvh_reads_warp bvh_waves_warp bvh_hits_warp bvh_packed_warp
     bvh_numeric_warp bvh_atomics_warp PROPERTIES SKIP_RETURN_CODE 77)
+# CRT-free startup attempt for a forced-wave compute pipeline (Refs #870; the desktop readback is #1132).
+# One EXE per shader variant and adapter, so the entry point takes no arguments. Each prints the
+# D3D12_OPTIONS1 lane range, the exact CreateComputePipelineState HRESULT and the debug-layer messages,
+# and reads back WaveGetLaneCount() when creation succeeds. An adapter whose range excludes the forced
+# width must refuse the pipeline and exits 77 with the HRESULT; creation that contradicts the range fails.
+foreach(width IN ITEMS 0 4 32)
+    set(variant_dir "${CMAKE_CURRENT_BINARY_DIR}/wave_startup_${width}")
+    set(defines)
+    if(width)
+        set(defines -D WAVE_STARTUP_WIDTH=${width})
+    endif()
+    add_custom_command(OUTPUT "${variant_dir}/wave_startup_cs.h"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${variant_dir}"
+        COMMAND "${DXC_EXECUTABLE}" -T cs_6_6 -E main ${defines} -Vn wave_startup_cs
+                -Fh "${variant_dir}/wave_startup_cs.h" "${CMAKE_CURRENT_SOURCE_DIR}/tests/wave_startup.hlsl"
+        DEPENDS tests/wave_startup.hlsl VERBATIM)
+    foreach(adapter IN ITEMS warp hardware)
+        set(target wave_startup_${width}_${adapter})
+        add_executable(${target} tests/wave_startup_exe.cpp "${variant_dir}/wave_startup_cs.h")
+        target_include_directories(${target} PRIVATE "${variant_dir}")
+        string(COMPARE EQUAL "${adapter}" warp is_warp)
+        target_compile_definitions(${target} PRIVATE WAVE_STARTUP_WIDTH=${width} WAVE_STARTUP_WARP=$<BOOL:${is_warp}>)
+        target_compile_options(${target} PRIVATE /GS- /Zl)
+        target_link_options(${target} PRIVATE /ENTRY:fixture_entry /NODEFAULTLIB /SUBSYSTEM:CONSOLE
+            /DYNAMICBASE /INCREMENTAL:NO)
+        target_link_libraries(${target} PRIVATE kernel32 d3d12 dxgi)
+        add_test(NAME ${target} COMMAND ${target})
+        set_tests_properties(${target} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    endforeach()
+endforeach()
 
 add_test(NAME bvh_differential_pipeline_warp COMMAND offscreen_check warp --bvh-differential-pipeline)
 set_tests_properties(bvh_differential_pipeline_warp PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
