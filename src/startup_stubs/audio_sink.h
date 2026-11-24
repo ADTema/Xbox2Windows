@@ -61,14 +61,9 @@ inline bool is_valid_sample_rate(uint32_t rate)
     return rate >= 1000u && rate <= 384000u;
 }
 
-inline bool is_supported_channel_count(uint32_t channels)
-{
-    return channels == 1u || channels == 2u || channels == 6u || channels == 8u;
-}
-
 inline bool is_supported_channel_conversion(uint32_t in_ch, uint32_t out_ch)
 {
-    if (!is_supported_channel_count(in_ch) || !is_supported_channel_count(out_ch)) return false;
+    if (in_ch == 0 || out_ch == 0) return false;
     if (in_ch == out_ch || in_ch == 1u) return true;
     if (in_ch == 2u && out_ch == 1u) return true;
     if ((in_ch == 6u || in_ch == 8u) && (out_ch == 1u || out_ch == 2u)) return true;

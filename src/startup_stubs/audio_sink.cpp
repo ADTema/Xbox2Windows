@@ -91,6 +91,7 @@ std::string AudioSink::open()
         return "endpoint services unavailable";
     buffer_frames_ = frames;
     p_ = std::move(impl);
+    resample_.reset();
     return {};
 }
 

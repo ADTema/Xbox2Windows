@@ -36,6 +36,15 @@ inline int check_pure()
     if (!convert_block(mono16, tone.data(), 480, {SampleKind::Pcm16, 1, 44100}, out) || out.size() != 441 * 2) return 16;
     if (convert_block(stereo16, out.data(), 120, {SampleKind::Pcm16, 6, 48000}, back)) return 17;   // unsupported upmix
 
+    // Keep the existing equal-channel and mono copy paths on quad endpoints.
+    const BlockFormat quad_f{SampleKind::Float32, 4, 48000};
+    const float quad[4] = {0.125f, -0.25f, 0.375f, -0.5f};
+    if (!convert_block(quad_f, quad, 1, quad_f, out) || out.size() != sizeof(quad) ||
+        std::memcmp(out.data(), quad, sizeof(quad)) != 0) return 24;
+    if (!convert_block(mono_f, quad, 1, quad_f, out) || out.size() != sizeof(quad)) return 25;
+    for (size_t channel = 0; channel < 4; ++channel)
+        if (read_sample(quad_f, out.data(), channel) != quad[0]) return 26;
+
     // Stereo -> mono fold-down.
     {
         const float st_data[4] = {0.8f, -0.2f, 0.4f, 0.4f};
