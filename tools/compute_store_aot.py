@@ -549,6 +549,19 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 scalar[dst] = 32
             else:
                 raise ValueError("Unverified active lane count wave size or group size")
+        elif m := re.fullmatch(r"s_ff1_i32_(b32|b64) s(\d+), (\S+)", line):
+            # First active lane of a full wave: sD = ctz(exec_lo / exec); SCC is preserved. Outside a
+            # guarded region lane 0 of every wave is active for any group of at least 1 thread, and for
+            # wave32 the high half of exec is 0, so the result folds to 0.
+            width, dst, src = m[1], int(m[2]), m[3]
+            expected_src = "exec_lo" if width == "b32" else "exec"
+            if src != expected_src:
+                raise ValueError("Unsupported first active lane source: " + src)
+            if dst in pending or dst > 105:
+                raise ValueError("Invalid scalar destination or pending load")
+            if guard is not None:
+                raise ValueError("First active lane inside guarded region")
+            scalar[dst] = 0
         elif m := re.fullmatch(r"s_bitreplicate_b64_b32 s\[(\d+):(\d+)\], (\S+)", line):
             # Each source bit fills two adjacent bits of the pair: D[2i] = D[2i + 1] = S0[i]. With an immediate
             # source both halves are known words; the low one replicates bits 0-15 and the high one bits 16-31.
