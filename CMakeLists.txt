@@ -2551,6 +2551,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     # The opt-in host-MXCSR profile: the lifted DLL, the noload and fixed controls that must break a rule, and
     # an /O2 build of the translation.
     cpu_asm_fixture(cpu_mxcsr_harness mxcsr_harness)
+    # The scalar float check loads the harness, and $<TARGET_FILE:> adds no build dependency, so the
+    # two translations the documented build names must build it too.
+    add_dependencies(cpu_float_original_lifted cpu_mxcsr_harness)
+    add_dependencies(cpu_float_swapped_lifted cpu_mxcsr_harness)
     cpu_asm_fixture(cpu_mxcsr mxcsr)
     set(mxcsr_controls)
     foreach(variant IN ITEMS lifted noload fixed)
