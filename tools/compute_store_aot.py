@@ -348,6 +348,13 @@ def descriptor_store_hlsl():
 
     An unmatched format, a channel-count mismatch, a misaligned dword store, or d16
     combined with a 16-bit integer format writes nothing.
+
+    UNORM and SNORM use the Direct3D float conversion: scale into the integer range,
+    add 0.5 for a non-negative value or subtract 0.5 for a negative one, then drop
+    the fraction (half away from zero). HLSL round() is ties-to-even and disagrees
+    on an exact tie. The RDNA ISA does not state the MUBUF format unit's tie break.
+    LLVM's AMDGPU packed conversions (v_cvt_pk_*) are ties-to-even on a different
+    unit, so this choice follows the Direct3D rule and is unverified on gfx1013.
     """
     legacy = []
     for field, code in sorted(LEGACY_DESCRIPTOR_FORMATS.items()):
@@ -402,12 +409,13 @@ def descriptor_store_hlsl():
         "uint descriptor_unorm(uint bits, float scale) {\n"
         "    precise float saturated = saturate(asfloat(bits));\n"
         "    precise float scaled = saturated * scale;\n"
-        "    return (uint)round(scaled);\n"
+        "    return (uint)floor(scaled + 0.5);\n"
         "}\n"
         "uint descriptor_snorm16(uint bits) {\n"
         "    precise float saturated = clamp(asfloat(bits), -1.0, 1.0);\n"
         "    precise float scaled = saturated * 32767.0;\n"
-        "    return (uint)(int)round(scaled);\n"
+        "    precise float rounded = scaled >= 0.0 ? floor(scaled + 0.5) : ceil(scaled - 0.5);\n"
+        "    return (uint)(int)rounded;\n"
         "}\n"
         "uint descriptor_f16(uint bits) { return f32tof16(asfloat(bits)); }\n"
         "uint descriptor_expand(uint packed, uint high) {\n"

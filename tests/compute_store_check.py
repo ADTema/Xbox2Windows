@@ -3,6 +3,7 @@ from pathlib import Path
 import math
 import operator
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -7091,6 +7092,8 @@ def draw(directory, compiler, renderer, backend, cases=None):
 F25 = 0x3e800000
 F75 = 0x3f400000
 F01 = 0x3dcccccd
+# binary32 value whose product with 255 is exactly 2.5. Half away from zero packs to 3; ties-to-even packs to 2.
+UNORM8_TIE = 0x3C20A0A1
 H25 = 0x3400
 H75 = 0x3A00
 PACKED_25_75 = (H75 << 16) | H25
@@ -7103,7 +7106,7 @@ DESCRIPTOR_GROUP = (4, 1, 1)
 # opcode, byte offset, GFX10 format code, legacy word3, source words.
 # A ("xor", immediate) source is that immediate xor the dispatch thread id.
 DESCRIPTOR_STORES = (
-    ("buffer_store_format_xyzw", 0, 56, False, (F25, F75, 0, 0)),
+    ("buffer_store_format_xyzw", 0, 56, False, (F25, F75, UNORM8_TIE, 0)),
     ("buffer_store_format_xyz", 16, 74, True, (F25, F75, F01)),
     ("buffer_store_format_d16_x", 28, 13, False, (H25,)),
     ("buffer_store_format_d16_xyzw", 32, 71, False, (PACKED_25_75, PACKED_75_25)),
@@ -7111,10 +7114,10 @@ DESCRIPTOR_STORES = (
     ("buffer_store_format_x", 56, 20, False, (("xor", UINT_PAYLOAD),)),
     ("buffer_store_format_d16_xy", 60, 23, False, (PACKED_25_75,)),
     ("buffer_store_format_d16_xyz", 68, 74, False, (PACKED_25_75, H25)),
-    ("buffer_store_format_xyzw", 80, 44, False, (F25, F75, 0, 0)),
+    ("buffer_store_format_xyzw", 80, 44, False, (F25, F75, 0, F75)),
     ("buffer_store_format_x", 96, 7, False, (F25,)),
     ("buffer_store_format_x", 100, 11, False, (UINT16_BITS,)),
-    ("buffer_store_format_x", 104, 8, False, (F25,)),
+    ("buffer_store_format_x", 104, 8, False, (F75,)),
     ("buffer_store_format_x", 108, 12, False, (SINT_BITS,)),
 )
 
@@ -7123,15 +7126,37 @@ def _float_bits(bits):
     return struct.unpack("<f", struct.pack("<I", bits & 0xffffffff))[0]
 
 
+def _f32(value):
+    return struct.unpack("<f", struct.pack("<f", float(value)))[0]
+
+
+def _round_half_away(scaled):
+    """Direct3D FLOAT to UNORM/SNORM: ±0.5, then drop the fraction."""
+    scaled = _f32(scaled)
+    if scaled >= 0.0:
+        return math.floor(_f32(scaled + 0.5))
+    return math.ceil(_f32(scaled - 0.5))
+
+
+def _round_nearest_even(scaled):
+    scaled = _f32(scaled)
+    sign = -1 if scaled < 0.0 else 1
+    magnitude = abs(scaled)
+    base = math.floor(magnitude)
+    fraction = magnitude - base
+    if fraction > 0.5 or (fraction == 0.5 and base % 2 == 1):
+        base += 1
+    return sign * base
+
+
 def descriptor_unorm_bits(bits, scale):
     value = min(1.0, max(0.0, _float_bits(bits)))
-    return math.floor(value * scale + 0.5)
+    return _round_half_away(_f32(_f32(value) * _f32(scale)))
 
 
 def descriptor_snorm16_bits(bits):
     value = min(1.0, max(-1.0, _float_bits(bits)))
-    rounded = math.floor(value * 32767.0 + 0.5) if value >= 0 else math.ceil(value * 32767.0 - 0.5)
-    return rounded & 0xffff
+    return _round_half_away(_f32(_f32(value) * _f32(32767.0))) & 0xffff
 
 
 def descriptor_f16_bits(bits):
@@ -7308,6 +7333,185 @@ def descriptor_store_round_trip(directory, lines, binding, kind, tool, objcopy, 
     assert output.read_text(encoding="ascii") == expected
 
 
+# Legacy V# word 3 with RESOURCE_LEVEL clear and identity DST_SEL. The field is the documented
+# (DFMT << 3) | NFMT, not a value read back from LEGACY_DESCRIPTOR_FORMATS.
+# 32 UINT is NFMT 4 (0x00024FAC). 32_32_32 FLOAT is 74. 16_16 FLOAT is 29.
+PINNED_LEGACY_WORDS = {
+    20: 0x00024FAC, 22: 0x00027FAC, 62: 0x0005CFAC, 64: 0x0005FFAC,
+    72: 0x0006CFAC, 74: 0x0006FFAC, 75: 0x00074FAC, 77: 0x00077FAC,
+    56: 0x00050FAC, 23: 0x00028FAC, 44: 0x00040FAC, 29: 0x0002FFAC,
+    71: 0x00067FAC, 7: 0x00010FAC, 8: 0x00011FAC, 11: 0x00014FAC,
+    12: 0x00015FAC, 13: 0x00017FAC,
+}
+# One thread's 28 dwords. The unorm8 blue channel is the 2.5 tie (3, not the ties-to-even 2).
+# The unorm10 alpha is 2 from scale 3.0. The snorm16 lane is 0.75 * 32767.
+PINNED_THREAD0 = (
+    0x0003BF40, 0xC5C5C5C5, 0xC5C5C5C5, 0xC5C5C5C5,
+    0x3E800000, 0x3F400000, 0x3DCCCCCD, 0xC5C53400,
+    0x3A003400, 0x34003A00, 0xC5C5C5C5, 0xC5C5C5C5,
+    0x3A003400, 0xC5C5C5C5, 0x89ABCDEF, 0xBFFF4000,
+    0xC5C5C5C5, 0x3E800000, 0x3F400000, 0x3E800000,
+    0x800BFD00, 0xC5C5C5C5, 0xC5C5C5C5, 0xC5C5C5C5,
+    0xC5C54000, 0xC5C51234, 0xC5C55FFF, 0xC5C5FEDC,
+)
+
+
+class _DescriptorShader:
+    """Evaluate the generated store helper. Numeric literals come from that text."""
+
+    def __init__(self, source):
+        unorm = re.search(r"uint descriptor_unorm\(uint bits, float scale\) \{(.*?)\n\}", source, re.S)
+        snorm = re.search(r"uint descriptor_snorm16\(uint bits\) \{(.*?)\n\}", source, re.S)
+        f16 = re.search(r"uint descriptor_f16\(uint bits\) \{(.*?)\}", source, re.S)
+        if not unorm or not snorm or not f16 or "f32tof16(asfloat(bits))" not in f16.group(1):
+            raise AssertionError("unrecognized descriptor conversion helper")
+        self.unorm_round = self._rounding(unorm.group(1), signed=False)
+        self.snorm_round = self._rounding(snorm.group(1), signed=True)
+        scale = re.search(r"\*\s*([0-9]+(?:\.[0-9]+)?)\s*;", snorm.group(1))
+        if not scale:
+            raise AssertionError("snorm scale missing")
+        self.snorm_scale = float(scale.group(1))
+        mask = re.search(r"formatWord & (0x[0-9a-fA-F]+)u", source)
+        field = re.search(r"formatWord >> (\d+)u\) & (0x[0-9a-fA-F]+)u", source)
+        fixed = re.search(
+            r"if \(fixedBits == (0x[0-9a-fA-F]+)u\) \{\s*format = field;\s*\} else if \(fixedBits == (0x[0-9a-fA-F]+)u\)",
+            source)
+        if not mask or not field or not fixed:
+            raise AssertionError("unrecognized descriptor format decode")
+        self.fixed_mask = int(mask.group(1), 16)
+        self.field_shift = int(field.group(1))
+        self.field_mask = int(field.group(2), 16)
+        self.gfx10_fixed = int(fixed.group(1), 16)
+        self.legacy_fixed = int(fixed.group(2), 16)
+        self.legacy_map = {int(item): int(code) for item, code in re.findall(
+            r"field == (\d+)u\) format = (\d+)u", source)}
+        self.expand = "d16 != 0u ? descriptor_expand(c0, 0u)" in source
+        self.arms = []
+        for match in re.finditer(
+                r"(?:if|else if) \(\((?P<fmt>.*?)\) && channels == (?P<ch>\d+)u(?P<rest>.*?)\) \{\n(?P<body>.*?)\n    \}",
+                source, re.S):
+            self.arms.append({
+                "formats": [int(code) for code in re.findall(r"format == (\d+)u", match["fmt"])],
+                "channels": int(match["ch"]),
+                "d16_clear": "d16 == 0u" in match["rest"],
+                "aligned": "(addr & 3u) == 0u" in match["rest"],
+                "body": " ".join(match["body"].split()),
+            })
+        if not self.arms:
+            raise AssertionError("descriptor store arms missing")
+
+    @staticmethod
+    def _rounding(body, *, signed):
+        half_away = "floor(scaled + 0.5)" in body and (not signed or "ceil(scaled - 0.5)" in body)
+        if half_away and "round(scaled)" not in body:
+            return _round_half_away
+        if "round(scaled)" in body:
+            return _round_nearest_even
+        raise AssertionError("unrecognized rounding")
+
+    def format_code(self, word):
+        fixed = word & self.fixed_mask
+        field = (word >> self.field_shift) & self.field_mask
+        if fixed == self.gfx10_fixed:
+            return field
+        if fixed == self.legacy_fixed:
+            return self.legacy_map.get(field)
+        return None
+
+    def unorm(self, bits, scale):
+        value = min(1.0, max(0.0, _float_bits(bits)))
+        return self.unorm_round(_f32(_f32(value) * _f32(scale))) & 0xffffffff
+
+    def snorm(self, bits):
+        value = min(1.0, max(-1.0, _float_bits(bits)))
+        rounded = self.snorm_round(_f32(_f32(value) * _f32(self.snorm_scale)))
+        return int(rounded) & 0xffffffff
+
+    def _scalar(self, expr, values):
+        expr = expr.strip()
+        if match := re.fullmatch(r"e(\d)", expr):
+            return values[int(match.group(1))] & 0xffffffff
+        if match := re.fullmatch(r"descriptor_unorm\(e(\d), ([0-9.]+)\)", expr):
+            return self.unorm(values[int(match.group(1))], float(match.group(2)))
+        if match := re.fullmatch(r"descriptor_snorm16\(e(\d)\)", expr):
+            return self.snorm(values[int(match.group(1))])
+        if match := re.fullmatch(r"descriptor_f16\(e(\d)\)", expr):
+            return descriptor_f16_bits(values[int(match.group(1))])
+        raise AssertionError(f"unrecognized store expression: {expr}")
+
+    def _or_expr(self, expr, values):
+        packed = 0
+        for term in expr.split("|"):
+            term = term.strip()
+            shift = 0
+            if match := re.fullmatch(r"\((.*) << (\d+)u\)", term):
+                term, shift = match.group(1), int(match.group(2))
+            elif match := re.fullmatch(r"\((.*)\) << (\d+)u", term):
+                term, shift = match.group(1), int(match.group(2))
+            packed |= (self._scalar(term, values) & 0xffffffff) << shift
+        return packed & 0xffffffff
+
+    def _rmw(self, buf, addr, half):
+        if addr & 1:
+            return
+        base = addr & ~3
+        shift = (addr & 2) << 3
+        dword = struct.unpack_from("<I", buf, base)[0]
+        dword = (dword & ~(0xffff << shift)) | ((half & 0xffff) << shift)
+        struct.pack_into("<I", buf, base, dword & 0xffffffff)
+
+    def _apply_body(self, body, buf, addr, values):
+        if match := re.fullmatch(r"descriptor_rmw16\(addr, (.*)\);", body):
+            self._rmw(buf, addr, self._scalar(match.group(1), values))
+        elif match := re.fullmatch(r"uint packed = (.*); outputData\.Store\(addr, packed\);", body):
+            struct.pack_into("<I", buf, addr, self._or_expr(match.group(1), values))
+        elif match := re.fullmatch(
+                r"uint lo = (.*); uint hi = (.*); outputData\.Store2\(addr, uint2\(lo, hi\)\);", body):
+            struct.pack_into("<I", buf, addr, self._or_expr(match.group(1), values))
+            struct.pack_into("<I", buf, addr + 4, self._or_expr(match.group(2), values))
+        elif body == "outputData.Store4(addr, uint4(e0, e1, e2, e3));":
+            for index in range(4):
+                struct.pack_into("<I", buf, addr + 4 * index, values[index] & 0xffffffff)
+        elif body == "outputData.Store3(addr, uint3(e0, e1, e2));":
+            for index in range(3):
+                struct.pack_into("<I", buf, addr + 4 * index, values[index] & 0xffffffff)
+        elif body == "outputData.Store2(addr, uint2(e0, e1));":
+            for index in range(2):
+                struct.pack_into("<I", buf, addr + 4 * index, values[index] & 0xffffffff)
+        elif match := re.fullmatch(r"outputData\.Store\(addr, e(\d)\);", body):
+            struct.pack_into("<I", buf, addr, values[int(match.group(1))] & 0xffffffff)
+        else:
+            raise AssertionError(f"unrecognized store body: {body}")
+
+    def store(self, buf, addr, word, channels, d16, data):
+        code = self.format_code(word)
+        if self.expand and d16:
+            halves = []
+            for item in data:
+                halves.append(descriptor_f16_to_f32(item & 0xffff))
+                halves.append(descriptor_f16_to_f32((item >> 16) & 0xffff))
+            values = (halves + [0, 0, 0, 0])[:4]
+        else:
+            values = (list(data) + [0, 0, 0, 0])[:4]
+        for arm in self.arms:
+            if (code in arm["formats"] and arm["channels"] == channels
+                    and not (arm["d16_clear"] and d16)
+                    and not (arm["aligned"] and (addr & 3))):
+                self._apply_body(arm["body"], buf, addr, values)
+                return
+
+
+def descriptor_shader_bytes(source, thread_id):
+    shader = _DescriptorShader(source)
+    buf = bytearray(SENTINEL.to_bytes(4, "little") * (DESCRIPTOR_STRIDE // 4))
+    for opcode, offset, code, legacy, data in DESCRIPTOR_STORES:
+        resolved = [(item[1] ^ thread_id) & 0xffffffff if isinstance(item, tuple) else item for item in data]
+        word = aot.descriptor_format_word(code, legacy=legacy)
+        suffix = opcode.removeprefix("buffer_store_format_")
+        shader.store(buf, offset, word, len(suffix.removeprefix("d16_")), suffix.startswith("d16_"), resolved)
+    return buf
+
+
 def descriptor_store_controls():
     assert descriptor_unorm_bits(F25, 255) == 64
     assert descriptor_unorm_bits(F75, 255) == 191
@@ -7315,18 +7519,18 @@ def descriptor_store_controls():
     assert descriptor_unorm_bits(F75, 1023) == 767
     assert descriptor_unorm_bits(F25, 65535) == 16384
     assert descriptor_unorm_bits(F75, 65535) == 49151
+    assert descriptor_unorm_bits(UNORM8_TIE, 255) == 3
+    assert _round_nearest_even(_f32(_float_bits(UNORM8_TIE) * 255.0)) == 2
     assert descriptor_snorm16_bits(F25) == 8192
+    assert descriptor_snorm16_bits(F75) == 24575
     assert descriptor_snorm16_bits(0xBE800000) == 0xE000
     assert descriptor_f16_bits(F25) == H25 and descriptor_f16_bits(F75) == H75
     assert descriptor_f16_to_f32(H25) == F25 and descriptor_f16_to_f32(H75) == F75
-    assert aot.descriptor_format_word(56) == 0x01000FAC | (56 << 12)
-    assert aot.descriptor_format_word(74, legacy=True) == 0xFAC | (((13 << 3) | 7) << 12)
-    assert aot.descriptor_format_word(29, legacy=True) == 0xFAC | (((5 << 3) | 7) << 12)
-    for code, (kind, channels) in aot.DESCRIPTOR_STORE_FORMATS.items():
-        assert aot.decode_buffer_descriptor_format(aot.descriptor_format_word(code)) == (code, kind, channels)
-        assert aot.decode_buffer_descriptor_format(aot.descriptor_format_word(code, legacy=True)) == (
-            code, kind, channels)
-    handled = aot.descriptor_format_word(56)
+    assert aot.descriptor_format_word(56) == 0x01038FAC
+    for code, word in PINNED_LEGACY_WORDS.items():
+        assert aot.descriptor_format_word(code, legacy=True) == word
+        assert aot.decode_buffer_descriptor_format(word)[0] == code
+    handled = 0x01038FAC
     for word in (aot.DESCRIPTOR_GFX10_FIXED | (2 << 12), aot.DESCRIPTOR_GFX10_FIXED | (9 << 12),
                  handled | (1 << 23), handled | (1 << 21), handled | (1 << 28), handled | (1 << 30),
                  handled & ~0xFFF, 0):
@@ -7334,26 +7538,21 @@ def descriptor_store_controls():
     lines, binding = descriptor_store_program()
     source = aot.lower(lines, DESCRIPTOR_GROUP, **binding)
     assert source.count("\n    store_descriptor_format(") == len(DESCRIPTOR_STORES)
-    for code in aot.DESCRIPTOR_STORE_FORMATS:
-        assert f"format == {code}u" in source
-    for field in aot.LEGACY_DESCRIPTOR_FORMATS:
-        assert f"field == {field}u" in source
-    assert "d16 == 0u" in source and "InterlockedAnd" in source and "InterlockedOr" in source
     assert "params[3].x" in source
     record = struct.unpack(f"<{DESCRIPTOR_STRIDE // 4}I", descriptor_thread_bytes(0))
-    assert record[0] == (64 | (191 << 8))
-    assert record[4:7] == (F25, F75, F01)
-    assert record[7] == (SENTINEL & 0xFFFF0000) | H25
-    assert record[8] == PACKED_25_75 and record[9] == PACKED_75_25
-    assert record[12] == PACKED_25_75
-    assert record[14] == UINT_PAYLOAD
-    assert record[15] == (16384 | (49151 << 16))
-    assert record[17:20] == (F25, F75, F25)
-    assert record[20] == (256 | (767 << 10))
-    assert record[24] == (SENTINEL & 0xFFFF0000) | 16384
-    assert record[25] == (SENTINEL & 0xFFFF0000) | UINT16_BITS
-    assert record[26] == (SENTINEL & 0xFFFF0000) | 8192
-    assert record[27] == (SENTINEL & 0xFFFF0000) | (SINT_BITS & 0xFFFF)
+    shader_record = struct.unpack(f"<{DESCRIPTOR_STRIDE // 4}I", descriptor_shader_bytes(source, 0))
+    assert record == PINNED_THREAD0
+    assert shader_record == PINNED_THREAD0
+    shader = _DescriptorShader(source)
+    # Legacy 32 UINT is field 36. A changed NFMT leaves this pinned word unstored.
+    legacy_uint = bytearray(SENTINEL.to_bytes(4, "little"))
+    shader.store(legacy_uint, 0, PINNED_LEGACY_WORDS[20], 1, False, (UINT_PAYLOAD,))
+    assert struct.unpack("<I", legacy_uint)[0] == UINT_PAYLOAD
+    # d16 plus 16-bit UINT or SINT writes nothing. Dropping the guard stores the widened half.
+    for word in (0x0100BFAC, 0x0100CFAC):
+        skipped = bytearray(SENTINEL.to_bytes(4, "little"))
+        shader.store(skipped, 0, word, 1, True, (UINT16_BITS,))
+        assert struct.unpack("<I", skipped)[0] == SENTINEL
     _, old_lines, old_binding = next(mubuf_format_store_cases())
     old = aot.lower(old_lines, 16, **old_binding)
     assert "store_descriptor_format(" not in old and "outputData.Store(" in old
