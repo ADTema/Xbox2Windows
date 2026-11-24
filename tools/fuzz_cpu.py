@@ -1457,10 +1457,120 @@ def generate_rsp(seed, count):
     return [*callees, *functions, *(rsp_control(f"fuzz_rsp_refused_{kind}", kind) for kind in RSP_CONTROLS)]
 
 
+# Counted loops: leaf functions, some with pushed registers, whose loops end in a backward conditional branch.
+# Every trip count comes from x masked to 4 bits (3 bits for a nested loop) and the counter is written only by
+# the loop's own update, so each input terminates within 16 iterations, or 8 times 8 when nested. The output
+# buffer keeps the final carried registers at 0 to 23, a value carried through memory at 24, an iteration count
+# at 32, the final counter (the count in the up form) at 36, an early-exit record at 40 to 55, the first saved
+# register at 56, one word per outer iteration from 64 to 191 and one word per inner iteration from 192 to 255.
+LOOP_FORMS = ("dec", "up", "guarded", "step")
+LOOP_CARRIED = ("rax", "rdx", "r10")
+LOOP_SAVED = ("rbx", "rsi", "rdi")
+LOOP_MEMORY, LOOP_COUNT, LOOP_FINAL, LOOP_EARLY, LOOP_SAVES, LOOP_TRACE, LOOP_INNER = 24, 32, 36, 40, 56, 64, 192
+
+
+def loop_operation(rng, target, sources):
+    """One update of a carried register from itself and the other carried values."""
+    source = rng.choice(sources)
+    dword = rng.random() < 0.2
+    a, b = (REGISTER_PARTS[target][0], REGISTER_PARTS[source][0]) if dword else (target, source)
+    return rng.choice((f"add {a}, {b}", f"sub {a}, {b}", f"xor {a}, {b}", f"imul {a}, {b}, {rng.choice((3, 5, 7, 31))}",
+                       f"rol {target}, {rng.choice((5, 13, 29))}", f"ror {target}, {rng.choice((3, 11))}",
+                       f"lea {target}, [{target}+{source}*{rng.choice((2, 4, 8))}+{rng.choice((1, 7, 0x51))}]",
+                       f"add {a}, {REGISTER_PARTS['r9'][0] if dword else 'r9'}", f"not {target}", f"neg {target}"))
+
+
+def loop_function(name, rng, form, nested, early):
+    """A counted loop of one of four forms, with an optional data-dependent early exit and nested loop.
+
+    dec: the counter runs from n down to 1 (DEC or SUB 1, then JNZ) or from n-1 down to 0 (DEC, then JNS).
+    up: an index runs from 0 up to n-1 (INC, CMP with the count, then JB, JNE or JL).
+    guarded: as dec from n, but n may be 0 and a TEST and JZ in front skips the loop.
+    step: the counter drops by 2 or 3 while it stays above 0 (SUB, then JG).
+    """
+    saved = rng.sample(LOOP_SAVED, rng.choice((0, 0, 1, 2)))
+    prolog = [line for register in saved for line in (f"push {register}", f".pushreg {register}")]
+    carried = [*LOOP_CARRIED, *saved]
+    top, exit_, out = f"{name}_top", f"{name}_exit", f"{name}_early"
+    # The count n is x masked, plus 1 where the loop has no guard; a dec loop that ends at 0 starts from n-1.
+    to_zero = form == "dec" and rng.random() < 0.5
+    lines = ["mov r9d, ecx", f"and r9d, {7 if nested else 15}"]
+    if form != "guarded" and not to_zero:
+        lines.append("inc r9d")
+    # Carried values defined from both arguments; each saved register is overwritten before it is read.
+    lines += ["mov rax, rcx", "lea r10, [rdx+rcx*2+3]", f"mov QWORD PTR [r8+{LOOP_MEMORY}], rdx",
+              f"mov DWORD PTR [r8+{LOOP_COUNT}], 0"]
+    for register in saved:
+        lines += [f"mov {register}, rdx", rng.choice((f"xor {register}, rcx", f"rol {register}, 17", f"add {register}, rcx"))]
+    if form == "up":
+        lines.append("xor r11d, r11d")
+    if form == "guarded":
+        lines += ["test r9d, r9d", f"jz {exit_}"]
+    # The outer trace: one word per iteration indexed by the counter or index, from LOOP_TRACE.
+    if form == "up":
+        trace = f"mov QWORD PTR [r8+r11*8+{LOOP_TRACE}], rax"
+    elif to_zero:
+        trace = f"mov QWORD PTR [r8+r9*8+{LOOP_TRACE}], rax"
+    else:
+        trace = f"mov QWORD PTR [r8+r9*8+{LOOP_TRACE - 8}], rax"
+
+    # RAX and a saved register, when there is one, change in every iteration.
+    targets = ["rax", *saved[:1], *rng.sample(carried, rng.choice((1, 2)))]
+    body = [loop_operation(rng, target, [r for r in carried if r != target]) for target in targets]
+    body.append(rng.choice((f"add QWORD PTR [r8+{LOOP_MEMORY}], rax", f"xor QWORD PTR [r8+{LOOP_MEMORY}], r10",
+                            f"sub QWORD PTR [r8+{LOOP_MEMORY}], rdx")))
+    body.append(rng.choice((f"add rax, QWORD PTR [r8+{LOOP_MEMORY}]", f"xor r10, QWORD PTR [r8+{LOOP_MEMORY}]",
+                            f"add rdx, QWORD PTR [r8+{LOOP_MEMORY}]")))
+    body += [f"add DWORD PTR [r8+{LOOP_COUNT}], 1", trace]
+    if early:
+        producer = rng.choice((f"test al, {rng.choice((3, 7))}", f"test r10d, {rng.choice((0xF, 0x1F))}",
+                               f"cmp eax, {rng.choice((0x10000000, 0x20000000))}"))
+        # After the first update, so the flags never cross the loop head.
+        at = rng.randrange(1, len(body) + 1)
+        body[at:at] = [producer, f"{'jb' if producer.startswith('cmp') else 'jz'} {out}"]
+    if nested:
+        # The inner count comes from the carried RAX, so it differs from one outer iteration to the next.
+        inner = f"{name}_inner"
+        body += ["mov ecx, eax", "and ecx, 7", "inc ecx", f"{inner}:",
+                 *(loop_operation(rng, target, [r for r in carried if r != target])
+                   for target in rng.sample(carried, rng.choice((1, 2)))),
+                 f"add QWORD PTR [r8+rcx*8+{LOOP_INNER - 8}], r10", "dec ecx", f"jnz {inner}"]
+    if form == "dec":
+        if to_zero:
+            body += ["dec r9d", f"jns {top}"]
+        else:
+            body += [rng.choice(("dec r9d", "sub r9d, 1")), f"jnz {top}"]
+    elif form == "guarded":
+        body += ["dec r9d", f"jnz {top}"]
+    elif form == "step":
+        body += [f"sub r9d, {rng.choice((2, 3))}", f"jg {top}"]
+    else:
+        body += ["inc r11d", "cmp r11d, r9d", f"{rng.choice(('jb', 'jne', 'jl'))} {top}"]
+
+    restore = [f"pop {register}" for register in reversed(saved)]
+    stores = [f"mov QWORD PTR [r8+{LOOP_SAVES}], {saved[0]}", f"add rax, {saved[0]}"] if saved else ["xor rax, r10"]
+    lines += [f"{top}:", *body, f"{exit_}:", "mov QWORD PTR [r8], rax", "mov QWORD PTR [r8+8], r10",
+              "mov QWORD PTR [r8+16], rdx", f"mov DWORD PTR [r8+{LOOP_FINAL}], r9d", *stores, *restore, "ret"]
+    if early:
+        lines += [f"{out}:", f"mov DWORD PTR [r8+{LOOP_EARLY}], 0EA51h", f"mov QWORD PTR [r8+{LOOP_EARLY + 8}], r9",
+                  "mov QWORD PTR [r8+16], rdx", "lea rax, [rax+r10*2]", *restore, "ret"]
+    return Function(name, lines, prolog)
+
+
+def generate_loops(seed, count):
+    """Exports with counted loops: the 16 combinations of form, nesting and early exit in a seeded order,
+    repeated with other bodies."""
+    rng = random.Random(seed)
+    shapes = [(form, nested, early) for form in LOOP_FORMS for nested in (False, True) for early in (False, True)]
+    rng.shuffle(shapes)
+    return [loop_function(f"fuzz_loop_{index}", rng, *shapes[index % len(shapes)]) for index in range(count)]
+
+
 AREAS = {"leaf": (generate, "cpu_fuzz"), "frames": (generate_frames, "cpu_fuzz_frames"),
          "calls": (generate_calls, "cpu_fuzz_calls"), "chains": (generate_chains, "cpu_fuzz_chains"),
          "switches": (generate_switches, "cpu_fuzz_switches"),
-         "scalar_fp": (generate_scalar_fp, "cpu_fuzz_scalar_fp"), "rsp": (generate_rsp, "cpu_fuzz_rsp")}
+         "scalar_fp": (generate_scalar_fp, "cpu_fuzz_scalar_fp"), "rsp": (generate_rsp, "cpu_fuzz_rsp"),
+         "loops": (generate_loops, "cpu_fuzz_loops")}
 
 
 def inputs_for(seed, area="leaf", signature=None):
@@ -1792,10 +1902,40 @@ def plant_stale_rsp(cpu_switch_aot, image, functions):
     cpu_switch_aot.Lifter.slot = slot
 
 
+def plant_back_edge_exit(cpu_switch_aot, image, functions):
+    """Retarget every backward conditional branch to its own fallthrough, the instruction after the loop.
+
+    This is a planted translator fault for the negative control: each loop body runs once, so any input
+    with more than one iteration leaves another trace, count and carried value. Every input still terminates.
+    """
+    from iced_x86 import FlowControl
+
+    original = cpu_switch_aot.Function.decode
+    planted = []
+
+    def decode(self, ip):
+        ins = original(self, ip)
+        if ins.flow_control == FlowControl.CONDITIONAL_BRANCH and ins.near_branch_target <= ip:
+            ins.near_branch64 = ins.next_ip
+            planted.append(ip)
+        return ins
+
+    cpu_switch_aot.Function.decode = decode
+    translate_original = cpu_switch_aot.translate
+
+    def translate(*args, **kwargs):
+        result = translate_original(*args, **kwargs)
+        if not planted:
+            raise SystemExit("the back_edge_exit fault found no backward branch")
+        return result
+
+    cpu_switch_aot.translate = translate
+
+
 MUTANTS = {"frames": ("reload_shift", plant_reload_shift), "calls": ("call_retarget", plant_call_retarget),
            "chains": ("swapped_arguments", plant_swapped_arguments),
            "switches": ("table_rotate", plant_table_rotate), "scalar_fp": ("minmax_swap", plant_minmax_swap),
-           "rsp": ("stale_rsp", plant_stale_rsp)}
+           "rsp": ("stale_rsp", plant_stale_rsp), "loops": ("back_edge_exit", plant_back_edge_exit)}
 
 
 def translate(seed, count, image, output, area="leaf", mutant=False):

@@ -1925,6 +1925,47 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_fuzz_rsp>" "$<TARGET_FILE:cpu_fuzz_rsp_lifted>" "${cpu_fuzz_rsp_o2}"
         --area rsp --mutant "$<TARGET_FILE:cpu_fuzz_rsp_mutant>")
     set_tests_properties(cpu_aot_fuzz_rsp PROPERTIES TIMEOUT 60)
+
+    # Counted loops with backward conditional branches, early exits and a nested loop, with every back edge retargeted planted.
+    set(CPU_FUZZ_LOOPS_SEED "0x100F" CACHE STRING "Seed for the CPU differential fuzz loop test")
+    set(CPU_FUZZ_LOOPS_FUNCTIONS "32" CACHE STRING "Number of exported functions in the CPU differential fuzz loop test")
+    set(cpu_fuzz_loops_asm "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_loops.asm")
+    set(cpu_fuzz_loops_def "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_loops.def")
+    add_custom_command(OUTPUT "${cpu_fuzz_loops_asm}" "${cpu_fuzz_loops_def}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" emit
+            "${CPU_FUZZ_LOOPS_SEED}" "${CPU_FUZZ_LOOPS_FUNCTIONS}" "${cpu_fuzz_loops_asm}"
+            "${cpu_fuzz_loops_def}" --area loops
+        DEPENDS tools/fuzz_cpu.py VERBATIM)
+    add_library(cpu_fuzz_loops SHARED "${cpu_fuzz_loops_asm}" "${cpu_fuzz_loops_def}")
+    set_target_properties(cpu_fuzz_loops PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_fuzz_loops PRIVATE /NOENTRY /NODEFAULTLIB /INCREMENTAL:NO /OPT:NOICF)
+    set(cpu_fuzz_loops_lifted "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_loops_lifted.cpp")
+    set(cpu_fuzz_loops_mutant "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_loops_mutant.cpp")
+    foreach(variant lifted mutant)
+        set(mutant_flag "")
+        if(variant STREQUAL "mutant")
+            set(mutant_flag "--mutant")
+        endif()
+        add_custom_command(OUTPUT "${cpu_fuzz_loops_${variant}}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" translate
+                "${CPU_FUZZ_LOOPS_SEED}" "${CPU_FUZZ_LOOPS_FUNCTIONS}" "$<TARGET_FILE:cpu_fuzz_loops>"
+                "${cpu_fuzz_loops_${variant}}" --area loops ${mutant_flag}
+            DEPENDS cpu_fuzz_loops tools/fuzz_cpu.py tools/cpu_switch_aot.py tools/cpu_leaf_aot.py
+                tools/cpu_call_aot.py tools/cpu_ranges.py VERBATIM)
+        add_library(cpu_fuzz_loops_${variant} SHARED "${cpu_fuzz_loops_${variant}}")
+        target_compile_features(cpu_fuzz_loops_${variant} PRIVATE cxx_std_20)
+    endforeach()
+    set(cpu_fuzz_loops_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_loops_lifted_o2.dll")
+    add_custom_command(OUTPUT "${cpu_fuzz_loops_o2}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /LD "${cpu_fuzz_loops_lifted}"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_loops_lifted_o2.obj" "/Fe${cpu_fuzz_loops_o2}"
+        DEPENDS "${cpu_fuzz_loops_lifted}" VERBATIM)
+    add_custom_target(cpu_fuzz_loops_lifted_o2 ALL DEPENDS "${cpu_fuzz_loops_o2}")
+    add_test(NAME cpu_aot_fuzz_loops COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" check "${CPU_FUZZ_LOOPS_SEED}" "${CPU_FUZZ_LOOPS_FUNCTIONS}"
+        "$<TARGET_FILE:cpu_fuzz_loops>" "$<TARGET_FILE:cpu_fuzz_loops_lifted>" "${cpu_fuzz_loops_o2}"
+        --area loops --mutant "$<TARGET_FILE:cpu_fuzz_loops_mutant>")
+    set_tests_properties(cpu_aot_fuzz_loops PROPERTIES TIMEOUT 60)
     cpu_asm_fixture(cpu_switch_addr32 switch_addr32)
     cpu_asm_fixture(cpu_switch_strings switch_strings)
     cpu_asm_fixture(cpu_string_probe string_probe)
