@@ -9943,3 +9943,22 @@ ctest --preset dev --no-tests=error -R '^cpu_aot_sse4a$' -V
 The [MASM fixture](../tests/cpu/sse4a.asm) exports 24 translated `op_*` functions covering immediate and register `extrq`/`insertq` (including `length=0` meaning `64`, bits `[7:6]`/`[15:14]` ignored, self-aliasing, and `xmm4`/`xmm5`), aligned and unaligned `movntsd`/`movntss`, a chained `op_pipeline`, and two dead-read fault-ordering controls (`op_discarded_read` and `op_sse4a_discarded_read`), alongside 22 Win64 MASM baseline `ref_*` exports so verification runs on both Intel and AMD hosts without skipping. [The differential check](../tests/cpu/sse4a_check.py) verifies 580 cases across the 22 differential exports bit-for-bit across `dev` and `release` (`/O2`) builds against both the independent Python AMD64 APM reference model and the Win64 MASM `ref_*` baseline (and cross-checks native `op_*` execution when `CPUID.80000001H:ECX[6]` is set), with 32-byte pre/post buffer guards, dead-read fault ordering, 6 `ALTER_IMM` divergence controls (minimum 7 differing cases), an output-mutation control, 6 alternate-encoding lift checks, 54 unit rejection controls, and 11 PE-patched DLL rejection controls. It also records decoded mnemonics of the translated exports through `FORM_COVERAGE_RECORD`.
 
 Not covered by this experiment: non-temporal cache-bypass hints, runtime `offset + width > 64` hardware-undefined behavior in register-form `extrq`/`insertq`, control flow or nonvolatile prologues, and title CPU code execution.
+
+## Host-CPU RDFSBASE, RDGSBASE, and RDPID lifting in cpu_switch_aot
+
+[The switch translator](../tools/cpu_switch_aot.py) adds an opt-in `--host-cpu` (`host_cpu=True`) mode lifting read-only `rdfsbase`, `rdgsbase` (32- and 64-bit register forms), and `rdpid` (64-bit register form) from `docs/coverage/x64_zen2.tsv` group `Integer` to the `<immintrin.h>` intrinsics (`_readfsbase_u32`, `_readfsbase_u64`, `_readgsbase_u32`, `_readgsbase_u64`, `_rdpid_u32`):
+
+- `rdfsbase`, `rdgsbase`, and `rdpid` read into a `const volatile` temporary before assigning the destination (zero-extending 32-bit `rdfsbase`/`rdgsbase` and 64-bit `rdpid` into the full 64-bit register) so `/O2` preserves unreferenced reads and execution order.
+- All three instructions are registered in `FLAG_NEUTRAL` so arithmetic flags are preserved across them, and all three are refused when `host_cpu` is omitted, when `rsp`/`esp` is addressed, when a `lock`/`rep`/`repne`/segment prefix is present, or when `rdpid` uses its 32-bit encoding.
+- Host segment-base writes (`wrfsbase`, `wrgsbase`) remain outside this read-only profile and are refused both with and without `--host-cpu`.
+
+```powershell
+cmake --build --preset dev --target cpu_switch_fsgsbase_rdpid cpu_switch_fsgsbase_rdpid_lifted
+ctest --preset dev --no-tests=error -R '^cpu_aot_switch_fsgsbase_rdpid$' -V
+```
+
+### Measured results and open scope
+
+The [MASM fixture](../tests/cpu/switch_fsgsbase_rdpid.asm) exports 9 translated functions covering 32- and 64-bit `rdfsbase`/`rdgsbase` (with high-bit prefill), nonvolatile `rbx`/`r12`/`r13` reads, `rdpid` single and repeated reads, `FLAG_NEUTRAL` flag preservation across `add` to `setb`/`sete`/`sets`/`seto`/`setp`, and unused reads, plus native-only `CPUID.07H`, `RDTSCP`, and `FS_BASE`-roundtrip helpers and 7 rejected negative exports (including 32- and 64-bit `wrfsbase`/`wrgsbase`). [The differential check](../tests/cpu/switch_fsgsbase_rdpid_check.py) exits 77 if `CPUID.07H` lacks `FSGSBASE` (`EBX[0]`) or `RDPID` (`ECX[22]`) and otherwise pins the thread to up to four logical processors, verifying 232 CMake-lifted and 232 `/O2`-lifted checks across `dev` and `release` builds against native execution (including canonical `FS_BASE` sweeps via the native-only helper and `RDTSCP` `IA32_TSC_AUX`), five `/O2` mutated-C++ negative controls (`keep_high32`, `truncate_64`, `swap_fs_gs`, `constant_rdpid`, `clobber_flags`), 27 unit/MASM rejection controls, and 9 PE-patched DLL rejection controls, while recording decoded mnemonics through `FORM_COVERAGE_RECORD`.
+
+Not covered by this experiment: host segment-base writes (`wrfsbase`/`wrgsbase`, which require an explicit isolation/restoration profile), cross-thread `FS_BASE`/`GS_BASE` migration, and title CPU code execution.
