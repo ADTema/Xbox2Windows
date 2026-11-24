@@ -70,7 +70,7 @@ struct FileObject : Object {
 struct QueueObject : Object {
     // Independent of QueueWork so a queue can report failures even when it has no worker.
     std::mutex error_mutex;
-    StorageErrorRecord error_record{};
+    StorageErrorRecord error_record = x2w_startup::empty_error_record();
     HANDLE error_event = nullptr;
 };
 
@@ -423,6 +423,7 @@ void count_failure(StorageFailure cause, Object* self = nullptr, const unsigned 
     std::memcpy(&request, bytes, sizeof request);
     auto& failure = record.first_failure;
     failure.result = result;
+    failure.command_type = x2w_startup::command_type_request;
     failure.options = request.options;
     failure.destination = request.destination;
     failure.destination_size = request.destination_size;
@@ -1364,7 +1365,7 @@ void __stdcall queue_retrieve_error_record(Object* self, StorageErrorRecord* out
     auto& object = *static_cast<QueueObject*>(self);
     const std::lock_guard guard(object.error_mutex);
     std::memcpy(out, &object.error_record, sizeof *out);
-    std::memset(&object.error_record, 0, sizeof object.error_record);
+    object.error_record = x2w_startup::empty_error_record();
     // The sample header and Microsoft Learn describe a new notification after each retrieve.
     // Keep the manual-reset event signaled until retrieval consumes the record. Reset under
     // the record's lock so a concurrent failure cannot lose its notification.

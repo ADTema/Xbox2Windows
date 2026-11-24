@@ -161,7 +161,10 @@ ctest --preset release --no-tests=error -R '^stream_root_srv_' -V
 `startup_stubs` submits two out-of-range reads and a success-only queue. The
 failed reads preserve their destination bytes, the record keeps the first
 request's fields and counts both failures, and only the failed queue's event
-signals. A second retrieve returns an empty record. A refused memory request
+signals. The consumer reads the record at the published Xbox offsets, declared in the
+test rather than taken from the stand-in's header: CommandType at +0x0c is
+`DSTORAGE_COMMAND_TYPE_REQUEST` (0) for a failure, and an empty record has a zero count
+and CommandType `DSTORAGE_COMMAND_TYPE_NONE` (-1). A second retrieve returns an empty record. A refused memory request
 then signals the event again and becomes the new first failure.
 `startup_storage_worker_start` also checks the record when a worker could
 not start and the caller acquires the event after Submit.

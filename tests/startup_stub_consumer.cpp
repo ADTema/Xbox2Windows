@@ -161,7 +161,7 @@ using GetHResultFn = long(__stdcall*)(void*, unsigned);
 using OpenFileFn = long(__stdcall*)(void*, const wchar_t*, const void*, void**);
 using CloseFileFn = void(__stdcall*)(void*);
 using GetErrorEventFn = HANDLE(__stdcall*)(void*);
-using RetrieveErrorRecordFn = void(__stdcall*)(void*, x2w_startup::StorageErrorRecord*);
+using RetrieveErrorRecordFn = void(__stdcall*)(void*, void*);
 using ReleaseFn = unsigned long(__stdcall*)(void*);
 
 struct SubmitGate {
@@ -179,10 +179,27 @@ long __stdcall hold_worker(void* fence, u64) {
     return S_OK;
 }
 
+// DSTORAGE_ERROR_RECORD offsets as the Xbox GDK reference (dstorage_xs.h) publishes the structure on x64,
+// declared here independently of src/startup_stubs/dstorage_error_record.h so a wrong stand-in layout
+// cannot agree with itself. FirstFailure is pointer-aligned, so HResult and CommandType share its
+// first 8 bytes and the Request arm of the union starts at 0x10.
+namespace xbox_error_record {
+constexpr std::size_t failure_count = 0x000, hresult = 0x008, command_type = 0x00c, options = 0x010,
+                      destination = 0x018, destination_size = 0x020, filename = 0x024, file_offset = 0x230,
+                      source = 0x238, source_size = 0x240, cancellation_tag = 0x248, name = 0x250, size = 0x290;
+constexpr std::int32_t command_none = -1, command_request = 0;  // DSTORAGE_COMMAND_TYPE
+template <class T> T read(const unsigned char* record, std::size_t offset)
+{
+    T value;
+    std::memcpy(&value, record + offset, sizeof value);
+    return value;
+}
+}  // namespace xbox_error_record
+
 bool dstorage_error_record_checks()
 {
-    using x2w_startup::StorageErrorRecord;
     using x2w_startup::StorageRequest;
+    namespace rec = xbox_error_record;
     auto check = [](bool condition, const char* label) {
         if (!condition) std::fprintf(stderr, "dstorage error record: %s\n", label);
         return condition;
@@ -234,8 +251,8 @@ bool dstorage_error_record_checks()
             while (!complete(status, 0) && GetTickCount64() - start < 5000) Sleep(1);
             return reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 0);
         }
-        void retrieve(StorageErrorRecord& record) const {
-            reinterpret_cast<RetrieveErrorRecordFn>(object->vtable[10])(object, &record);
+        void retrieve(unsigned char* record) const {
+            reinterpret_cast<RetrieveErrorRecordFn>(object->vtable[10])(object, record);
         }
     } failing, successful;
 
@@ -275,28 +292,40 @@ bool dstorage_error_record_checks()
     reinterpret_cast<CloseFileFn>(file->vtable[3])(file);
 
     struct {
-        StorageErrorRecord record;
+        alignas(8) unsigned char record[rec::size];
         u64 after;
     } buffer{{}, 0xabcdef0123456789ull};
-    auto retrieve = [&](const Queue& q) -> const StorageErrorRecord& {
-        std::memset(&buffer.record, 0xaa, sizeof buffer.record);
+    auto retrieve = [&](const Queue& q) -> const unsigned char* {
+        std::memset(buffer.record, 0xaa, sizeof buffer.record);
         q.retrieve(buffer.record);
         return buffer.record;
     };
+    auto text_equal = [](const unsigned char* record, std::size_t offset, const char* text, std::size_t bytes) {
+        return strncmp(reinterpret_cast<const char*>(record + offset), text, bytes) == 0;
+    };
+    // An empty record: no failures and CommandType NONE (the docs leave the rest undefined), guard intact.
     auto empty_record = [&] {
-        const unsigned char zero[sizeof(StorageErrorRecord)]{};
-        return std::memcmp(&buffer.record, zero, sizeof zero) == 0 && buffer.after == 0xabcdef0123456789ull;
+        return rec::read<std::uint32_t>(buffer.record, rec::failure_count) == 0 &&
+               rec::read<std::int32_t>(buffer.record, rec::command_type) == rec::command_none &&
+               buffer.after == 0xabcdef0123456789ull;
     };
 
-    const auto& record = retrieve(failing);
-    const auto& details = record.first_failure;
-    if (!check(buffer.after == 0xabcdef0123456789ull && record.failure_count == 2, "expected two failures and an intact guard") ||
-        !check(details.result == E_FAIL && details.options == first.options && details.destination == first.destination &&
-               details.destination_size == first.destination_size && details.file_offset == first.file_offset &&
-               details.source == nullptr && details.source_size == first.source_size &&
-               details.cancellation_tag == first.cancellation_tag &&
-               wcsncmp(details.filename, filename, std::size(details.filename)) == 0 &&
-               strncmp(details.name, first.name, std::size(details.name)) == 0, "record did not preserve the first file request"))
+    const unsigned char* record = retrieve(failing);
+    wchar_t recorded_name[MAX_PATH];
+    std::memcpy(recorded_name, record + rec::filename, sizeof recorded_name);
+    if (!check(buffer.after == 0xabcdef0123456789ull && rec::read<std::uint32_t>(record, rec::failure_count) == 2,
+               "expected two failures and an intact guard") ||
+        !check(rec::read<std::int32_t>(record, rec::command_type) == rec::command_request,
+               "first failure's CommandType is not DSTORAGE_COMMAND_TYPE_REQUEST") ||
+        !check(rec::read<HRESULT>(record, rec::hresult) == E_FAIL && rec::read<u64>(record, rec::options) == first.options &&
+               rec::read<void*>(record, rec::destination) == first.destination &&
+               rec::read<std::uint32_t>(record, rec::destination_size) == first.destination_size &&
+               rec::read<u64>(record, rec::file_offset) == first.file_offset &&
+               rec::read<void*>(record, rec::source) == nullptr &&
+               rec::read<std::uint32_t>(record, rec::source_size) == first.source_size &&
+               rec::read<u64>(record, rec::cancellation_tag) == first.cancellation_tag &&
+               wcsncmp(recorded_name, filename, MAX_PATH) == 0 && text_equal(record, rec::name, first.name, 64),
+               "record did not preserve the first file request"))
         return false;
     if (!check(WaitForSingleObject(failing.event, 0) == WAIT_TIMEOUT, "retrieve did not reset the event")) return false;
     retrieve(failing);
@@ -310,14 +339,19 @@ bool dstorage_error_record_checks()
     failing.enqueue(too_small);
     if (!check(failing.submit() == E_FAIL && memory == sentinel, "short memory destination was not refused") ||
         !check(WaitForSingleObject(failing.event, 0) == WAIT_OBJECT_0, "next failure did not re-signal the event")) return false;
-    const auto& memory_failure = retrieve(failing).first_failure;
-    return check(buffer.record.failure_count == 1 && memory_failure.result == E_FAIL &&
-                 memory_failure.options == too_small.options && memory_failure.destination == too_small.destination &&
-                 memory_failure.destination_size == too_small.destination_size && memory_failure.filename[0] == 0 &&
-                 memory_failure.file_offset == 0 && memory_failure.source == too_small.source &&
-                 memory_failure.source_size == too_small.source_size &&
-                 memory_failure.cancellation_tag == too_small.cancellation_tag &&
-                 strncmp(memory_failure.name, too_small.name, std::size(memory_failure.name)) == 0 &&
+    const unsigned char* memory_failure = retrieve(failing);
+    return check(rec::read<std::uint32_t>(memory_failure, rec::failure_count) == 1 &&
+                 rec::read<std::int32_t>(memory_failure, rec::command_type) == rec::command_request &&
+                 rec::read<HRESULT>(memory_failure, rec::hresult) == E_FAIL &&
+                 rec::read<u64>(memory_failure, rec::options) == too_small.options &&
+                 rec::read<void*>(memory_failure, rec::destination) == too_small.destination &&
+                 rec::read<std::uint32_t>(memory_failure, rec::destination_size) == too_small.destination_size &&
+                 rec::read<wchar_t>(memory_failure, rec::filename) == 0 &&
+                 rec::read<u64>(memory_failure, rec::file_offset) == 0 &&
+                 rec::read<void*>(memory_failure, rec::source) == too_small.source &&
+                 rec::read<std::uint32_t>(memory_failure, rec::source_size) == too_small.source_size &&
+                 rec::read<u64>(memory_failure, rec::cancellation_tag) == too_small.cancellation_tag &&
+                 text_equal(memory_failure, rec::name, too_small.name, 64) &&
                  buffer.after == 0xabcdef0123456789ull && WaitForSingleObject(failing.event, 0) == WAIT_TIMEOUT,
                  "record did not restart with the next memory request");
 }

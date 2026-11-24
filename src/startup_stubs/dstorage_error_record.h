@@ -22,10 +22,24 @@ struct StorageRequest {
     const char* name;
 };
 
+// DSTORAGE_COMMAND_TYPE, from the Xbox GDK reference (dstorage_xs.h): the kind of the first failed
+// entry. NONE means no failure is recorded and the rest of the record is undefined.
+enum StorageCommandType : std::int32_t {
+    command_type_none = -1,
+    command_type_request = 0,
+    command_type_status = 1,
+    command_type_signal = 2,
+};
+
+// DSTORAGE_ERROR_RECORD as the Xbox GDK reference publishes it: HResult, then CommandType, then a
+// union of the request, status and signal arms. Only the request arm is filled here, since only read
+// requests are recorded as failures. The Win32 sample header leaves CommandType out and has padding
+// at its offset; every other offset is the same.
 struct StorageErrorRecord {
     std::uint32_t failure_count;
     struct Failure {
         HRESULT result;
+        std::int32_t command_type;
         std::uint64_t options;
         void* destination;
         std::uint32_t destination_size;
@@ -55,6 +69,7 @@ static_assert(sizeof(StorageErrorRecord::Failure) == 0x288);
 static_assert(offsetof(StorageErrorRecord, failure_count) == 0x000);
 static_assert(offsetof(StorageErrorRecord, first_failure) == 0x008);
 static_assert(offsetof(StorageErrorRecord, first_failure.result) == 0x008);
+static_assert(offsetof(StorageErrorRecord, first_failure.command_type) == 0x00c);
 static_assert(offsetof(StorageErrorRecord, first_failure.options) == 0x010);
 static_assert(offsetof(StorageErrorRecord, first_failure.destination) == 0x018);
 static_assert(offsetof(StorageErrorRecord, first_failure.destination_size) == 0x020);
@@ -64,5 +79,14 @@ static_assert(offsetof(StorageErrorRecord, first_failure.source) == 0x238);
 static_assert(offsetof(StorageErrorRecord, first_failure.source_size) == 0x240);
 static_assert(offsetof(StorageErrorRecord, first_failure.cancellation_tag) == 0x248);
 static_assert(offsetof(StorageErrorRecord, first_failure.name) == 0x250);
+
+// The record of a queue with no failure since the last retrieve: a zero count and CommandType NONE.
+// All-zero bytes would read as CommandType REQUEST.
+inline StorageErrorRecord empty_error_record() noexcept
+{
+    StorageErrorRecord record{};
+    record.first_failure.command_type = command_type_none;
+    return record;
+}
 
 }  // namespace x2w_startup

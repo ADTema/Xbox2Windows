@@ -317,7 +317,9 @@ bool worker_cannot_start(Fixture& f)
     const DWORD reset = WaitForSingleObject(event, 0);
     CloseHandle(event);
     if (notified != WAIT_OBJECT_0 || reset != WAIT_TIMEOUT || record.failure_count != requests_per_run ||
-        record.first_failure.result != E_OUTOFMEMORY || record.first_failure.destination != destination.data() ||
+        record.first_failure.result != E_OUTOFMEMORY ||
+        record.first_failure.command_type != x2w_startup::command_type_request ||
+        record.first_failure.destination != destination.data() ||
         record.first_failure.source != f.stream.data() || record.first_failure.source_size != f.stream.size())
         return fail("failed request's record or event was wrong after Submit without a worker");
     return serves_next_request(f, q);
