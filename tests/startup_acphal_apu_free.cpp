@@ -369,7 +369,7 @@ void hal_and_address_mapping()
 {
     check(hal_create_fn(nullptr) == no_pointer, "AcpHalCreate(null) returns E_POINTER");
     if (void* ro = VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READONLY)) {
-        check(hal_create_fn(ro) == no_pointer, "AcpHalCreate(read-only) returns E_POINTER");
+        check(hal_create_fn(static_cast<void**>(ro)) == no_pointer, "AcpHalCreate(read-only) returns E_POINTER");
         VirtualFree(ro, 0, MEM_RELEASE);
     } else {
         check(false, "VirtualAlloc PAGE_READONLY for AcpHalCreate negative control");
