@@ -29,6 +29,8 @@ __declspec(dllexport) const char* D3D12SDKPath = ".\\D3D12\\";
 using Microsoft::WRL::ComPtr;
 constexpr UINT side = 64;
 
+void check_descriptor_heap_paging(ID3D12Device* device, bool swapped);
+
 bool contains_ignoring_case(const wchar_t* text, const wchar_t* part)
 {
     const size_t length = std::wcslen(part);
@@ -547,13 +549,29 @@ OperationResult run_dual_uav(const OperationContext& ctx)
 
 OperationResult run_descriptor_window_submissions(const OperationContext& ctx)
 {
-    check_descriptor_window_submissions(ctx.device, false);
+    check_descriptor_window_submissions(ctx.device, DescriptorWindowCase::direct);
     return {OutcomeKind::pass, nullptr};
 }
 
 OperationResult run_descriptor_window_stale(const OperationContext& ctx)
 {
-    check_descriptor_window_submissions(ctx.device, true);
+    check_descriptor_window_submissions(ctx.device, DescriptorWindowCase::stale_window);
+    return {OutcomeKind::pass, nullptr};
+}
+
+bool validate_descriptor_record_args(int, char** argv)
+{
+    const std::string_view scenario = argv[3];
+    return scenario == "live" || scenario == "stale" || scenario == "unknown";
+}
+
+OperationResult run_descriptor_record_copy(const OperationContext& ctx)
+{
+    const std::string_view scenario = ctx.argv[3];
+    auto test = DescriptorWindowCase::copied_record;
+    if (scenario == "stale") test = DescriptorWindowCase::stale_record;
+    if (scenario == "unknown") test = DescriptorWindowCase::unknown_record;
+    check_descriptor_window_submissions(ctx.device, test);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -892,6 +910,13 @@ OperationResult run_wave_shuffle(const OperationContext& ctx)
         "skip: wave shuffle fixture requires SM 6.6 and a supported forced wave width");
 }
 
+template<bool Swapped>
+OperationResult run_descriptor_heap_paging(const OperationContext& ctx)
+{
+    check_descriptor_heap_paging(ctx.device, Swapped);
+    return {OutcomeKind::pass, nullptr};
+}
+
 constexpr CapabilityGate kNoGate{};
 constexpr CapabilityGate kGateSm60BufferOps{
     D3D_SHADER_MODEL_6_0, false, false, 0,
@@ -978,6 +1003,7 @@ const OperationSpec kOperations[] = {
     {"--dual-uav", 3, 3, nullptr, kNoGate, run_dual_uav},
     {"--descriptor-window-submissions", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_window_submissions},
     {"--descriptor-window-stale", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_window_stale},
+    {"--descriptor-record-copy", 4, 4, validate_descriptor_record_args, kGateSm60BufferOps, run_descriptor_record_copy},
     {"--texture-mips", 3, 3, nullptr, kNoGate, run_texture_mips},
     {"--check-bc7-tail", 6, kUnboundedArgc, nullptr, kNoGate, run_check_bc7_tail},
     {"--check-bc7-mip1", 6, 6, nullptr, kNoGate, run_check_bc7_mip1},
@@ -1036,6 +1062,8 @@ const OperationSpec kOperations[] = {
     {"--gpu-alias-atomic-waterfall", 3, 3, nullptr, kGateSm60AtomicWaterfall, run_gpu_alias_atomic_waterfall},
     {"--gpu-alias-registry", 3, 3, nullptr, kNoGate, run_gpu_alias_registry},
     {"--buffer-ops", 3, 3, nullptr, kGateSm60BufferOps, run_buffer_ops},
+    {"--descriptor-heap-paging", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_heap_paging<false>},
+    {"--descriptor-heap-paging-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_heap_paging<true>},
     {"--wave-shuffle", 3, 3, nullptr, kGateWaveShuffle, run_wave_shuffle},
 };
 
@@ -1209,6 +1237,9 @@ int run_self_test()
                    "Unknown GPU operation or invalid arguments: --bvh-wave")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--dual-uav", "extra"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --dual-uav")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--descriptor-record-copy", "invalid"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --descriptor-record-copy")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--descriptor-record-copy", "unknown"}, CliAction::operation)) return 1;
     if (!check_cli({"offscreen_check", "warp", "--compute-root-file"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --compute-root-file")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--spirv-sampler-views"}, CliAction::usage_error,
