@@ -627,6 +627,16 @@ foreach(backend IN ITEMS warp hardware)
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_TEST_SUBMIT_FENCE_FAIL=1")
 endforeach()
 
+# GPU writes the dispatch record that the desktop command processor consumes (Refs #1412).
+add_executable(startup_indirect_dispatch tests/startup_indirect_dispatch.cpp tests/desktop_gpu.cpp)
+target_compile_features(startup_indirect_dispatch PRIVATE cxx_std_17)
+target_link_libraries(startup_indirect_dispatch PRIVATE d3d12_xs_shim d3d12 dxgi d3dcompiler)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_indirect_dispatch_${backend} COMMAND startup_indirect_dispatch ${backend})
+    set_tests_properties(startup_indirect_dispatch_${backend} PROPERTIES TIMEOUT 30)
+endforeach()
+set_tests_properties(startup_indirect_dispatch_hardware PROPERTIES SKIP_RETURN_CODE 77)
+
 # OMSetRenderTargets with a single descriptor range, handles that hold no view, and a cleared copied descriptor.
 add_executable(startup_rtv_bind tests/startup_rtv_bind.cpp)
 target_compile_features(startup_rtv_bind PRIVATE cxx_std_17)
