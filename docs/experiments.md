@@ -4845,6 +4845,46 @@ variable to `1` for the other variants. These switches come from the
 32.0.16.2114); WARP 10.0.26100.10068. The D3D12 debug layer was unavailable
 for all three backends.
 
+#### Independent laptop baseline
+
+On source `f859099e0ceff0153b0d8aeb715947100aa9ea2f`, the unmodified fixture
+reproduced the Intel first-full-query failure on two consecutive runs. The
+NVIDIA hardware control and WARP control each completed the full fixture
+successfully. This adds an independent Intel UHD laptop result; it does not
+isolate the cause or replace the query-order and shader-output variants above.
+
+| Adapter | Result | Diagnostic |
+|---|---|---|
+| Intel UHD Graphics (`8086:9a68`) | Failed twice at the first draw | `Full draw coverage mismatch`; `debug_errors=0`, `debug_warnings=0` |
+| NVIDIA GeForce RTX 3060 Laptop GPU (`10de:2520`) | Passed | Full `sampled_coverage_hardware` fixture |
+| Microsoft Basic Render Driver (`1414:008c`) | Passed | Full `sampled_coverage_warp` fixture |
+
+The unchanged fixture does not print the failing full-draw count before it
+returns, so no count is claimed for the Intel runs. It failed on the first
+`main`, slot 0 case (scale 1, threshold 0.5); the WARP and NVIDIA results are
+controls for this build and fixture.
+
+**Commands.** With the Python environment installed as described in
+`AGENTS.md`, configure and build the fixture, then run the same hardware test
+once with each adapter selection. Run the WARP fixture separately:
+
+```powershell
+. .\tools\dev.ps1
+cmake --preset dev
+cmake --build --preset dev --parallel 2 --target offscreen_check
+$env:XBOX2WINDOWS_ADAPTER = 'Intel'
+ctest --preset dev --no-tests=error -R '^sampled_coverage_hardware$' -V
+$env:XBOX2WINDOWS_ADAPTER = 'NVIDIA'
+ctest --preset dev --no-tests=error -R '^sampled_coverage_hardware$' -V
+ctest --preset dev --no-tests=error -R '^sampled_coverage_warp$' -V
+```
+
+**Environment.** Windows 11 Home build 26300; MSVC 19.51.36260, Windows SDK
+10.0.26100 and DXC 1.9.2602.17. Intel UHD Graphics (`8086:9a68`, driver
+30.0.100.9864); NVIDIA GeForce RTX 3060 Laptop GPU (`10de:2520`, driver
+32.0.16.2124); WARP 10.0.26100.9818. The D3D12 debug layer was enabled on
+all three backends.
+
 ### Buffered depth export
 
 `tools/depth_mask_aot.py` follows the two entry table pointers through scalar
