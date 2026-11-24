@@ -8540,3 +8540,14 @@ The fixture checks the XG layout, tile spans, block offsets, copy in and out, an
 ```powershell
 ctest --preset release --no-tests=error --output-on-failure -R '^startup_xg_bc_chain_'
 ```
+
+### Nine-mip BC5/BC7 tile queries
+
+XG texture-computer slot 10 reports a 64 KiB standard tile layout for 1024×512 and 1024×1024 single-sample BC5_UNORM and BC7_UNORM textures with nine mips, one or two array slices, explicit layout `0x109`, default alignment and zero flags. Each slice starts with one packed tile containing six mips. The 1024×512 standard mips start at tiles 4, 2 and 1 in a 12-tile slice. The 1024×1024 standard mips start at tiles 6, 2 and 1 in a 22-tile slice.
+
+`startup_xg_bc_tiling` checks 80 subresource queries, including a request spanning the last packed mip in one slice and the first standard mips of the next. The returned count includes only standard mips. Their entries use their original positions in the requested range. Sentinel bytes cover packed entries and the remainder of the caller's array. The field values were compared with XCL's slot 10 implementation on source-built inputs. The optional AMD AddrLib test independently verifies the surface size, slice stride, first packed mip and standard and packed macro-tile offsets for all eight shapes and formats. [XCL implementation](https://github.com/ivall/xcl/blob/64b3f35599bb7102f55d640e1a791e7d6dd3b175/crates/xcl/src/hle/xg.rs#L610-L658) · [AMD AddrLib revision](https://gitlab.freedesktop.org/mesa/mesa/-/tree/5c142e46f3f6e752ed745fd48912ebb8fad67145/src/amd/addrlib)
+
+```powershell
+cmake --build --preset release --target startup_stub_xg_xs xg_swizzle_select_check
+ctest --preset release --no-tests=error --output-on-failure -R '^(startup_xg_bc_tiling|xg_bc64_tiling_reference)$'
+```
