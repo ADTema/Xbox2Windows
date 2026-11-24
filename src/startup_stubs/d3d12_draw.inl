@@ -392,14 +392,19 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
 // Private shader-visible heap for the translated draws' tables, used as a ring.
 constexpr UINT draw_heap_size = 1u << 18;
 ID3D12DescriptorHeap* draw_heap;
+Wrapper* draw_heap_device;
 UINT draw_heap_increment;
 volatile LONG draw_heap_cursor;
 
-bool ensure_draw_heap()
+bool ensure_draw_heap(Wrapper* device)
 {
-    if (draw_heap) return true;
+    // The translated pipeline and upload ring are scoped to the current
+    // startup render device. A list from another device cannot use this heap.
+    if (!device || device != the_device) return false;
+    if (draw_heap) return device == draw_heap_device;
     const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, draw_heap_size, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     if (FAILED(device_of(the_device)->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&draw_heap)))) return false;
+    draw_heap_device = device;
     draw_heap_increment = device_of(the_device)->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     return true;
 }
@@ -509,17 +514,17 @@ bool frame_copy(u64 address, std::size_t bytes, u64* offset)
     return true;
 }
 
-void buffer_view(D3D12_CPU_DESCRIPTOR_HANDLE dest, bool have, u64 offset, std::size_t bytes)
+void buffer_view(D3D12_CPU_DESCRIPTOR_HANDLE dest, ID3D12Resource* buffer, u64 offset, std::size_t bytes)
 {
     D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
     desc.Format = DXGI_FORMAT_R32_TYPELESS;
     desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
     desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    desc.Buffer.FirstElement = have ? offset / 4 : 0;
-    desc.Buffer.NumElements = have ? static_cast<UINT>((bytes + 3) / 4) : 1;
+    desc.Buffer.FirstElement = buffer ? offset / 4 : 0;
+    desc.Buffer.NumElements = buffer ? static_cast<UINT>((bytes + 3) / 4) : 1;
     desc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
-    device_of(the_device)->CreateShaderResourceView(have ? upload_ring : nullptr, &desc, dest);
-    if (!have) InterlockedIncrement(&null_bindings);
+    device_of(the_device)->CreateShaderResourceView(buffer, &desc, dest);
+    if (!buffer) InterlockedIncrement(&null_bindings);
 }
 
 // Texture contents. Linear backing uses desktop copyable footprints; an announced BC7 4 KiB
@@ -749,7 +754,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     AcquireSRWLockExclusive(&draw_lock);
     BoundPipeline* bound = translation_for(pass.pipeline);
     Translation* tr = bound ? translation_for_targets(bound->translation, pass) : nullptr;
-    ID3D12PipelineState* pipeline = tr && tr->state == 1 && ensure_draw_heap() ? pipeline_for(*bound, *tr, pass) : nullptr;
+    ID3D12PipelineState* pipeline = tr && tr->state == 1 && ensure_draw_heap(self->own().list_device) ? pipeline_for(*bound, *tr, pass) : nullptr;
     if (!pipeline || (tr->samplers.heap && !prepare_draw_sampler_heap(pass, list, tr->samplers.reserved_fallback))) {
         ReleaseSRWLockExclusive(&draw_lock);
         return false;
@@ -789,7 +794,9 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         const D3D12_CPU_DESCRIPTOR_HANDLE dest{draw_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{first + i} * draw_heap_increment};
         u64 address = 0, offset = 0;
         std::size_t bytes = 0;
-        if (srv.source == 1 && srv.a < 8) {
+        PlacedVertexView placed{};
+        if (srv.source == 1 && srv.a >= 0 && srv.a < 8) {
+            placed = pass.placed_vb[srv.a];
             address = pass.vb[srv.a].BufferLocation;
             bytes = pass.vb[srv.a].SizeInBytes;
             strides[i] = pass.vb[srv.a].StrideInBytes;
@@ -882,6 +889,27 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             bytes = static_cast<std::size_t>(strides[i] ? strides[i] : 1) * words[2];
         }
         if (bytes > (16u << 20)) bytes = 16u << 20;
+        if (placed.reject || (placed.owner && !InterlockedCompareExchange(&placed.owner->own().refs, 0, 0))) {
+            buffer_view(dest, nullptr, 0, 0);
+            continue;
+        }
+        if (placed.owner && bytes % 4 != 0) {
+            // Preserve tight byte-sized streams. The desktop raw view is rounded
+            // to a DWORD, so initialise its final padding without reading the guest.
+            const auto padded = (bytes + 3) & ~std::size_t{3};
+            auto* target = readable_window(address, bytes) >= bytes ? reserve_upload_ring(padded, &offset) : nullptr;
+            if (target) {
+                std::memcpy(target, reinterpret_cast<const void*>(address), bytes);
+                std::memset(target + bytes, 0, padded - bytes);
+            }
+            buffer_view(dest, target ? upload_ring : nullptr, offset, padded);
+            continue;
+        }
+        if (placed.alias && address % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT == 0 && bytes) {
+            require_state(self, placed.alias, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            buffer_view(dest, placed.alias, address - reinterpret_cast<u64>(placed.owner->own().title_memory), bytes);
+            continue;
+        }
         bool have = address && bytes && readable_window(address, bytes) >= bytes && frame_copy(address, bytes, &offset);
         // Experiment (X2W_DRAW_NULL_IDENTITY=1): an empty buffer slot reads as repeated identity
         // matrices instead of zeros. The start-up screen's last pass takes its world matrix from a
@@ -894,7 +922,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             bytes = sizeof(identity);
             have = frame_copy(address, bytes, &offset);
         }
-        buffer_view(dest, have, offset, bytes);
+        buffer_view(dest, have ? upload_ring : nullptr, offset, bytes);
         if (InterlockedIncrement(&tr->logged_bindings) <= 8) {
             char head[3 * 48 + 1] = "";
             if (have) hex_text(reinterpret_cast<const void*>(address), bytes < 48 ? bytes : 48, head, sizeof(head));
@@ -1017,7 +1045,12 @@ void __stdcall list_index_buffer(Wrapper* self, const D3D12_INDEX_BUFFER_VIEW* v
 void __stdcall list_vertex_buffers(Wrapper* self, UINT start, UINT count, const D3D12_VERTEX_BUFFER_VIEW* views)
 {
     if (!views || !x2w_local::readable(views, std::size_t{count} * sizeof(*views))) return;
-    for (UINT i = 0; i < count && start + i < 8; ++i) pass_of(self).vb[start + i] = views[i];
+    if (start >= 8) return;
+    Pass& pass = pass_of(self);
+    for (UINT i = 0; i < count && i < 8 - start; ++i) {
+        pass.vb[start + i] = views[i];
+        pass.placed_vb[start + i] = placed_vertex_view(self->own().list_device, views[i]);
+    }
 }
 // List slot 13, DrawIndexedInstanced(index count, instances, start index, base vertex, start instance).
 void __stdcall list_draw_indexed(Wrapper* self, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance)

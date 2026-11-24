@@ -8690,6 +8690,19 @@ The fixture checks the XG layout, tile spans, block offsets, copy in and out, an
 ctest --preset release --no-tests=error --output-on-failure -R '^startup_xg_bc_chain_'
 ```
 
+### Placed vertex buffers consumed by a translated draw
+
+`startup_placed_vertex_{hardware,warp}` opens two real slot-133 buffers on CPU-visible allocations with bases separated by 1 TiB. Slot 48 supplies the full guest address and byte length to a translated vertex-stream binding. The shader can read from the registered GPU buffer directly when the resource aliases the guest memory, the length covers whole DWORDs and the start is aligned to 16 bytes. Views crossing a registered boundary or overlapping multiple live placements on the list's device produce a null descriptor before staging. Final wrapper release removes the placement from binding lookup.
+
+The fixture records draws reading the last valid DWORD, updates that word before submission and verifies the GPU sees the new value. An eight-byte view starting at the last DWORD is rejected. Its shader reads only offset zero from the null descriptor. After a fence, the high range is released and a larger buffer is registered at the same address. The second draw reads both the end of the new range and an address common to the old and new registrations. The RTX 4060 Laptop GPU (32.0.16.1656) and WARP (10.0.26100.9818) each read back all 64 pixels on Windows 11 build 26200.9974 with the debug layer off.
+
+```powershell
+cmake --build --preset release --target startup_stream_consumer startup_placement_alloc
+ctest --preset release --no-tests=error --output-on-failure -R '^startup_(placement_alloc|placed_vertex_)'
+```
+
+`startup_placement_alloc` fails each allocation made while adding a second buffer. It checks that the operation returns `E_OUTOFMEMORY`, the existing resource and index remain intact, the lock can be reacquired, and registration at the same address succeeds on retry.
+
 ### Nine-mip BC5/BC7 tile queries
 
 XG texture-computer slot 10 reports a 64 KiB standard tile layout for 1024×512 and 1024×1024 single-sample BC5_UNORM and BC7_UNORM textures with nine mips, one or two array slices, explicit layout `0x109`, default alignment and zero flags. Each slice starts with one packed tile containing six mips. The 1024×512 standard mips start at tiles 4, 2 and 1 in a 12-tile slice. The 1024×1024 standard mips start at tiles 6, 2 and 1 in a 22-tile slice.
