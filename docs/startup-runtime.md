@@ -489,7 +489,7 @@ one byte too little capacity and a truncated stream must be rejected without wri
 destination. On bare deflate data, a match that starts at the first output byte decodes and one that
 starts a byte earlier is rejected before it copies anything. A hand-built dynamic block whose only
 distance code is one bit long, the one incomplete code set zlib accepts, must decode with and without
-the lookup table.
+the lookup table. Both also hold with input and capacity to spare.
 
 The decoder looks Huffman codes of up to 10 bits up in a table filled when the code is built; longer
 codes and the last byte of input are decoded one bit at a time. A differential case decodes 900
@@ -501,10 +501,50 @@ Status, size and bytes must equal those of the same probe built with `X2W_INFLAT
 `inflate.h` decodes past an incomplete code set that zlib rejects; with this seed, no case needs it.
 The negative control is the probe built with
 `X2W_INFLATE_FAULTY_TABLE`, where codes exactly 10 bits long decode as the next symbol. It must
-differ from the reference in at least one case; it differs in 265. No GPU and no game files are needed:
+differ from the reference in at least one case; it differs in 265.
+
+A boundary case decodes 57 small streams at every output capacity up to one byte past their size, and
+truncated to every length at full and at a random capacity: 63994 cases. The streams hold matches at
+every distance from 1 to 16 with lengths around 8, 16 and 32 bytes and up to 258, some after a sync
+flush; stored blocks of 0, 1 and 300 bytes at each of the eight bit positions after a fixed block; and
+one stored block of 65535 bytes. Status, size and bytes must equal the bit-at-a-time build and
+CPython's zlib. The exception is a truncated stored block that would not fit either: the decoder
+checks the block's length against the input first and reports `corrupt_stream` where zlib reports
+insufficient output (809 cases). A window case decodes 5 streams of 96 to 160 KiB whose matches
+reach the 32 KiB window: zlib's encoder keeps 262 bytes of lookahead out of its window and never reaches distance 32768, so three are fixed blocks written by
+hand with matches at distance 32768 and lengths up to 258, the last match ending at the end of the
+output. Each runs at exact capacity, one byte short, at the end of inner 32768-distance matches and
+truncated: 52 cases, all equal to the bit-at-a-time build and to zlib. In every case the probe ends both the stream and the destination
+at a no-access page, so a read past the input or a write past the capacity faults.
+
+While at least 8 input bytes and 258 output bytes (the longest match) remain, the decoder takes whole
+symbols from a 64-bit bit buffer that one 8-byte load refills, with no per-symbol bounds check. It
+leaves anything else (end of block, codes longer than 10 bits, invalid symbols and distances) to the
+bit-at-a-time loop, and gives back the whole bytes it loaded but did not use, so that loop, stored
+blocks and the Adler-32 trailer start at the same bit position as before. The bit-at-a-time build
+has neither this loop nor the 8-byte match copy and the one-memcpy stored block; it copies a byte at
+a time. Three negative controls must each be caught: `X2W_INFLATE_FAULTY_MARGIN` enters the loop
+one output byte short of the longest match and writes past a destination in the boundary case;
+`X2W_INFLATE_FAULTY_INPUT_MARGIN` enters it with 7 input bytes left and reads past an input in the
+random case; `X2W_INFLATE_FAULTY_DISTANCE` drops the loop's distance check and does not reject the
+match that starts before the output when input and capacity are to spare. No GPU and no game files
+are needed:
 
 ```powershell
 ctest --preset release --no-tests=error -R '^startup_inflate$' -V
+```
+
+The same script measures throughput; it is not a ctest. It decodes 16 MiB seeded streams (stored,
+fixed Huffman, dynamic Huffman word text, dynamic Huffman bytes of about 7.3 bits of entropy), three
+per run, through the probe's batch mode and prints decoded MiB/s next to CPython's zlib on the same
+data. Probes given together run interleaved; the first of six rounds is dropped and the best of the
+other five is kept. Each run prints the sum of the Adler-32 values of its outputs, which must match
+the input's, so the decoding cannot be skipped. Only time inside the decoder counts; the zlib column
+includes CPython's call overhead. To compare two commits, build the probe of each and pass both:
+
+```powershell
+cmake --build --preset release --target startup_inflate_probe
+.\out\pe-env\Scripts\python.exe -B tests/startup_inflate_check.py --bench out/build/release/startup_inflate_probe.exe
 ```
 
 ## DirectStorage destinations that are not writable

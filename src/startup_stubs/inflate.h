@@ -1,20 +1,41 @@
 // Experimental (docs/startup-runtime.md): a small zlib (RFC 1950) / deflate (RFC 1951)
 // decoder for the DirectStorage stand-in. Written from the RFCs. Huffman codes up to fast_bits long
 // decode with one table lookup; longer codes and the last byte of input take canonical-code decoding
-// one bit at a time.
+// one bit at a time. While 8 input bytes and 258 output bytes remain, codes() decodes whole symbols
+// from a 64-bit bit buffer without per-symbol bounds checks.
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
-// tests/startup_inflate_check.py builds its reference probe with 0 (bit-at-a-time decoding only).
+// tests/startup_inflate_check.py builds its reference probe with 0 (bit-at-a-time decoding only) and
+// its negative controls with the X2W_INFLATE_FAULTY_* macros. The functions here are inline, so every
+// translation unit linked into one binary must see the same values (one-definition rule).
 #ifndef X2W_INFLATE_FAST_BITS
 #define X2W_INFLATE_FAST_BITS 10
+#endif
+
+// The fast loop's 8-byte loads take the first input byte as the lowest.
+#if !defined(_MSC_VER) && !(defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+#error "inflate.h assumes a little-endian target"
 #endif
 
 namespace x2w_inflate {
 
 constexpr int fast_bits = X2W_INFLATE_FAST_BITS;
+// Table entries keep the code length in 4 bits.
+static_assert(fast_bits >= 0 && fast_bits <= 15, "X2W_INFLATE_FAST_BITS must be 0 to 15");
+#ifndef X2W_INFLATE_FAULTY_MARGIN
+constexpr std::size_t fast_out_margin = 258;  // the longest match
+#else  // negative control for tests/startup_inflate_check.py: one byte short of the longest match
+constexpr std::size_t fast_out_margin = 257;
+#endif
+#ifndef X2W_INFLATE_FAULTY_INPUT_MARGIN
+constexpr std::size_t fast_in_margin = 8;  // one 8-byte load
+#else  // negative control: the load reads one byte past the input
+constexpr std::size_t fast_in_margin = 7;
+#endif
 
 struct Stream {
     const unsigned char* in;
@@ -112,6 +133,21 @@ inline int decode(Stream& s, const Huffman& h) noexcept
     return -1;
 }
 
+// Writes length bytes from distance back (distance >= 1, both already checked) and nothing past them.
+inline void copy_match(unsigned char* out, std::size_t distance, std::size_t length) noexcept
+{
+    const unsigned char* from = out - distance;
+    if (fast_bits > 0 && distance >= 8 && length >= 8) {
+        // No chunk overlaps its source; the last one ends at the match end and rewrites bytes already final.
+        for (; length > 8; length -= 8, out += 8, from += 8) std::memcpy(out, from, 8);
+        std::memcpy(out + length - 8, from + length - 8, 8);
+    } else if (fast_bits > 0 && distance == 1) {
+        std::memset(out, from[0], length);
+    } else {
+        for (std::size_t i = 0; i < length; ++i) out[i] = from[i];
+    }
+}
+
 inline bool codes(Stream& s, const Huffman& lencode, const Huffman& distcode) noexcept
 {
     static const std::uint16_t length_base[29] = {3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
@@ -123,6 +159,55 @@ inline bool codes(Stream& s, const Huffman& lencode, const Huffman& distcode) no
     static const std::uint8_t dist_extra[30] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
                                                 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
     for (;;) {
+        // While 8 input bytes and the longest match of output remain, one 8-byte load refills a 64-bit
+        // buffer to at least 56 bits, more than a symbol with its extra bits takes (2 * fast_bits + 18),
+        // and no symbol can overflow the output. This loop takes only whole valid symbols that both
+        // tables decode; anything else (end of block, a longer code, an invalid symbol or distance) is
+        // left unconsumed for the careful loop below. On exit the whole bytes pulled in but not consumed
+        // go back to in_pos, so bit_count is below 8 again as decode(), stored() and the trailer expect.
+        if (fast_bits > 0 && s.in_size - s.in_pos >= fast_in_margin && s.out_size - s.out_pos >= fast_out_margin) {
+            constexpr std::uint64_t mask = (std::uint64_t{1} << fast_bits) - 1;
+            std::uint64_t buffer = s.bit_buffer;
+            int count = s.bit_count;
+            std::size_t in_pos = s.in_pos, out_pos = s.out_pos;
+            while (s.in_size - in_pos >= fast_in_margin && s.out_size - out_pos >= fast_out_margin) {
+                std::uint64_t next;
+                std::memcpy(&next, s.in + in_pos, 8);  // little endian: first input bit lowest
+                buffer |= next << count;
+                in_pos += (63 - count) >> 3;
+                count |= 56;
+                const int entry = lencode.fast[buffer & mask];
+                if (!entry) break;
+                int used = entry & 15, symbol = entry >> 4;
+                if (symbol < 256) {
+                    s.out[out_pos++] = static_cast<unsigned char>(symbol);
+                    buffer >>= used;
+                    count -= used;
+                    continue;
+                }
+                symbol -= 257;
+                if (symbol < 0 || symbol >= 29) break;
+                const std::size_t length = length_base[symbol] + ((buffer >> used) & ((1u << length_extra[symbol]) - 1));
+                used += length_extra[symbol];
+                const int dist_entry = distcode.fast[(buffer >> used) & mask];
+                symbol = dist_entry >> 4;
+                if (!dist_entry || symbol >= 30) break;
+                used += dist_entry & 15;
+                const std::size_t distance = dist_base[symbol] + ((buffer >> used) & ((1u << dist_extra[symbol]) - 1));
+                used += dist_extra[symbol];
+#ifndef X2W_INFLATE_FAULTY_DISTANCE  // negative control: no distance check in this loop
+                if (distance > out_pos) break;
+#endif
+                buffer >>= used;
+                count -= used;
+                copy_match(s.out + out_pos, distance, length);
+                out_pos += length;
+            }
+            s.in_pos = in_pos - (count >> 3);
+            s.bit_count = count & 7;
+            s.bit_buffer = static_cast<std::uint32_t>(buffer) & ((1u << s.bit_count) - 1);
+            s.out_pos = out_pos;
+        }
         int symbol = decode(s, lencode);
         if (symbol < 0) return false;
         if (symbol < 256) {
@@ -145,7 +230,8 @@ inline bool codes(Stream& s, const Huffman& lencode, const Huffman& distcode) no
                 s.overflow = true;
                 return false;
             }
-            for (std::size_t i = 0; i < length; ++i, ++s.out_pos) s.out[s.out_pos] = s.out[s.out_pos - distance];
+            copy_match(s.out + s.out_pos, distance, length);
+            s.out_pos += length;
         }
     }
 }
@@ -163,7 +249,13 @@ inline bool stored(Stream& s) noexcept
         s.overflow = true;
         return false;
     }
-    for (unsigned i = 0; i < length; ++i) s.out[s.out_pos++] = s.in[s.in_pos++];
+    if (fast_bits > 0 && length) {  // out may be null when length is 0
+        std::memcpy(s.out + s.out_pos, s.in + s.in_pos, length);
+        s.out_pos += length;
+        s.in_pos += length;
+    } else {
+        for (unsigned i = 0; i < length; ++i) s.out[s.out_pos++] = s.in[s.in_pos++];
+    }
     return true;
 }
 
