@@ -269,9 +269,9 @@ cmake --build out/build/clang --target xmem_shim d3d12_xs_shim startup_stub_acph
   startup_stub_xapu startup_stub_xcrdapi startup_stub_xg_xs startup_stub_gameinput
 ```
 
-The toolchain file quotes the SDK and `LIBCASE` paths inside its flag strings, so the checkout,
-the splat and the build directory may contain spaces (checked with all three in directories whose
-names have a space).
+The toolchain file quotes the SDK and `LIBCASE` paths inside its flag strings, so those two and
+the build directory may contain spaces (checked with all three in directories whose names have a
+space; a source directory with spaces was not tried).
 
 Four things differ from an MSVC build:
 
