@@ -286,6 +286,11 @@ add_executable(startup_draw_bmp_check tests/startup_draw_bmp.cpp)
 add_test(NAME startup_draw_bmp COMMAND startup_draw_bmp_check)
 
 add_executable(startup_dump_fence_check tests/startup_dump_fence.cpp tests/desktop_gpu.cpp)
+add_executable(startup_overlay_window tests/startup_overlay_window.cpp)
+target_compile_features(startup_overlay_window PRIVATE cxx_std_17)
+target_include_directories(startup_overlay_window PRIVATE src)
+target_link_libraries(startup_overlay_window PRIVATE user32)
+add_test(NAME startup_overlay_window COMMAND startup_overlay_window)
 target_compile_features(startup_dump_fence_check PRIVATE cxx_std_17)
 target_include_directories(startup_dump_fence_check PRIVATE src)
 target_link_libraries(startup_dump_fence_check PRIVATE d3d12 dxgi)
@@ -300,7 +305,14 @@ add_executable(startup_nv12_draw tests/startup_nv12_draw.cpp tests/desktop_gpu.c
 target_compile_features(startup_nv12_draw PRIVATE cxx_std_17)
 target_include_directories(startup_nv12_draw PRIVATE src)
 target_link_libraries(startup_nv12_draw PRIVATE startup_stub_xg_xs d3d12 dxgi d3dcompiler)
+add_executable(startup_plane_refresh tests/startup_plane_refresh.cpp tests/desktop_gpu.cpp)
+target_compile_features(startup_plane_refresh PRIVATE cxx_std_17)
+target_include_directories(startup_plane_refresh PRIVATE src)
+target_link_libraries(startup_plane_refresh PRIVATE d3d12 dxgi)
 foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_plane_refresh_${backend} COMMAND startup_plane_refresh)
+    set_tests_properties(startup_plane_refresh_${backend} PROPERTIES
+        ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=${backend}" TIMEOUT 60 SKIP_RETURN_CODE 77)
     add_test(NAME startup_nv12_draw_${backend} COMMAND startup_nv12_draw)
     set_tests_properties(startup_nv12_draw_${backend} PROPERTIES
         ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=${backend}" TIMEOUT 60 SKIP_RETURN_CODE 77)
@@ -1070,6 +1082,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_sampler_heap_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_sampler_heap_check.py")
     foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_r8_uint_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_r8_uint_check.py" "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_r8_uint_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME startup_sampler_heap_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_sampler_heap_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
@@ -1829,6 +1845,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     set(cpu_sse2_exports
         "op_cmppd_0,op_cmppd_1,op_cmppd_2,op_cmppd_3,op_cmppd_4,op_cmppd_5,op_cmppd_6,op_cmppd_7,"
         "op_cmppd_mem,"
+        "op_cmpsd_0,op_cmpsd_1,op_cmpsd_2,op_cmpsd_3,op_cmpsd_4,op_cmpsd_5,op_cmpsd_6,op_cmpsd_7,"
+        "op_cmpsd_mem,op_cmpsd_mem_plus1,"
         "op_maxsd_reg,op_maxsd_mem,op_minsd_reg,op_minsd_mem,op_sqrtsd_reg,op_sqrtsd_mem,"
         "op_cvtsd2si_r32_reg,op_cvtsd2si_r64_reg,op_cvtsd2si_r32_mem,op_cvtsd2si_r64_mem,"
         "op_cvtdq2pd_reg,op_cvtdq2pd_mem,op_cvtdq2ps_reg,op_cvtdq2ps_mem,"
@@ -3479,9 +3497,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_fprem>"
         "$<TARGET_FILE:cpu_x87_fprem_lifted>" ${x87_fprem_control_files})
     cpu_asm_fixture(cpu_x87_fldcw x87_fldcw)
-    # The checked translation and ten mutated controls that the check requires to mismatch.
+    # The checked translation and seventeen mutated controls that the check requires to mismatch.
     set(x87_fldcw_control_files "")
-    foreach(variant IN ITEMS lifted rcnearest pc53 fistnearest constnearest rawword nounmasked pc01 noreturn onereturn fninitword fninitsw deferred)
+    foreach(variant IN ITEMS lifted rcnearest pc53 fistnearest constnearest rawword nounmasked pc01 noreturn onereturn fninitword fninitsw deferred swtop swbyte swwide swaddr swnone)
         set(x87_fldcw_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_x87_fldcw_${variant}.cpp")
         add_custom_command(OUTPUT "${x87_fldcw_fixture}"
             COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_fldcw.py"
@@ -4718,6 +4736,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-guard-read "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(compute_store_aot_guard_read_${adapter} PROPERTIES TIMEOUT 45)
+        add_test(NAME compute_store_aot_mubuf_subword_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-mubuf-subword "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(compute_store_aot_mubuf_subword_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_mubuf_subword_${adapter}.txt")
         add_test(NAME compute_store_aot_f32_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-f32 "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})

@@ -983,6 +983,12 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or row_tag[1] == column_tag[1]):
                 raise ValueError("Unverified plane byte offset")
             vector[dst] = ("plane_bytes", row_tag[1], shift, *column_tag[1:])
+        elif ((m := re.fullmatch(r"v_and_b32_e32 v(\d+), (?:0xffff|65535), v(\d+)", line))
+              and isinstance(partial := vector.get(int(m[2])), tuple) and partial[0] == "source_low16"):
+            dst = int(m[1])
+            if dst > 255:
+                raise ValueError("Invalid vector destination")
+            vector[dst] = ("alu", f"(inputData.Load({partial[1]}) & 0xffffu)")
         elif m := re.fullmatch(rf"(v_(?:add|sub|subrev|mul)_f32_e32) v(\d+), {FLOAT_SOURCE}, (v\d+)", line):
             op, dst = m[1], int(m[2])
             words = [float_word(token, scalar, vector, pending) for token in m.groups()[2:]]
@@ -1019,20 +1025,29 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or row_tag[1] == column_tag[1]):
                 raise ValueError("Unverified row pitch byte offset")
             vector[dst] = ("pitch_bytes", row_tag[1], int(pitch, 0), *column_tag[1:])
-        elif m := re.fullmatch(r"(?:buffer_load_dword|tbuffer_load_format_(?P<channels>x|xy|xyz|xyzw)) "
+        elif m := re.fullmatch(r"(?:buffer_load_(?:dword|(?P<subword>[us](?:byte|short)))"
+                               r"|tbuffer_load_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
                                r"(?P<dst>v\d+|v\[\d+:\d+\]), (?P<addr>off|v\d+), s\[(?P<base>\d+):(?P<high>\d+)\], 0"
-                               r"(?(channels) format:\[(?P<format>BUF_FMT_(?:32_){1,4}UINT)\])"
+                               r"(?(channels) format:\[(?P<format>BUF_FMT_(?:(?:32_){1,4}|(?:16_){1,4})UINT)\])"
                                r"(?P<idxen> idxen)?(?P<offen> offen)?"
                                r"(?: offset:(?P<offset>\d+))?", line):
             channels = m["channels"]
-            count = len(channels) if channels else 1
+            packed = channels is not None and channels.startswith("d16_")
+            components = len(channels.removeprefix("d16_")) if channels else 1
+            count = (components + 1) // 2 if packed else components
             dst, *last = map(int, re.findall(r"\d+", m["dst"]))
             base, high = int(m["base"]), int(m["high"])
             offset = int(m["offset"] or 0)
             addr, idxen, offen = m["addr"], m["idxen"], m["offen"]
+            subword = m["subword"]
+            width = 4 if subword is None else 1 if subword.endswith("byte") else 2
+            if subword and (cpu != "gfx1030" or not idxen or offen):
+                raise ValueError("Unsupported subword buffer read target or address mode")
             if channels and (cpu != "gfx1030" or not idxen or offen):
                 raise ValueError("Unsupported typed buffer read target or address mode")
-            if channels and m["format"] != f"BUF_FMT_{'32_' * count}UINT":
+            # The three-component D16 form uses the four-component 16-bit format.
+            format_components = 4 if packed and components == 3 else components
+            if channels and m["format"] != f"BUF_FMT_{('16_' if packed else '32_') * format_components}UINT":
                 raise ValueError("Unsupported typed buffer read format")
             if last != ([] if count == 1 else [dst + count - 1]) or dst + count > 256:
                 raise ValueError("Unverified buffer read destination")
@@ -1045,7 +1060,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Reads from the stored UAV are not supported")
             if kinds != tuple(("srv", i) for i in range(4)):
                 raise ValueError("Unverified buffer read descriptor")
-            if offset % 4 or offset > 4095:
+            if offset % width or offset > 4095:
                 raise ValueError("Unverified read offset")
             tag = vector.get(int(addr[1:])) if addr != "off" else None
             if addr == "off" and not idxen and not offen:
@@ -1057,14 +1072,26 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             elif (idxen and not offen and source_stride is not None and isinstance(tag, tuple)
                   and tag[0] == "thread"):
                 # idxen: index * stride + instruction offset, inside one source element.
-                if offset + 4 * count > source_stride:
+                if offset + width * count > source_stride:
                     raise ValueError("Read leaves its source element")
-                addresses = [f"tid.{AXES[tag[1]]} * {source_stride}u + {offset + 4*i}u" for i in range(count)]
+                aligned = offset & ~3
+                addresses = [f"tid.{AXES[tag[1]]} * {source_stride}u + {aligned + 4*i}u" for i in range(count)]
             else:
                 raise ValueError("Unsupported read address")
             for reg, address in enumerate(addresses, dst):
                 vector.pop(reg, None)
-                loading[reg] = ("source", address)
+                # Whole-word consumers cannot read the undefined upper half of an odd D16 result.
+                kind = "source_low16" if packed and components % 2 and reg == dst + count - 1 else "source"
+                word = (kind, address)
+                if subword:
+                    # The stride and SRV base are DWORD-aligned, so the enclosing word stays in the record.
+                    bits, shift = width * 8, (offset % 4) * 8
+                    field = f"(({hlsl_word(word)} >> {shift}u) & {((1 << bits) - 1):#x}u)"
+                    if subword.startswith("s"):
+                        sign = f"{1 << (bits - 1):#x}u"
+                        field = f"(({field} ^ {sign}) - {sign})"
+                    word = ("alu", field)
+                loading[reg] = word
         elif m := re.fullmatch(r"(?:buffer_store_dword(?:x([234]))?|"
                                r"tbuffer_store_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
                                r"(v\d+|v\[\d+:\d+\]), (off|v\d+|v\[\d+:\d+\]), s\[(\d+):(\d+)\], 0"
