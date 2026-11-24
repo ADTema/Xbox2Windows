@@ -342,6 +342,13 @@ KNOWN_RDNA2_BASE_OPCODES = {
 }
 
 
+# Scalar program-control and compare-immediate forms the disassembler decodes: recognition only, no lowering.
+KNOWN_RDNA2_BASE_OPCODES |= {
+    "s_wakeup", "s_setkill", "s_sethalt", "s_sendmsg", "s_sendmsghalt", "s_icache_inv", "s_incperflevel",
+    "s_decperflevel", "s_ttracedata", "s_ttracedata_imm", "s_endpgm_saved", "s_endpgm_ordered_ps_done",
+    "s_wait_idle", "s_waitcnt_depctr", "s_denorm_mode", "s_call_b64",
+}
+
 KNOWN_RDNA2_BASE_OPCODES |= (
     SUPPORTED_ALU
     | {f"v_{name}" for name in PIXEL_INTEGER}
