@@ -3801,6 +3801,26 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_acphal_hal_provider_faulty>" "$<TARGET_FILE:cpu_exe_io>")
     set_tests_properties(cpu_native_acphal_hal PROPERTIES TIMEOUT 60)
 
+    add_library(cpu_gameinput_provider SHARED tests/cpu/gameinput_provider.cpp tests/cpu/gameinput_provider.def)
+    foreach(variant IN ITEMS create_fail other_thread shifted_layout)
+        string(TOUPPER "${variant}" variant_define)
+        add_library(cpu_gameinput_provider_${variant} SHARED
+            tests/cpu/gameinput_provider.cpp tests/cpu/gameinput_provider.def)
+        target_compile_definitions(cpu_gameinput_provider_${variant} PRIVATE GAMEINPUT_TEST_${variant_define})
+    endforeach()
+    add_library(cpu_gameinput_provider_wrong SHARED tests/cpu/gameinput_provider.cpp tests/cpu/gameinput_provider_wrong.def)
+    add_executable(cpu_gameinput_caller tests/cpu/gameinput_caller.asm tests/cpu/exe_startup.asm)
+    set_target_properties(cpu_gameinput_caller PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_gameinput_caller PRIVATE /ENTRY:native_startup /EXPORT:native_entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+    target_link_libraries(cpu_gameinput_caller PRIVATE cpu_gameinput_provider cpu_exe_io)
+    add_test(NAME cpu_native_gameinput COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/gameinput_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_gameinput_caller>" "$<TARGET_FILE:cpu_gameinput_provider>"
+        "$<TARGET_FILE:cpu_gameinput_provider_create_fail>" "$<TARGET_FILE:cpu_gameinput_provider_other_thread>"
+        "$<TARGET_FILE:cpu_gameinput_provider_shifted_layout>" "$<TARGET_FILE:cpu_gameinput_provider_wrong>"
+        "$<TARGET_FILE:cpu_exe_io>")
+    set_tests_properties(cpu_native_gameinput PROPERTIES TIMEOUT 120)
+
     add_library(cpu_xapu_queue_provider SHARED tests/cpu/xapu_queue_provider.cpp tests/cpu/xapu_queue_provider.def)
     add_library(cpu_xapu_queue_provider_lenient SHARED tests/cpu/xapu_queue_provider.cpp tests/cpu/xapu_queue_provider.def)
     target_compile_definitions(cpu_xapu_queue_provider_lenient PRIVATE XAPU_TEST_LENIENT)

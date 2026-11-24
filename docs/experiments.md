@@ -4984,6 +4984,37 @@ ctest --preset dev --no-tests=error -R '^cpu_native_xapu_queue$' -V
 ctest --preset release --no-tests=error -R '^cpu_native_xapu_queue$' -V
 ```
 
+### GameInput ordinal 1 caller and recorder
+
+A source-built caller ([`gameinput_caller.asm`](../tests/cpu/gameinput_caller.asm)) imports `GameInput.dll` ordinal 1 with no name, as the statically read console caller in #1056 does, plus one named query export of the test provider and `finish_exe` from `cpu_exe_io.dll`. It starts through [`exe_startup.asm`](../tests/cpu/exe_startup.asm). A test-only recording provider ([`gameinput_provider.cpp`](../tests/cpu/gameinput_provider.cpp)) exports `GameInputCreate` at ordinal 1 (`NONAME`) and serves the v0 objects. This is not a production `GameInput.dll`.
+
+- **Public evidence:** the v0 interfaces, method order, structures and error codes follow the Windows SDK header `um/GameInput.h` (10.0.26100.0) and the GameInput reference on Microsoft Learn, which documents the v0 header as static across the GDK, the NuGet package and the Windows SDK. The provider restates the declarations it needs and pins their sizes and offsets with `static_assert`.
+- **Observed call shapes reproduced (#1056):** ordinal 1 with one argument; `IGameInput` slots 4, 5, 6, 9, 13 and 16; `IGameInputReading` slots 14, 15 and 22; `IGameInputDevice` slots 3 and 10. The keyboard registration is made while the caller holds a recursive lock that its device callback takes again.
+- **Fixture policy (not console evidence):** one synthetic gamepad and one keyboard with fixed 32-byte IDs, three-entry reading histories, callbacks for blocking enumeration delivered synchronously on the registering thread, kinds other than gamepad and keyboard refused, and every refusal code.
+- **Verified cases** (identical under the Windows loader and `pe_map`):
+  1. A null output returns `E_POINTER`. Ordinal 1 returns an object, and a second call returns the same object.
+  2. The keyboard callback with blocking enumeration runs once during registration, on the registering thread, while the caller holds its lock. It sees the keyboard's ID at `GetDeviceInfo()` + `0x20`.
+  3. The gamepad callback runs once during registration with the caller's context and the gamepad's ID.
+  4. Registering the mouse kind returns `E_INVALIDARG` with the token untouched.
+  5. `GetGamepadState` fills the 28 zeroed bytes of the current reading. The reading before it, requested relative to the current one, returns the earlier state.
+  6. The current keyboard reading reports 3 keys in 12-byte entries, including an E0-prefixed scan code (`0xE04B`) and right Shift. The next reading returns `GAMEINPUT_E_READING_NOT_FOUND` (`0x838A0003`) with a null output.
+  7. `FindDeviceFromId` with the gamepad's own ID returns the same device, and `SetRumbleState` receives 0.5 for both motors and 0 for both triggers. An all-zero ID returns `GAMEINPUT_E_DEVICE_NOT_FOUND` (`0x838A0002`).
+  8. Unregistering with 5000 µs and with an infinite timeout returns `true`, and a second unregister returns `false`. Afterwards, the caller holds no references.
+  9. The checker reads back the provider records after the `pe_map` run: 3 create calls (1 refused), 3 registrations (1 refused), 2 callbacks with none on another thread, 4 reading requests (1 refused), 1 rumble call with zero trigger values, no calls to unused slots and no outstanding references.
+- **Controls:**
+  - A provider whose ordinal 1 fails stops the caller at Step 1 (`0xF01`).
+  - A provider that delivers the blocking-enumeration callback on another thread and waits for it stops the caller at Step 2 (`0xF02`). The caller's bounded lock spin reports it instead of deadlocking.
+  - A provider that writes the gamepad state 4 bytes late stops the caller at Step 5 (`0xF05`).
+  - Withholding ordinal 1 stops `pe_map` before entry with `unresolved import GameInput.dll!#1` and no provider calls. A provider that exports the function at ordinal 2 stops `pe_map` with the same diagnostic. The Windows loader refuses it with `0xC0000138` (`STATUS_ORDINAL_NOT_FOUND`).
+  - With no provider binding, `pe_map` stops before entry. The Windows loader then searches the system directory. On a machine with `System32\GameInput.dll`, it loads that DLL and refuses the test's named export (`0xC0000139`). Otherwise it reports `0xC0000135`.
+
+On success the caller exits with `0x6A1`, also with `CPU_CRC_TEST_LIVE_WORKER=1` under the Windows loader. The fixture shows that a provider satisfying these call shapes is distinguishable from one that breaks them under both loaders. It does not establish the console runtime's callback thread, history depth, scan-code encoding or refusal codes. Run:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_gameinput$' -V
+ctest --preset release --no-tests=error -R '^cpu_native_gameinput$' -V
+```
+
 ### DirectStorage factory and queue adapter
 
 This fixture exercises the DirectStorage initialization sequence and submission controls. The source-built caller ([`dstorage_caller.asm`](../tests/cpu/dstorage_caller.asm)) imports `DStorageGetFactory` by name from `xcrdapi.dll` and `finish_exe` from `cpu_exe_io.dll`, starting through [`exe_startup.asm`](../tests/cpu/exe_startup.asm). Under a controlled adapter provider ([`dstorage_provider.cpp`](../tests/cpu/dstorage_provider.cpp)), it verifies factory acquisition, staging buffer configuration, queue creation, delayed submission, and exact readback:
