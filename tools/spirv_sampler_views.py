@@ -11,19 +11,23 @@ BRIDGE = "%bridge_cmp"
 BRIDGE_SET = "3"
 
 
-def strip_comment(line):
-    """Drop a trailing `;` comment, leaving any `;` inside a quoted string alone."""
-    quoted = escaped = False
-    for position, char in enumerate(line):
-        if quoted and escaped:
-            escaped = False
-        elif quoted and char == "\\":
-            escaped = True
-        elif char == '"':
-            quoted = not quoted
-        elif char == ";" and not quoted:
-            return line[:position].rstrip()
-    return line
+def strip_comments(assembly):
+    """Split into lines and drop `;` comments; a quoted string may span lines and may hold a `;`."""
+    lines, quoted, escaped = [], False, False
+    for line in assembly.splitlines():
+        end = len(line)
+        for position, char in enumerate(line):
+            if quoted and escaped:
+                escaped = False
+            elif quoted and char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = not quoted
+            elif char == ";" and not quoted:
+                end = position
+                break
+        lines.append(line[:end].rstrip() if end < len(line) else line)
+    return lines
 
 
 def read_module(lines):
@@ -157,7 +161,7 @@ def bridge_names(module, split):
 def split_sampler_views(assembly):
     if "Dref" not in assembly:
         return assembly
-    lines = [strip_comment(line) for line in assembly.splitlines()]
+    lines = strip_comments(assembly)
     module = read_module(lines)
     defs = module["defs"]
     tables, plains = sampler_variables(defs)

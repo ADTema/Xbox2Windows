@@ -203,6 +203,12 @@ def check_sampler_tables(source, folder, assembler, validator, cross):
     assert split_lines(commented) == split_lines(named), "a comment changed the result"
     assert any(line.startswith("OpEntryPoint") and line.endswith("%out %bridge_cmp") for line in split_lines(commented))
     emit_checked(split_sampler_views(commented), folder, assembler, validator, cross)
+    # A string that spans lines keeps its closing quote even when a continuation line holds a semicolon.
+    multiline = source.replace("OpDecorate %texture DescriptorSet 0",
+                               '%text = OpString "first line\nint tmp = 0; }"\nOpDecorate %texture DescriptorSet 0', 1)
+    assert multiline != source
+    assert 'int tmp = 0; }"' in split_sampler_views(multiline).splitlines()
+    emit_checked(split_sampler_views(multiline), folder, assembler, validator, cross)
     # A sparse ordinary sample is still an ordinary use of the table (text-level: no residency capability here).
     sparse = source.replace("%raw = OpImageSampleImplicitLod %vec4 %si %uv", "%raw = OpImageSparseSampleImplicitLod %vec4 %si %uv")
     assert sparse != source and any(line.startswith("OpDecorate %bridge_cmp ") for line in split_lines(sparse))
