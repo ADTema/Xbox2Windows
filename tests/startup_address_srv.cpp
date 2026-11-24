@@ -366,21 +366,24 @@ int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
 }
 
 // One-texel textures published by address (X2W_TEST_SINGLE_ELEMENT=2d or 3d), one 1x4 column per draw. The texel
-// sits at offset 0 of its memory whatever the layout field says. Column 3 follows eleven refused descriptions
-// and must still show the view published before them; the last is a flagless view over a GPU-written resource.
+// sits at offset 0 of its memory whatever the layout field says. Before column 3 the column-2 texel is rewritten
+// without a new publication, then fifteen calls are refused; each names memory holding another texel, so any of
+// them taking the descriptor would change column 3.
 int draw_single_element_srvs(void* guest, void* list)
 {
     wchar_t mode[4]{};
     GetEnvironmentVariableW(L"X2W_TEST_SINGLE_ELEMENT", mode, 4);
     const bool volume = mode[0] == L'3';
-    alignas(256) static unsigned char memory[5][256];
+    alignas(256) static unsigned char memory[8][256];
     const unsigned char a[] = {0x11, 0x22, 0x33, 0xff}, b[] = {0xc0, 0x40, 0x80, 0xff}, c[] = {0x5a, 0xa5, 0x3c, 0xff};
+    const unsigned char d[] = {0x81, 0x18, 0xe7, 0xff}, other[] = {0xde, 0xad, 0xbe, 0xef};
     const unsigned char bgra[] = {0x10, 0x20, 0xf0, 0xff};
     const std::uint16_t half[] = {0x3400, 0x3a00, 0x3c00, 0x3c00};  // 0.25, 0.75, 1, 1
     std::memcpy(memory[0], a, 4);
     std::memcpy(memory[1], b, 4);
     std::memcpy(memory[2], bgra, 4);
     std::memcpy(memory[3], half, 8);
+    for (int row : {4, 5, 7}) std::memcpy(memory[row], other, 4);
     Word cpu = 0;
     if (!bind_view_table(guest, list, cpu)) return 42;
     const auto texel = [&](DXGI_FORMAT format, UINT layout) {
@@ -408,9 +411,10 @@ int draw_single_element_srvs(void* guest, void* list)
     publish(swizzled, view_of(swizzled, ptr(memory[1]))); draw(1);
     std::memcpy(memory[0], c, 4);  // rewritten, then published again at the same address
     publish(rgba, view_of(rgba, ptr(memory[0]))); draw(2);
+    std::memcpy(memory[0], d, 4);  // rewritten without a new publication: column 3 must read it
     const auto refuse = [&](auto edit) {
         auto desc = rgba;
-        auto v = view_of(desc, ptr(memory[0]));
+        auto v = view_of(desc, ptr(memory[5]));
         edit(desc, v);
         publish(desc, v);
     };
@@ -419,6 +423,8 @@ int draw_single_element_srvs(void* guest, void* list)
     refuse([](auto& d, auto&) { d.DepthOrArraySize = 2; });
     refuse([](auto& d, auto&) { d.SampleDesc.Count = 4; });
     refuse([](auto& d, auto&) { d.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x115); });  // 4 KiB S with XOR
+    refuse([](auto& d, auto&) { d.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x10b); });  // reserved mode
+    refuse([](auto& d, auto&) { d.Alignment = 0x400000; });
     refuse([](auto& d, auto& v) { d.Format = v.view.Format = DXGI_FORMAT_BC1_UNORM; });
     refuse([](auto& d, auto& v) { d.Format = v.view.Format = DXGI_FORMAT_R8_UNORM; });   // placed-texture path
     refuse([](auto& d, auto&) { d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS; });
@@ -426,19 +432,32 @@ int draw_single_element_srvs(void* guest, void* list)
         v.view.ViewDimension = volume ? D3D12_SRV_DIMENSION_TEXTURE2D : D3D12_SRV_DIMENSION_TEXTURE3D;
     });
     refuse([](auto&, auto& v) { v.view.Texture2D.MipLevels = 2; });
-    // A placed UAV texture at an address is written on the desktop side; a flagless view there stays refused.
+    refuse([](auto&, auto& v) { v.address = 0; });
+    // Placed UAV resources are written on the desktop side. A flagless view at the base of a 1x1 UAV texture,
+    // and one 256 bytes into a 512-byte UAV buffer, stay refused.
     auto written = rgba;
     written.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    void* uav = nullptr;
+    D3D12_RESOURCE_DESC written_buffer{};
+    written_buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    written_buffer.Width = 512;
+    written_buffer.Height = written_buffer.DepthOrArraySize = written_buffer.MipLevels = written_buffer.SampleDesc.Count = 1;
+    written_buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    written_buffer.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    void* uav[2]{};
     if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(memory[4]), ptr(&written), D3D12_RESOURCE_STATE_COMMON, 0,
-                                           ptr(&__uuidof(ID3D12Resource)), ptr(&uav))))) return 48;
+                                           ptr(&__uuidof(ID3D12Resource)), ptr(&uav[0])))) ||
+        FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(memory[6]), ptr(&written_buffer), D3D12_RESOURCE_STATE_COMMON, 0,
+                                           ptr(&__uuidof(ID3D12Resource)), ptr(&uav[1]))))) return 48;
     publish(rgba, view_of(rgba, ptr(memory[4])));
+    publish(rgba, view_of(rgba, ptr(memory[7])));
     draw(3);
     const auto bgra_desc = texel(DXGI_FORMAT_B8G8R8A8_UNORM, 0x100);
     publish(bgra_desc, view_of(bgra_desc, ptr(memory[2]))); draw(4);
     const auto half_desc = texel(DXGI_FORMAT_R16G16B16A16_FLOAT, 0x105);
     publish(half_desc, view_of(half_desc, ptr(memory[3]))); draw(5);
-    publish(rgba, view_of(rgba, 0)); draw(6);  // zero address: refused, column 5's view stays
-    publish(rgba, view_of(rgba, ptr(memory[0]))); draw(7);
+    draw(6);  // the same view again
+    auto aligned = rgba;
+    aligned.Alignment = 0x10000;
+    publish(aligned, view_of(aligned, ptr(memory[0]))); draw(7);
     return 0;
 }

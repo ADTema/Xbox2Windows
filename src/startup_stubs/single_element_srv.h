@@ -4,9 +4,11 @@
 
 namespace x2w_startup {
 // One texel, one mip, one sample, 2D or 3D. In every layout accepted here the only element sits at offset 0
-// of the title memory: UNKNOWN, linear (0x100) and the swizzle modes without pipe/bank XOR (0x101..0x10B; a
-// swizzle address is block index * block size + a bit pattern of the coordinates, both zero at the origin).
-// XOR modes (0x110 and up) can move the origin by the surface's pipe/bank XOR and are refused. Formats are
+// of the title memory: UNKNOWN, linear (0x100) and the GFX10 swizzle modes without pipe/bank XOR that AMD addrlib
+// defines (256B_S/D 0x101/0x102, 4KB_S/D 0x105/0x106, 64KB_S/D 0x109/0x10A; a swizzle address is block index *
+// block size + a bit pattern of the coordinates, both zero at the origin). Reserved modes (0x103, 0x104, 0x107,
+// 0x108, 0x10B) and XOR modes (0x110 and up, which can move the origin by the surface's pipe/bank XOR) are
+// refused, as is an alignment other than the default or 64 KiB, which the desktop texture cannot take. Formats are
 // plain colour formats whose element is one texel with the same bytes on desktop; R8_UNORM keeps its placed-
 // texture path, and block-compressed, planar, depth and packed console formats are refused. Returns the
 // element size in bytes, or 0 when the description is not such a texture.
@@ -15,8 +17,14 @@ inline UINT single_element_bytes(const D3D12_RESOURCE_DESC& r)
     const UINT layout = static_cast<UINT>(r.Layout);
     if ((r.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D && r.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) ||
         r.Width != 1 || r.Height != 1 || r.DepthOrArraySize != 1 || r.MipLevels != 1 || r.SampleDesc.Count != 1 ||
-        r.SampleDesc.Quality != 0 || (layout != 0 && (layout < 0x100 || layout > 0x10B)))
+        r.SampleDesc.Quality != 0 || (r.Alignment != 0 && r.Alignment != 0x10000))
         return 0;
+    switch (layout) {
+    case 0: case 0x100: case 0x101: case 0x102: case 0x105: case 0x106: case 0x109: case 0x10A:
+        break;
+    default:
+        return 0;
+    }
     // GPU-written textures are never uploaded from title memory.
     if (r.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))

@@ -2,13 +2,14 @@
 
 Each run draws eight 1x4 columns from a translated pixel shader that loads texel (0, 0, 0):
   0  RGBA8, layout UNKNOWN            1  RGBA8, layout 0x105 (another address)
-  2  the column-0 texel rewritten and published again; it must read the new value
-  3  after eleven refused calls (2x1, two mips, two slices, four samples, XOR layout 0x115, BC1, R8,
-     a UAV flag, the other view dimension, a two-mip view, and a flagless view over a placed UAV texture,
-     whose texels live on the desktop side): the column-2 view must be unchanged
+  2  the column-0 texel rewritten and published again
+  3  the same texel rewritten again without a new publication (it must read the new value, in the same frame),
+     after fifteen refused calls that each name memory holding another texel: 2x1, two mips, two slices, four
+     samples, XOR layout 0x115, reserved layout 0x10b, 4 MiB alignment, BC1, R8, a UAV flag, the other view
+     dimension, a two-mip view, a zero address, and flagless views at the base of a placed UAV texture and
+     256 bytes into a placed UAV buffer
   4  B8G8R8A8, layout 0x100           5  R16G16B16A16_FLOAT, layout 0x105
-  6  a zero address after column 5: refused, column 5's view stays
-  7  the column-0 address and description again
+  6  column 5's view drawn again      7  the column-0 address with 64 KiB alignment
 Usage: startup_single_element_srv_check.py <startup_stream_consumer> <hardware|warp>
 Without the single-element path every column except 3 and 6 reads a null view (zero).
 """
@@ -21,12 +22,13 @@ from startup_address_srv_check import draw_texture
 A = (0x11, 0x22, 0x33, 0xff)
 B = (0xc0, 0x40, 0x80, 0xff)
 C = (0x5a, 0xa5, 0x3c, 0xff)
+D = (0x81, 0x18, 0xe7, 0xff)
 BGRA = (0xf0, 0x20, 0x10, 0xff)
 HALF = (64, 191, 255, 255)  # 0.25, 0.75, 1, 1 as UNORM8
 
 
 def expected():
-    columns = [A, B, C, C, BGRA, HALF, HALF, C]
+    columns = [A, B, C, D, BGRA, HALF, HALF, D]
     return bytes(c for _ in range(4) for column in columns for c in column)
 
 
@@ -46,7 +48,7 @@ def check(directory, consumer, backend, dimension):
                 raise AssertionError(f"{dimension} column {(i // 4) % 8} row {i // 32}: actual {actual[i:i + 4].hex()} "
                                      f"expected {want[i:i + 4].hex()}")
         raise AssertionError(f"{dimension}: readback length {len(actual)}, expected {len(want)}")
-    print(f"{backend} {dimension}: 8 columns of one-texel views exact, eleven refused calls kept the previous view")
+    print(f"{backend} {dimension}: 8 columns of one-texel views exact, fifteen refused calls kept the previous view")
     return 0
 
 

@@ -1,6 +1,7 @@
 // x2w_startup::single_element_bytes and supports_single_element_srv (src/startup_stubs/single_element_srv.h)
 // without a device. Accepted: 1x1 2D and 1x1x1 3D textures with one mip and one sample, layout UNKNOWN, linear
-// or a swizzle mode without XOR, a plain colour format and a view naming the whole texture. Each refused case
+// or a defined GFX10 swizzle mode without XOR, default or 64 KiB alignment, a plain colour format and a view naming
+// the whole texture. Each refused case
 // differs from an accepted one in a single field.
 // --mutate xor: expect the XOR layout 0x115 to be accepted (a negative control).
 #include "startup_stubs/single_element_srv.h"
@@ -56,7 +57,9 @@ int main(int argc, char** argv)
         edited("3D RGBA8 layout UNKNOWN", d3, 4, true, none),
         edited("3D RGBA8 linear 0x100", d3, 4, true, [](auto& d, auto&) { d.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x100); }),
         edited("2D RGBA8 4 KiB S 0x105", d2, 4, true, [](auto& d, auto&) { d.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x105); }),
-        edited("3D RGBA8 64 KiB R 0x10b", d3, 4, true, [](auto& d, auto&) { d.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x10b); }),
+        edited("3D RGBA8 64 KiB D 0x10a", d3, 4, true, [](auto& d, auto&) { d.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x10a); }),
+        edited("2D RGBA8 256 B S 0x101", d2, 4, true, [](auto& d, auto&) { d.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101); }),
+        edited("3D 64 KiB alignment", d3, 4, true, [](auto& d, auto&) { d.Alignment = 0x10000; }),
         edited("3D R16G16B16A16_FLOAT", d3, 8, true, [](auto& d, auto& v) { d.Format = v.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; }),
         edited("2D R32G32B32A32_FLOAT", d2, 16, true, [](auto& d, auto& v) { d.Format = v.Format = DXGI_FORMAT_R32G32B32A32_FLOAT; }),
         edited("2D R16_FLOAT", d2, 2, true, [](auto& d, auto& v) { d.Format = v.Format = DXGI_FORMAT_R16_FLOAT; }),
@@ -77,6 +80,13 @@ int main(int argc, char** argv)
                [](auto& d, auto&) { d.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x115); }),
         edited("64 KiB Z T 0x110", d3, 0, false, [](auto& d, auto&) { d.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x110); }),
         edited("reserved mode 0x10c", d3, 0, false, [](auto& d, auto&) { d.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x10c); }),
+        edited("reserved mode 0x103", d2, 0, false, [](auto& d, auto&) { d.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x103); }),
+        edited("reserved mode 0x104", d3, 0, false, [](auto& d, auto&) { d.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x104); }),
+        edited("reserved mode 0x107", d2, 0, false, [](auto& d, auto&) { d.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x107); }),
+        edited("reserved mode 0x108", d3, 0, false, [](auto& d, auto&) { d.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x108); }),
+        edited("reserved mode 0x10b", d3, 0, false, [](auto& d, auto&) { d.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x10b); }),
+        edited("4 KiB alignment", d2, 0, false, [](auto& d, auto&) { d.Alignment = 0x1000; }),
+        edited("4 MiB alignment", d3, 0, false, [](auto& d, auto&) { d.Alignment = 0x400000; }),
         edited("ROW_MAJOR", d2, 0, false, [](auto& d, auto&) { d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR; }),
         // Flags and formats.
         edited("render-target flag", d2, 0, false, [](auto& d, auto&) { d.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET; }),

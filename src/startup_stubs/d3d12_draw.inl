@@ -736,8 +736,9 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     const u64 total = tiled_chain ? x2w_startup::bc64::Chain(original->console).bytes() : tiled && !single ? surface.size() : stride * (slices - 1) + slice_total;
     const bool announced = state.generation != generation;
     const UINT elapsed = static_cast<UINT>(frame_number) - static_cast<UINT>(state.checked_frame);
-    const bool recheck = (tiled_address || tiled_chain) ? elapsed != 0
-        : x2w_startup::recheck_cpu_texture(desc, total, elapsed);
+    // A single texel (at most 16 bytes) is rehashed on every bind, so a write between two draws is seen.
+    const bool recheck = single || ((tiled_address || tiled_chain) ? elapsed != 0
+        : x2w_startup::recheck_cpu_texture(desc, total, elapsed));
     if (state.done && !announced && !recheck) return;
     if (readable_window(reinterpret_cast<u64>(memory), static_cast<std::size_t>(total)) < total) {
         if (!state.done) InterlockedIncrement(&textures_unreadable);
