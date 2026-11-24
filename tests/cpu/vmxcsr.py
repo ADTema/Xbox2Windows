@@ -31,7 +31,21 @@ EXPORTS = (*mxcsr.EXPORTS, *MIXED)
 # (c4 e1 f8 ae 10 is still VLDMXCSR), so it is not among them.
 MALFORMED = {"VEX.L=1": "c5fcae10", "VEX.L=1 three-byte": "c4e17cae10", "vvvv!=1111": "c5b8ae10",
              "pp=01": "c5f9ae10", "register operand": "c5f8aed0", "map 0F38": "c4e278ae10"}
-CONTROLS = {"noload": [("_mm_setcsr(want);", "(void)want;")], "fixed": [(", _mm_getcsr());", ", 0x1f80u);")]}
+# Undefined encodings next to VSTMXCSR [rax] (c5 f8 ae 18, the /3 form), same defects as above.
+MALFORMED_STORE = {"VEX.L=1": "c5fcae18", "VEX.L=1 three-byte": "c4e17cae18", "vvvv!=1111": "c5b8ae18",
+                   "pp=01": "c5f9ae18", "register operand": "c5f8aed8", "map 0F38": "c4e278ae18"}
+# The valid VEX.128 forms the malformed ones above are one defect away from, with the marker each lowers to.
+WELL_FORMED = {"VLDMXCSR": ("c5f8ae10", "_mm_setcsr(want)"), "VLDMXCSR VEX.W=1": ("c4e1f8ae10", "_mm_setcsr(want)"),
+               "VSTMXCSR": ("c5f8ae18", "_mm_getcsr()"), "VSTMXCSR VEX.W=1": ("c4e1f8ae18", "_mm_getcsr()")}
+CONTROLS = {"noload": [("_mm_setcsr(want);", "(void)want;")], "fixed": [(", _mm_getcsr());", ", 0x1f80u);")],
+            # The unmasked-exception refusal never fires, so mxcsr_after loads 0x1d80.
+            "unmasked": [("(want & 0x1f80u) != 0x1f80u", "(want & 0x1f80u) == 0x1f81u")]}
+# One instruction of a mixed export each: variant -> (export, literal, replacement). The control must break a rule
+# in that export, so each of its four MXCSR instructions has a check that notices when it is wrong.
+SINGLE = {"mixldload": ("mix_ld_vst", "_mm_setcsr(want);", "(void)want;"),
+          "mixvstread": ("mix_ld_vst", ", _mm_getcsr());", ", 0x1f80u);"),
+          "mixvldload": ("mix_vld_st", "_mm_setcsr(want);", "(void)want;"),
+          "mixstread": ("mix_vld_st", ", _mm_getcsr());", ", 0x1f80u);")}
 
 
 def emit(image, output, variant="lifted"):
@@ -41,6 +55,11 @@ def emit(image, output, variant="lifted"):
             (bounds,) = function_ranges(pe, export_rva(pe, name))
             code = lower(region(pe, *bounds), ["rcx = a; rdx = b; r8 = c; r9 = state;"], {}, {}, {},
                          host_mxcsr=Mxcsr(mxcsr.REJECT))
+            if variant in SINGLE and SINGLE[variant][0] == name:
+                _, literal, replacement = SINGLE[variant]
+                if code.count(literal) != 1:
+                    raise AssertionError(f"variant {variant}: expected one {literal!r} in {name}")
+                code = code.replace(literal, replacement)
             parts.append(f"static __declspec(noinline) word {name}_body(word a, word b, word c, word state, "
                          f"int* mxcsr_status) {{\n{code}\n}}\n")
             parts.append(mxcsr_entry(name, f"{name}_body"))
@@ -72,6 +91,30 @@ def rejected_by_default(image):
                 else:
                     raise AssertionError(f"{name}: the default profile lowered {site}")
     return refused
+
+
+def malformed_lowering():
+    """Malformed VEX loads and stores are refused by the lowering itself, at their address, in the host-MXCSR
+    profile, and the well-formed forms next to them (VEX.W included) lower to the host MXCSR access."""
+    start = 0x1000
+    for form, table in (("VLDMXCSR", MALFORMED), ("VSTMXCSR", MALFORMED_STORE)):
+        for label, hex_bytes in table.items():
+            body = list(Decoder(64, bytes.fromhex(hex_bytes) + b"\xc3", ip=start))
+            if not body[0].is_invalid:
+                raise AssertionError(f"{form} {label} ({hex_bytes}) decodes as {body[0]}, expected invalid")
+            try:
+                lower(body, [], {}, {}, {}, host_mxcsr=Mxcsr(mxcsr.REJECT))
+            except ValueError as exc:
+                if f"{start:#x}" not in str(exc):
+                    raise AssertionError(f"{form} {label}: the refusal does not name {start:#x}: {exc}")
+            else:
+                raise AssertionError(f"{form} {label} ({hex_bytes}) was lowered")
+    for label, (hex_bytes, marker) in WELL_FORMED.items():
+        body = list(Decoder(64, bytes.fromhex(hex_bytes) + b"\xc3", ip=start))
+        code = lower(body, ["rcx = a; rdx = b; r8 = c; r9 = state;"], {}, {}, {}, host_mxcsr=Mxcsr(mxcsr.REJECT))
+        if body[0].is_invalid or marker not in code:
+            raise AssertionError(f"{label} ({hex_bytes}) did not lower to {marker}: {code}")
+    return len(MALFORMED) + len(MALFORMED_STORE)
 
 
 def malformed_refused():
@@ -145,12 +188,22 @@ def check_translated(harness_path, native_path, lifted_path, *extra_paths):
                 print(f"{stem}: the /O2 build keeps every rule ({reads})")
                 continue
             variant = stem.rsplit("_", 1)[-1]
-            problem = mxcsr.lifted_violation(host, None, load(path), f"control {variant}")
+            problem = (mxcsr.lifted_violation(host, None, load(path), f"control {variant}")
+                       or mixed_violation(host, load(path), f"control {variant}"))
             print(f"control {variant}: {problem}")
             if problem is None:
                 raise AssertionError(f"control {variant} kept every rule")
+            if variant in SINGLE and f" {SINGLE[variant][0]}(" not in problem:
+                raise AssertionError(f"control {variant} broke a rule, but not in {SINGLE[variant][0]}: {problem}")
     finally:
         host.set(original)
+
+
+def check_malformed():
+    """The lowering alone, no fixture: runs wherever the Python tools run."""
+    count = malformed_lowering()
+    print(f"{count} malformed VEX loads and stores are refused by the lowering at their address; the well-formed "
+          "forms, VEX.W included, lower to the host MXCSR access")
 
 
 CHILD = """
@@ -226,6 +279,6 @@ if __name__ == "__main__":
         emit(Path(image), Path(output), *variant)
     elif mode == "check":
         part, *rest = args
-        {"translated": check_translated, "native": check_native}[part](*rest)
+        {"translated": check_translated, "native": check_native, "malformed": check_malformed}[part](*rest)
     else:
         raise ValueError(mode)

@@ -2703,7 +2703,7 @@ if(EXISTS "${INTAKE_PYTHON}")
     # own test and exits 77 on a host that cannot execute VEX instructions.
     cpu_asm_fixture(cpu_vmxcsr vmxcsr)
     set(vmxcsr_controls)
-    foreach(variant IN ITEMS lifted noload fixed)
+    foreach(variant IN ITEMS lifted noload fixed unmasked mixldload mixvstread mixvldload mixstread)
         set(vmxcsr_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_vmxcsr_${variant}.cpp")
         add_custom_command(OUTPUT "${vmxcsr_fixture}"
             COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/vmxcsr.py"
@@ -2724,6 +2724,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_vmxcsr COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/vmxcsr.py"
         check translated "$<TARGET_FILE:cpu_mxcsr_harness>" "$<TARGET_FILE:cpu_vmxcsr>" "$<TARGET_FILE:cpu_vmxcsr_lifted>"
         ${vmxcsr_controls} "${vmxcsr_o2}")
+    # The lowering alone refuses every malformed VEX load and store and lowers their well-formed neighbours.
+    add_test(NAME cpu_aot_vmxcsr_malformed COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/vmxcsr.py"
+        check malformed)
     add_test(NAME cpu_aot_vmxcsr_native COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/vmxcsr.py"
         check native "$<TARGET_FILE:cpu_mxcsr_harness>" "$<TARGET_FILE:cpu_vmxcsr>" "$<TARGET_FILE:cpu_vmxcsr_lifted>")
     set_tests_properties(cpu_aot_vmxcsr_native PROPERTIES SKIP_RETURN_CODE 77)
