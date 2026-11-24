@@ -306,6 +306,15 @@ These are measured on one executable; treat them as hypotheses for others.
   The source-built 2D draw reads distinct colors from mips zero and two, and a wrong-mip
   reference must fail at pixel (0, 0). The 3D case checks nonconsecutive address registers
   during translation. Run `ctest --preset release --no-tests=error -R '^startup_image_load_mip_' -V`.
+- **2D array images.** `image_sample`, `image_sample_lz`, `image_sample_l` and `image_load` with
+  `dim:SQ_RSRC_IMG_2D_ARRAY` use a `Texture2DArray<float4>` (manifest kind `tex2da`). The slice is
+  the third address component, as `float3(u, v, slice)` for a sample and `int4(x, y, slice, 0)`
+  for a load. Before, the stage was refused and every draw through its pipeline was skipped.
+  Two source-built pixel stages draw one texel of a 2x2 texture with two slices on WARP and
+  hardware with DXC and FXC; a slice fixed to 0 and exchanged coordinates fail it
+  (`ctest --preset release --no-tests=error -R "^startup_image_2d_array_"`). Cube, multisampled
+  and 1D images are still refused. Not covered: an array with mip levels in `image_load`
+  (`image_load_mip`), and binding a single-slice 2D view to an array declaration in the draw path.
 - **Flat parameters.** `v_interp_mov_f32` reads a `nointerpolation uint4` copy written from the
   exported registers, so integer words reach the pixel stage unchanged. FXC folds `asfloat()` of a
   constant and flushes binary32 denormal patterns such as 1 or 2 to 0, which a float copy lost
@@ -362,7 +371,7 @@ These are measured on one executable; treat them as hypotheses for others.
   The source-built readback uses `ctest --preset dev --no-tests=error -R '^startup_sampler_heap_' -V`.
 - The startup shader translator lowers `image_sample_l` (explicit level, 2D and 3D, any `dmask`) to
   `SampleLevel(sampler, uv, level)`, taking the level from the last address register. Offset, compare,
-  gather, clamp, cube, array, 1D and `unorm` forms are refused. Only the translation is checked
+  gather, clamp, cube, 1D and `unorm` forms are refused. Only the translation is checked
   (`python -B tests/startup_image_sample_l_check.py`); a WARP readback of distinct mip levels is still open.
 - Slot 86 graphics streams can submit VS/PS requests to the offline cache. The fixture sends
   complete shader containers and a wrapped root through WARP, runs `gfx2hlsl.py --pending`, and

@@ -680,9 +680,12 @@ class Stage:
         dst = reg_range(ops[0])
         dim = [m for m in mods if m.startswith('dim:')][0][4:]
         dmask = int([m for m in mods if m.startswith('dmask:')][0][6:], 0)
-        if dim not in ('SQ_RSRC_IMG_2D', 'SQ_RSRC_IMG_3D'):
+        kinds = {'SQ_RSRC_IMG_2D': 'tex2d', 'SQ_RSRC_IMG_3D': 'tex3d', 'SQ_RSRC_IMG_2D_ARRAY': 'tex2da'}
+        if dim not in kinds:
             raise Unsupported('image dimension %s' % dim)
-        three = dim == 'SQ_RSRC_IMG_3D'
+        # A 2D array takes the slice as its third address component, where a volume takes z. Sample and
+        # Load on a Texture2DArray take it in the same place, so only the declared type differs.
+        three = dim != 'SQ_RSRC_IMG_2D'
         coords = ops[1]
         if coords.startswith('['):
             cs = [c.strip() for c in coords[1:-1].split(',')]
@@ -704,7 +707,9 @@ class Stage:
             if len(cs) != (4 if three else 3):
                 raise Unsupported('image_sample_l with %d address registers' % len(cs))
             lod, cs = cs[-1], cs[:-1]
-        tex = self.pipe.resource(self.descriptor(ops[2]), 'tex3d' if three else 'tex2d')
+        if how == 'load_mip' and dim == 'SQ_RSRC_IMG_2D_ARRAY':
+            raise Unsupported('image_load_mip on a 2D array')
+        tex = self.pipe.resource(self.descriptor(ops[2]), kinds[dim])
         if how in ('load', 'load_mip'):
             axes = 3 if three else 2
             mip = '0'
@@ -1098,7 +1103,7 @@ class Pipeline:
                'return (lo >> k) | (b.Load((a & ~3u) + 4) << (32 - k)); }',
                'cbuffer entry : register(b0) { %s };' % ' '.join('uint ud%d;' % i for i in range(len(self.uds)))]
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
-            out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'tex2d': 'Texture2D<float4>', 'tex3d': 'Texture3D<float4>'}[r['kind']], r['index'], r['index']))
+            out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>', 'tex3d': 'Texture3D<float4>'}[r['kind']], r['index'], r['index']))
         for key, i in self.samplers.items():
             out.append('SamplerState q%d : register(s%d);' % (i, i))
         if self.uses_sampler_heap:
