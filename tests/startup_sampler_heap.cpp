@@ -6,8 +6,9 @@
 // full-screen vertex shader, then reads the colour back.
 //
 // The texture is 2x1 R32_FLOAT {0.25, 0.75}, sampled at u = 1.25 by the fixture shader. The table
-// holds point samplers: entry 0 wraps (texel 0, 0.25), entry 1 clamps (texel 1, 0.75), and every
-// other entry uses a transparent-black border (0.0), so the readback names the entry the shader used.
+// holds point samplers: entry 0 wraps (texel 0, 0.25), entry 1 clamps (texel 1, 0.75), entries 2 to
+// 2046 use a transparent-black border (0.0), and entry 2047, the fallback the shader picks for an
+// unaligned or out-of-range offset, uses a border of 0.5, so the readback names the entry used.
 #include "desktop_gpu.h"
 
 #include <cstdint>
@@ -62,7 +63,7 @@ ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device)
     return root;
 }
 
-D3D12_SAMPLER_DESC point_sampler(D3D12_TEXTURE_ADDRESS_MODE mode)
+D3D12_SAMPLER_DESC point_sampler(D3D12_TEXTURE_ADDRESS_MODE mode, float border = 0.0f)
 {
     D3D12_SAMPLER_DESC desc{};
     desc.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
@@ -70,7 +71,8 @@ D3D12_SAMPLER_DESC point_sampler(D3D12_TEXTURE_ADDRESS_MODE mode)
     desc.MaxAnisotropy = 1;
     desc.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
     desc.MaxLOD = D3D12_FLOAT32_MAX;
-    return desc;  // BorderColor stays transparent black
+    desc.BorderColor[0] = desc.BorderColor[1] = desc.BorderColor[2] = desc.BorderColor[3] = border;
+    return desc;
 }
 }  // namespace
 
@@ -140,7 +142,8 @@ float check_startup_sampler_heap(ID3D12Device* device, const char* vertex_path, 
     for (UINT i = 0; i < heap_size; ++i) {
         const auto desc = point_sampler(i == 0 ? D3D12_TEXTURE_ADDRESS_MODE_WRAP
                                         : i == 1 ? D3D12_TEXTURE_ADDRESS_MODE_CLAMP
-                                                 : D3D12_TEXTURE_ADDRESS_MODE_BORDER);
+                                                 : D3D12_TEXTURE_ADDRESS_MODE_BORDER,
+                                        i == heap_size - 1 ? 0.5f : 0.0f);
         auto handle = sampler_heap->GetCPUDescriptorHandleForHeapStart();
         handle.ptr += SIZE_T{i} * stride;
         device->CreateSampler(&desc, handle);

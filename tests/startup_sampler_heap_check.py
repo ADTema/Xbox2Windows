@@ -9,7 +9,8 @@
 The fixture is a source-built gfx1013 vertex+pixel pair. Its pixel stage loads a texture descriptor
 from table 0 and four sampler words from the sampler heap at the byte offset in root constant 1 (s9),
 then samples at (1.25, 0.5) and exports the result. tests/startup_sampler_heap.cpp binds a 2048-entry
-point-sampler table: entry 0 wraps (0.25), entry 1 clamps (0.75), the rest use a black border (0.0).
+point-sampler table: entry 0 wraps (0.25), entry 1 clamps (0.75), entries 2 to 2046 use a black border
+(0.0), and entry 2047, the fallback for unaligned or out-of-range offsets, uses a border of 0.5.
 """
 import os
 import re
@@ -91,12 +92,16 @@ def controls():
     pipe = translate(PS_WORDS, True)
     ps, manifest = pipe.hlsl_ps(), pipe.manifest()
     assert 'SamplerState qh[2048] : register(s0, space1);' in ps, ps
-    m = re.search(r'(\w+)\.Sample\(qh\[(s\d+) >> 4\], ', ps)
+    m = re.search(r'(\w+)\.Sample\(qh\[x2w_sampler_entry\((s\d+)\)\], ', ps)
     assert m, ps
     assert re.search(r'\b%s = ud1;' % m.group(2), ps), ps
-    assert 'udsrc 1 rootconst 1 0' in manifest and 'smpheap 2048 1' in manifest, manifest
+    guard = ('uint x2w_sampler_entry(uint offset) { return (offset & 15u) != 0 || offset >= 32752u ? 2047u : '
+             'offset >> 4; }')
+    assert guard in ps, ps
+    assert 'udsrc 1 rootconst 1 0' in manifest and 'smpheap 2048 1 fallback 2047' in manifest, manifest
     assert not re.search(r'^smp ', manifest, re.M) and not pipe.notes, (manifest, pipe.notes)
-    print('run-time offset: qh[%s >> 4] with %s = ud1 (root constant 1); manifest smpheap 2048 1' % (m.group(2), m.group(2)))
+    print('run-time offset: qh[x2w_sampler_entry(%s)] with %s = ud1 (root constant 1); unaligned or >= 32752 reads '
+          'entry 2047; manifest smpheap 2048 1 fallback 2047' % (m.group(2), m.group(2)))
 
     # A constant heap offset is still refused, with or without the table.
     for heap in (True, False):
@@ -165,7 +170,10 @@ def compile_hlsl(compiler, kind, source, out, profile, directory):
 
 def check_draw(dxc, renderer, adapter, fxc=None):
     # (pixel words, table byte offset, expected red bits)
-    cases = [(0, 0x3e800000), (16, 0x3f400000), (32, 0x00000000), (2047 * 16, 0x00000000)]
+    # Entries 0, 1 and 2, the last title entry (2046), the first out-of-range offset (2047 * 16), the
+    # largest offset and an unaligned one; the last three must read the fallback entry's 0.5 border.
+    cases = [(0, 0x3e800000), (16, 0x3f400000), (32, 0x00000000), (2046 * 16, 0x00000000),
+             (2047 * 16, 0x3f000000), (0xfffffff0, 0x3f000000), (8, 0x3f000000)]
     compilers = [('dxc', dxc, 'vs_6_0', 'ps_6_0')] + ([('fxc', fxc, 'vs_5_1', 'ps_5_1')] if fxc else [])
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
@@ -173,7 +181,9 @@ def check_draw(dxc, renderer, adapter, fxc=None):
             vs = compile_hlsl(compiler, kind, FULLSCREEN_VS, 'fullscreen_%s' % kind, vs_profile, directory)
             shader = compile_hlsl(compiler, kind, translate(PS_WORDS, True).hlsl_ps(), 'ps_%s' % kind, ps_profile, directory)
             # Negative control: the run-time shader with its index dropped must lose entry 1.
-            dropped = re.sub(r'qh\[s\d+ >> 4\]', 'qh[0]', translate(PS_WORDS, True).hlsl_ps())
+            guarded = translate(PS_WORDS, True).hlsl_ps()
+            dropped = re.sub(r'qh\[x2w_sampler_entry\(s\d+\)\]', 'qh[0]', guarded)
+            assert dropped != guarded
             mutant = compile_hlsl(compiler, kind, dropped, 'ps_dropped_%s' % kind, ps_profile, directory)
             for offset, expected, dropped_index in [c + (False,) for c in cases] + [(16, 0x3f400000, True)]:
                 run = subprocess.run([renderer, adapter, '--startup-sampler-heap', str(vs),

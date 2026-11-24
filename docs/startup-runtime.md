@@ -86,7 +86,7 @@ adds memory dumps to the stop report.
 | `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user |
 | `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return |
 | `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses (0x4 = A); keyboard and XInput pad 0 also work |
-| `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into a bounded table, `SamplerState qh[2048] : register(s0, space1)` indexed by offset / 16, and writes `smpheap 2048 1` to the manifest. The stand-in does not bind that table yet, so leave this off for startup runs ([#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143)) |
+| `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into a bounded table, `SamplerState qh[2048] : register(s0, space1)`, and writes `smpheap 2048 1 fallback 2047` to the manifest. Entries 0 to 2046 are the title's sampler-heap entries (entry n at byte offset 16 n); entry 2047 is reserved for a fallback sampler. The generated shader reads the fallback for an offset that is not a multiple of 16 or is at or past 2047 × 16, because the host cannot check an offset the shader computes. The stand-in does not bind that table yet, so leave this off for startup runs ([#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143)) |
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
 | `X2W_TRAP_CONTINUE=<exports>` | lets listed trap exports return 0 instead of ending the process |
 

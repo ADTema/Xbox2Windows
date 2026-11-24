@@ -250,8 +250,9 @@ class Stage:
         if any(self.sym.get(r[1] + i) != ('smpheap', first[1], i) for i in range(4)):
             raise Unsupported('sampler operand %s mixes sampler heap words' % tok)
         self.pipe.uses_sampler_heap = True
-        # Sampler descriptors are 16 bytes, so the byte offset selects entry offset / 16.
-        return 'qh[s%d >> 4]' % first[1]
+        # Sampler descriptors are 16 bytes; x2w_sampler_entry() maps the byte offset to its entry and
+        # sends unaligned or out-of-range offsets to the fallback entry.
+        return 'qh[x2w_sampler_entry(s%d)]' % first[1]
 
     def const_words(self, tok):
         r = reg_range(tok)
@@ -865,13 +866,21 @@ def parse_root(blob):
     raise Unsupported('no RTS0 part')
 
 
-# Run-time sampler heap indexing: an s_load from the sampler heap with a register offset becomes
-# qh[offset / 16] over a bounded table (SamplerState qh[SAMPLER_HEAP_SIZE] : register(s0, space1),
-# manifest line 'smpheap <count> <space>'), the form a desktop SM 5.1 / 6.0 shader can index at run
-# time. Opt-in with X2W_SAMPLER_HEAP=1 until the stand-in binds that table; otherwise such a load
-# keeps the default-sampler shortcut.
+# Run-time sampler heap indexing: an s_load from the sampler heap with a register offset becomes a
+# read of a bounded table, SamplerState qh[SAMPLER_HEAP_SIZE] : register(s0, space1), the form a
+# desktop SM 5.1 / 6.0 shader can index at run time. Opt-in with X2W_SAMPLER_HEAP=1 until the
+# stand-in binds that table; otherwise such a load keeps the default-sampler shortcut.
+#
+# Contract at the manifest boundary ('smpheap <count> <space> fallback <entry>'):
+# - entries 0 .. SAMPLER_HEAP_FALLBACK - 1 hold the title's sampler-heap entries, entry n at byte
+#   offset 16 * n;
+# - entry SAMPLER_HEAP_FALLBACK is reserved: the host fills it with a fallback sampler;
+# - the shader computes the entry itself (x2w_sampler_entry): a byte offset that is not a multiple
+#   of 16, or that lies at or past 16 * SAMPLER_HEAP_FALLBACK, reads the fallback entry. The host
+#   cannot check the offset, which is computed in the shader, so the guard is in the shader.
 SAMPLER_HEAP_SIZE = 2048  # D3D12's limit for a shader-visible sampler heap
 SAMPLER_HEAP_SPACE = 1
+SAMPLER_HEAP_FALLBACK = SAMPLER_HEAP_SIZE - 1
 
 
 class Pipeline:
@@ -924,6 +933,8 @@ class Pipeline:
             out.append('SamplerState q%d : register(s%d);' % (i, i))
         if self.uses_sampler_heap:
             out.append('SamplerState qh[%d] : register(s0, space%d);' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE))
+            out.append('uint x2w_sampler_entry(uint offset) { return (offset & 15u) != 0 || offset >= %du ? %du : offset >> 4; }'
+                       % (16 * SAMPLER_HEAP_FALLBACK, SAMPLER_HEAP_FALLBACK))
         return out
 
     def interface(self, for_pixel):
@@ -977,7 +988,7 @@ class Pipeline:
         for key, i in self.samplers.items():
             lines.append('smp %d %s' % (i, ' '.join('0x%x' % w for w in key)))
         if self.uses_sampler_heap:
-            lines.append('smpheap %d %d' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE))
+            lines.append('smpheap %d %d fallback %d' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE, SAMPLER_HEAP_FALLBACK))
         lines.append('params %d' % (max(self.params) + 1 if self.params else 0))
         lines.append('targets %s' % ' '.join(k[3:] for k in sorted(self.ps.exports) if k.startswith('mrt')))
         return '\n'.join(lines) + '\n'
