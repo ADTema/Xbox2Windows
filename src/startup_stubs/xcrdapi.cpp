@@ -246,7 +246,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
         for (int i = 0; i < 0x40; ++i) std::snprintf(bytes + 3 * i, 4, "%02x ", request[i]);
         log("x2w-dstorage Queue::EnqueueRequest [%s]", bytes);
     }
-    // Option bits (from the reference projects' notes, matched against this title's requests): bit 0
+    // Option bits (matched against the requests one executable makes): bit 0
     // zlib, bits 1-4 a BCPack BC format number, bit 21 a destination given as 64 KiB physical page
     // tokens (+0x10 low 16 bits: offset into the first page), bit 22 a memory source.
     const bool zlib = (options & 1) != 0;
