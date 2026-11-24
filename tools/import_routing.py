@@ -4,7 +4,7 @@ The policy classifies import module names only. It does not resolve exports,
 prove a provider, or load the image.
 """
 
-POLICY_VERSION = 1
+POLICY_VERSION = 2
 ROUTE_KIND = "candidate"
 RESOLUTION = "not_checked"
 ROUTES = ("hle", "windows", "stub", "unsupported")
@@ -31,9 +31,12 @@ POLICY = {
         "d3dcompiler_47.dll",
         "dbghelp.dll",
         "dxgi.dll",
+        "gameinput.dll",
         "gdi32.dll",
         "kernel32.dll",
         "kernelbase.dll",
+        "mfplat.dll",
+        "mfreadwrite.dll",
         "msvcrt.dll",
         "ntdll.dll",
         "ole32.dll",
@@ -48,6 +51,7 @@ POLICY = {
         "user32.dll",
         "userenv.dll",
         "version.dll",
+        "winhttp.dll",
         "winmm.dll",
         "ws2_32.dll",
         "xaudio2_8.dll",

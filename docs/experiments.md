@@ -2573,6 +2573,22 @@ old pair into the destination. The fixture aliases the destination with
 the data pair and exports all four dwords for one and two groups. Replacing
 the returned pair with the post-update pair must fail the CPU comparison.
 
+### Paired exchanges and a full-wave LDS counter
+
+The compute profile lowers the returning dword exchange within a 16-byte
+private record and the returning stride-64 qword exchange in two initialized
+planes. The destination receives both pre-exchange values, including when its
+registers overlap both inputs. `ds_append` and `ds_consume` use the counter at
+LDS byte zero with zero M0 and a full wave32. The lane-zero word must already
+be initialized. Each instruction broadcasts the old word and changes the
+counter by 32 modulo 2^32. Other private words retain their values.
+
+The `compute_store_aot_lds_packed`, `compute_store_aot_lds_private` and
+`compute_store_aot_lds_strided` fixtures check exchange ordering, operand aliasing, counter broadcast,
+wraparound and group isolation. Their mutations reverse exchange offsets or
+counter direction. The binary fixture round-trips the four forms with LLVM 15.
+
+
 The private LDS f32 profile requires `--lds-f32-mode normal-rne` as a
 caller guarantee that interpreted operands and results are normal binary32
 or positive zero and that the native arithmetic uses round-to-nearest-even.
@@ -4391,6 +4407,14 @@ ctest --preset dev --no-tests=error -R '^descriptor_window_' -V
 ```
 
 Repeat with the `release` preset.
+
+#### CPU-copied binding records
+
+`descriptor_record_copy` reuses the same shader and submission sequence. After fence 1, the test copies a 32-byte CPU binding record into the second record with `memcpy`. The live path reads the copied ID and uses `CopyDescriptorsSimple` to transfer its SRV from a CPU-only staging heap to shader-visible slot 999,999. The stale control reads a saved record while binding that same GPU slot. The records contain fixture-defined IDs and are independent of the opaque D3D12 descriptors. [Startup observation on #870](https://github.com/R0Y00/Xbox2Windows/issues/870#issuecomment-7116272710) · [Microsoft descriptor-copy guidance](https://learn.microsoft.com/en-us/windows/win32/direct3d12/copying-descriptors)
+
+The first snapshot is `13579bdf,a5a5a5a5` in all cases. The live copy reads `13579bdf,2468ace0` at fence 2. The stale mirror repeats the old word and reads `13579bdf,13579bdf`. An unknown ID must leave the descriptor copy count, submitted list count, completed fence and readback unchanged. The corrected record then produces the same result as the live path.
+
+Build `offscreen_check` as above and run `ctest --preset dev --no-tests=error -R '^descriptor_record_copy_' -V`. Repeat with `release`. These tests use Shader Model 6.0 and skip when the adapter lacks it.
 
 ### Desktop GPU addresses for xmem graphics allocations
 
