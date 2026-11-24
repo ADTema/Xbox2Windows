@@ -309,7 +309,10 @@ long __stdcall factory_create_status_array(Object*, unsigned capacity, const cha
     Object* object = make(status);
     object->capacity = capacity;
     object->results = new LONG[capacity ? capacity : 1];
-    for (unsigned i = 0; i < capacity; ++i) object->results[i] = static_cast<LONG>(0x8000000A);  // E_PENDING
+    // A new slot is complete with S_OK until EnqueueStatus marks it pending (#1843), as in Microsoft's
+    // Win32 implementation of this API (Xbox-GDK-Samples, MIT: SimpleDirectStorageCombo/DirectStorageWin32/
+    // DirectStorageWin32WrapperStatusArray.cpp). A caller may poll IsComplete before a slot's first use.
+    for (unsigned i = 0; i < capacity; ++i) object->results[i] = S_OK;
     *out = object;
     return S_OK;
 }
