@@ -221,10 +221,11 @@ int main(int argc, char** argv)
     void* pso_back_less = create_stream_pso(guest, root, vs_back, ps_red, ds_less, false);
     void* pso_front_off = create_stream_pso(guest, root, vs_front, ps_green, ds_disabled, false);
     void* pso_back_off = create_stream_pso(guest, root, vs_back, ps_red, ds_disabled, false);
-    void* pso_front_ds1 = create_stream_pso(guest, root, vs_front, ps_green, ds_less, true);
+    // Depth-only pass: no pixel shader, so nothing declares SV_Target0 for a zero-RTV bind.
+    void* pso_front_depth_only = create_stream_pso(guest, root, vs_front, {}, ds_less, true);
     // DepthBoundsTestEnable has no translated equivalent: the pipeline is refused for drawing, not translated without it.
     void* pso_front_bounds = create_stream_pso(guest, root, vs_front, ps_green, ds_less, true, TRUE);
-    if (!pso_front_bounds || !pso_front_less || !pso_back_less || !pso_front_off || !pso_back_off || !pso_front_ds1) return 9;
+    if (!pso_front_bounds || !pso_front_less || !pso_back_less || !pso_front_off || !pso_back_off || !pso_front_depth_only) return 9;
     if (argc == 7) return 0;
 
     ComPtr<ID3D12Device> desktop;
@@ -315,7 +316,7 @@ int main(int argc, char** argv)
 
     if (const int rc = run_case(1, argv[7], Bind::normal, pso_front_less, pso_back_less)) return rc;
     if (const int rc = run_case(2, argv[8], Bind::normal, pso_front_off, pso_back_off)) return rc;
-    if (const int rc = run_case(3, argv[9], Bind::depth_only, pso_front_ds1, pso_back_less)) return rc;
+    if (const int rc = run_case(3, argv[9], Bind::depth_only, pso_front_depth_only, pso_back_less)) return rc;
     if (const int rc = run_case(4, argv[10], Bind::read_only_depth, pso_front_less, pso_back_less)) return rc;
     // Controls: nothing may be drawn for a wrong descriptor kind or an enabled depth bounds test.
     if (const int rc = run_case(5, argv[11], Bind::rtv_as_depth, pso_front_less, pso_back_less)) return rc;
