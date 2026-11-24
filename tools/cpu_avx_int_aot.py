@@ -30,6 +30,8 @@ excluding the 28 forms carved out to cpu_vex_aot.py (PR #325)):
     vpcmpeqb/w/d/q, vpcmpgtb/w/d/q. Each 128-bit half is computed independently
     (no carry or compare crosses the lane boundary) and all 256 bits of the
     destination are written.
+  - 256-bit (VEX.L=1, AVX2, register operands only) min / max: vpmaxsb/sw/sd/ub/uw/ud,
+    vpminsb/sw/sd/ub/uw/ud. The 128-bit vpmaxsw and vpminsw encodings stay with cpu_vex_aot.py.
 
 Transport/ABI glue: vmovdqu (128/256-bit flat load, store and register copy),
 flat 32/64-bit GPR load/store mov for scratch GPRs, and terminal ret.
@@ -77,6 +79,8 @@ WIDE_BINARY_HELPERS = {
         "vpsubb", "vpsubw", "vpsubd", "vpsubq",
         "vpcmpeqb", "vpcmpeqw", "vpcmpeqd", "vpcmpeqq",
         "vpcmpgtb", "vpcmpgtw", "vpcmpgtd", "vpcmpgtq",
+        "vpmaxsb", "vpmaxsw", "vpmaxsd", "vpmaxub", "vpmaxuw", "vpmaxud",
+        "vpminsb", "vpminsw", "vpminsd", "vpminub", "vpminuw", "vpminud",
     )
 }
 WIDE_BINARY_CODES = {
@@ -86,6 +90,8 @@ WIDE_BINARY_CODES = {
         "VPSUBB", "VPSUBW", "VPSUBD", "VPSUBQ",
         "VPCMPEQB", "VPCMPEQW", "VPCMPEQD", "VPCMPEQQ",
         "VPCMPGTB", "VPCMPGTW", "VPCMPGTD", "VPCMPGTQ",
+        "VPMAXSB", "VPMAXSW", "VPMAXSD", "VPMAXUB", "VPMAXUW", "VPMAXUD",
+        "VPMINSB", "VPMINSW", "VPMINSD", "VPMINUB", "VPMINUW", "VPMINUD",
     )
 }
 
@@ -722,6 +728,15 @@ static Vec256 op_vpmaxsb(const Vec256& a, const Vec256& b) {
     return out;
 }
 
+static Vec256 op_vpmaxsw(const Vec256& a, const Vec256& b) {
+    Vec256 out{};
+    for (unsigned i = 0; i < 8u; ++i) {
+        const std::uint16_t x = lane16(a, i), y = lane16(b, i);
+        set_lane16(out, i, s16(x) > s16(y) ? x : y);
+    }
+    return out;
+}
+
 static Vec256 op_vpmaxsd(const Vec256& a, const Vec256& b) {
     Vec256 out{};
     for (unsigned i = 0; i < 4u; ++i) {
@@ -763,6 +778,15 @@ static Vec256 op_vpminsb(const Vec256& a, const Vec256& b) {
     for (unsigned i = 0; i < 16u; ++i) {
         const std::uint8_t x = lane8(a, i), y = lane8(b, i);
         set_lane8(out, i, s8(x) < s8(y) ? x : y);
+    }
+    return out;
+}
+
+static Vec256 op_vpminsw(const Vec256& a, const Vec256& b) {
+    Vec256 out{};
+    for (unsigned i = 0; i < 8u; ++i) {
+        const std::uint16_t x = lane16(a, i), y = lane16(b, i);
+        set_lane16(out, i, s16(x) < s16(y) ? x : y);
     }
     return out;
 }
