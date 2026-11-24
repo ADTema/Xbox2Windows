@@ -4653,6 +4653,26 @@ In this configuration all `bvh_*_warp`, `dxr_*_warp` and `bvh_differential_warp`
 
 On Windows 11 build 26200 at `1ccc326`, the in-box WARP (10.0.26100.9818) reports a 4..4 lane range with SM 6.6, so `bvh_wave64_warp` and the forced 16/32/64 variants of `wave_shuffle_warp` skip on capability; its native-width shuffle reads are all correct (affine and rotation 64/64, no block-misrouted reads, no control errors). The GTX 1660 SUPER (driver 32.0.16.1074) reports 32..32 lanes: `bvh_wave64_hardware` skips, and `wave_shuffle_hardware` passes at native and forced width 32 with every read from the requested lane. The lane-block misroute was observed in the app-local WARP 1.0.22 + Agility SDK setup above. The in-box WARP run could exercise only native width 4, because the fixture has no override for the reported lane range. [Cross-check report](https://github.com/R0Y00/Xbox2Windows/issues/145#issuecomment-7114625084)
 
+### Wave64 emulation with group-shared memory
+
+`src/wave64_emulate.hlsli` gives a 64-thread group the results of 64-lane wave operations without wave intrinsics: `Wave64ReadLaneAt`, `Wave64ReadLaneFirst`, `Wave64ActiveSum` and `Wave64ActiveBallot`. Each lane (its `SV_GroupIndex`) writes its value to a group-shared slot, the group waits on a barrier, every lane reads the slots it needs, and a second barrier frees the slots for the next call. The result does not depend on the native wave width, so it holds on 32-lane NVIDIA waves, on WARP's 8 lanes, and under a forced `[WaveSize(64)]` on WARP 1.0.22, where `WaveReadLaneAt` misroutes. The fixture needs only `cs_6_0`.
+
+Limits: the group must be exactly 64 threads, and every call must be reached by all 64 threads in uniform control flow, because a group barrier inside divergent control flow is undefined. With all 64 lanes active, the first active lane is lane 0. Values are `uint`. Prefix, min/max, bitwise and quad operations are not provided. The `wave_shuffle` and `bvh_wave64` tests still measure the adapters' own wave operations and are unchanged.
+
+`wave64_emulate_<adapter>` compares the affine, rotation and mirror reads of `wave_shuffle`, a first-lane read, a sum and a ballot (`t % 3 == 0`) on all 64 threads with a CPU reference, 448 values per run. It runs at the native width and, where SM 6.6 and the lane range allow it, at a forced width of 64. The negative control is a build whose affine read requests the next lane, and the test requires it to be reported on all 64 threads.
+
+Measured on `31f9ebb` with this change, Windows 10 build 19045, debug layer enabled:
+
+| Adapter | Native width | Forced width 64 | Negative control |
+|---|---|---|---|
+| WARP 1.0.22 (Agility SDK 1.620.2) | 0 of 448 wrong | 0 of 448 wrong; `wave_shuffle_warp` on the same adapter: 64 of 64 affine reads misrouted | 64 of 64 reported |
+| WARP 10.0.19041 (in-box) | 0 of 448 wrong | Skipped, lane range 4..4 | 64 of 64 reported |
+| NVIDIA GeForce RTX 3080 (32.0.15.9174) | 0 of 448 wrong | Skipped, lane range 32..32 | 64 of 64 reported |
+
+```powershell
+ctest --preset dev --no-tests=error -R '^wave64_emulate_' -V
+```
+
 ## Mapped DLL draw with a Windows reference
 
 `cpu_native_frame_hardware` and `cpu_native_frame_warp` load the same source-built DLL with `LoadLibraryW` and with `pe_map`. Both paths record TLS before the DLL entry on process attach and detach. The DLL's `guest_draw` export selects the shared two-texture shader fixture and calls the graphics provider through its bound import. The provider calls the host test, which runs the existing offscreen renderer in a child process. The renderer checks every RGBA channel against the CPU reference, and the test compares the two 64×64 captures byte for byte. Withholding the graphics provider must fail mapping before startup or drawing.
