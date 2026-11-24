@@ -4,7 +4,11 @@
 
 Xbox2Windows researches static recompilation from Xbox Series X|S (Scarlett) to x64 Windows. It translates selected x64 machine code into C++ and selected gfx1013 shaders into desktop DXIL. You can run the public tests without a game installation.
 
-> **Current status.** The full-package DXIL scan found a compiled route for 26,500 of 26,503 shader records. On an RTX 4060 Laptop, an offline run with a modified local diagnostic EXE and a debugger configured to automatically continue assertions played the intro, accepted setup and reached loading. The diagnostic run displayed readable language names and English legal text after scrolling and switching pages. Startup of the original EXE, interactive main-menu navigation and gameplay remain unverified. [Run results and first failure #870](https://github.com/R0Y00/Xbox2Windows/issues/870) · [Independent RX 9070 XT report](https://github.com/R0Y00/Xbox2Windows/pull/1135) · [GPU tasks #874](https://github.com/R0Y00/Xbox2Windows/issues/874)
+> **Startup.** On an RTX 4060 Laptop, a modified diagnostic EXE with automatic assertion continuation played the intro, displayed readable setup text and reached loading. Startup of the original EXE, main-menu navigation and gameplay remain unverified. [Progress and current blockers #870](https://github.com/R0Y00/Xbox2Windows/issues/870) · [RX 9070 XT report](https://github.com/R0Y00/Xbox2Windows/pull/1135) · [GPU tasks #874](https://github.com/R0Y00/Xbox2Windows/issues/874)
+>
+> **Static recompilation.** A source-built EXE reads two compressed BC7 texture pages and draws them. Native Windows, mapped PE and AOT builds produced identical pixels on RTX 4060 Laptop and WARP. [Archive-to-draw test #1331](https://github.com/R0Y00/Xbox2Windows/pull/1331)
+>
+> **Shader compilation.** The full-package scan found a DXIL compilation route for 26,500 of 26,503 shader records.
 
 ## Community and contributions
 
