@@ -1828,6 +1828,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     set(cpu_sse2_exports
         "op_cmppd_0,op_cmppd_1,op_cmppd_2,op_cmppd_3,op_cmppd_4,op_cmppd_5,op_cmppd_6,op_cmppd_7,"
         "op_cmppd_mem,"
+        "op_cmpsd_0,op_cmpsd_1,op_cmpsd_2,op_cmpsd_3,op_cmpsd_4,op_cmpsd_5,op_cmpsd_6,op_cmpsd_7,"
+        "op_cmpsd_mem,op_cmpsd_mem_plus1,"
         "op_maxsd_reg,op_maxsd_mem,op_minsd_reg,op_minsd_mem,op_sqrtsd_reg,op_sqrtsd_mem,"
         "op_cvtsd2si_r32_reg,op_cvtsd2si_r64_reg,op_cvtsd2si_r32_mem,op_cvtsd2si_r64_mem,"
         "op_cvtdq2pd_reg,op_cvtdq2pd_mem,op_cvtdq2ps_reg,op_cvtdq2ps_mem,"
