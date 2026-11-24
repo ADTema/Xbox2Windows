@@ -5649,6 +5649,15 @@ control mismatching. The D3D12 debug layer was unavailable.
 [Leonida RDNA2 measurements](https://github.com/ItsNotRexed/Leonida/pull/1685) ·
 [AMD RDNA 2 instruction set](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
 
+**Negated sources on the vector select.** A VOP3 `v_cndmask_b32` can carry the `-` source modifier,
+which in an integer instruction is that source's sign bit flipped. The select handler passed the printed
+operand to the uint helper, so `v_cndmask_b32_e64 v31, v30, -v30` was refused - 2 of the 29 refused
+shaders in the first main-game loading-screen cache (#870, issue #1709). The select now reads both sources
+through a helper that flips the sign bit for a `-` operand and emits the same text as before when there is
+none. The helper is used only where the translation models the modifier: another integer instruction
+carrying the same `-` operand is still refused rather than silently flipping a bit. Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_cndmask_neg$' -V`.
+
 ## Pixel color without a texture sample
 
 For an unsampled pixel program, a matched P1/P2 interpolation in the entry mask can supply attr0.x/y/z/w from a four-component TEXCOORD0. The profile binds entry v0/v1 to the barycentric pair and the observed m0 source to the interpolation base. Each completed P2 produces a distinct value, including when the destination overwrites v0. The test vertex shader varies all four channels across a full-screen triangle. CPU references check all four output words at 1,024 pixel centers; an incorrect channel at an interior pixel must fail. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_attribute_'`.

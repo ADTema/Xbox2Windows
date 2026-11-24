@@ -217,6 +217,15 @@ class Stage:
         except ValueError:
             raise Unsupported('operand %r' % tok)
 
+    def u_src(self, tok):
+        """uint expression for an integer-context source that the disassembler may print negated."""
+        # In an integer instruction the `-` modifier is the source's sign bit flipped: the same bit
+        # pattern a float negation produces. Only handlers that model it ask for this; other integer
+        # sources keep using u(), so an unexpected negation stays a refusal rather than a silent flip.
+        if tok.startswith('-') and not re.match(r'-[\d.]', tok):
+            return '(%s ^ 0x80000000u)' % self.u(tok[1:])
+        return self.u(tok)
+
     def f(self, tok):
         """float expression, with the inline neg/abs operand modifiers."""
         neg = False
@@ -854,7 +863,8 @@ class Stage:
 
     def op_v_cndmask_b32(self, ops, mods):
         mask = self.u(ops[3]) if len(ops) > 3 else 'vcc'
-        self.set_v(reg_range(ops[0])[1], '(%s & 1) ? %s : %s' % (mask, self.u(ops[2]), self.u(ops[1])))
+        self.set_v(reg_range(ops[0])[1],
+                   '(%s & 1) ? %s : %s' % (mask, self.u_src(ops[2]), self.u_src(ops[1])))
 
     def op_v_interp_p1_f32(self, ops, mods):
         self.note_attr(ops[2], 'linear')
