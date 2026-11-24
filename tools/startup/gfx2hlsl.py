@@ -147,7 +147,8 @@ def stream_fetch(vs_container, layout_text):
         kind, register, mask, vgpr, last = image[at:at + 5]
         count = last + 1
         # The count reaches the highest component the shader reads (mask 0x4 comes with count 3): load all of them.
-        if kind != FETCH_KIND or mask >> last != 1 or not 1 <= count <= 4 or vgpr < 1 or len(fetch) == 16:
+        if (kind != FETCH_KIND or mask >> last != 1 or not 1 <= count <= 4 or vgpr < 1 or vgpr + count > 256
+                or len(fetch) == 16):
             raise Unsupported('unverified vertex fetch record %s' % image[at:at + 5].hex())
         if register not in inputs:
             raise Unsupported('vertex fetch record for input register %d outside the signature' % register)
@@ -1527,16 +1528,21 @@ class Pipeline:
         flat = re.compile(r'\s*o\.fparam(\d+) = ')
         body = [line for line in s.body() if not (flat.match(line) and int(flat.match(line).group(1)) not in self.flat)]
         if s.fetched:
-            # Behind a fetch call every input register comes from the fetch: a read of anything else written by
-            # nothing earlier (v0 aside) would silently be 0, so refuse it.
+            # Behind a fetch call a register read as 0 by default would hide a missing input, so every read must be
+            # of a register defined on all paths. Proven here only for the entry block (straight-line code from the
+            # call to the first branch or branch target): v0, the fetched registers, and registers an unpredicated
+            # write in that block assigned before the read. A write under an exec predicate or in any later block
+            # does not define a register.
             written = {0}
-            for line in body:
-                target = re.match(r'\s*(?:if \(exec & 1\) )?v(\d+) = (.*)', line)
-                unwritten = {int(n) for n in re.findall(r'\bv(\d+)\b', target.group(2) if target else line)} - written
-                if unwritten:
-                    raise Unsupported('vertex stage reads v%d, which neither the fetch nor the program writes' % min(unwritten))
-                if target:
-                    written.add(int(target.group(1)))
+            for index, (start, lines, term) in enumerate(s.blocks):
+                for line in lines + ([term[1]] if term and term[0] == 'branch' else []):
+                    target = re.match(r'v(\d+) = (.*)', line)
+                    unwritten = {int(n) for n in re.findall(r'\bv(\d+)\b', target.group(2) if target else line)} - written
+                    if unwritten:
+                        raise Unsupported('vertex stage reads v%d, which neither the fetch nor an unconditional write '
+                                          'before the first branch defines' % min(unwritten))
+                    if target and index == 0 and start == 0:
+                        written.add(int(target.group(1)))
         out += s.declarations() + ['    v0 = vid;'] + body + ['    return o;', '}',
             '// Rectangle lists arrive as six vertices per rectangle: corners 0 1 2, 0 2 and the fourth corner 0 + 2 - 1.',
             'VSOut main(uint vid : SV_VertexID) {',

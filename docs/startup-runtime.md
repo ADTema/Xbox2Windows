@@ -71,17 +71,24 @@ count 3, mask 0x8 with count 4), and all components up to that one are loaded. N
 the call has a record. In all 1,983 programs the header's u32 at +0x1d8 equals the number of records.
 
 Refused: a header of any other size, a record of another kind, a mask whose highest bit is not its count,
-overlapping registers, and a record count that disagrees with +0x1d8. A fetched element is also refused when it is
+overlapping registers, a record reaching past v255, and a record count that disagrees with +0x1d8. A fetched element is also refused when it is
 per-instance, sits in a vertex-buffer slot above 7 (the stand-in binds slots 0 to 7), has an unknown format, or is
 appended (`D3D12_APPEND_ALIGNED_ELEMENT`) after an element of unknown size or one that ends off a 4-byte boundary,
 because the packing there is not measured. Elements that no record fetches are not checked. An unreadable layout
 is logged, and the translation is requested without it. Components a format lacks read
 as 0, 0, 0 and 1, as in the existing vertex-fetch table; that default is not measured for this path.
 
-A shader that starts with the call and has no layout is refused. So is one that reads a register that neither
-the fetch nor its own code wrote, other than v0. Before this change the call was cut off with the header and
-every input read as zero. The draw then had zero area and wrote no pixel. Programs without the call translate
-as before.
+A shader that starts with the call and has no layout is refused.
+
+After the call, every vertex register the shader reads must be defined on all paths. The translator proves this only
+for the entry block: the straight-line code from the call to the first branch or branch target. A register counts as
+defined when it is v0, a fetched register, or written in the entry block before the read by an instruction that
+runs with the entry exec mask. A write after exec was changed, or in any block after the entry block, does not
+count, even when it would run on every path. A read of any other register is refused. Programs whose later
+blocks only read registers defined this way still translate.
+
+Before this change the call was cut off with the header and every input read as zero. The draw then had zero area
+and wrote no pixel. Programs without the call translate as before.
 
 Run `ctest --preset release --no-tests=error -R "^startup_stream_fetch_(warp|hardware)$" -V` after building
 `startup_stream_consumer`. The source-built shader declares POSITION and TEXCOORD. The stream lists them in the
@@ -89,8 +96,19 @@ other order, TEXCOORD in slot 0 and POSITION in slot 1 at `D3D12_APPEND_ALIGNED_
 target: one from start vertex 3, and one indexed with indices 4 to 9 and base vertex 5. Exactly the two position
 rectangles are drawn. Two mutations of the generated fetch must fail the exact check and draw the TEXCOORD
 rectangles instead: the records' registers exchanged, and both elements read from slot 0. Leaving the base vertex
-out of the fetch index also fails it. Refused cases: no layout (not drawn either), an export of an unfetched
-register, a z-only record whose count stops below z, an element in slot 8, and a mismatched record count.
+out of the fetch index also fails it. A shader without its layout is refused and not drawn.
+
+The translator cases need no device: `python -B tests/startup_stream_fetch_check.py`, or
+`ctest --preset release --no-tests=error -R "^startup_stream_fetch_translate$"`. They check the generated loads and
+manifest entries for both slots. They also check these refusals:
+- no layout;
+- an export of v12 that nothing defines;
+- v12 written only after exec was set to 0;
+- v12 written only in code a branch jumps over;
+- a z-only record whose count stops below z (a count of 3 translates);
+- an element in slot 8, a per-instance element, or an element of format 10;
+- a record of kind 7, or one that reaches past v255;
+- a header record count that disagrees with the table.
 
 The pixel stage still reads attribute N from vertex output N. It does not yet pair the two by semantic, so a
 pixel shader that reads only some of the vertex outputs can receive the wrong one. That is a separate problem.

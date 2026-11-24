@@ -13,10 +13,14 @@ vertex 3, one indexed (indices 4-9, base vertex 5), so the fetch index must incl
              rectangles, row 0 of [0, 4) and pixel (3, 3), so the exact check above fails.
   one slot:  the generated fetch reading both elements from slot 0 (a mutation) also draws the TEXCOORD rectangles.
   no layout: the same stream without the INPUT_LAYOUT subobject is refused by the translator and not drawn.
-  unwritten: a vertex shader that exports v12, which no record fetches, is refused.
-  z only:    a record that reads only z (mask 0x4) with count 3 translates; with count 2 it is refused.
-  refused:   a fetched element in vertex-buffer slot 8 (the stand-in binds 0 to 7), and a header record count that
-             disagrees with the table.
+
+Without arguments only the translator cases run (no consumer, device or compiler); with a consumer and a backend
+they run first, then the draws.
+  fetch text: the generated loads and manifest entries for both slots.
+  refused:    no layout; an export of v12 that nothing defines; v12 written only with exec masked off, or only in
+              code a branch jumps over; a z-only record whose count stops below z (count 3 translates); a fetched
+              element in slot 8 (the stand-in binds 0 to 7), per-instance or of format 10; a record of kind 7 or
+              reaching past v255; a header record count that disagrees with the table.
 """
 import os
 from pathlib import Path
@@ -182,30 +186,95 @@ def check(directory, consumer, backend):
     bare = Run(directory / "bare", consumer, backend, vertex(), False)
     assert not list(bare.cache.glob("*.ia"))
     status = gfx2hlsl.translate_request(str(bare.cache), bare.key)
-    assert status == "unsupported: vertex stage calls a fetch routine and the pipeline declares no input layout", status
+    assert status == "unsupported: " + NO_LAYOUT, status
     result = bare.draw()
     if "-> drawn;" in result.stderr:
         raise AssertionError("a vertex shader with a fetch call and no layout was drawn")
-    print(f"{backend} no layout: refused ({status[13:]})")
+    print(f"{backend} no layout: refused and not drawn")
+    return 0
 
-    # unwritten: an export of v12, which nothing fetches or writes, is refused.
-    unwritten = Run(directory / "unwritten", consumer, backend, vertex(param_first=12), True)
-    status = gfx2hlsl.translate_request(str(unwritten.cache), unwritten.key)
-    assert status == "unsupported: vertex stage reads v12, which neither the fetch nor the program writes", status
-    print(f"{backend} unwritten register: refused ({status[13:]})")
+
+# Translator-only cases: no consumer, no device, no shader compiler.
+NO_LAYOUT = "vertex stage calls a fetch routine and the pipeline declares no input layout"
+UNDEFINED = "vertex stage reads v12, which neither the fetch nor an unconditional write before the first branch defines"
+EXEC_LO_0, EXEC_LO_ALL, BRANCH_OVER_ONE = 0xbefe0380, 0xbefe03c1, 0xbf820001  # s_mov_b32 exec_lo, 0 / -1; s_branch +1
+V7_ONE, V12_ONE = vop1(1, 7, 242), vop1(1, 12, 242)                         # v_mov_b32 v7 / v12, 1.0
+EXPORTS_V12 = [0xf80008cf, 0x07060504, 0xf800020f, 0x070c0c0c, ENDPGM]      # pos0 v4-v7; param0 v12, v12, v12, v7
+EMPTY_ROOT = (b"DXBC" + bytes(16) + struct.pack("<4I", 1, 68, 1, 36) + b"RTS0" + struct.pack("<I", 24)
+              + struct.pack("<6I", 1, 0, 24, 0, 24, 0))
+
+
+def translate(directory, vs, layout):
+    """Publish a request as the stand-in would and translate it without compiling: (status, vs.hlsl, manifest)."""
+    directory.mkdir(parents=True)
+    ps = pixel(False)
+    ia = layout.encode() if layout else b""
+    key = gfx2hlsl.pipeline_key(vs, ps, EMPTY_ROOT, ia)
+    files = {".a": vs, ".b": ps, ".root": EMPTY_ROOT}
+    if ia:
+        files[".ia"] = ia
+    for ext, data in files.items():
+        (directory / ("req_%016x%s" % (key, ext))).write_bytes(data)
+    status = gfx2hlsl.translate_request(str(directory), key)
+    result = [directory / ("%016x%s" % (key, ext)) for ext in (".vs.hlsl", ".txt")]
+    return (status,) + tuple(p.read_text() if p.exists() else "" for p in result)
+
+
+def translate_checks(directory):
+    saved = os.environ.get("X2W_FXC")
+    os.environ["X2W_FXC"] = ""
+    try:
+        return translate_cases(directory)
+    finally:
+        if saved is None:
+            os.environ.pop("X2W_FXC", None)
+        else:
+            os.environ["X2W_FXC"] = saved
+
+
+def translate_cases(directory):
+    # The generated fetch: POSITION (record 0, slot 1) into v4-v6 and TEXCOORD (record 1, slot 0) into v8-v10,
+    # each at (vertex id + base-vertex entry value) * the slot's stride.
+    status, vs, manifest = translate(directory / "fetch", vertex(), LAYOUT_TEXT)
+    assert status == "ok", status
+    for line in ("a = (vid + ud1) * ud3 + 0;", "v4 = r0.Load(a);", "v6 = r0.Load(a + 8);",
+                 "a = (vid + ud1) * ud4 + 0;", "v8 = r1.Load(a);", "v10 = r1.Load(a + 8);"):
+        assert "    %s\n" % line in vs, line + "\n" + vs
+    for line in ("udsrc 1 basevertex", "udsrc 3 stride 0", "udsrc 4 stride 1", "srv 0 buf vb 1", "srv 1 buf vb 0"):
+        assert line + "\n" in manifest, line + "\n" + manifest
+    print("translate: fetch loads and manifest as expected")
+
+    # Refused: no layout; a register nothing defines; the only write masked off by exec, or bypassed by a branch.
+    for label, words, layout, want in (
+            ("no layout", None, None, NO_LAYOUT),
+            ("unwritten", [SWAPPC, PREFETCH, V7_ONE, WAIT_VM] + EXPORTS_V12, LAYOUT_TEXT, UNDEFINED),
+            ("masked write", [SWAPPC, PREFETCH, V7_ONE, EXEC_LO_0, V12_ONE, EXEC_LO_ALL, WAIT_VM] + EXPORTS_V12,
+             LAYOUT_TEXT, UNDEFINED),
+            ("bypassed write", [SWAPPC, PREFETCH, V7_ONE, BRANCH_OVER_ONE, V12_ONE, WAIT_VM] + EXPORTS_V12,
+             LAYOUT_TEXT, UNDEFINED)):
+        vs = vertex() if words is None else fetch_container(words, RECORDS)
+        status, _, _ = translate(directory / label.replace(" ", "_"), vs, layout)
+        assert status == "unsupported: " + want, (label, status)
+        print(f"translate: {label} refused")
 
     # z only: the count reaches the highest component read; a mask above the count is refused.
     for count, want in ((3, "ok"), (2, "unsupported: unverified vertex fetch record 0600040401")):
-        records = [(6, 0, 0x4, 4, count - 1), RECORDS[1]]
-        z_only = Run(directory / ("z%d" % count), consumer, backend, vertex(records=records), True)
-        status = gfx2hlsl.translate_request(str(z_only.cache), z_only.key)
+        status, _, _ = translate(directory / ("z%d" % count), vertex(records=[(6, 0, 0x4, 4, count - 1), RECORDS[1]]),
+                                 LAYOUT_TEXT)
         assert status == want, status
-    print(f"{backend} z-only record: count 3 translates, count 2 refused")
+    print("translate: z-only record with count 3 translates, count 2 refused")
 
-    # refused: slot 8 is never bound by the stand-in; the header's record count must match the table.
-    slot8 = LAYOUT_TEXT.replace("POSITION 0 6 1 ", "POSITION 0 6 8 ")
+    # Record and layout refusals.
     for container, text, want in (
-            (vertex(), slot8, "input layout slot 8: the stand-in binds vertex-buffer slots 0 to 7"),
+            (vertex(), LAYOUT_TEXT.replace("POSITION 0 6 1 ", "POSITION 0 6 8 "),
+             "input layout slot 8: the stand-in binds vertex-buffer slots 0 to 7"),
+            (vertex(), LAYOUT_TEXT.replace("POSITION 0 6 1 4294967295 0 0", "POSITION 0 6 1 4294967295 1 1"),
+             "per-instance input layout element"),
+            (vertex(), LAYOUT_TEXT.replace("POSITION 0 6 ", "POSITION 0 10 "), "input layout format 10"),
+            (vertex(records=[(7,) + RECORDS[0][1:], RECORDS[1]]), LAYOUT_TEXT,
+             "unverified vertex fetch record 0700070402"),
+            (vertex(records=[(6, 0, 0x7, 254, 2), RECORDS[1]]), LAYOUT_TEXT,
+             "unverified vertex fetch record 060007fe02"),
             (fetch_container([SWAPPC, ENDPGM], RECORDS, header_count=3), LAYOUT_TEXT,
              "vertex fetch header counts 3 records, the table holds 2")):
         try:
@@ -214,10 +283,13 @@ def check(directory, consumer, backend):
             assert str(reason) == want, reason
         else:
             raise AssertionError("accepted: " + want)
-    print(f"{backend} slot 8 and a mismatched record count: refused")
+    print("translate: slot 8, per-instance, format 10, record kind 7, a record past v255 and a mismatched count refused")
     return 0
 
 
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as temp:
-        sys.exit(check(Path(temp), *sys.argv[1:]))
+        result = translate_checks(Path(temp) / "translate")
+        if len(sys.argv) > 1:
+            result = check(Path(temp), *sys.argv[1:])
+        sys.exit(result)
