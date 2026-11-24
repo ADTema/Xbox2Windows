@@ -1165,31 +1165,39 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 reg = first + index
                 vector.pop(reg, None)
                 loading[reg] = ("alu", f"{name}.{'xyzw'[index]}")
-        elif m := re.fullmatch(r"(?:buffer_store_dword(?:x([234]))?|"
+        elif m := re.fullmatch(r"(?:buffer_store_(?:dword(?:x(?P<raw_count>[234]))?|(?P<subword>byte|short)(?P<store_hi>_d16_hi)?)|"
                                r"tbuffer_store_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
-                               r"(v\d+|v\[\d+:\d+\]), (off|v\d+|v\[\d+:\d+\]), s\[(\d+):(\d+)\], 0"
+                               r"(?P<data>v\d+|v\[\d+:\d+\]), (?P<addr>off|v\d+|v\[\d+:\d+\]), "
+                               r"s\[(?P<base>\d+):(?P<high>\d+)\], 0"
                                r"(?(channels) format:\[(?P<format>BUF_FMT_(?:(?:32_){1,4}|(?:16_){1,4})UINT)\])"
                                r"(?P<idxen> idxen)?(?P<offen> offen)?(?: offset:(?P<offset>\d+))?", line):
             channels = m["channels"]
             packed = channels is not None and channels.startswith("d16_")
-            components = len(channels.removeprefix("d16_")) if channels else int(m[1] or 1)
+            components = len(channels.removeprefix("d16_")) if channels else int(m["raw_count"] or 1)
             partial = packed and components % 2 != 0
             count = (components + 1) // 2 if packed else components
             idxen, offen = m["idxen"], m["offen"]
+            subword = m["subword"]
+            if subword and (cpu != "gfx1030" or not idxen or offen or stride is None):
+                raise ValueError("Unsupported subword buffer store target or address mode")
+            width = {"byte": 1, "short": 2}.get(subword, 4)
             format_components = 4 if packed and components == 3 else components
             fmt = f"BUF_FMT_{('16_' if packed else '32_') * format_components}UINT"
             if channels and (cpu != "gfx1030" or not idxen or offen or m["format"] != fmt):
                 raise ValueError("Unsupported typed buffer store format, target or address mode")
-            first, *last = map(int, re.findall(r"\d+", m[3]))
-            base, high = int(m[5]), int(m[6])
+            first, *last = map(int, re.findall(r"\d+", m["data"]))
+            base, high = int(m["base"]), int(m["high"])
             offset = int(m["offset"] or 0)
             if (last != ([] if count == 1 else [first + count - 1])
-                    or high != base + 3 or base % 4 or offset % 4 or offset > 4095
+                    or high != base + 3 or base % 4 or offset % width or offset > 4095
                     or pending.intersection(range(base, high + 1))
                     or any(scalar.get(base + i) != ("uav", i) for i in range(4))):
                 raise ValueError("Unverified raw UAV store")
+            byte_shift = (offset % 4) * 8
+            # Reserve and address the containing DWORD for a subword store.
+            offset &= ~3
             address = f"{offset}u"
-            addr = m[4]
+            addr = m["addr"]
             addr_regs = list(map(int, re.findall(r"\d+", addr)))
             tags = [vector.get(reg) for reg in addr_regs]
             if addr == "off" and not idxen and not offen and dims == (1, 1, 1) and stride is None:
@@ -1254,7 +1262,14 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             if not all(is_word(value) for value in values):
                 raise ValueError("Store data is not a known word")
             words = list(map(hlsl_word, values))
-            if partial:
+            if subword:
+                # The indexed layout and whole-DWORD reservation make the read/modify/write single-writer.
+                mask = (1 << (width * 8)) - 1
+                keep = 0xffffffff ^ (mask << byte_shift)
+                source_shift = 16 if m["store_hi"] else 0
+                words[0] = (f"((outputData.Load({address}) & {keep:#x}u) | "
+                            f"((({words[0]} >> {source_shift}u) & {mask:#x}u) << {byte_shift}u))")
+            elif partial:
                 # Reserve the entire final DWORD, including the untouched high half. The indexed
                 # layout, aligned stride and overlap checks give that word a single writer.
                 final_address = address if count == 1 else f"{address} + 4u"

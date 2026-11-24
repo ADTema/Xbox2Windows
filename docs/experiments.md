@@ -3203,6 +3203,45 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^compute_store_aot_mtbuf_store_(warp|hardware)$' -V
 ```
 
+### Indexed gfx1030 raw subword writes
+
+The compute store profile lowers `buffer_store_byte`, `buffer_store_short`,
+`buffer_store_byte_d16_hi`, and `buffer_store_short_d16_hi`. The [AMD RDNA 2 Shader ISA](https://gpuopen.com/download/rdna2-shader-instruction-set-architecture.pdf)
+assigns these untyped operations MUBUF opcodes 24 through 27. They take one or
+two bytes from bit 0 or bit 16 of a known VGPR. The supported address uses
+`idxen`, a verified dispatch-thread index, zero scalar offset, and a naturally
+aligned immediate within a DWORD-aligned record. The UAV descriptor must be
+ready after `lgkmcnt(0)`. The caller supplies in-range, unswizzled records and
+an aligned raw UAV initialized with the bytes to preserve. The caller also
+excludes accesses from other dispatches or bindings during execution.
+
+The generated DXIL reads the containing DWORD, replaces the selected field,
+and writes that DWORD. The indexed layout gives each invocation its own
+record, and the translator reserves the entire DWORD for this store. It
+refuses another store to that DWORD, even to different bytes. Other address
+layouts, cache and status modifiers, and native descriptor bounds are outside
+this profile.
+
+The wave32 fixtures vary both VGPR halves per invocation and store into one
+of the middle DWORD's byte positions in a 12-byte record. The CPU reference
+updates little-endian byte slices and compares all 320 output words for one
+and three groups, including adjacent bytes, records, and the untouched tail.
+Selecting the wrong VGPR half or overwriting the containing DWORD must
+mismatch at output word 1. Rejection controls cover overlapping writes,
+misaligned shorts, record overruns, missing descriptor waits and addresses
+that do not distinguish every invocation. LLVM 15 assembles all four forms
+and compares the synthetic compute-container CLI output to direct lowering.
+The GPU fixtures execute the translated desktop DXIL.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_store_subword_' -V
+```
+
+```sh
+python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
 ### Indexed gfx1030 raw subword reads
 
 The compute store profile lowers `buffer_load_ubyte`, `buffer_load_sbyte`,
