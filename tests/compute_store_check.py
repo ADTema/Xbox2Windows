@@ -2058,6 +2058,21 @@ LDS_QWORD_CASES += [(op, lds_qword_program(op), LDS_QWORD_RETURN_BINDING) for op
 LDS_QWORD_CASES += [(op, lds_qword_counter_program(op),
                      LDS_QWORD_RETURN_BINDING if "_rtn" in op else LDS_QWORD_BINDING) for op in LDS_QWORD_COUNTERS]
 
+LDS_QWORD_BORROW_PROGRAM = LDS_WIDE_SETUP + [
+    "v_mov_b32_e32 v16, 0", "v_mov_b32_e32 v17, 0x40000001",
+    "ds_write_b64 v5, v[16:17] offset:8", "s_waitcnt lgkmcnt(0)",
+    "v_mov_b32_e32 v18, 0", "v_mov_b32_e32 v19, 0x80000000",
+    "ds_dec_u64 v5, v[18:19] offset:8", "s_waitcnt lgkmcnt(0)",
+    "ds_read_b64 v[10:11], v5 offset:8", "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen", "s_endpgm",
+]
+LDS_QWORD_CASES += [("lds_dec_borrow", LDS_QWORD_BORROW_PROGRAM, LDS_QWORD_BINDING)]
+
+
+def lds_qword_borrow_reference(groups):
+    # 0x40000001_00000000 - 1 under a larger limit: the zero low word borrows.
+    return [word for _ in range(groups * 32) for word in (0xffffffff, 0x40000000)]
+
 
 LDS_F64_CMPST = ("ds_cmpst_f64", "ds_cmpst_rtn_f64")
 
@@ -2220,6 +2235,8 @@ def lds_controls():
     rejects("Unverified private LDS write", aot.lower,
             variant(high, ("ds_write_b32 v5, v6", "s_nop 0")), 32, **LDS_BINDING)
 
+    assert lds_qword_borrow_reference(1)[:2] == [0xffffffff, 0x40000000]
+    aot.lower(LDS_QWORD_BORROW_PROGRAM, 32, **LDS_QWORD_BINDING)
     ret = lds_qword_program("ds_add_rtn_u64")
     instruction = "ds_add_rtn_u64 v[18:19], v5, v[18:19] offset:8"
     for bad in (instruction.replace("v[18:19], v5", "v[18:20], v5"),
@@ -2567,6 +2584,11 @@ def ds_mutants(name, lines, binding, source):
             alternate = "ds_or_b64" if name == "ds_and_b64" else "ds_and_b64"
             wrong = aot.lower(variant(lines, (name, alternate)), 32, **binding)
             yield wrong, 0
+    elif name == "lds_dec_borrow":
+        # Drop the high-word borrow; the low word still wraps to 0xffffffff.
+        wrong = source.replace(" - uint(", " - 0u * uint(")
+        assert wrong != source
+        yield wrong, 1
     elif name in LDS_WIDE_QUADS:
         if name == "lds_b128":
             change = ("v_mov_b32_e32 v19, 0xf0e1d2c3", "v_mov_b32_e32 v19, 0")
@@ -2697,6 +2719,8 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
                 words = lds_wave_counter_reference(groups)
             elif name in LDS_QWORD_COUNTERS:
                 words = lds_qword_counter_reference(name, groups)
+            elif name == "lds_dec_borrow":
+                words = lds_qword_borrow_reference(groups)
             elif name in LDS_QWORD_UPDATES or name in LDS_QWORD_RETURNS:
                 words = lds_qword_reference(name, groups)
             elif name in LDS_WIDE_PROGRAMS or name in LDS_WIDE_QUADS:

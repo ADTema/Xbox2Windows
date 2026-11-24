@@ -2903,6 +2903,10 @@ wraparound and group isolation. Their mutations reverse exchange offsets or
 counter direction. The binary fixture round-trips the four forms with LLVM 15.
 
 
+A dedicated `lds_dec_borrow` case writes `0x40000001_00000000` under the
+`0x80000000_00000000` limit: the old pair is strictly below the limit and
+nonzero, its zero low word borrows, and the result is
+`0x40000000_ffffffff`. Dropping the high-word borrow term changes word 1.
 The private LDS f32 profile requires `--lds-f32-mode normal-rne` as a
 caller guarantee that interpreted operands and results are normal binary32
 or positive zero and that the native arithmetic uses round-to-nearest-even.
