@@ -372,10 +372,12 @@ class ResourceChecks(unittest.TestCase):
         })
 
     def test_texture_descriptor_detail_command(self) -> None:
+        tool = Path(__file__).resolve().parents[1] / "tools" / "texture_descriptors.py"
         with TemporaryDirectory() as directory:
             path = Path(directory) / "synthetic.ttpf"
             path.write_bytes(descriptor_archive())
-            result = run_cli(texture_descriptors_main, path, "--descriptor", "257")
+            result = subprocess.run([sys.executable, "-B", str(tool), str(path), "--descriptor", "257"],
+                                    capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout), {
                 "descriptor_index": 257, "width": 12, "height": 44,
