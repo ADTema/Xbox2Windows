@@ -4500,7 +4500,7 @@ def sdwa_cmp_destination_expected(word0, word1):
             int((word0 & 0xff) == ((word1 >> 16) & 0xffff)), 0, 0)
 
 
-def check_sdwa_cmp_controls(directory):
+def check_sdwa_cmp_controls(directory=None):
     """Static checks: all 46 forms lower, the destination rules hold, the neighbours stay refused."""
     assert len(SDWA_CMP_FORMS) == 46 and len({entry["form"] for entry in SDWA_CMP_FORMS}) == 46
     source = translate_int(uncompressed_export(sdwa_cmp_body()))
@@ -4522,7 +4522,7 @@ def check_sdwa_cmp_controls(directory):
     ]))
     assert "asint(((params[0].w >> 8u) & 0xffu))" in model
     assert "((params[0].w >> 16u) & 0xffffu) < asuint(" in model
-    assert "<< 16u) >> 16)" in model
+    assert "<< 16) >> 16)" in model
     assert "0xffffu) & 0xffffu)" in model
     assert "class16(((params[0].w >> 16u) & 0xffffu))" in model
     assert "class32(asfloat(((params[0].w >> 16u) & 0xffu)))" in model
@@ -17054,6 +17054,7 @@ _CONTROL_SUBCHECKS = (
     "check_cvt_int_f64_lowering",
     "check_cvt_f32_f64_lowering",
     "check_sdwa_integer_lowering",
+    "check_sdwa_cmp_controls",
     "check_pack_int16_lowering",
     "check_sat_pack_u8_lowering",
     "check_pack_b32_lowering",
