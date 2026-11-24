@@ -88,6 +88,10 @@ jobs:
               (["tests/startup_gfx2hlsl_vopc_sdwa_check.py", "decode", "libLLVM-15.so.1"], {}),
               (["tests/startup_gfx2hlsl_sop2_complement_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_sop2_complement_check.py", "decode", "libLLVM-15.so.1"], {}),
+              (["tests/startup_gfx2hlsl_f32_lg_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_gfx2hlsl_f32_lg_check.py", "decode", "libLLVM-15.so.1"], {}),
+              (["tests/startup_gfx2hlsl_f32_nan_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_gfx2hlsl_f32_nan_check.py", "decode", "libLLVM-15.so.1"], {}),
               (["tests/startup_inline_sampler_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_smem_address_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/compute_entry_layout_check.py", "binary", "llvm-mc-15"], {}),
@@ -194,6 +198,7 @@ jobs:
             tests/startup_gfx2hlsl_capture_check.py \
             tests/startup_translator_check.py \
             tests/startup_gfx2hlsl_smem_offset_check.py \
+            tests/startup_gfx2hlsl_refusals_check.py \
             tests/startup_gfx2hlsl_scalar_m0_check.py \
             tests/startup_gfx2hlsl_readfirstlane_uniform_check.py \
             tests/startup_triage_run_check.py \
@@ -204,11 +209,14 @@ jobs:
             tests/startup_gfx2hlsl_shift64_check.py \
             tests/startup_gfx2hlsl_vopc_sdwa_check.py \
             tests/startup_gfx2hlsl_sop2_complement_check.py \
+            tests/startup_gfx2hlsl_f32_lg_check.py \
+            tests/startup_gfx2hlsl_f32_nan_check.py \
             tests/startup_inline_sampler_check.py \
             tests/startup_buffer_address_check.py \
             tests/startup_smem_address_check.py \
             tests/startup_stream_fetch_check.py \
             tests/compute_entry_layout_check.py \
+            tests/startup_ngg_slice_check.py \
             tests/run_checks_parallel_check.py
   build-and-test:
     name: Build and test on Windows
