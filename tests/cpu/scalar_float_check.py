@@ -31,7 +31,27 @@ ROOTS = {"root_ss": 4, "root_sd": 8}
 DEFAULT_MXCSR, DAZ, FTZ = 0x1f80, 0x40, 0x8000
 ROUNDING_WORDS = [DEFAULT_MXCSR, 0x3f80, 0x5f80, 0x7f80]
 EXTREMA_WORDS = [DEFAULT_MXCSR | DAZ, DEFAULT_MXCSR | DAZ | FTZ, DEFAULT_MXCSR | FTZ]
-ROOT_WORDS = ROUNDING_WORDS + [DEFAULT_MXCSR | DAZ, 0x5f80 | DAZ, 0x3f80 | DAZ | FTZ]
+ROOT_WORDS = ROUNDING_WORDS + [DEFAULT_MXCSR | DAZ, 0x5f80 | DAZ, 0x3f80 | DAZ | FTZ, DEFAULT_MXCSR | FTZ, 0x5f80 | FTZ]
+# Results fixed from the instruction set reference, (MXCSR word, export, operands, result bits). DAZ reads a
+# denormal operand as a zero of its sign, so the root of a negative denormal is -0 and not the default NaN, and a
+# denormal MIN or MAX result leaves as a signed zero. FTZ alone leaves the operands as they are.
+DAZ_WORDS = [DEFAULT_MXCSR | DAZ, DEFAULT_MXCSR | DAZ | FTZ]
+DENORMAL_ANSWERS = [
+    (word, name, (operand, None), result) for word in DAZ_WORDS for name, operand, result in (
+        ("root_ss", 0x807fffff, 0x80000000), ("root_ss", 0x80000001, 0x80000000), ("root_ss", 0x00000001, 0),
+        ("root_ss", 0x007fffff, 0), ("root_sd", 0x800fffffffffffff, 1 << 63), ("root_sd", 0x8000000000000001, 1 << 63),
+        ("root_sd", 1, 0), ("root_sd", 0x000fffffffffffff, 0))
+] + [
+    (word, name, (a, b, None), result) for word in DAZ_WORDS for name, a, b, result in (
+        ("min_ss", 0x807fffff, 0x3f800000, 0x80000000), ("min_ss", 0x00000001, 0x3f800000, 0),
+        ("max_ss", 0x807fffff, 0xbf800000, 0x80000000), ("max_ss", 0x00000001, 0xbf800000, 0),
+        ("min_sd", 0x800fffffffffffff, 0x3ff0000000000000, 1 << 63), ("min_sd", 1, 0x3ff0000000000000, 0),
+        ("max_sd", 0x800fffffffffffff, 0xbff0000000000000, 1 << 63), ("max_sd", 1, 0xbff0000000000000, 0))
+] + [
+    (DEFAULT_MXCSR | FTZ, name, values, result) for name, values, result in (
+        ("root_ss", (0x807fffff, None), 0xffc00000), ("root_sd", (0x800fffffffffffff, None), 0xfff8000000000000),
+        ("min_ss", (0x807fffff, 0x3f800000, None), 0x807fffff), ("max_sd", (1, 0xbff0000000000000, None), 1))
+]
 # The operands of the constant-source exports, as an integer built into the code: sqrt(2) as a float and
 # sqrt(3) as a double.
 CONSTANT_ROOTS = {"root_const_ss": (2, 4), "root_const_sd": (3, 8)}
@@ -137,8 +157,10 @@ def reference(name, values, payload, variant=None, mxcsr=DEFAULT_MXCSR):
     def root(bits, width):
         quiet = 1 << (22 if width == 4 else 51)
         indefinite = 0xffc00000 if width == 4 else 0xfff8000000000000
-        bits = flush(bits, width)
+        raw, bits = bits, flush(bits, width)
         x = number(bits, width)
+        if variant == "library-sign-test" and raw != bits and raw >> 8 * width - 1:
+            return indefinite  # a runtime that tests the sign of the bits before the processor reads the operand
         if x != x:
             return bits if variant == "snan-not-quieted" else bits | quiet
         if x < 0:
@@ -501,7 +523,8 @@ def constant_root(name, word):
 
 # Each wrong rule of the MXCSR checks and the export it breaks.
 MXCSR_MUTANTS = [("min_ss", "daz-result-kept"), ("max_ss", "daz-result-kept"), ("min_sd", "daz-result-kept"),
-                 ("max_sd", "daz-result-kept"), ("root_ss", "nearest-only"), ("root_sd", "nearest-only")]
+                 ("max_sd", "daz-result-kept"), ("root_ss", "nearest-only"), ("root_sd", "nearest-only"),
+                 ("root_ss", "library-sign-test"), ("root_sd", "library-sign-test")]
 
 
 def check_mxcsr(original, lifted, access):
@@ -530,6 +553,12 @@ def check_mxcsr(original, lifted, access):
                     if wrong != expected:
                         counts[(name, variant)] = counts.get((name, variant), 0) + 1
         counts[name] = counts.get(name, 0) + 1
+    for word, name, values, result in DENORMAL_ANSWERS:
+        payload = SEED + bytes([FILL]) * (WINDOWS[name] - 8)
+        for label, call in (("processor", original), ("translation", lifted)):
+            got = under(access, word, call, name, values, payload)[0]
+            if got != result:
+                raise AssertionError(f"{label} {name}{values} under MXCSR {word:#x}: {got:#x}, not {result:#x}")
     for name in CONSTANT_ROOTS:
         if len({bits for (case, bits) in seen if case == name}) < 2:
             raise AssertionError(f"{name} gave one result under every rounding control")

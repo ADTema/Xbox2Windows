@@ -360,6 +360,7 @@ def lift(pe, name, result, slots):
 
 
 FLOAT_PRELUDE = PRELUDE + """#include <cmath>
+#include <emmintrin.h>
 #include <limits>
 // One host instruction per guest operation: no fused multiply-add.
 #if defined(_MSC_VER) && !defined(__clang__)
@@ -403,15 +404,18 @@ template <class Float, class Bits> static Bits daz(Bits bits) {
     if (magnitude == 0 || magnitude > fraction) return bits;
     return runtime(cast<Float>(static_cast<Bits>(1))) == static_cast<Float>(0) ? bits & sign : bits;
 }
-// SQRTSS and SQRTSD with exceptions masked. A NaN operand is returned quieted with its payload, a negative
-// operand other than -0 gives the default NaN, whose sign is set, and -0 gives -0. The host function is
-// kept out of those cases because its NaN sign and its errno handling are not the processor's.
+// SQRTSS and SQRTSD run on the processor itself, through the intrinsics, and not through the host library
+// function: the processor reads a denormal operand as a zero of its sign under DAZ, returns -0 for -0, quiets a
+// NaN operand, gives the default NaN for any other negative operand and rounds as the MXCSR says. A C library
+// root decides those cases on its own (a runtime that tests the sign of the bits returns a NaN for a negative
+// denormal under DAZ, where the processor returns -0).
+static float hardware_root(float value) { return _mm_cvtss_f32(_mm_sqrt_ss(_mm_set_ss(value))); }
+static double hardware_root(double value) {
+    const __m128d operand = _mm_set_sd(value);
+    return _mm_cvtsd_f64(_mm_sqrt_sd(operand, operand));
+}
 template <class Float, class Bits> static Bits root(Bits b) {
-    const Bits quiet = static_cast<Bits>(1) << (std::numeric_limits<Float>::digits - 2);
-    const Float y = runtime(cast<Float>(b));
-    if (y != y) return b | quiet;
-    if (y < 0) return static_cast<Bits>(~(quiet - 1));
-    return cast<Bits>(static_cast<Float>(std::sqrt(y)));
+    return cast<Bits>(hardware_root(runtime(cast<Float>(b))));
 }
 // MINSS, MAXSS, MINSD and MAXSD return the destination only when the comparison is true. Equal values
 // (so zeros of either sign) and any NaN, which compares false, give the source operand unchanged.
