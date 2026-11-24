@@ -522,7 +522,7 @@ OperationResult run_compute_texture_msaa_case(const OperationContext& ctx)
 OperationResult run_compute_texture_store_case(const OperationContext& ctx)
 {
     return skip_if_false(check_compute_texture_store_file(ctx.device, ctx.argv[3], ctx.argv[4]),
-                         "Typed UAV store unavailable for the image case format");
+                         "Required typed UAV operations unavailable for the image case format");
 }
 
 OperationResult run_spirv_sampler_views(const OperationContext& ctx)
@@ -726,6 +726,12 @@ OperationResult run_sampled_coverage(const OperationContext& ctx)
 OperationResult run_check_pixel_compare(const OperationContext& ctx)
 {
     check_pixel_compare(ctx.device, ctx.argv[3], ctx.argv[4]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_check_pixel_gather(const OperationContext& ctx)
+{
+    check_pixel_gather(ctx.device, ctx.argv[3], ctx.argv[4]);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -1289,6 +1295,7 @@ const OperationSpec kOperations[] = {
     {"--dual-pixel-swapped", 5, 5, nullptr, kNoGate, run_dual_pixel_swapped},
     {"--sampled-coverage", 5, 5, nullptr, kNoGate, run_sampled_coverage},
     {"--check-pixel-compare", 5, 5, nullptr, kNoGate, run_check_pixel_compare},
+    {"--check-pixel-gather", 5, 5, nullptr, kNoGate, run_check_pixel_gather},
     {"--check-pixel-case", 5, 6, nullptr, kNoGate, run_check_pixel_case},
     {"--check-pixel-case-rg", 5, 5, nullptr, kNoGate, run_check_pixel_case_rg},
     {"--compute-to-pixel", 6, 7, nullptr, kNoGate, run_compute_to_pixel},

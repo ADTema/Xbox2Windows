@@ -30,6 +30,10 @@ records. The control expects the first blend patch to win and must fail.
 ## Output window and fallback diagnostics
 
 The desktop swap chain has its own top-level window, class `X2WOutputWindow`.
+The presenter only samples non-empty single-sample 2D surfaces without
+`D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE` and with a supported view format
+(`src/startup_stubs/present_view_format.h`), and marks itself failed if
+closing its command list fails.
 When a present cannot show its surface, the GDI fallback selects a visible,
 unowned guest window in the same process. If only the presenter is visible,
 the fallback leaves it alone. To exercise both z-orders with source-built
@@ -130,7 +134,10 @@ the five parts add up to N:
 The classification lives in `src/startup_stubs/null_binding_cause.h`. The source-built
 `startup_null_views_check` fixture checks every cause, that the parts sum to the total, and that
 valid bindings add nothing. It does not draw, so the counters in the totals line itself are checked
-by reading a render log.
+by reading a render log. The device prints the counts by cause value, so
+`ctest --preset dev --no-tests=error -R "^startup_null_cause_labels(_buffer_token_control)?$" -V`
+checks without a device that each cause lands in the slot printed under its label, and that the
+header's names follow the same order. The control swaps the buffer and token slots and must fail.
 
 ## What is measured
 
@@ -227,6 +234,23 @@ starts a byte earlier is rejected before it copies anything. No GPU and no game 
 ctest --preset release --no-tests=error -R '^startup_inflate$' -V
 ```
 
+## Local switches, logging, and memory probing
+
+`tests/startup_local_log_check.cpp` (device-free ctest `startup_local_log`, with negative
+control `startup_local_log_guard_drop_control`) verifies `src/startup_stubs/local_log.h`:
+`env_on` (a leading `1` in values up to three characters, preserving `GetLastError`), atomic
+`first_calls` countdowns, `logf` (stderr and `X2W_TRAP_LOG` output, CRLF and 1533-byte payload
+truncation, `MAX_PATH` boundary behavior, and `GetLastError` preservation on file-open failure),
+`probe_readable` (invalid-pointer and zero-length refusals, multi-page reads, `PAGE_NOACCESS` /
+`MEM_RESERVE` prefix truncation, and `PAGE_GUARD` re-arming verified by `VirtualQuery` and a
+second probe), and `readable`/`writable` boundaries across `PAGE_READONLY`, `PAGE_READWRITE`,
+`PAGE_WRITECOPY`, `PAGE_NOACCESS`, `PAGE_GUARD`, and `MEM_RESERVE`. No GPU is required:
+
+```powershell
+cmake --build --preset dev --target startup_local_log_check
+ctest --preset dev --no-tests=error -R '^startup_local_log(_guard_drop_control)?$' -V
+```
+
 ## Switches
 
 | Variable | Effect |
@@ -241,8 +265,8 @@ ctest --preset release --no-tests=error -R '^startup_inflate$' -V
 | `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. |
 | `X2W_AUDIO_PERMISSIVE=1` | audio HAL / APU stand-ins accept their calls (no output) |
 | `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call |
-| `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user |
-| `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is handed to the executable with a trailing separator, added when missing, because the executable appends names to it as it is; encoded as UTF-8, up to 259 bytes including the trailing separator; a longer value is refused with a log line and `S:\` is used (`src/startup_stubs/storage_root.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`) |
+| `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user, and creates one offline store context for that user |
+| `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is UTF-8, with a trailing separator added when missing. If the path is invalid or exceeds 259 bytes including the separator, the proxy logs the refusal and uses `S:\` (`src/startup_stubs/storage_root_utf8.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`). |
 | `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses (0x4 = A); keyboard and XInput pad 0 also work |
 | `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into `SamplerState qh[2048] : register(s0, space1)` and writes `smpheap 2048 1 fallback 2047`. The stand-in uses entries 0 to 2046 for the bound heap and reserves entry 2047 for unaligned or out-of-range offsets. It also accepts the original `smpheap 2048 1` manifest with all 2,048 entries available. [#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143) |
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
@@ -252,6 +276,12 @@ ctest --preset release --no-tests=error -R '^startup_inflate$' -V
 | `X2W_DUMP_AT=<seconds>[,...]` | the startup debugger writes every thread's stack to `threads_<seconds>.txt` at those times, for a run that stalls before a watchdog or the timeout ends it |
 | `X2W_VALLOC_MIN=<hex bytes>` | the startup debugger logs each virtual-memory allocation of at least that size to `files.txt` (`VALLOC`), with the requested address (0 for any, unreadable for an incomplete read), size, type, protection and the main-image and stand-in return addresses on the caller's stack |
 | `X2W_HOST_CPU=1` (`run.ps1 -HostCpu`) | the startup debugger rewrites main-image instructions the host processor lacks at their first fault: see [Host processors without the console's instructions](#host-processors-without-the-consoles-instructions) |
+
+With `X2W_RUNTIME_PROXY=1` and `X2W_FAKE_USER=1`, store-interface method 3
+(`XStoreCreateContext` on provider `0dd112ac`) writes one context handle for the local user and
+returns success. Other store methods are not answered: a call that still carries the local user
+handle returns `0x80004005`.
+[#1147](https://github.com/R0Y00/Xbox2Windows/issues/1147)
 
 The startup shader cache key includes the translator revision. After updating from
 an earlier translation revision, run the recording build once to emit
@@ -411,6 +441,9 @@ These are measured on one executable; treat them as hypotheses for others.
 - **DirectStorage file ranges.** A nonempty file request checks its byte offset and length against
   the current file size before allocating the staging buffer. A range ending at EOF is valid.
   An overrun or short read fails the queue request and preserves the destination.
+  `ctest --preset dev --no-tests=error -R '^startup_dstorage_file_read' -V` reads
+  `src/startup_stubs/dstorage_file_read.h` at offsets above 2 GiB, across 4 GiB and at EOF above
+  4 GiB in a sparse temporary file, and skips (77) where the temporary folder has no sparse files.
   The `startup_storage_directory_batch` fixture submits ten requests across two synthetic RDS5/ETPF
   files on one queue. In each file, moving the first absolute source offset by 896 KiB selects a
   different valid 28-byte zlib stream. Both return success and produce 4096 bytes. Comparing the
@@ -463,6 +496,12 @@ These are measured on one executable; treat them as hypotheses for others.
   Wrapped sampler heaps keep the 16-byte title stride separate from the desktop descriptor increment
   for CPU handles and descriptor copies.
   The source-built readback uses `ctest --preset dev --no-tests=error -R '^startup_sampler_heap_' -V`.
+  The readback samples only wrap, clamp and border samplers along U. A device-free check covers the
+  rest of the sampler word decoding (each address mode on each axis, filters, anisotropy and border
+  colour), the `smpheap` manifest lines that are refused, snapshot counts and unreadable records, and
+  snapshot equality: build `startup_translated_sampler_bindings_check` and run
+  `ctest --preset dev --no-tests=error -R "^startup_translated_sampler_bindings(_shared_axis_control)?$" -V`.
+  The control expects all three axes to use the U field and must fail.
 - The startup shader translator lowers `image_sample_l` (explicit level, 2D and 3D, any `dmask`) to
   `SampleLevel(sampler, uv, level)`, taking the level from the last address register. Offset, compare,
   gather, clamp, cube, 1D and `unorm` forms are refused. Only the translation is checked
@@ -510,6 +549,16 @@ While a permissive XApu connection is open, the desktop shim requests 1 ms Windo
 timer resolution for the mix worker's short refill waits. The last disconnect
 releases the request. This affects scheduling and preserves the existing audio
 routing and sample format.
+
+With `X2W_AUDIO_PERMISSIVE=1`, `xapu.dll` tracks active handles across `XApuConnect`
+and `XApuDisconnect`, refuses null outputs (`E_POINTER`) and unknown or disconnected
+handles (`E_HANDLE`), and queues one completion entry per `XApuEnqueueCommand` call so
+`XApuGetResultCount` and `XApuDequeueResult` retire commands cleanly (zeroing the
+`0x58`-byte result buffer without fabricating unmeasured fields, and returning `E_FAIL`
+when the queue is empty). The all-zero result is a placeholder: its type field (`+0`) is not a measured
+completion value, and no caller has been observed consuming it. Entries are counters only, so memory does
+not grow per command. Handles are never reused. Default non-permissive mode still traps on every export
+(`ctest --preset dev --no-tests=error -R '^startup_xapu_queue$' -V`).
 
 `src/startup_stubs/audio_sink.{h,cpp}` is a desktop WASAPI shared-mode render sink. It opens the
 default render endpoint, takes the mix format from `GetMixFormat` (32-bit float or 16-bit PCM only),
@@ -591,6 +640,12 @@ the stand-in path; the texture format used in the reported video remains to be c
 cmake --build --preset release --target startup_nv12_draw d3d12_xs_shim
 ctest --preset release --no-tests=error -R '^startup_nv12_draw_' -V
 ```
+
+`ctest --preset dev --no-tests=error -R '^startup_slice_footprints' -V` checks
+`src/startup_stubs/slice_footprints.h` without a GPU. It covers NV12 descriptions refused for odd or zero
+sizes, mips, layers, samples or dimension; the one-frame R8 plane and 15-frame re-read intervals and the
+inclusive 32 MiB cap; the footprint request for 15 and 16 mips and without a device; and the bytes up to
+the end of the last row. The padded-last-row control must fail.
 
 ## Host processors without the console's instructions
 
@@ -792,6 +847,9 @@ Typed element bytes come from the format (1 to 16 bytes). Formats that cannot ba
 `unsupported_description` and leave the destination descriptor unchanged. Translated draws bind typed
 views with the format's element size and stride. The refusal reasons are listed in
 `docs/experiments.md` ("Name the cause of a refused slot 70 call").
+`ctest --preset dev --no-tests=error -R '^startup_memory_srv_report$' -V` checks the refusal line
+without a device, with a distinct value in each 2D and 2D-array view field, the raw words of a
+cube-array view, and widths, first elements, addresses and destinations above 4 GiB.
 
 Checks:
 

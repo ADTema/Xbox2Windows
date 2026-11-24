@@ -875,25 +875,31 @@ def cmpx_skip_asm():
     return program
 
 
-def cmpx_predicate_group(kind, first):
+def cmpx_predicate_group(kind, first, encoding="e32"):
     """Four v_cmpx regions, one per predicate, each setting one channel to 1.0 where `s44 <op> v18` holds.
 
     Mirrors predicate_group and int_predicate_group: v18 copies s45 and v19 copies s47 (1.0). The regions
-    alternate the s_mov_b64 and s_or_b64 restores, so both closes are drawn for every kind.
+    alternate the s_mov_b64 and s_or_b64 restores, so both closes are drawn for every kind. The integer and
+    binary16 kinds copy s45 with v_mov_b32, so the high half of the word reaches the comparison unchanged.
+    The e64 float forms compare `-v18, -s44`, which has the relation of `s44, v18`, and the e64 integer forms
+    compare `s44, s45`, an SGPR src1 that VOPC e32 cannot encode.
     """
-    predicates = PREDICATES if kind == "f32" else INT_PREDICATES
+    sources = ("s44, v18" if encoding == "e32" else "-v18, -s44" if kind in ("f32", "f16") else "s44, s45")
+    predicates = PREDICATES if kind in ("f32", "f16") else INT_PREDICATES
     copy = (["v_sub_f32_e64 v18, s45, 0", "v_sub_f32_e64 v19, s47, 0"] if kind == "f32"
             else ["v_mov_b32_e32 v18, s45", "v_mov_b32_e32 v19, s47"])
     body = copy + [f"v_mov_b32_e32 v{12 + channel}, 0" for channel in range(4)]
     for channel, op in enumerate(predicates[first:first + 4]):
-        body += [CMPX_SAVE, f"v_cmpx_{op}_{kind}_e32 s44, v18", f"v_mov_b32_e32 v{12 + channel}, v19",
+        body += [CMPX_SAVE, f"v_cmpx_{op}_{kind}_{encoding} {sources}", f"v_mov_b32_e32 v{12 + channel}, v19",
                  CMPX_MOV_RESTORE if channel % 2 == 0 else CMPX_OR_RESTORE]
     return with_constants(body)
 
 
-# The 16-bit kinds have no f/t forms: groups starting at lt and le draw lt, eq, le, gt, ne and ge.
+# The 16-bit integer kinds have no f/t forms: groups starting at lt and le draw lt, eq, le, gt, ne and ge.
+# binary16 has all 16 predicates, as binary32.
 CMPX_PREDICATE_GROUPS = tuple((kind, first) for kind, firsts in (("f32", (0, 4, 8, 12)), ("i32", (0, 4)),
-                                                                 ("u32", (0, 4)), ("i16", (1, 3)), ("u16", (1, 3)))
+                                                                 ("u32", (0, 4)), ("i16", (1, 3)), ("u16", (1, 3)),
+                                                                 ("f16", (0, 4, 8, 12)))
                               for first in firsts)
 # Pairs (s44, s45) for the 16-bit kinds: the high halves differ, so only the low 16 bits may decide.
 CMPX_INT16_PAIRS = ((0x12348000, 0xabcd0000), (0xffff1234, 0x00001234), (0x00000001, 0xffff0000),
@@ -908,12 +914,12 @@ def cmpx_int16_relation(kind, left, right):
     return 0 if a < b else (1 if a == b else 2)
 
 
-def cmpx64_group(kind, group):
-    """cmp64_group with each e32 comparison opening a v_cmpx region that sets its channel to 1.0 (v22)."""
+def cmpx64_group(kind, group, encoding="e32"):
+    """cmp64_group with each comparison opening a v_cmpx region that sets its channel to 1.0 (v22)."""
     body = [f"v_mov_b32_e32 v{12 + channel}, 0" for channel in range(4)]
     for channel in range(4):
-        src0, src1 = cmp64_sources(CMP64_SHAPES[(channel + group) % 4], "e32")
-        body += [CMPX_SAVE, f"v_cmpx_{CMP64_PREDICATES[4 * group + channel]}_{kind}_e32 {src0}, {src1}",
+        src0, src1 = cmp64_sources(CMP64_SHAPES[(channel + group) % 4], encoding)
+        body += [CMPX_SAVE, f"v_cmpx_{CMP64_PREDICATES[4 * group + channel]}_{kind}_{encoding} {src0}, {src1}",
                  f"v_mov_b32_e32 v{12 + channel}, v22", CMPX_MOV_RESTORE if channel % 2 == 0 else CMPX_OR_RESTORE]
     return cmp64_program(body)
 
@@ -937,14 +943,95 @@ def cmpx_class_region(restore=CMPX_MOV_RESTORE, classes=CMPX_CLASS_POSITIVE_NORM
 CMPX_CLASS_MASKS = (0x200, 3, 0x40, 0x80)
 
 
-def cmpx_class_group(masks=CMPX_CLASS_MASKS):
-    """Four v_cmpx_class_f32 regions, each setting one channel to 1.0 when s44+channel is in its class mask."""
+def cmpx_class_group(masks=CMPX_CLASS_MASKS, kind="f32", encoding="e32"):
+    """Four v_cmpx_class regions, each setting one channel to 1.0 when s44+channel is in its class mask.
+
+    The e64 forms take the mask as a constant, and the third reads |s46|, so -0 tests as +0.
+    """
     body = ["v_mov_b32_e32 v19, 1.0"] + [f"v_mov_b32_e32 v{12 + channel}, 0" for channel in range(4)]
     for channel, classes in enumerate(masks):
-        body += [f"v_mov_b32_e32 v18, {classes if classes <= 64 else hex(classes)}", CMPX_SAVE,
-                 f"v_cmpx_class_f32_e32 s{44 + channel}, v18", f"v_mov_b32_e32 v{12 + channel}, v19",
-                 CMPX_MOV_RESTORE if channel % 2 == 0 else CMPX_OR_RESTORE]
+        mask = classes if classes <= 64 else hex(classes)
+        if encoding == "e32":
+            body += [f"v_mov_b32_e32 v18, {mask}", CMPX_SAVE, f"v_cmpx_class_{kind}_e32 s{44 + channel}, v18"]
+        else:
+            value = "|s46|" if channel == 2 else f"s{44 + channel}"
+            body += [CMPX_SAVE, f"v_cmpx_class_{kind}_e64 {value}, {mask}"]
+        body += [f"v_mov_b32_e32 v{12 + channel}, v19", CMPX_MOV_RESTORE if channel % 2 == 0 else CMPX_OR_RESTORE]
     return with_constants(body)
+
+
+def half_bits_value(bits):
+    """The binary16 value of the low 16 bits of a word."""
+    return struct.unpack("<e", struct.pack("<H", bits & 0xffff))[0]
+
+
+def class_bit(bits, *, half):
+    """The v_cmp_class class bit (LLVM SIInstrFlags::ClassFlags) of the low 16 bits of a word as binary16
+    (half=True, as v_cmp_class_f16 reads it) or of the whole word as binary32 (half=False)."""
+    sign, inf, quiet, normal = ((0x8000, 0x7c00, 0x200, 0x400) if half
+                                else (0x80000000, 0x7f800000, 0x400000, 0x800000))
+    value = bits & (0xffff if half else 0xffffffff)
+    magnitude, negative = value & (sign - 1), value >= sign
+    if magnitude > inf:
+        return 0x2 if value & quiet else 0x1
+    if magnitude == inf:
+        return 0x4 if negative else 0x200
+    if magnitude >= normal:
+        return 0x8 if negative else 0x100
+    if magnitude:
+        return 0x10 if negative else 0x80
+    return 0x20 if negative else 0x40
+
+
+def cmpx_float_relation(left, right):
+    """0, 1, 2 or 3 for less, equal, greater or unordered: the bit of the predicate index that holds."""
+    if math.isnan(left) or math.isnan(right):
+        return 3
+    return 0 if left < right else (1 if left == right else 2)
+
+
+# binary16 (s44, s45) words for the v_cmpx_<op>_f16 groups, one per relation shape: less, equal, signed zero, greater,
+# denormals, infinities and a NaN on either side (a signaling one on the right). The high halves are chosen so a
+# binary32 read of the whole word gives a different relation; check_cmpx_controls asserts both claims.
+CMPX_F16_PAIRS = (("lt", 0x4000bc00, 0xc0003c00), ("eq", 0x12343c00, 0xabcd3c00),
+                  ("signed-zero", 0x00008000, 0x7fc00000), ("gt", 0xbf804000, 0x3f80c000),
+                  ("denormal", 0x3f800001, 0x00000002), ("inf", 0x0000fc00, 0x00007c00),
+                  ("left-nan", 0x3f807e00, 0x3f803c00), ("right-nan", 0x40003c00, 0x3f807c01))
+
+
+def cmpx_f16_relation(left, right, *, whole_word=False):
+    """The relation of the low halves as binary16, or with whole_word=True of the full words as binary32."""
+    if whole_word:
+        return cmpx_float_relation(*struct.unpack("<2f", struct.pack("<2I", left, right)))
+    return cmpx_float_relation(half_bits_value(left), half_bits_value(right))
+
+
+# v_cmpx_class_f16 regions on the CMPX_CLASS_MASKS properties in binary16: +inf against its own bit, a quiet NaN
+# against both NaN bits, -0 against the +0 bit and a positive denormal against its bit. Each high half makes the
+# binary32 class of the whole word differ (+normal, +normal, +normal, -denormal), so a 32-bit read gives 0 in every
+# channel.
+CMPX_CLASS_F16_BITS = (0x12347c00, 0x3f807e00, 0x40008000, 0x80000001)
+# (s44, s45) pairs of the 32-bit integer groups: signed and unsigned orders differ on the first and fourth.
+CMPX_INT_PAIRS = ((0x80000000, 0x00000000), (0xbf800000, 0xbf800000), (0x3f800000, 0xbf800000),
+                  (0xc0000000, 0xbf800000))
+# (s44, s45) words of the predicate groups per kind; the binary32 pairs are -1/1, -0/+0, 1/-1 and a NaN either side.
+CMPX_WORD_PAIRS = {"f32": tuple(struct.unpack("<2I", struct.pack("<2f", left, right))
+                                for left, right in ((-1, 1), (-0.0, 0.0), (1, -1), (math.nan, 1), (1, math.nan))),
+                   "f16": tuple((left, right) for _, left, right in CMPX_F16_PAIRS),
+                   "i32": CMPX_INT_PAIRS, "u32": CMPX_INT_PAIRS, "i16": CMPX_INT16_PAIRS, "u16": CMPX_INT16_PAIRS}
+
+
+def cmpx_relation(kind, left, right):
+    """0, 1, 2 or 3 (less, equal, greater, unordered) of the words `left` and `right` as v_cmpx_*_<kind> reads them."""
+    if kind == "f32":
+        return cmpx_float_relation(*struct.unpack("<2f", struct.pack("<2I", left, right)))
+    if kind == "f16":
+        return cmpx_f16_relation(left, right)
+    if kind in ("i16", "u16"):
+        return cmpx_int16_relation(kind, left, right)
+    if kind == "i32":
+        left, right = (v - 0x100000000 if v & 0x80000000 else v for v in (left, right))
+    return 0 if left < right else (1 if left == right else 2)
 
 
 def cmpx_observables():
@@ -1040,6 +1127,32 @@ def check_cmpx_draw(directory, compiler, renderer, backend):
     case.write_bytes(class_constants + struct.pack("<4f", *class_expected) * 64)
     cases.append((case, "pass"))
     run_pixel_batch(renderer, backend, shader, cases)
+    # The same class regions as v_cmpx_class_f16 on the low halves of CMPX_CLASS_F16_BITS. Wrong references: each
+    # channel flipped, and the binary32 class of the whole words (0 in every channel).
+    source.write_text(translate(cmpx_class_group(kind="f16")), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    class_constants = bytearray(256)
+    struct.pack_into("<4I", class_constants, 12, *CMPX_CLASS_F16_BITS)
+    class_expected = [float(class_bit(bits, half=True) & classes != 0)
+                      for bits, classes in zip(CMPX_CLASS_F16_BITS, CMPX_CLASS_MASKS)]
+    assert class_expected == [1.0, 1.0, 0.0, 1.0], class_expected
+    whole_word = [float(class_bit(bits, half=False) & classes != 0)
+                  for bits, classes in zip(CMPX_CLASS_F16_BITS, CMPX_CLASS_MASKS)]
+    assert whole_word == [0.0] * 4, whole_word
+    cases = []
+    for k in range(4):
+        wrong = list(class_expected)
+        wrong[k] = 1.0 - wrong[k]
+        case = directory / f"cmpx-class-f16-group-wrong-{k}.case"
+        case.write_bytes(class_constants + struct.pack("<4f", *wrong) * 64)
+        cases.append((case, "mismatch"))
+    case = directory / "cmpx-class-f16-group-as-32-bit.case"
+    case.write_bytes(class_constants + struct.pack("<4f", *whole_word) * 64)
+    cases.append((case, "mismatch"))
+    case = directory / "cmpx-class-f16-group.case"
+    case.write_bytes(class_constants + struct.pack("<4f", *class_expected) * 64)
+    cases.append((case, "pass"))
+    run_pixel_batch(renderer, backend, shader, cases)
     # VCC and SCC from before the region, on mixed, full and empty masks; SCC is 1 only for 0.5.
     source.write_text(translate(cmpx_observables()), encoding="ascii")
     compile_shader(compiler, source, shader)
@@ -1060,8 +1173,6 @@ def check_cmpx_draw(directory, compiler, renderer, backend):
     # Every accepted predicate: relations less, equal, greater and (f32 only) unordered.
     float_inputs = (("lt", -1, 1, 0), ("signed-zero", -0.0, 0.0, 1), ("gt", 1, -1, 2),
                     ("left-nan", math.nan, 1, 3), ("right-nan", 1, math.nan, 3))
-    int_pairs = ((0x80000000, 0x00000000), (0xbf800000, 0xbf800000), (0x3f800000, 0xbf800000),
-                 (0xc0000000, 0xbf800000))
     for kind, first in CMPX_PREDICATE_GROUPS:
         source.write_text(translate(cmpx_predicate_group(kind, first)), encoding="ascii")
         compile_shader(compiler, source, shader)
@@ -1073,8 +1184,31 @@ def check_cmpx_draw(directory, compiler, renderer, backend):
                 case = directory / f"cmpx-{kind}-{first}-{label}.case"
                 write_case(case, constants, tuple((op >> relation) & 1 for op in range(first, first + 4)))
                 cases.append((case, "pass"))
+        elif kind == "f16":
+            # binary16 on the low halves. Wrong references: the binary32 relation of the whole words, and the
+            # less and greater rows swapped (a reversed predicate), wherever this group's truth row differs.
+            wrong_rows = 0
+            for label, left, right in CMPX_F16_PAIRS:
+                relation = cmpx_f16_relation(left, right)
+                whole = cmpx_f16_relation(left, right, whole_word=True)
+                assert whole != relation, (label, relation, whole)
+                constants = bytearray(256)
+                struct.pack_into("<IIff", constants, 12, left, right, 0.0, 1.0)
+                row = tuple((op >> relation) & 1 for op in range(first, first + 4))
+                case = directory / f"cmpx-f16-{first}-{label}.case"
+                case.write_bytes(constants + struct.pack("<4f", *row) * 64)
+                cases.append((case, "pass"))
+                swapped = {0: 2, 2: 0}.get(relation, relation)
+                for wrong_label, wrong_relation in (("as-32-bit", whole), ("reversed", swapped)):
+                    wrong = tuple((op >> wrong_relation) & 1 for op in range(first, first + 4))
+                    if wrong != row:
+                        case = directory / f"cmpx-f16-{first}-{label}-{wrong_label}.case"
+                        case.write_bytes(constants + struct.pack("<4f", *wrong) * 64)
+                        cases.append((case, "mismatch"))
+                        wrong_rows += 1
+            assert wrong_rows >= 4, (first, wrong_rows)
         else:
-            for left, right in (CMPX_INT16_PAIRS if kind in ("i16", "u16") else int_pairs):
+            for left, right in CMPX_WORD_PAIRS[kind]:
                 lv, rv = left, right
                 if kind == "i32":
                     lv, rv = (v - 0x100000000 if v & 0x80000000 else v for v in (left, right))
@@ -1134,6 +1268,117 @@ def check_cmpx_draw(directory, compiler, renderer, backend):
             except AssertionError as error:
                 error.add_note(f"64-bit v_cmpx draw on {backend}, kind={kind}, group={group}")
                 raise
+    # binary64 v_cmpx regions against the cmpf64 reference, on every CMPF64_WORDS row: the rows separate the
+    # unsigned integer order, unequal signed zeros, flushed denormals and a high-word-only NaN test.
+    for group in CMPXF64_GROUPS:
+        source.write_text(translate_f64(cmpxf64_group(group)), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        cases = []
+        for index, words in enumerate(CMPF64_WORDS):
+            constants = bytearray(256)
+            struct.pack_into("<4I", constants, 12, *words)
+            case = directory / f"cmpxf64-{group}-{index}.case"
+            write_case(case, bytes(constants), cmpf64_expected("e32", group, words), integer_rt=True)
+            cases.append((case, "pass"))
+        # Wrong references on one row each: the operands swapped for group 0 on -1.0 against -2.0 (row 3), and
+        # every class channel flipped on the first row.
+        wrong_row = 3 if group == 0 else 0 if group == "class" else None
+        if wrong_row is not None:
+            words = CMPF64_WORDS[wrong_row]
+            right = cmpf64_expected("e32", group, words)
+            if group == 0:
+                wrong = tuple(as_float(0x3f800000 if cmpf64_truth(CMPF64_PREDICATES[channel],
+                                                                  *reversed([cmpf64_operand(t, words) for t in
+                                                                             cmpf64_sources(CMPF64_SHAPES[channel % 4],
+                                                                                            "e32")])) else 0)
+                              for channel in range(4))
+            else:
+                wrong = tuple(as_float(0x3f800000) if value == 0 else as_float(0) for value in right)
+            assert wrong != right, group
+            constants = bytearray(256)
+            struct.pack_into("<4I", constants, 12, *words)
+            case = directory / f"cmpxf64-{group}-wrong.case"
+            write_case(case, bytes(constants), wrong, integer_rt=True)
+            cases.append((case, "mismatch"))
+        try:
+            run_pixel_batch(renderer, backend, shader, cases)
+        except AssertionError as error:
+            error.add_note(f"binary64 v_cmpx draw on {backend}, group={group}")
+            raise
+    return 0
+
+
+def check_cmpx_e64_draw(directory, compiler, renderer, backend):
+    """Draw the VOP3 (e64) v_cmpx regions on WARP or hardware (issue #932).
+
+    Each group has the predicates of its e32 group, with SGPR or constant sources and, on the float types,
+    source modifiers. The float predicate groups negate and swap both sources, which keeps each relation, so
+    the e32 rows are the references and the rows with less and greater swapped (a dropped modifier) are the
+    wrong ones. The class groups read |s46| for -0; the 64-bit groups use the e64 shapes and references of
+    the v_cmp draws.
+    """
+    source, shader = directory / "cmpx-e64.hlsl", directory / "cmpx-e64.cso"
+
+    def draw(text, cases, note):
+        source.write_text(text, encoding="ascii")
+        compile_shader(compiler, source, shader)
+        try:
+            run_pixel_batch(renderer, backend, shader, cases)
+        except AssertionError as error:
+            error.add_note(f"e64 v_cmpx draw on {backend}, {note}")
+            raise
+
+    def case(name, words, row, outcome, *, integer_rt=False):
+        constants = bytearray(256)
+        struct.pack_into(f"<{len(words)}I", constants, 12, *words)
+        path = directory / f"cmpx-e64-{name}.case"
+        write_case(path, bytes(constants), row, integer_rt=integer_rt)
+        return path, outcome
+
+    one = 0x3f800000
+    for kind, first in CMPX_PREDICATE_GROUPS:
+        cases, wrong_rows = [], 0
+        for index, (left, right) in enumerate(CMPX_WORD_PAIRS[kind]):
+            relation = cmpx_relation(kind, left, right)
+            row = tuple(float((op >> relation) & 1) for op in range(first, first + 4))
+            cases.append(case(f"{kind}-{first}-{index}", (left, right, 0, one), row, "pass"))
+            swapped = {0: 2, 2: 0}.get(relation, relation)
+            wrong = tuple(float((op >> swapped) & 1) for op in range(first, first + 4))
+            if wrong != row:
+                cases.append(case(f"{kind}-{first}-{index}-reversed", (left, right, 0, one), wrong, "mismatch"))
+                wrong_rows += 1
+        assert wrong_rows, (kind, first)
+        draw(translate(cmpx_predicate_group(kind, first, "e64")), cases, f"kind={kind}, first={first}")
+    # Class groups: +inf, a quiet NaN, -0 read as |-0| = +0 and a positive denormal. Wrong references: the
+    # unmodified -0 (the e32 answers), and every channel flipped.
+    for kind, bits in (("f32", CLASS_BITS), ("f16", CMPX_CLASS_F16_BITS)):
+        half = kind == "f16"
+        values = [b & (0x7fff if half else 0x7fffffff) if channel == 2 else b for channel, b in enumerate(bits)]
+        row = tuple(float(class_bit(v, half=half) & m != 0) for v, m in zip(values, CMPX_CLASS_MASKS))
+        unmodified = tuple(float(class_bit(b, half=half) & m != 0) for b, m in zip(bits, CMPX_CLASS_MASKS))
+        assert row == (1.0, 1.0, 1.0, 1.0) and unmodified == (1.0, 1.0, 0.0, 1.0), (kind, row, unmodified)
+        cases = [case(f"class-{kind}", bits, row, "pass"),
+                 case(f"class-{kind}-unmodified", bits, unmodified, "mismatch"),
+                 case(f"class-{kind}-flipped", bits, tuple(1.0 - v for v in row), "mismatch")]
+        draw(translate(cmpx_class_group(kind=kind, encoding="e64")), cases, f"class kind={kind}")
+    for kind in ("i64", "u64"):
+        for group in (0, 1):
+            cases = [case(f"{kind}-{group}-{index}", words, cmp64_expected(kind, "e64", group, words), "pass",
+                          integer_rt=True) for index, words in enumerate(CMP64_WORDS)]
+            if (kind, group) == ("i64", 0):
+                # Wrong reference: the unsigned answers for the signed shader on -1 against 0.
+                cases.append(case("i64-0-as-unsigned", CMP64_WORDS[3],
+                                  cmp64_expected("u64", "e64", 0, CMP64_WORDS[3]), "mismatch", integer_rt=True))
+            draw(translate_int(cmpx64_group(kind, group, "e64")), cases, f"kind={kind}, group={group}")
+    for group in CMPXF64_GROUPS:
+        cases = [case(f"f64-{group}-{index}", words, cmpf64_expected("e64", group, words), "pass", integer_rt=True)
+                 for index, words in enumerate(CMPF64_WORDS)]
+        # Wrong reference on the first row: every channel flipped.
+        right = cmpf64_expected("e64", group, CMPF64_WORDS[0])
+        cases.append(case(f"f64-{group}-flipped", CMPF64_WORDS[0],
+                          tuple(as_float(one) if value == 0 else as_float(0) for value in right), "mismatch",
+                          integer_rt=True))
+        draw(translate_f64(cmpxf64_group(group, "e64")), cases, f"binary64 group={group}")
     return 0
 
 
@@ -3272,10 +3517,10 @@ def check_cmp64_controls():
                     == translate_int(cmp64_program([f"v_cmp_lt_u64_e64 vcc_lo, v[18:19], {token}"]))), token
         else:
             error(f"v_cmp_lt_u64 vcc_lo, v[18:19], {token}", invalid + token)
-    # An e32 v_cmpx is admitted only as a masked-region opener; binary64 has its own controls.
-    error("v_cmpx_lt_i64_e32 v[18:19], v[20:21]", "Unsupported v_cmpx execution mask save")
-    for line in ("v_cmpx_lt_u64_e64 v[18:19], v[20:21]",
-                 "v_cmpx_lt_i64_e64 s52, v[18:19], v[20:21]", "v_cmp_lt_i64_sdwa vcc_lo, v[18:19], v[20:21]",
+    # A v_cmpx is admitted only as a masked-region opener; binary64 has its own controls.
+    for line in ("v_cmpx_lt_i64_e32 v[18:19], v[20:21]", "v_cmpx_lt_u64_e64 v[18:19], s[46:47]"):
+        error(line, "Unsupported v_cmpx execution mask save")
+    for line in ("v_cmpx_lt_i64_e64 s52, v[18:19], v[20:21]", "v_cmp_lt_i64_sdwa vcc_lo, v[18:19], v[20:21]",
                  "v_cmp_lt_i64_dpp vcc_lo, v[18:19], v[20:21] quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
                  "v_cmp_ngt_i64_e64 s52, v[18:19], v[20:21]", "v_cmp_lg_u64_e64 s52, v[18:19], v[20:21]"):
         error(line, "Unsupported instruction")
@@ -3525,6 +3770,28 @@ def cmpf64_expected(encoding, group, words):
 
 
 CMPF64_GROUPS = tuple((encoding, group) for encoding in ("e32", "e64") for group in (0, 1, 2, 3, "class"))
+CMPXF64_GROUPS = (0, 1, 2, 3, "class")
+
+
+def cmpxf64_group(group, encoding="e32"):
+    """The cmpf64 group with each comparison opening a v_cmpx region that sets its channel to 1.0 (v22).
+
+    Same predicates, operand shapes and class masks as cmpf64_group(encoding, group), so
+    cmpf64_expected(encoding, ...) is the reference. The regions alternate the s_mov_b64 and s_or_b64 restores.
+    """
+    body = [f"v_mov_b32_e32 v{12 + channel}, 0" for channel in range(4)]
+    for channel in range(4):
+        if group == "class":
+            source, classes = CMPF64_CLASS[encoding][channel]
+            if encoding == "e32":
+                body += [f"v_mov_b32_e32 v23, {classes}", CMPX_SAVE, f"v_cmpx_class_f64_e32 {source}, v23"]
+            else:
+                body += [CMPX_SAVE, f"v_cmpx_class_f64_e64 {source}, {classes:#x}"]
+        else:
+            src0, src1 = cmpf64_sources(CMPF64_SHAPES[(channel + group) % 4], encoding)
+            body += [CMPX_SAVE, f"v_cmpx_{CMPF64_PREDICATES[4 * group + channel]}_f64_{encoding} {src0}, {src1}"]
+        body += [f"v_mov_b32_e32 v{12 + channel}, v22", CMPX_MOV_RESTORE if channel % 2 == 0 else CMPX_OR_RESTORE]
+    return cmp64_program(body)
 
 
 def cmpf64_program(encoding, group):
@@ -3539,6 +3806,45 @@ def check_cmpf64_controls():
         translate_f64(program)
         forms.update(line.split()[0] for line in program if line.startswith("v_cmp_"))
     assert forms == {f"v_cmp_{op}_f64_{enc}" for op in (*CMPF64_PREDICATES, "class") for enc in ("e32", "e64")}, forms
+    # v_cmpx regions on binary64 (issue #932 follow-up): every predicate and the class test as e32 and e64 openers.
+    cmpx_forms = set()
+    for encoding, group in CMPF64_GROUPS:
+        program = cmpxf64_group(group, encoding)
+        text = translate_f64(program)
+        assert text[text.index(" main("):].count(" ? ") == 4, group
+        cmpx_forms.update(line.split()[0] for line in program if line.startswith("v_cmpx_"))
+        expect_value_error(translate_int, program, "binary64 denormal mode unknown at entry")
+    assert cmpx_forms == {f"v_cmpx_{op}_f64_{enc}" for op in (*CMPF64_PREDICATES, "class")
+                          for enc in ("e32", "e64")}, cmpx_forms
+
+    def opener_lowering(first):
+        """The binary64 declarations and predicate emitted for `first`, with the cmp numbers dropped."""
+        program = cmp64_program(["v_mov_b32_e32 v23, 0x204", *first])
+        return [re.sub(r"cmp\d+", "cmp", line.strip()) for line in translate_f64(program).splitlines()
+                if re.match(r"\s+(uint2?|bool) cmp\d+", line)]
+
+    # Each binary64 opener lowers like the e32 v_cmp of the same predicate on the same sources.
+    for compare, plain in (("v_cmpx_lt_f64_e32 v[18:19], v[20:21]", "v_cmp_lt_f64_e32 vcc_lo, v[18:19], v[20:21]"),
+                           ("v_cmpx_nge_f64_e32 s[44:45], v[20:21]", "v_cmp_nge_f64_e32 vcc_lo, s[44:45], v[20:21]"),
+                           ("v_cmpx_u_f64_e32 -2.0, v[20:21]", "v_cmp_u_f64_e32 vcc_lo, -2.0, v[20:21]"),
+                           ("v_cmpx_class_f64_e32 v[20:21], v23", "v_cmp_class_f64_e32 vcc_lo, v[20:21], v23"),
+                           ("v_cmpx_lt_f64_e64 -v[18:19], |v[20:21]|", "v_cmp_lt_f64_e64 s52, -v[18:19], |v[20:21]|"),
+                           ("v_cmpx_o_f64_e64 v[18:19], s[46:47]", "v_cmp_o_f64_e64 s52, v[18:19], s[46:47]"),
+                           ("v_cmpx_ge_f64_e64 v[18:19], 0.5", "v_cmp_ge_f64_e64 s52, v[18:19], 0.5"),
+                           ("v_cmpx_class_f64_e64 v[20:21], 0x204", "v_cmp_class_f64_e64 s52, v[20:21], 0x204")):
+        opened = opener_lowering([CMPX_SAVE, compare, "v_mov_b32_e32 v12, v22", CMPX_MOV_RESTORE])
+        mask = "vcc_lo" if "vcc_lo" in plain else "s52"
+        reference = opener_lowering([plain, f"v_cndmask_b32_e64 v12, 0, v22, {mask}"])
+        assert opened and opened == reference, (compare, opened, reference)
+    # Refused: SDWA, an e32 SGPR pair or single VGPR as VSRC1, e32 source modifiers, an e32 SGPR class mask, an
+    # e64 SGPR destination, clamp and an integer literal other than 0.
+    for compare in ("v_cmpx_lt_f64_e64 s52, v[18:19], v[20:21]", "v_cmpx_lt_f64_e64 v[18:19], v[20:21] clamp",
+                    "v_cmpx_lt_f64_e64 v[18:19], 7", "v_cmpx_lt_f64_sdwa v[18:19], v[20:21]",
+                    "v_cmpx_lt_f64_e32 v[18:19], s[46:47]",
+                    "v_cmpx_lt_f64_e32 v[18:19], v20", "v_cmpx_lt_f64_e32 -v[18:19], v[20:21]",
+                    "v_cmpx_lt_f64_e32 |v[18:19]|, v[20:21]", "v_cmpx_class_f64_e32 v[18:19], s46",
+                    "v_cmpx_lt_f64"):
+        must_reject(translate_f64, cmp64_program([CMPX_SAVE, compare, "v_mov_b32_e32 v12, v22", CMPX_MOV_RESTORE]))
     # The forms need the declared binary64 denormal state, because MODE[7:6] could flush denormal inputs.
     for encoding, group in (("e32", 0), ("e64", "class")):
         expect_value_error(translate_int, cmpf64_program(encoding, group), "binary64 denormal mode unknown at entry")
@@ -3585,7 +3891,9 @@ def check_cmpf64_controls():
     error("v_cmp_class_f64_e32 vcc_lo, v[18:19], 3", "VOPC e32 src1 must be a VGPR")
     error("v_cmp_class_f64_e64 s52, v[18:19], 1.0", "Unsupported class mask")
     error("v_cmp_lt_f64_e64 s52, v[60:61], v[20:21]", "Untracked 64-bit comparison source: v[60:61]")
-    for line in ("v_cmp_lt_f64 vcc_lo, v[18:19], v[20:21]", "v_cmpx_lt_f64_e32 v[18:19], v[20:21]",
+    # A binary64 v_cmpx opens a region only directly after the entry-mask save (as the 64-bit integer forms).
+    error("v_cmpx_lt_f64_e32 v[18:19], v[20:21]", "Unsupported v_cmpx execution mask save")
+    for line in ("v_cmp_lt_f64 vcc_lo, v[18:19], v[20:21]",
                  "v_cmp_lt_f64_sdwa vcc_lo, v[18:19], v[20:21]", "v_cmp_lt_f64_e64 s52, v[18:19], v[20:21] clamp"):
         error(line, invalid + "v[20:21] clamp" if line.endswith("clamp") else "Unsupported instruction")
     # A masked region and a pending scalar load.
@@ -11272,16 +11580,32 @@ def check_cmpx_controls():
     for restore in (CMPX_MOV_RESTORE, CMPX_OR_RESTORE):
         assert selects(cmpx_region(restore)) == 2
     assert selects(cmpx_skip()) == 2
-    for kind, first in CMPX_PREDICATE_GROUPS:
-        assert selects(cmpx_predicate_group(kind, first)) == 4
-    for kind in ("i64", "u64"):
-        for group in (0, 1):
-            assert selects(cmpx64_group(kind, group)) == 4
+    for encoding in ("e32", "e64"):
+        for kind, first in CMPX_PREDICATE_GROUPS:
+            assert selects(cmpx_predicate_group(kind, first, encoding)) == 4
+        for kind in ("i64", "u64"):
+            for group in (0, 1):
+                assert selects(cmpx64_group(kind, group, encoding)) == 4
+        assert selects(cmpx_class_group(encoding=encoding)) == 4
+        assert selects(cmpx_class_group(kind="f16", encoding=encoding)) == 4
+    # The e64 float groups apply both negations, and the third e64 class channel the absolute value.
+    assert re.search(r"\(\(-\w+\) > \(-params\[0\]\.w\)\)", translate(cmpx_predicate_group("f32", 4, "e64")))
+    assert "abs(" in translate(cmpx_class_group(encoding="e64"))
     for restore in (CMPX_MOV_RESTORE, CMPX_OR_RESTORE):
         assert selects(cmpx_class_region(restore)) == 2
     assert selects(cmpx_class_group()) == 4
     assert translate(cmpx_class_group()).count("(class32(") == 4
-    # Each accepted comparison kind lowers like the v_cmp of the same kind.
+    assert selects(cmpx_class_group(kind="f16")) == 4
+    assert [cmpx_f16_relation(left, right) for _, left, right in CMPX_F16_PAIRS] == [0, 1, 1, 2, 0, 0, 3, 3]
+    assert all(cmpx_f16_relation(left, right, whole_word=True) != cmpx_f16_relation(left, right)
+               for _, left, right in CMPX_F16_PAIRS)
+    assert translate(cmpx_class_group(kind="f16")).count("(class16(") == 4
+    # Each accepted comparison kind lowers like the v_cmp of the same kind: every binary16 predicate, with a
+    # register, an inline constant and a 16-bit literal as src0, and the binary16 class test.
+    f16_pairs = [(f"v_cmpx_{op}_f16_e32 {src0}, v12", f"v_cmp_{op}_f16_e32 vcc_lo, {src0}, v12")
+                 for op in PREDICATES for src0 in ("s44", "v13", "-1.0", "0x7c01")]
+    f16_pairs += [(f"v_cmpx_class_f16_e32 {src0}, v12", f"v_cmp_class_f16_e32 vcc_lo, {src0}, v12")
+                  for src0 in ("s44", "v13", "0.5", "-4", "0x7c00")]
     for compare, plain in (("v_cmpx_lt_f32_e32 s44, v12", "v_cmp_lt_f32_e32 vcc_lo, s44, v12"),
                            ("v_cmpx_ge_i32_e32 v13, v12", "v_cmp_ge_i32_e32 vcc_lo, v13, v12"),
                            ("v_cmpx_ne_u32_e32 0x3f000000, v12", "v_cmp_ne_u32_e32 vcc_lo, 0x3f000000, v12"),
@@ -11289,7 +11613,8 @@ def check_cmpx_controls():
                            ("v_cmpx_gt_i16_e32 v13, v12", "v_cmp_gt_i16_e32 vcc_lo, v13, v12"),
                            ("v_cmpx_le_u16_e32 0x8000, v12", "v_cmp_le_u16_e32 vcc_lo, 0x8000, v12"),
                            ("v_cmpx_class_f32_e32 s44, v12", "v_cmp_class_f32_e32 vcc_lo, s44, v12"),
-                           ("v_cmpx_class_f32_e32 0x200, v12", "v_cmp_class_f32_e32 vcc_lo, 0x200, v12")):
+                           ("v_cmpx_class_f32_e32 0x200, v12", "v_cmp_class_f32_e32 vcc_lo, 0x200, v12"),
+                           *f16_pairs):
         expr = next(line for line in translate(cmpx_region(compare=compare)).splitlines() if "bool cmp" in line)
         reference = next(line for line in translate(uncompressed_export([plain])).splitlines() if "bool cmp" in line)
         assert expr.split(" = ", 1)[1] == reference.split(" = ", 1)[1], (compare, expr, reference)
@@ -11339,16 +11664,45 @@ def check_cmpx_controls():
     expect_value_error(translate, [CMPX_MOV_RESTORE.replace("60:61", "58:59") if line == "s_or_b64 exec, exec, s[60:61]"
                                    else line for line in masked_region()], "Unexpected execution mask restore")
     must_reject(translate, [line for line in region if line != CMPX_MOV_RESTORE])
-    # Out of scope for this stage: e64, SDWA, f16/f64 and their class forms, VSRC1 not a VGPR (a pair at 64 bits),
-    # the 16-bit f/t forms gfx10 lacks, a float token on a 16-bit integer, and source modifiers.
-    for compare in ("v_cmpx_gt_f32_e64 s44, v12", "v_cmpx_gt_f32_sdwa s44, v12 src0_sel:DWORD src1_sel:DWORD",
-                    "v_cmpx_gt_f16_e32 s44, v12", "v_cmpx_gt_f64_e32 s[44:45], v[12:13]",
+    # The e64 openers lower like the e64 v_cmp of the same sources, modifiers included.
+    def opener(compare):
+        text = translate(cmpx_region(compare=compare))
+        return re.sub(r"cmp\d+", "cmp", re.search(r"bool cmp\d+ = (.*);", text)[1])
+
+    def plain(compare):
+        text = translate(uncompressed_export([compare, "v_cndmask_b32_e64 v13, v13, s45, s52"]))
+        return re.sub(r"cmp\d+", "cmp", re.search(r"bool cmp\d+ = (.*);", text)[1])
+
+    for compare, reference in (("v_cmpx_gt_f32_e64 -s44, |v12|", "v_cmp_gt_f32_e64 s52, -s44, |v12|"),
+                               ("v_cmpx_gt_u32_e64 v12, s44", "v_cmp_gt_u32_e64 s52, v12, s44"),
+                               ("v_cmpx_ge_i16_e64 v12, 5", "v_cmp_ge_i16_e64 s52, v12, 5"),
+                               ("v_cmpx_nlt_f16_e64 -v12, |s44|", "v_cmp_nlt_f16_e64 s52, -v12, |s44|"),
+                               ("v_cmpx_class_f32_e64 -v12, 0x204", "v_cmp_class_f32_e64 s52, -v12, 0x204"),
+                               ("v_cmpx_class_f16_e64 |v12|, s44", "v_cmp_class_f16_e64 s52, |v12|, s44")):
+        assert opener(compare) == plain(reference), (compare, opener(compare), plain(reference))
+    # Out of scope for this stage: SDWA, an e32 VSRC1 that is not a VGPR (a pair at 64 bits; binary64 refusals
+    # are in check_cmpf64_controls), the 16-bit f/t forms gfx10 lacks, a float token on a 16-bit integer, e32
+    # source modifiers and, for binary16, a literal wider than 16 bits. In e64: an SGPR destination (gfx10
+    # v_cmpx writes only EXEC), clamp, omod, modifiers on an integer source or on a class mask.
+    for compare in ("v_cmpx_gt_f32_e64 s52, s44, v12", "v_cmpx_gt_f32_e64 s44, v12 clamp",
+                    "v_cmpx_gt_f32_e64 s44, v12 mul:2", "v_cmpx_gt_i32_e64 -s44, v12",
+                    "v_cmpx_gt_u16_e64 |s44|, v12", "v_cmpx_class_f32_e64 s44, -v12",
+                    "v_cmpx_class_f32_e64 s44, |v12|", "v_cmpx_gt_f16_e64 s44, 0x10000",
+                    "v_cmpx_gt_f32_sdwa s44, v12 src0_sel:DWORD src1_sel:DWORD",
                     "v_cmpx_t_i16_e32 s44, v12", "v_cmpx_gt_i16_e32 1.0, v12", "v_cmpx_gt_u64_e32 s[44:45], v12",
-                    "v_cmpx_gt_i64_e32 v[12:13], s[44:45]", "v_cmpx_gt_u16_e64 s44, v12",
-                    "v_cmpx_class_f32_e64 s44, v12", "v_cmpx_class_f32_e32 v12, s44",
+                    "v_cmpx_gt_i64_e32 v[12:13], s[44:45]", "v_cmpx_t_u16_e64 s44, v12",
+                    "v_cmpx_class_f32_e32 v12, s44",
                     "v_cmpx_class_f32_e32 -v13, v12", "v_cmpx_class_f32_e32 |v13|, v12",
                     "v_cmpx_class_f32_sdwa s44, v12 src0_sel:DWORD src1_sel:DWORD",
-                    "v_cmpx_class_f16_e32 s44, v12", "v_cmpx_class_f64_e32 s[44:45], v12",
+                    "v_cmpx_gt_f16_sdwa s44, v12 src0_sel:WORD_0 src1_sel:WORD_0",
+                    "v_cmpx_gt_f16_e32 v12, s44", "v_cmpx_gt_f16_e32 -v13, v12", "v_cmpx_gt_f16_e32 -s44, v12",
+                    "v_cmpx_gt_f16_e32 |v13|, v12", "v_cmpx_gt_f16_e32 abs(v13), v12",
+                    "v_cmpx_gt_f16_e32 neg(v13), v12", "v_cmpx_gt_f16_e32 0x10000, v12", "v_cmpx_gt_f16_e32 s44",
+                    "v_cmpx_gt_f16 s44, v12", "v_cmpx_class_f16_e64 s44, -v12",
+                    "v_cmpx_class_f16_sdwa s44, v12 src0_sel:WORD_0 src1_sel:DWORD",
+                    "v_cmpx_class_f16_e32 v12, s44", "v_cmpx_class_f16_e32 v12, 0x200",
+                    "v_cmpx_class_f16_e32 -v13, v12", "v_cmpx_class_f16_e32 |v13|, v12",
+                    "v_cmpx_class_f16_e32 0x10000, v12",
                     "v_cmpx_gt_f32_e32 v12, s44",
                     "v_cmpx_gt_f32_e32 -v13, v12", "v_cmpx_gt_f32_e32 |v13|, v12",
                     "v_cmpx_gt_f32 s44, v12", "v_cmpx_gt_f32_e32 s44"):
@@ -15964,11 +16318,16 @@ def check_binary(directory, assembler, objcopy, library):
         fixtures.append((scc_skip_asm(compare, branch), translate, "gfx1013", "", scc_skip(compare, branch)))
     fixtures.extend((program, translate) for program in (
         cmpx_region(), cmpx_region(CMPX_OR_RESTORE), cmpx_observables(),
-        *(cmpx_predicate_group(kind, first) for kind, first in CMPX_PREDICATE_GROUPS)))
-    fixtures.extend((cmpx64_group(kind, group), translate_int) for kind in ("i64", "u64") for group in (0, 1))
+        *(cmpx_predicate_group(kind, first, encoding) for kind, first in CMPX_PREDICATE_GROUPS
+          for encoding in ("e32", "e64"))))
+    fixtures.extend((cmpx64_group(kind, group, encoding), translate_int) for kind in ("i64", "u64") for group in (0, 1)
+                    for encoding in ("e32", "e64"))
     fixtures.append((cmpx_skip_asm(), translate, "gfx1013", "", cmpx_skip()))
     fixtures.extend((program, translate) for program in (cmpx_class_region(), cmpx_class_region(CMPX_OR_RESTORE),
                                                          cmpx_class_group()))
+    fixtures.extend((cmpxf64_group(group, encoding), translate_f64) for encoding, group in CMPF64_GROUPS)
+    fixtures.extend((cmpx_class_group(kind=kind, encoding=encoding), translate)
+                    for kind, encoding in (("f16", "e32"), ("f32", "e64"), ("f16", "e64")))
     fixtures.extend((program, translate_int) for op in SHIFT64_OPS for program in shift64_programs(op).values())
     fixtures.extend((region_body_program(body, approximate), translate)
                     for _, body, _, approximate in REGION_BODY_FORMS)
@@ -21128,7 +21487,7 @@ def main():
                     "draw-sad",
                     "draw-int16-vop3", "draw-int16-ternary", "draw-compressed-export", "draw-uncompressed-export",
                     "draw-uncompressed-integer-export",
-                    "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-cmpx-regions", "draw-scc-skip",
+                    "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-cmpx-regions", "draw-cmpx-e64", "draw-scc-skip",
                     "draw-region-body", "draw-region-waits", "draw-region-scalar-alu", "draw-region-scalar-load", "draw-div-fmas",
                     "draw-cmp64", "draw-cmp-f64", "draw-shift64",
                     "draw-f16-arith", "draw-f16-round", "draw-f16-fmac-ldexp", "draw-f16-cvt-int16", "draw-f16-to-int16", "draw-flat-scratch", "draw-smem-pointers",
@@ -21172,6 +21531,7 @@ def main():
                         "draw-exec-regions": check_masked_draw,
                         "draw-scc-skip": check_scc_skip_draw,
                         "draw-cmpx-regions": check_cmpx_draw,
+                        "draw-cmpx-e64": check_cmpx_e64_draw,
                         "draw-region-body": check_region_body_draw,
                         "draw-region-waits": check_region_wait_draw,
                         "draw-region-scalar-alu": check_region_scalar_alu_draw,
