@@ -2382,7 +2382,12 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_sse_fp_harness>")
     set(cpu_avx_fp_move_exports
         "op_vmovq_xmm_xmm,op_vmovq_xmm_m64,op_vmovq_m64_xmm,op_vmovq_xmm_r64,op_vmovq_r64_xmm,"
-        "op_vmaskmovdqu,op_pipeline,op_discarded_read,op_discarded_read64")
+        "op_vmaskmovdqu,op_pipeline,op_discarded_read,op_discarded_read64,"
+        "op_vmovupd_xmm_load,op_vmovupd_ymm_load,op_vmovupd_xmm_store,op_vmovupd_ymm_store,"
+        "op_vmovupd_xmm_reg,op_vmovupd_ymm_reg,op_vmovupd_xmm_regst,op_vmovupd_ymm_regst,"
+        "op_vmovapd_xmm_load,op_vmovapd_ymm_load,op_vmovapd_xmm_store,op_vmovapd_ymm_store,"
+        "op_vmovapd_xmm_reg,op_vmovapd_ymm_reg,op_vmovapd_xmm_regst,op_vmovapd_ymm_regst,"
+        "op_pd_pipeline")
     string(CONCAT cpu_avx_fp_move_exports ${cpu_avx_fp_move_exports})
     foreach(variant IN ITEMS original altered)
         cpu_asm_fixture(cpu_avx_fp_move_${variant} avx_fp_move)

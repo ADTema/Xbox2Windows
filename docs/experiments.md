@@ -8973,11 +8973,12 @@ execution.
 ## AVX quadword and masked-byte moves
 
 [The AVX quadword and masked-byte move translator](../tools/cpu_avx_fp_move_aot.py) lifts
-bounded straight-line Windows x64 leaf functions covering two `VEX` forms from
+bounded straight-line Windows x64 leaf functions covering four `VEX` forms from
 `docs/coverage/x64_zen2.tsv` group `AVX`:
 
 - Quadword / GPR moves: `vmovq` across all four `VEX.128` `Code` encodings (`VEX_VMOVQ_XMM_XMMM64`, `VEX_VMOVQ_XMMM64_XMM`, `VEX_VMOVQ_XMM_RM64`, `VEX_VMOVQ_RM64_XMM`) and all five operand shapes (`xmm, xmm`; `xmm, m64`; `m64, xmm`; `xmm, r64`; `r64, xmm`), zeroing `YMM[255:64]` on `XMM` writes.
 - Conditional byte store: `vmaskmovdqu` (`VEX.128` `xmm1, xmm2` to implicit `[rdi]`), requiring nonvolatile `rdi` save/restore via a volatile scratch GPR around `mov rdi, r8`.
+- Packed-double moves: `vmovupd` and `vmovapd` in `VEX.128` and `VEX.256` for loads, stores and register copies (including the store-form `0F 11` / `0F 29` register encodings). They share the tables and the checks of `vmovups`/`vmovaps`: the bytes move unchanged (no float conversion, no NaN canonicalisation), a `VEX.128` register write zeroes `[255:128]`, and the aligned forms reject a displacement that is not a multiple of the operand size. A leaf that mixes these moves with `vmovq` or `vmovups` glue was not accepted by this translator or by [the AVX move translator](../tools/cpu_avx_move_aot.py), which carves those forms out.
 
 Each lifted export takes `(word rcx, word rdx, word r8)` pointing to caller-owned
 flat buffers and returns `void`. `YMM0`..`YMM5` use the portable `Vec256` model
@@ -8993,12 +8994,12 @@ writable page (even with all mask MSBs clear, and on `k = 15` could commit a wri
 prefix before faulting); per Intel SDM, all-zero-mask faulting and partial-fault progress
 are implementation-dependent and outside this portable slice. Transport and ABI glue covers
 `vmovups`, `vmovaps`,
-`vmovdqu`, `vmovdqa`, `vzeroupper`, 64-bit `mov` and terminal `ret`. The translator
+`vmovupd`, `vmovapd`, `vmovdqu`, `vmovdqa`, `vzeroupper`, 64-bit `mov` and terminal `ret`. The translator
 rejects legacy SSE encodings (`movq`, `maskmovdqu`), EVEX encodings, FP arithmetic
 (`vaddsubps`, `vaddsubpd`), nonvolatile registers (`XMM6`..`15`, `YMM6`..`15`,
 `RBX`/`RBP`/`RSI`/`R12`..`R15`/`RSP`, and unrestored, non-`r8`, or leaked `RDI`),
-non-argument memory bases, stores outside `r8`, unaligned `vmovaps`/`vmovdqa` operands,
-prefixes, RIP-relative addressing, undefined registers, missing `ret` and trailing bytes
+non-argument memory bases, stores outside `r8`, unaligned `vmovaps`/`vmovapd`/`vmovdqa`
+operands, prefixes, RIP-relative addressing, undefined registers, missing `ret` and trailing bytes
 after `ret`.
 
 ```powershell
@@ -9008,10 +9009,15 @@ ctest --preset dev --no-tests=error -R '^cpu_aot_avx_fp_move$' -V
 
 ### Measured results and open scope
 
-The [MASM fixture](../tests/cpu/avx_fp_move.asm) exports 9 functions covering all five
+The [MASM fixture](../tests/cpu/avx_fp_move.asm) exports 26 functions covering all five
 `vmovq` operand shapes (`+1`/`+9` unaligned), `vmaskmovdqu` with `rdi` save/restore, a
-chained `vzeroupper` pipeline, and two dead-read fault-ordering controls
-(`op_discarded_read` and `op_discarded_read64`).
+chained `vzeroupper` pipeline, two dead-read fault-ordering controls
+(`op_discarded_read` and `op_discarded_read64`), and 17 `vmovupd`/`vmovapd` exports: for each
+of the two mnemonics, `xmm` and `ymm` load, store, register copy and store-form register
+copy (with the destination `YMM` preloaded with other data so the `VEX.128` zeroing is
+visible), plus one pipeline that mixes them with `vmovq`. The differential check feeds the
+`vmovupd`/`vmovapd` exports the same 14 vectors as the other moves plus 8 vectors of
+signalling and quiet NaN payloads, `-0.0`, infinities, a subnormal and single-precision NaNs.
 [The differential check](../tests/cpu/avx_fp_move_check.py) skips with exit code 77
 when CPUID/XCR0 lacks AVX and otherwise verifies 134 cases across the 7 differential
 exports bit-for-bit against both the native MASM DLL and an independent Python reference
@@ -9022,7 +9028,18 @@ observations with fault status and writable prefix logged, dead-read fault order
 (`op_discarded_read`, `op_discarded_read64`), 3 `ALTER_OP`
 divergence controls (`14`, `12`, `30`), an output-mutation comparator control, 8
 alternate-encoding lift checks, 38 unit rejection controls (including the `RDI`-save
-definedness leak control), and 9 end-to-end PE-patched DLL rejection controls.
+definedness leak control), and 9 end-to-end PE-patched DLL rejection controls. The counts in
+this paragraph were measured before the `vmovupd`/`vmovapd` exports were added.
+
+The `vmovupd`/`vmovapd` extension was run on Linux only: the fixture was assembled with
+`llvm-ml-19` and linked with `lld-link-19`, the translator ran on that PE, the lifted C++ was
+built with `x86_64-w64-mingw32-g++` at `-O0` and `-O2`, and the native and lifted DLLs were
+run under Wine on 508 vectors (the 134 earlier vectors and 374 new ones across 24 exports) and
+matched the independent byte model bit-for-bit, including the three `ALTER_OP` builds
+diverging from the original (14, 12 and 30 cases for the earlier exports, 20, 21 and 21 for the
+new ones). The generated C++ for the nine earlier exports is byte-identical before and after
+the change. The rejection controls (52 unit controls, 12 PE-patched controls, 10 alternate
+encodings) passed on Linux. The MSVC/ML64 build and the Windows `ctest` run were not done.
 
 Not covered by this experiment: non-temporal cache hints or implementation-dependent
 partial-page fault progress on `vmaskmovdqu`, control flow, nonvolatile `xmm6`..`xmm15`
