@@ -1056,24 +1056,31 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Unsupported read address")
             vector.pop(dst, None)
             loading[dst] = ("source", address)
-        elif m := re.fullmatch(r"buffer_store_dword(?:x([234]))? (v\d+|v\[\d+:\d+\]), (off|v\d+|v\[\d+:\d+\]), "
-                               r"s\[(\d+):(\d+)\], 0( idxen)?( offen)?(?: offset:(\d+))?", line):
-            count = int(m[1] or 1)
-            first, *last = map(int, re.findall(r"\d+", m[2]))
-            base, high = int(m[4]), int(m[5])
-            offset = int(m[8] or 0)
+        elif m := re.fullmatch(r"(?:buffer_store_dword(?:x([234]))?|tbuffer_store_format_(?P<channels>x|xy|xyz|xyzw)) "
+                               r"(v\d+|v\[\d+:\d+\]), (off|v\d+|v\[\d+:\d+\]), s\[(\d+):(\d+)\], 0"
+                               r"(?(channels) format:\[(?P<format>BUF_FMT_(?:32_){1,4}UINT)\])"
+                               r"(?P<idxen> idxen)?(?P<offen> offen)?(?: offset:(?P<offset>\d+))?", line):
+            channels = m["channels"]
+            count = len(channels) if channels else int(m[1] or 1)
+            idxen, offen = m["idxen"], m["offen"]
+            if channels and (cpu != "gfx1030" or not idxen or offen or m["format"] != f"BUF_FMT_{'32_' * count}UINT"):
+                raise ValueError("Unsupported typed buffer store format, target or address mode")
+            first, *last = map(int, re.findall(r"\d+", m[3]))
+            base, high = int(m[5]), int(m[6])
+            offset = int(m["offset"] or 0)
             if (last != ([] if count == 1 else [first + count - 1])
                     or high != base + 3 or base % 4 or offset % 4 or offset > 4095
                     or pending.intersection(range(base, high + 1))
                     or any(scalar.get(base + i) != ("uav", i) for i in range(4))):
                 raise ValueError("Unverified raw UAV store")
             address = f"{offset}u"
-            addr_regs = list(map(int, re.findall(r"\d+", m[3])))
+            addr = m[4]
+            addr_regs = list(map(int, re.findall(r"\d+", addr)))
             tags = [vector.get(reg) for reg in addr_regs]
-            if (m[3] == "off" and not m[6] and not m[7] and dims == (1, 1, 1) and stride is None):
+            if addr == "off" and not idxen and not offen and dims == (1, 1, 1) and stride is None:
                 store_layout = ("fixed",)
                 covered = set()
-            elif (stride is not None and m[6] and not m[7] and len(addr_regs) == 1
+            elif (stride is not None and idxen and not offen and len(addr_regs) == 1
                     and isinstance(tags[0], tuple) and tags[0][0] == "thread" and offset + 4 * count <= stride):
                 # One index axis: every other group dimension must be one, so no two
                 # invocations of a group share an address.
@@ -1081,7 +1088,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 store_layout = ("index", index)
                 covered = {index}
                 address = f"tid.{AXES[index]} * {stride}u + {offset}u"
-            elif (stride is not None and m[6] and m[7] and len(addr_regs) == 2 and addr_regs[1] == addr_regs[0] + 1
+            elif (stride is not None and idxen and offen and len(addr_regs) == 2 and addr_regs[1] == addr_regs[0] + 1
                     and all(isinstance(tag, tuple) for tag in tags)
                     and tags[0][0] == "thread" and tags[1][0] == "thread_bytes" and tags[0][1] != tags[1][1]):
                 # idxen offen: address = index * stride + byte offset + instruction offset.
@@ -1091,7 +1098,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 store_layout = ("index_offset", index, column, shift)
                 covered = {index, column}
                 address = f"tid.{AXES[index]} * {stride}u + (tid.{AXES[column]} << {shift}u) + {offset}u"
-            elif (stride is not None and m[6] and m[7] and len(addr_regs) == 2 and addr_regs[1] == addr_regs[0] + 1
+            elif (stride is not None and idxen and offen and len(addr_regs) == 2 and addr_regs[1] == addr_regs[0] + 1
                     and all(isinstance(tag, tuple) for tag in tags)
                     and tags[0][0] == "thread" and tags[1][0] == "plane_bytes"
                     and tags[0][1] not in (tags[1][1], tags[1][3])):
@@ -1104,7 +1111,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 covered = {index, row, column}
                 address = (f"tid.{AXES[index]} * {stride}u + (tid.{AXES[row]} << {row_shift}u)"
                            f" + (tid.{AXES[column]} << {shift}u) + {offset}u")
-            elif (m[7] and not m[6] and len(addr_regs) == 1
+            elif (offen and not idxen and len(addr_regs) == 1
                     and isinstance(tags[0], tuple) and tags[0][0] == "pitch_bytes"):
                 # offen only: (row & 0xffffff) * pitch + (column << shift) + instruction offset.
                 # Without idxen the descriptor stride is not used, so the stride binding is ignored.
