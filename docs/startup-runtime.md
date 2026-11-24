@@ -25,6 +25,18 @@ requested view. This applies only to Texture2D views with no resource or counter
 `ctest --test-dir out/bin --no-tests=error -R "^startup_null_views_" -V` against your build
 directory to exercise both slots on hardware and WARP.
 
+## 16-bit packed targets
+
+A description that asks for a B5G5R5A1_UNORM or B4G4R4A4_UNORM texture as a render target or for
+unordered access is created as R8G8B8A8_UNORM when the adapter lacks that use for the packed
+format and has it for R8G8B8A8_UNORM (`src/startup_stubs/packed_target_format.h`). Views that name
+the packed format on such a texture use R8G8B8A8_UNORM too. Without this the description is
+refused, its allocation-info answer is all ones and the executable gets no texture. The first
+four stand-ins are logged. Texel data the executable writes itself in the packed layout is not
+converted; the measured textures are render targets it only draws to. Run
+`ctest --preset release --no-tests=error -R '^startup_packed_target$' -V` for the selection rule
+against adapters described by their support bits.
+
 ## What is measured
 
 With the switches below, an x64 console executable on an AMD RDNA4 GPU (Windows 11, release

@@ -25,6 +25,7 @@
 
 #include <d3d12.h>
 #include "null_texture_view.h"
+#include "packed_target_format.h"
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
 #include <dxgi1_4.h>
@@ -650,6 +651,22 @@ D3D12_RESOURCE_DESC sanitized(const D3D12_RESOURCE_DESC& desc)
     }
     if (desc.Alignment != 0 && desc.Alignment != 0x10000 && desc.Alignment != 0x400000) copy.Alignment = 0;
     copy.Format = desktop_format(desc.Format);
+    // A 16-bit packed target the adapter cannot render to or write as a UAV: packed_target_format.h.
+    if (the_device && x2w_startup::packed_target_format(copy.Format)) {
+        ID3D12Device* const device = static_cast<ID3D12Device*>(the_device->own().real);
+        const DXGI_FORMAT stand_in = x2w_startup::packed_target_stand_in(copy, [device](DXGI_FORMAT format) -> UINT {
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
+            return SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)))
+                ? static_cast<UINT>(support.Support1) : 0u;
+        });
+        if (stand_in != copy.Format) {
+            static LONG stand_ins;
+            if (first_calls(stand_ins, 4))
+                log("x2w-d3d12 texture format %d with flags 0x%x: shortcut - not supported for that use here, created as format %d",
+                    copy.Format, copy.Flags, stand_in);
+            copy.Format = stand_in;
+        }
+    }
     return copy;
 }
 
@@ -1941,7 +1958,8 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
         std::memcpy(desc_copy, reinterpret_cast<const void*>(args[desc_index]), sizeof(desc_copy));
         DXGI_FORMAT format;
         std::memcpy(&format, desc_copy, sizeof(format));
-        const DXGI_FORMAT mapped = desktop_format(format);
+        DXGI_FORMAT mapped = desktop_format(format);
+        if (args[0]) mapped = x2w_startup::packed_view_format(mapped, reinterpret_cast<ID3D12Resource*>(args[0])->GetDesc().Format);
         if (mapped != format) {
             std::memcpy(desc_copy, &mapped, sizeof(mapped));
             args[desc_index] = reinterpret_cast<u64>(desc_copy);
