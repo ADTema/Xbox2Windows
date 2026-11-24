@@ -38,6 +38,14 @@ INLINE_MINUS_ONE = 193   # inline constant -1, the mask the census shader uses
 LITERAL_SOURCE = 255
 
 
+def encode_vopc_e32(op, src0, vsrc1, literal=None):
+    """Encode a VOPC comparison in its 32-bit form; a cmpx writes EXEC implicitly."""
+    w0 = ((0b0111110 << 25) | ((op & 0xFF) << 17) | ((vsrc1 & 0xFF) << 9) | (src0 & 0x1FF))
+    code = struct.pack('<I', w0)
+    if literal is not None:
+        code += struct.pack('<I', literal)
+    return code
+
 def encode_vopc(op, sdst, src0, src1, literal=None):
     """Encode a VOPC comparison in its VOP3A form; a source of 255 is followed by its literal dword."""
     w0 = (0b110101 << 26) | ((op & 0x3FF) << 16) | (sdst & 0xFF)
@@ -76,24 +84,24 @@ def translate(code):
 
 
 # 1. The encoder produces the form the decoder reads; a layout change shows up here first.
-asm, emitted, stage = translate(encode_vopc(VOPC_CMP_CLASS_F32, VCC_LO, INLINE_MINUS_ONE, V4))
+asm, emitted, stage = translate(encode_vopc(VOPC_CMP_CLASS_F32, VCC_LO, V4, INLINE_MINUS_ONE))
 check('encodes and decodes the class compare',
-      asm == ['v_cmp_class_f32_e64 vcc_lo, -1, v4'], repr(asm))
+      asm == ['v_cmp_class_f32_e64 vcc_lo, v4, -1'], repr(asm))
 
 # 2. The predicate is the class of the value against the mask, written to VCC for the non-exec form.
 check('the all-classes mask matches everything', 'class32(F(v4))' in emitted and '0xffffffffu' in emitted, emitted)
 check('the result is written to vcc', emitted.startswith('vcc = '), emitted)
 
 # 3. The execution-mask form writes EXEC and stops the straight-line assumption.
-asm, emitted, stage = translate(encode_vopc(VOPC_CMPX_CLASS_F32, VCC_LO, INLINE_MINUS_ONE, V4))
+asm, emitted, stage = translate(encode_vopc(VOPC_CMPX_CLASS_F32, VCC_LO, V4, INLINE_MINUS_ONE))
 check('the exec-mask class compare writes exec', emitted.startswith('exec = '), emitted)
 check('the exec-mask form clears exec_known', stage.exec_known is False)
 
 # 4. A literal mask and a register value reach the helper as an integer and a float operand.
-asm, emitted, _stage = translate(encode_vopc(VOPC_CMP_CLASS_F32, VCC_LO, LITERAL_SOURCE, V4,
+asm, emitted, _stage = translate(encode_vopc(VOPC_CMP_CLASS_F32, VCC_LO, V4, LITERAL_SOURCE,
                                              literal=0x00000300))
 check('a literal mask is read as an integer', '0x00000300u' in emitted, emitted)
-asm, emitted, _stage = translate(encode_vopc(VOPC_CMP_CLASS_F32, VCC_LO, V0, V4))
+asm, emitted, _stage = translate(encode_vopc(VOPC_CMP_CLASS_F32, VCC_LO, V4, V0))
 check('a register mask is read as an integer', 'class32(F(v4)) & v0' in emitted, emitted)
 
 # 5. The helper is in the preamble the generated shader is built with, with the ten classes from the encoding.
@@ -102,6 +110,22 @@ pipe.uds, pipe.resources, pipe.samplers, pipe.uses_sampler_heap = [], {}, {}, Fa
 common = ' '.join(pipe.common())
 check('the class helper is emitted in the common preamble', 'uint class32(float value)' in common, common[:200])
 check('the helper separates quiet from signaling NaN', '0x00400000u' in common, common[:200])
+
+
+# 6. The _e32 cmpx spelling prints no destination; it still writes EXEC, and the value stays in SRC0.
+asm, emitted, stage = translate(encode_vopc_e32(VOPC_CMPX_CLASS_F32, V4, V0))
+check('encodes and decodes the e32 exec-mask form', asm == ['v_cmpx_class_f32_e32 v4, v0'], repr(asm))
+check('the e32 exec-mask form lowers', emitted.startswith('exec = ') and 'class32(F(v4)) & v0' in emitted, emitted)
+check('the e32 exec-mask form clears exec_known', stage.exec_known is False)
+
+# 7. A narrowed EXEC stays narrowed: the predicate is intersected with it, and the non-exec form does not
+#    reactivate lanes either.
+stage = Stage()
+stage.exec_known = False
+decoded = G.decode(encode_vopc(VOPC_CMP_CLASS_F32, VCC_LO, V4, INLINE_MINUS_ONE))
+for _o, _s, name, asm_text in decoded:
+    stage.one(name, asm_text)
+check('a narrowed exec is intersected with the predicate', 'exec & ' in ' '.join(stage.lines), ' '.join(stage.lines))
 
 if failures:
     print('FAIL')

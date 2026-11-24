@@ -959,14 +959,21 @@ class Stage:
         self.set_v(reg_range(ops[0])[1], 'f32tof16(%s) | (f32tof16(%s) << 16)' % (self.f(ops[1]), self.f(ops[2])))
 
     def compare(self, base, ops):
-        # v_cmp_class_f32 / v_cmpx_class_f32 test the binary32 class of SRC1 against the mask in SRC0.
-        # The mask is an integer operand (often the inline -1), the value is read as float.
+        # v_cmp_class_f32 / v_cmpx_class_f32 test the binary32 class of the value in SRC0 against the
+        # class-bit mask in SRC1 (the ISA order: the float operand first, the integer mask second).
         if base in ('v_cmp_class_f32', 'v_cmpx_class_f32'):
-            if len(ops) != 3:
+            if len(ops) == 3:
+                dst, value, mask = ops
+            elif base == 'v_cmpx_class_f32' and len(ops) == 2:
+                # The _e32 spelling writes EXEC implicitly and prints no destination.
+                dst, (value, mask) = 'exec', ops
+            else:
                 raise Unsupported('%s with %d operands' % (base, len(ops)))
-            dst, mask, value = ops
             cond = '(class32(%s) & %s) != 0u' % (self.f(value), self.u(mask))
             predicate = '((%s) ? 1u : 0u)' % cond
+            # A narrowed EXEC must stay narrowed: intersect with it, as the generic compare path does.
+            if not self.exec_known:
+                predicate = '(exec & %s)' % predicate
             if base == 'v_cmpx_class_f32' or dst in ('exec', 'exec_lo'):
                 self.exec_known = False
                 self.emit('exec = %s;' % predicate)
