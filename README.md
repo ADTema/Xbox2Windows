@@ -4,7 +4,7 @@
 
 Xbox2Windows researches static recompilation from Xbox Series X|S (Scarlett) to x64 Windows. It translates selected x64 machine code into C++ and selected gfx1013 shaders into desktop DXIL. You can run the public tests without a game installation.
 
-> **Current status.** The full-package DXIL compilation scan found a compiled route for 26,500 of 26,503 shader records. The [RX 9070 XT startup report](https://github.com/R0Y00/Xbox2Windows/pull/1135) reached the intro. A local RTX 4060 Laptop diagnostic build now presents the intro and reaches the Narration Experience and UI Text Size setup pages after fixing wide-descriptor bindings. In one paired run, the [counted-loop change](https://github.com/R0Y00/Xbox2Windows/pull/1230) increased intro decoder advancement from 13.92 to 29.99 frames/s. Audio is under investigation and gameplay frame rate is unmeasured. Interactive gameplay remains unverified. A separate WARP run created six graphics pipelines. The first reference-checked frame remains open. [Live startup progress #870](https://github.com/R0Y00/Xbox2Windows/issues/870) · [GPU tasks #874](https://github.com/R0Y00/Xbox2Windows/issues/874)
+> **Current status.** The full-package DXIL scan found a compiled route for 26,500 of 26,503 shader records. On an RTX 4060 Laptop, the local offline startup build plays the intro, accepts setup and enters loading. Language names are still missing from the selector, and interactive main-menu navigation remains unverified. [Run results and first failure #870](https://github.com/R0Y00/Xbox2Windows/issues/870) · [Independent RX 9070 XT report](https://github.com/R0Y00/Xbox2Windows/pull/1135) · [GPU tasks #874](https://github.com/R0Y00/Xbox2Windows/issues/874)
 
 ## Community and contributions
 
