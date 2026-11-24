@@ -1346,6 +1346,38 @@ class TestRdna2Disasm(unittest.TestCase):
             self.assertEqual(insns[0]["opcode"], expected_name)
             self.assertEqual(insns[0]["length"], 4)
 
+    # Encodings and spellings from llvm-mc gfx1013 (identical text on LLVM 15 and 19).
+    SOP2_CARRY_LOGIC_PACK_FORMS = (
+            ("01020082", "s_addc_u32 s0, s1, s2"),
+            ("01028082", "s_subb_u32 s0, s1, s2"),
+            ("0102008b", "s_orn2_b32 s0, s1, s2"),
+            ("0204808b", "s_orn2_b64 s[0:1], s[2:3], s[4:5]"),
+            ("0102008c", "s_nand_b32 s0, s1, s2"),
+            ("0204808c", "s_nand_b64 s[0:1], s[2:3], s[4:5]"),
+            ("0102008d", "s_nor_b32 s0, s1, s2"),
+            ("0204808d", "s_nor_b64 s[0:1], s[2:3], s[4:5]"),
+            ("0102008e", "s_xnor_b32 s0, s1, s2"),
+            ("0204808e", "s_xnor_b64 s[0:1], s[2:3], s[4:5]"),
+            ("01020099", "s_pack_ll_b32_b16 s0, s1, s2"),
+            ("01028099", "s_pack_lh_b32_b16 s0, s1, s2"),
+            ("0102009a", "s_pack_hh_b32_b16 s0, s1, s2"),
+    )
+
+    def test_sop2_carry_logic_pack_forms(self):
+        """Issue #938: SOP2 carry, inverted-logic and 16-bit pack ops decode to LLVM's text and re-assemble to the same bytes."""
+        raw = b"".join(bytes.fromhex(h) for h, _ in self.SOP2_CARRY_LOGIC_PACK_FORMS)
+        expected = [text for _, text in self.SOP2_CARRY_LOGIC_PACK_FORMS]
+        self.assertEqual([rec["assembly"] for rec in disasm_rdna2(raw)], expected)
+        if not os.environ.get("LLVM_LIB"):
+            return
+        resolved_lib = resolve_llvm_lib(os.environ["LLVM_LIB"])
+        assembler = resolve_tool("LLVM_MC", ["llvm-mc-15", "llvm-mc"])
+        objcopy = resolve_tool("LLVM_OBJCOPY", ["llvm-objcopy-15", "llvm-objcopy"])
+        if not assembler or not objcopy:
+            self.fail(f"SOP2 round trip requires llvm-mc and llvm-objcopy (assembler={assembler}, objcopy={objcopy})")
+        self.assertEqual(assemble_with_llvm_mc(expected, assembler, objcopy), raw)
+        self.assertEqual(llvm_disassemble(raw, resolved_lib), expected)
+
     def test_vop2_integer_opcode_table_synthetic_forms(self):
         from disasm_rdna2 import VOP2_OPS
         target_ops = {0x16, 0x18, 0x1a, 0x1b, 0x1c, 0x1d, 0x25, 0x26, 0x27}
