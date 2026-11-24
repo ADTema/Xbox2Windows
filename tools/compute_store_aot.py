@@ -73,6 +73,11 @@ SALU_SOURCE = r"(s\d+|-?\d+|0x[0-9a-f]+)"
 ALU_SOURCE = r"(s\d+|v\d+|-?\d+|0x[0-9a-f]+)"
 # Results are inline HLSL expressions; a longer one is rejected instead of growing without bound.
 ALU_EXPRESSION_LIMIT = 1024
+# Caller guarantees for a MIMG image descriptor: an 8-dword resource descriptor that names a 2D,
+# linear (non-swizzled) image of the listed format. The translator checks where the eight words were
+# loaded from, not the 9-bit GFX10 format, type, swizzle, level or size fields inside them; the two
+# 16-byte descriptor slots are bound to t0. Value: (HLSL texel type, channel count).
+IMAGE_FORMATS = {"R32G32B32A32_UINT": ("uint4", 4)}
 # Template operands are the old LDS word and the source VGPR, both HLSL uints.
 LDS_RMW = {
     "ds_add_u32": "({0} + {1})",
@@ -175,12 +180,15 @@ def labelled(decoded):
 
 def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, stride=None,
           constant_descriptor=None, group_reg_y=None, group_reg_z=None, source_descriptor=None,
-          source_stride=None, cpu="gfx1013", lds_bytes=0, lds_f32_mode=None, lds_f64_mode=None):
+          source_stride=None, image_descriptor=None, image_format=None,
+          cpu="gfx1013", lds_bytes=0, lds_f32_mode=None, lds_f64_mode=None):
     """v0, v1 and v2 are local X, Y and Z; group_reg, group_reg_y and group_reg_z are the group IDs.
 
     gfx10 compute waves receive each local ID in its own VGPR. Y and Z are bound only when that
     group dimension is larger than one. Descriptors name u0 and optionally b0 and a read-only raw
-    source t0; source_stride is the t0 byte stride that indexed reads use.
+    source t0; source_stride is the t0 byte stride that indexed reads use. image_descriptor is the
+    table byte offset of the 8-dword image descriptor; image_format is the caller's statement of
+    the image format inside it, and the texel is bound to t0.
     """
     dims = checked_group(group)
     if cpu not in ("gfx1013", "gfx1030"):
@@ -202,6 +210,16 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
     if source_stride is not None and (source_descriptor is None or not 4 <= source_stride <= 0x3fff
                                       or source_stride % 4):
         raise ValueError("Indexed reads require a source binding and aligned stride")
+    if image_descriptor is not None or image_format is not None:
+        # The 8-dword image descriptor occupies two 16-byte slots, both bound to t0.
+        if (image_format not in IMAGE_FORMATS or image_descriptor is None or source_descriptor is not None
+                or not 0 <= image_descriptor < 1 << 20 or image_descriptor % 4
+                or any(image_descriptor + half in descriptor_bindings for half in (0, 16))
+                or any(abs(image_descriptor + half - offset) < 16
+                       for half in (0, 16) for offset in descriptor_bindings)):
+            raise ValueError("Invalid or overlapping image descriptor binding")
+        descriptor_bindings[image_descriptor] = ("image", 0)
+        descriptor_bindings[image_descriptor + 16] = ("image", 1)
     group_regs = {axis: reg for axis, reg in enumerate((group_reg, group_reg_y, group_reg_z)) if reg is not None}
     if (any(not 0 <= reg <= 105 or reg == table_reg for reg in group_regs.values())
             or len(set(group_regs.values())) != len(group_regs)):
@@ -218,6 +236,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
     loading = {}
     stores = []
     ds_steps = []
+    # Image loads are typed reads of the bound texture, so each one becomes a local variable at the
+    # point where its coordinates are known; the loaded components enter vector only at vmcnt(0).
+    image_steps = []
     lds_enabled = ds_group and 128 <= lds_bytes <= 65536
     lds_word = None
     lds_strided_words = {}
@@ -1077,6 +1098,37 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 # Track only the low half of an odd trailing component. Whole-word consumers cannot read it.
                 kind = "source_low16" if packed and components % 2 and reg == dst + count - 1 else "source"
                 loading[reg] = (kind, address)
+        elif m := re.fullmatch(r"image_load (v\d+|v\[\d+:\d+\]), v\[(\d+):(\d+)\], "
+                               r"s\[(\d+):(\d+)\] dmask:0x([0-9a-f]+) dim:SQ_RSRC_IMG_2D( unorm)?", line):
+            # One typed 2D read: (x, y) come from two packed address dwords, and dmask selects the
+            # leading components of the caller-declared texel format in ascending order. LLVM 15
+            # encodes non-sampler loads with the unorm (un-normalized address) flag, which has no
+            # effect on this integer-address lowering.
+            x, y, base, high = int(m[2]), int(m[3]), int(m[4]), int(m[5])
+            dmask = int(m[6], 16)
+            count = bin(dmask).count("1")
+            destination = [int(n) for n in re.findall(r"\d+", m[1])]
+            first, last = destination[0], destination[-1]
+            if (cpu != "gfx1030" or image_format is None or guard_span is not None
+                    or last != first + count - 1 or dmask != (1 << count) - 1
+                    or count > IMAGE_FORMATS[image_format][1] or y != x + 1
+                    or any(first + index > 255 or first + index in loading for index in range(count))):
+                raise ValueError("Unsupported image load target")
+            if high != base + 7 or base % 4 or pending.intersection(range(base, high + 1)):
+                raise ValueError("Unresolved image descriptor")
+            if tuple(scalar.get(base + index) for index in range(8)) != tuple(
+                    (("image", index // 4), index % 4) for index in range(8)):
+                raise ValueError("Unverified image descriptor")
+            coordinates = (vector.get(x), vector.get(y))
+            if not all(is_word(value) for value in coordinates):
+                raise ValueError("Unverified image coordinates")
+            name = f"image_load_{len(image_steps)}"
+            address = f"int3(asint({hlsl_word(coordinates[0])}), asint({hlsl_word(coordinates[1])}), 0)"
+            image_steps.append(f"    {IMAGE_FORMATS[image_format][0]} {name} = imageData.Load({address});")
+            for index in range(count):
+                reg = first + index
+                vector.pop(reg, None)
+                loading[reg] = ("alu", f"{name}.{'xyzw'[index]}")
         elif m := re.fullmatch(r"(?:buffer_store_dword(?:x([234]))?|"
                                r"tbuffer_store_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
                                r"(v\d+|v\[\d+:\d+\]), (off|v\d+|v\[\d+:\d+\]), s\[(\d+):(\d+)\], 0"
@@ -1195,11 +1247,15 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                if constant_descriptor is not None else "")
     if source_descriptor is not None:
         cbuffer += "ByteAddressBuffer inputData : register(t0);\n"
+    if image_descriptor is not None:
+        cbuffer += f"Texture2D<{IMAGE_FORMATS[image_format][0]}> imageData : register(t0);\n"
     local = ""
+    steps = [step for _, step in ds_steps] + image_steps
+    if steps:
+        body = "\n".join([*steps, body])
     if ds_steps:
         shared = [slot for slot, _ in ds_steps if slot is not None]
         cbuffer += "".join(f"groupshared uint {slot}[32];\n" for slot in shared)
-        body = "\n".join([*(step for _, step in ds_steps), body])
         if shared:
             local = ", uint3 local : SV_GroupThreadID"
     # Helpers are selected from the final body, so a float ALU result used only by a DS step still gets its definition.
@@ -1229,6 +1285,10 @@ def main():
     parser.add_argument("--source-descriptor", type=lambda n: int(n, 0),
                         help="Table byte offset bound to stable read-only t0, with no overlap with u0")
     parser.add_argument("--source-stride", type=int, help="Indexed t0 byte stride")
+    parser.add_argument("--image-descriptor", type=lambda n: int(n, 0),
+                        help="Table byte offset of the 8-dword image descriptor bound to t0")
+    parser.add_argument("--image-format", choices=sorted(IMAGE_FORMATS),
+                        help="Caller statement of the format inside the image descriptor")
     args = parser.parse_args()
     if args.output.suffix.lower() != ".hlsl" or args.output.resolve() == args.container.resolve():
         parser.error("Choose an HLSL destination distinct from the input")
@@ -1242,7 +1302,8 @@ def main():
                    descriptor_offset=args.descriptor_offset, group_reg=args.group_reg, stride=args.stride,
                    constant_descriptor=args.constant_descriptor, group_reg_y=args.group_reg_y,
                    group_reg_z=args.group_reg_z, source_descriptor=args.source_descriptor,
-                   source_stride=args.source_stride, cpu=args.cpu, lds_bytes=args.lds_bytes,
+                   source_stride=args.source_stride, image_descriptor=args.image_descriptor,
+                   image_format=args.image_format, cpu=args.cpu, lds_bytes=args.lds_bytes,
                    lds_f32_mode=args.lds_f32_mode, lds_f64_mode=args.lds_f64_mode)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(source, encoding="ascii")
