@@ -1286,19 +1286,22 @@ def check_sse_fp_native_driver():
 
 def check_swap_coverage():
     """v_swap_b32 is VOP1 in both references and counts as covered only through the accepted spelling.
-    The _e64, DPP and SDWA spellings reach only rejections, and the neighbouring v_swaprel_b32 stays uncovered."""
+    The _e64, DPP and SDWA spellings reach only rejections. The neighbouring v_swaprel_b32 is lowered since #1795
+    and is covered through its own accepted spelling, not through v_swap_b32."""
     import pixel_aot_check as pixel
     _controls_accepted()
     assert "v_swap_b32" in pixel.ACCEPTED
-    assert not {"v_swap_b32_e64", "v_swap_b32_dpp", "v_swap_b32_sdwa", "v_swaprel_b32"} & pixel.ACCEPTED
+    assert "v_swaprel_b32" in pixel.ACCEPTED
+    assert not {"v_swap_b32_e64", "v_swap_b32_dpp", "v_swap_b32_sdwa"} & pixel.ACCEPTED
     for name in ("gfx1013.tsv", "rdna2.tsv"):
         reference = fc.load_reference(name)
         assert ("VOP1", "v_swap_b32") in reference, name
         covered = fc.gfx_forms(pixel.ACCEPTED, reference)
         assert ("VOP1", "v_swap_b32") in covered, name
-        assert ("VOP1", "v_swaprel_b32") not in covered, name
-        # Control: without the accepted word the form is not covered.
+        assert ("VOP1", "v_swaprel_b32") in covered, name
+        # Controls: without the accepted word the form is not covered, and each form needs its own word.
         assert ("VOP1", "v_swap_b32") not in fc.gfx_forms(pixel.ACCEPTED - {"v_swap_b32"}, reference), name
+        assert ("VOP1", "v_swaprel_b32") not in fc.gfx_forms(pixel.ACCEPTED - {"v_swaprel_b32"}, reference), name
 
 
 def check_pk_fmac_coverage():
