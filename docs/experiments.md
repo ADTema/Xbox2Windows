@@ -7132,3 +7132,33 @@ python3 -B tests/rdna2_tools_check.py
 
 Scope: decoding and scanner recognition only. None of these forms is lowered by a translator, and no
 measurement on hardware or in a Windows run backs the descriptions.
+
+## gfx1013 VOP3 and MUBUF decoding: integer multiply, quad SAD, interpolation move, high-half format buffer ops
+
+`tools/disasm_rdna2.py` decodes six more gfx1013 forms (issue #938): the VOP3 opcodes `v_mul_lo_i32` (0x16b),
+`v_qsad_pk_u16_u8` (0x172), `v_mqsad_pk_u16_u8` (0x173) and `v_interp_mov_f32_e64` (0x202), and the MUBUF
+opcodes `buffer_load_format_d16_hi_x` (0x26) and `buffer_store_format_d16_hi_x` (0x27). `v_interp_mov_f32_e64` is
+printed with its parameter selector and attribute (`p10`, `p20` or `p0`, then `attrN.x` to `.w`), as llvm-mc prints it.
+`tools/scan_unsupported_shaders.py` recognizes the mnemonics so they are not reported as unknown.
+
+The decoder follows the modifier grammar llvm-mc accepts for these ops. Abs and neg bits are refused on all four
+VOP3 forms, clamp is refused on `v_mul_lo_i32`, an output modifier is refused on all but `v_interp_mov_f32_e64`, and a
+set src2 field is refused on the two-source forms. The op_sel bits are ignored, as they are by the assembler.
+A refused word becomes an eight-byte `..._unsupported` record, so the next instruction keeps its offset. The two
+MUBUF ops refuse the lds bit and a `tfe` status dword past v255, and print the status dword in the vdata range
+when `tfe` is set. A `v_interp_mov_f32_e64` parameter selector of 3 is refused here, where llvm-mc prints it as
+`invalid_param_3`.
+
+```sh
+python3 -B tests/rdna2_tools_check.py
+LLVM_LIB=libLLVM-15.so.1 LLVM_MC=llvm-mc-15 LLVM_OBJCOPY=llvm-objcopy-15 python3 -B tests/rdna2_tools_check.py
+```
+
+Measured: with LLVM 15.0.6 all 118 checks pass, including a grid of every abs, neg, clamp, omod and op_sel
+combination on the four VOP3 ops (4096 words) that must be accepted or refused as LLVM does. LLVM 15 does not decode the
+two MUBUF opcodes for gfx1013 (`instruction not supported on this GPU`), so their spelling and modifier bits are
+checked against LLVM 19.1.7 only, and that check skips itself when the LLVM in use is the older one.
+
+Scope: decoding and scanner recognition only. None of these forms is lowered by a translator, and no
+measurement on hardware or in a Windows run backs the descriptions. `v_interp_p1_f32_e64` and `v_interp_p2_f32_e64`
+(0x200 and 0x201 on gfx1013) are not decoded by this change.
