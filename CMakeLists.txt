@@ -1132,6 +1132,29 @@ target_sources(offscreen_check PRIVATE tests/bvh_reads_waves.cpp tests/bvh_hits.
 target_sources(offscreen_check PRIVATE tests/bvh_atomics.cpp tests/bvh_numeric.cpp)
 # A title graphics allocation opened as a D3D12 heap and addressed through translated GPU addresses.
 target_sources(offscreen_check PRIVATE tests/gpu_alias.cpp src/era_gpu_alias.cpp src/era_title_va.cpp src/era_heap.cpp)
+# The same open without a GPU: spans it must refuse before calling D3D12, and spans that must reach
+# the device, against a recording fake device. The control builds a generated copy of
+# era_gpu_alias.cpp that no longer compares the allocation base, which the interior pointer must catch.
+add_executable(era_gpu_alias_check tests/era_gpu_alias_check.cpp tests/era_gpu_alias_fake_device.cpp
+    src/era_gpu_alias.cpp)
+target_include_directories(era_gpu_alias_check PRIVATE src tests)
+target_compile_features(era_gpu_alias_check PRIVATE cxx_std_17)
+add_test(NAME era_gpu_alias_open COMMAND era_gpu_alias_check)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS src/era_gpu_alias.cpp)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/era_gpu_alias.cpp" gpu_alias_text)
+string(FIND "${gpu_alias_text}" "info.AllocationBase != base || " gpu_alias_anchor)
+if(gpu_alias_anchor LESS 0)
+    message(FATAL_ERROR "era_gpu_alias.cpp lost the anchor used by era_gpu_alias_open_base_control")
+endif()
+string(REPLACE "info.AllocationBase != base || " "" gpu_alias_text "${gpu_alias_text}")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/gpu_alias_base_control/era_gpu_alias.cpp" "${gpu_alias_text}")
+add_executable(era_gpu_alias_base_control_check tests/era_gpu_alias_check.cpp tests/era_gpu_alias_fake_device.cpp
+    "${CMAKE_CURRENT_BINARY_DIR}/gpu_alias_base_control/era_gpu_alias.cpp")
+target_include_directories(era_gpu_alias_base_control_check PRIVATE src tests)
+target_compile_features(era_gpu_alias_base_control_check PRIVATE cxx_std_17)
+add_test(NAME era_gpu_alias_open_base_control COMMAND era_gpu_alias_base_control_check)
+set_tests_properties(era_gpu_alias_open_base_control PROPERTIES PASS_REGULAR_EXPRESSION
+    "FAIL: interior pointer: passed to D3D12")
 # A title buffer window: two 64 KiB pages, a non-page-aligned offset, copies in both directions and
 # named rejects for an outside address, a misaligned page run and an uncommitted page.
 target_sources(offscreen_check PRIVATE tests/gpu_alias_window.cpp)
