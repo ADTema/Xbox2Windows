@@ -695,7 +695,12 @@ These are measured on one executable; treat them as hypotheses for others.
   decodes `CB_BLENDn_CONTROL` and a `CB_TARGET_MASK` nibble into `D3D12_RENDER_TARGET_BLEND_DESC`. It
   refuses forms D3D12 can't express (`BOTH_SRC_ALPHA`, constant alpha without alpha blend factor
   support, MIN/MAX with factors other than ONE). Its draws match a CPU model of the register fields
-  (`ctest --preset release --no-tests=error -R "^startup_cb_blend"`).
+  (`ctest --preset release --no-tests=error -R "^startup_cb_blend"`). A device-free check decodes
+  each 5-bit factor value in each of the four factor slots, each pair of colour and alpha combine
+  functions, the MIN/MAX rule on each slot, the write mask and `control_word`, and checks the
+  reason of each refusal. Its `_dest_alpha_control` run, which expects a destination alpha factor
+  in its colour form, is the negative control
+  (`ctest --preset dev --no-tests=error -R "^startup_cb_blend_decode" -V`).
 - Audio produces no output from the console audio path. A separate desktop render sink exists
   (see "Audio output"); nothing connects the console path to it yet.
 

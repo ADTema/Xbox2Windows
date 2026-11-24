@@ -904,6 +904,15 @@ add_custom_command(OUTPUT "${startup_cb_blend_ps}" COMMAND "${DXC_EXECUTABLE}" -
     -Vn startup_cb_blend_ps -Fh "${startup_cb_blend_ps}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_cb_blend.hlsl"
     DEPENDS tests/startup_cb_blend.hlsl VERBATIM)
 target_sources(offscreen_check PRIVATE tests/startup_cb_blend.cpp "${startup_cb_blend_vs}" "${startup_cb_blend_ps}")
+# The same decoder without a device (#1149): each factor value in each of the four factor slots,
+# colour and alpha combine functions apart, refusal reasons, MIN / MAX per slot, the write mask and
+# control_word. The mutated run (destination alpha left in its colour form) is the negative control.
+add_executable(startup_cb_blend_check tests/startup_cb_blend_check.cpp)
+target_include_directories(startup_cb_blend_check PRIVATE src)
+target_compile_features(startup_cb_blend_check PRIVATE cxx_std_17)
+add_test(NAME startup_cb_blend_decode COMMAND startup_cb_blend_check)
+add_test(NAME startup_cb_blend_decode_dest_alpha_control COMMAND startup_cb_blend_check --mutate dest-alpha-colour)
+set_tests_properties(startup_cb_blend_decode_dest_alpha_control PROPERTIES WILL_FAIL TRUE)
 # Composite provenance (#1628): one VS and two pixel shaders from one HLSL file.
 set(startup_composite_provenance_headers "")
 foreach(stage IN ITEMS "vs_6_0;vs_main;vs" "ps_6_0;ps_fill;fill" "ps_6_0;ps_composite;composite")
