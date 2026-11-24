@@ -294,6 +294,12 @@ target_link_libraries(startup_stub_consumer PRIVATE startup_stub_chad startup_st
 add_executable(startup_draw_bmp_check tests/startup_draw_bmp.cpp)
 add_test(NAME startup_draw_bmp COMMAND startup_draw_bmp_check)
 
+# Input for the launcher containment check (docs/startup-runtime.md): writes known bytes to both
+# streams and the trap log, reports a known exit code, or holds memory, spawns a child or stays
+# alive so the launch tool's job limits have to stop it.
+add_executable(startup_launch_probe tests/startup_launch_probe.cpp)
+target_compile_features(startup_launch_probe PRIVATE cxx_std_17)
+
 add_executable(startup_dump_fence_check tests/startup_dump_fence.cpp tests/desktop_gpu.cpp)
 add_executable(startup_overlay_window tests/startup_overlay_window.cpp)
 target_compile_features(startup_overlay_window PRIVATE cxx_std_17)
@@ -1130,6 +1136,11 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/startup_xg_bc7_layout_check.py" "$<TARGET_FILE:startup_stub_xg_xs>")
     set_tests_properties(startup_xg_bc7_layout PROPERTIES TIMEOUT 30
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_XG_BC7_4K_S_LAYOUT=1")
+    # tools/startup/launch.py's containment (#1149): the exit code, captured stdout/stderr and trap
+    # log, the timeout kill, the commit cap and the process limit, and the missing-EXE path.
+    add_test(NAME startup_launch COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_launch_check.py" "$<TARGET_FILE:startup_launch_probe>")
+    set_tests_properties(startup_launch PROPERTIES TIMEOUT 120)
 
     add_test(NAME startup_stream_request_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
         "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_check.py" "$<TARGET_FILE:startup_stream_consumer>")
