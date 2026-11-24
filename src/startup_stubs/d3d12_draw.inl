@@ -14,6 +14,7 @@ struct Translation {
     enum UdKind { rect, base_vertex, start_instance, root_constant, stride, mrt_bits };
     struct Ud { int kind, a, b; };
     int state = 0;                           // 1 ready, 2 unavailable
+    ULONGLONG retry_manifest_at = 0;         // Only an absent manifest can become ready on a later draw.
     std::vector<Srv> srvs;
     std::vector<Ud> uds;
     x2w_startup::TranslatedSamplers samplers;
@@ -122,12 +123,18 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
     std::string manifest;
     if (!cache_path(path, L"", tr.key, L".txt")) return;
     if (!read_text(path, manifest)) {
-        InterlockedIncrement(&translation_missing);
-        static LONG missing;
-        if (rtv_request.empty() && first_calls(missing, 12))
-            log("x2w-draw no translation for pipeline %016llx", tr.key);
+        if (!tr.retry_manifest_at) {
+            InterlockedIncrement(&translation_missing);
+            static LONG missing;
+            if (rtv_request.empty() && first_calls(missing, 12))
+                log("x2w-draw no translation for pipeline %016llx", tr.key);
+        }
+        tr.retry_manifest_at = GetTickCount64() + 1000;
         return;
     }
+    // The writer publishes this marker last. A malformed published result stays rejected.
+    const bool previously_missing = tr.retry_manifest_at != 0;
+    tr.retry_manifest_at = 0;
     bool matched_rtv = false;
     for (std::size_t at = 0; at < manifest.size();) {
         std::size_t end = manifest.find('\n', at);
@@ -176,6 +183,7 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
         return;
     }
     tr.state = 1;
+    if (previously_missing) InterlockedDecrement(&translation_missing);
     InterlockedIncrement(&translation_ready);
     log("x2w-draw pipeline %016llx translated: %zu entry values, %zu resources, %zu static samplers, sampler_heap=%u",
         tr.key, tr.uds.size(), tr.srvs.size(), tr.samplers.statics.size(), tr.samplers.heap ? 1u : 0u);
@@ -354,8 +362,12 @@ bool needs_rtv_variant(DXGI_FORMAT format)
 
 Translation* translation_for_targets(Translation* base, const Pass& pass)
 {
-    if (!base || std::none_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant))
+    if (!base) return nullptr;
+    if (std::none_of(pass.target_formats, pass.target_formats + pass.target_count, needs_rtv_variant)) {
+        if (base->retry_manifest_at && GetTickCount64() >= base->retry_manifest_at)
+            load_translation(*base);
         return base;
+    }
     std::string request = "rtv1 " + std::to_string(base->key);
     for (UINT i = 0; i < pass.target_count; ++i)
         request += " " + std::to_string(static_cast<unsigned>(pass.target_formats[i]));
@@ -369,6 +381,8 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
             publish_shader_request(key, L".rtv", request.data(), request.size());
             log("x2w-draw no RTV translation for %016llx (%s)", key, request.c_str());
         }
+    } else if (entry->retry_manifest_at && GetTickCount64() >= entry->retry_manifest_at) {
+        load_translation(*entry, request);
     }
     return entry;
 }
