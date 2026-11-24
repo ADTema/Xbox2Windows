@@ -29,7 +29,7 @@ bool tiled_bc_srv(const D3D12_RESOURCE_DESC& r)
 void log_partial_tile_view(const D3D12_RESOURCE_DESC& r, u64 address, bool announced, bool published)
 {
     static LONG lines;
-    if (!first_calls(lines, 16)) return;
+    if (!first_calls(lines, 64)) return;
     const auto bytes = x2w_startup::Bc16Surface(r).size();
     const auto* data = reinterpret_cast<const unsigned char*>(address);
     const bool readable = x2w_local::readable(data, bytes);

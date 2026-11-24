@@ -10902,7 +10902,9 @@ published through device slot 70 without a prior resource object. The tested
 layout is 0x105, 4 KiB standard non-XOR. Width and height must be whole 4x4
 blocks, with one mip, one slice, and one sample. Each tile holds 16 by 16
 compressed blocks. A partial last tile column or row is padded to a whole tile,
-as AMD addrlib does for a single-mip thin surface: `ComputeSurfaceInfoMacroTiled`
+as AMD addrlib does for a single-mip thin surface (read in the GPUOpen PAL copy
+of `gfx10addrlib.cpp` at `c5e80007`, not the Mesa revision pinned for the
+optional addrlib tests): `ComputeSurfaceInfoMacroTiled`
 aligns pitch and height to the block size and places mip 0 at offset 0, and the
 address of a block is its tile index (row times tiles per padded pitch, plus
 column) times 4 KiB, plus its offset in the tile. The runtime copies the
