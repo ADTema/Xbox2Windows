@@ -605,9 +605,11 @@ longer exhausts the heap. While nothing has been freed the offsets are the ones 
   already freed) is `E_INVALIDARG` and changes nothing.
 - `ApuIsVirtualAddressValid` and the two map calls still test the whole heap range, not live blocks.
 
-The shape-context allocation (`AcpHalAllocateShapeContexts`, types other than 4) is unchanged. The source-built
-check loads the stub, cycles 64 MiB through a 2 MiB heap, checks reuse, alignment, coalescing and every refused
-call, then runs 4 threads of 1000 rounds against an interval map of live blocks:
+The shape-context allocation (`AcpHalAllocateShapeContexts`, types other than 4) returns `E_NOTIMPL`,
+rolling back any already allocated XMA block and zeroing its output pointer and APU address. The source-built
+check loads the stub, checks non-permissive traps, cycles 64 MiB through a 2 MiB heap, checks reuse, alignment,
+coalescing, every refused call, shape-context allocation and partial-failure rollback, `AcpHalCreate`, and the
+address validity/mapping exports, then runs 4 threads of 1000 rounds against an interval map of live blocks:
 
 ```
 ctest --preset dev --no-tests=error -R '^startup_acphal_apu_free$' -V
