@@ -16917,6 +16917,7 @@ def _check_controls_inline(directory):
     # SDWA v_movrel* (#1917): the selections apply to the indexed words; the refusals of v_mov_b32_sdwa hold.
     sdwa_hlsl = translate_int(uncompressed_export(SDWA_MOVREL_BODY))
     assert "dpp_soff" in sdwa_hlsl and "dpp_doff" in sdwa_hlsl and "QuadRead" not in sdwa_hlsl
+    check_sdwa_movrel_pins(sdwa_hlsl)
     sdwa_bank = ["v_mov_b32_e32 v24, 0x44332211", "v_mov_b32_e32 v25, 0x88776655"]
     for bad_seq, message in (
         (sdwa_bank + ["s_mov_b32 m0, 1",
@@ -21880,6 +21881,38 @@ def check_sdwa_movrel_draw(directory, compiler, renderer, backend):
         run_pixel_batch(renderer, backend, shader, [(good, "mismatch")])
         print(f"control {label}: pixel mismatch, as required")
     return 0
+
+
+# Device-free pins of the SDWA selections in SDWA_MOVREL_BODY (#1917): each pattern is the exact expression one source
+# or destination selection produces, with temporaries as \d+, and the count is how often it must appear (once per
+# static move, once per reachable destination of a dynamic one). Dropping, swapping or changing a selection fails.
+SDWA_MOVREL_PINS = (
+    # R: dynamic v_movrels, src0_sel:BYTE_3 into dst_sel:WORD_1 with UNUSED_PRESERVE.
+    (r"asfloat\(\(\(asuint\(alu\d+\) & 0xffffu\) \| \(\(\(\(asuint\(dpp_src\d+\) >> 24u\) & 0xffu\) & 0xffffu\) << 16u\)\)\)", 1),
+    # R: static v_movrels, sext(BYTE_1) into BYTE_0 with UNUSED_PRESERVE.
+    (r"asfloat\(\(\(asuint\(alu\d+\) & 0xffffff00u\) \| \(\(asuint\(asint\(asuint\(alu\d+\) << 16u\) >> 24u\) & 0xffu\) << 0u\)\)\)", 1),
+    # G: dynamic v_movreld, sext(BYTE_2) of the source, then WORD_0 with UNUSED_PRESERVE in each of four destinations.
+    (r"uint dpp_val\d+ = asuint\(asint\(asuint\(alu\d+\) << 8u\) >> 24u\);", 1),
+    (r"asfloat\(\(\(asuint\(alu\d+\) & 0xffff0000u\) \| \(\(dpp_val\d+ & 0xffffu\) << 0u\)\)\)", 4),
+    # G: static v_movreld, WORD_1 into BYTE_3 with UNUSED_PAD.
+    (r"asfloat\(\(\(\(\(asuint\(alu\d+\) >> 16u\) & 0xffffu\) & 0xffu\) << 24u\)\)", 1),
+    # B and A: dynamic moves read WORD_0 of the indexed source.
+    (r"uint dpp_val\d+ = \(\(asuint\(dpp_src\d+\) >> 0u\) & 0xffffu\);", 2),
+    # B: dynamic v_movrelsd, BYTE_2 with UNUSED_PRESERVE in each of four destinations.
+    (r"asfloat\(\(\(asuint\(alu\d+\) & 0xff00ffffu\) \| \(\(dpp_val\d+ & 0xffu\) << 16u\)\)\)", 4),
+    # B: static v_movrelsd, sext(BYTE_0) into DWORD with UNUSED_PAD.
+    (r"asfloat\(asuint\(asint\(asuint\(alu\d+\) << 24u\) >> 24u\)\)", 1),
+    # A: dynamic v_movrelsd_2, WORD_1 with UNUSED_PRESERVE in each of four destinations.
+    (r"asfloat\(\(\(asuint\(alu\d+\) & 0xffffu\) \| \(\(dpp_val\d+ & 0xffffu\) << 16u\)\)\)", 4),
+    # A: static v_movrelsd_2, BYTE_3 into BYTE_0 with UNUSED_PAD.
+    (r"asfloat\(\(\(\(\(asuint\(alu\d+\) >> 24u\) & 0xffu\) & 0xffu\) << 0u\)\)", 1),
+)
+
+
+def check_sdwa_movrel_pins(hlsl):
+    for pattern, count in SDWA_MOVREL_PINS:
+        found = len(re.findall(pattern, hlsl))
+        assert found == count, f"SDWA movrel selection {pattern!r}: {found} occurrences, expected {count}"
 
 
 def check_swaprel_draw(directory, compiler, renderer, backend):
