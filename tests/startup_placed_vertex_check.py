@@ -12,7 +12,7 @@ float4 main(float4 p : SV_Position) : SV_Target {
     return float4(float(vertices.Load(0)) / 255.0, 0, 0, 1);
 }
 """
-    actual = draw_texture(directory, consumer, backend, shader, {"X2W_TEST_PLACED_VERTEX": "1"}, "srv 0 buf vb 0")
+    actual = draw_texture(directory, consumer, backend, shader, {"X2W_TEST_PLACED_VERTEX": "1"}, binding="srv 0 buf vb 0")
     if actual is None:
         return 77
     first = (directory / "pixels.first").read_bytes()
