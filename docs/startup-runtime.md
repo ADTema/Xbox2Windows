@@ -40,15 +40,43 @@ directory to exercise both slots on hardware and WARP.
 
 ## 16-bit packed targets
 
-A description that asks for a B5G5R5A1_UNORM or B4G4R4A4_UNORM texture as a render target or for
-unordered access is created as R8G8B8A8_UNORM when the adapter lacks that use for the packed
-format and has it for R8G8B8A8_UNORM (`src/startup_stubs/packed_target_format.h`). Views that name
-the packed format on such a texture use R8G8B8A8_UNORM too. Without this the description is
+A description that asks for a B5G5R5A1_UNORM or B4G4R4A4_UNORM render target is created as
+R8G8B8A8_UNORM when the adapter lacks that use for the packed format and has it for
+R8G8B8A8_UNORM (`src/startup_stubs/packed_target_format.h`). Without this the description is
 refused, its allocation-info answer is all ones and the executable gets no texture. The first
-four stand-ins are logged. Texel data the executable writes itself in the packed layout is not
-converted; the measured textures are render targets it only draws to. Run
-`ctest --preset release --no-tests=error -R '^startup_packed_target$' -V` for the selection rule
-against adapters described by their support bits.
+four stand-ins are logged.
+
+The rule covers the roles that were measured and nothing else: a single-sample 2D texture with
+one array slice that is a render target, alone or with unordered access. Other dimensions,
+arrays, multisampled textures and textures without the render-target flag keep their format.
+
+A stand-in texture carries the format it was asked for as private data. A view that names that
+format on that texture is created as R8G8B8A8_UNORM, both when the executable creates the view
+and when the draw path builds its own view from the recorded description. A packed view of any
+other texture of a different format is refused and logged: of a plain R8G8B8A8_UNORM texture, of
+the stand-in for the other packed format, or of a texture in the other packed format.
+
+Limits:
+
+- Quantization. The stand-in keeps 8 bits a channel where the packed formats keep 5, 4 or 1.
+  Rendered values are not rounded to the packed precision, so a read of the target can differ
+  from the console's in the low bits: a channel cleared to 0.45 reads 115 from the stand-in and
+  119 from B4G4R4A4; one cleared to 0.2 reads 51 and, from B5G5R5A1, 49.
+- CPU-authored texels. Data the executable writes or reads itself in the 16-bit layout (uploads,
+  copies to or from buffers, mapped reads) is not converted. Only textures that are rendered to
+  and then sampled are covered.
+- Unordered-access writes to a stand-in are not exercised by a fixture.
+
+Checks:
+
+- `ctest --preset release --no-tests=error -R '^startup_packed_target$' -V`: the selection rule
+  against adapters described by their support bits, and the view verdicts, without a device.
+- `ctest --preset release --no-tests=error -R '^startup_packed_target_draw_' -V`: through the
+  wrapper, a texture of each packed format is created (slot 133), cleared through a render-target
+  view, sampled in a draw and read back. The expected pixel follows the format this adapter
+  gets, so the check holds with and without the stand-in. B5G6R5_UNORM and R8G8B8A8_UNORM are
+  drawn as controls and never substituted; a packed view of a plain R8G8B8A8_UNORM texture and a
+  B5G5R5A1 view of a B4G4R4A4 target must be refused.
 
 ## Null bindings in translated draws
 

@@ -856,6 +856,25 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 std::memcpy(&desc, record.desc, 40);
                 desc.Format = desktop_format(desc.Format);
             }
+            if (texture && x2w_startup::packed_target_format(desc.Format)) {
+                // The view recorded from the title names a packed format: follow a stand-in texture,
+                // and bind nothing for a texture the view does not fit (packed_target_format.h).
+                const auto verdict = x2w_startup::packed_view(desc.Format, texture->GetDesc().Format, x2w_startup::packed_stand_in_of(texture));
+                if (verdict == x2w_startup::PackedView::stand_in) desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                if (verdict == x2w_startup::PackedView::refused) {
+                    static LONG refused;
+                    if (first_calls(refused, 6))
+                        log("x2w-draw   %016llx srv %u: packed format %d on a texture of format %d that does not stand in for it; binding null",
+                            tr->key, i, desc.Format, texture->GetDesc().Format);
+                    texture = nullptr;
+                    desc = {};
+                    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                    desc.ViewDimension = dimension;
+                    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                    desc.Texture2D.MipLevels = 1;
+                    if (srv.kind == 2) desc.Texture2DArray.ArraySize = 1;
+                }
+            }
             if (texture) upload_texture(self, resource, texture);
             if (texture) require_state(self, texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             const bool had_texture = texture != nullptr;
