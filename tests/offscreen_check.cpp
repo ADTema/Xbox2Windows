@@ -507,6 +507,12 @@ OperationResult run_spirv_sampler_views(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_dynamic_sampler_index(const OperationContext& ctx)
+{
+    check_dynamic_sampler_index(ctx.device);
+    return {OutcomeKind::pass, nullptr};
+}
+
 // Two builds of one shader that differ only in the sampler descriptor index source (#1115). The
 // SV_DispatchThreadID build must match the shared expected words; the SV_GroupID build is printed
 // for the record, because an adapter that folds the index still matches on some drivers.
@@ -1081,6 +1087,7 @@ const OperationSpec kOperations[] = {
     {"--ffx-immediate-conversion", 4, 4, nullptr, kNoGate, run_ffx_immediate_conversion},
     {"--compute-store-case", 5, 5, nullptr, kNoGate, run_compute_store_case},
     {"--spirv-sampler-views", 4, 4, nullptr, kGateSm60SamplerViews, run_spirv_sampler_views},
+    {"--dynamic-sampler-index", 3, 3, nullptr, kGateSm60SamplerViews, run_dynamic_sampler_index},
     // Two builds that differ only in the sampler descriptor index source (#1115): the
     // SV_DispatchThreadID build is asserted, the SV_GroupID build is recorded per swap.
     {"--sampler-index-control", 3, 3, nullptr, kGateSm60SamplerIndexControl, run_sampler_index_control},
