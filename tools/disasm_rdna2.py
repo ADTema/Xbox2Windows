@@ -1178,6 +1178,8 @@ MTBUF_FORMATS = {
 # DPP8 (233, or 234 with FI set), SDWA (249) and DPP16 (250). The dword holds the real SRC0 and
 # the lane or sub-dword controls.
 VOP_EXTENSION_FORMS = {233: "DPP8", 234: "DPP8", 249: "SDWA", 250: "DPP16"}
+VOP1_DPP_UNSUPPORTED = frozenset(("v_readfirstlane_b32", "v_pipeflush", "v_clrexcp", "v_swap_b32", "v_swaprel_b32"))
+VOP2_DPP_UNSUPPORTED_OPS = frozenset((0x06, 0x20, 0x21, 0x2c, 0x2d, 0x37, 0x38, 0x3c))
 SDWA_SEL_NAMES = ("BYTE_0", "BYTE_1", "BYTE_2", "BYTE_3", "WORD_0", "WORD_1", "DWORD")
 # Scalar source codes 209-234 are outside the supported LLVM 15 decoder subset for GFX10 SDWA: LLVM 15
 # refuses every VOPC SDWA record that names one as src0 or src1. This records LLVM 15's behaviour; it is
@@ -1257,6 +1259,149 @@ def _decode_vopc_sdwa(w1: int, vsrc1: int, op_name: str, comment: str) -> tuple[
         dst_str = decode_s_reg(sdst) if sdst_en else "vcc_lo"
         asm = f"{sdwa_name} {dst_str}, {src0_str}, {src1_str} {sels}"
     return (8, sdwa_name, asm, comment)
+
+
+def _vop1_dpp_has_mods(op_name: str) -> bool | None:
+    """Return whether VOP1 DPP16 supports float input modifiers, or None if DPP is unsupported."""
+    if op_name.startswith("v_vop1_") or op_name in VOP1_DPP_UNSUPPORTED:
+        return None
+    if (op_name.startswith(("v_cvt_f64_", "v_cvt_i32_f64", "v_cvt_u32_f64", "v_cvt_f32_f64", "v_frexp_exp_i32_f64"))
+            or op_name.endswith(("_f64_e32", "_f64", "_b64_e32", "_b64"))):
+        return None
+    base = op_name[:-4] if op_name.endswith("_e32") else op_name
+    return base.endswith(("_f32", "_f16"))
+
+
+def _vop2_dpp_mods(op: int, op_name: str) -> tuple[bool, bool] | None:
+    """Return (src0_has_mods, src1_has_mods) for VOP2 DPP16, or None if DPP is unsupported."""
+    if op_name.startswith("v_vop2_") or op in VOP2_DPP_UNSUPPORTED_OPS:
+        return None
+    base = op_name[:-4] if op_name.endswith("_e32") else op_name
+    if base == "v_ldexp_f16":
+        return (True, False)
+    if base == "v_cvt_pkrtz_f16_f32":
+        return (True, True)
+    is_float = base.endswith(("_f32", "_f16"))
+    return (is_float, is_float)
+
+
+def _format_dpp16_ctrl(dpp_ctrl: int) -> str | None:
+    """Decode a 9-bit GFX10 DPP16 control field, or return None if invalid on GFX10."""
+    if dpp_ctrl <= 0xff:
+        return (f"quad_perm:[{dpp_ctrl & 0x3},{(dpp_ctrl >> 2) & 0x3},"
+                f"{(dpp_ctrl >> 4) & 0x3},{(dpp_ctrl >> 6) & 0x3}]")
+    if 0x101 <= dpp_ctrl <= 0x10f:
+        return f"row_shl:{dpp_ctrl & 0xf}"
+    if 0x111 <= dpp_ctrl <= 0x11f:
+        return f"row_shr:{dpp_ctrl & 0xf}"
+    if 0x121 <= dpp_ctrl <= 0x12f:
+        return f"row_ror:{dpp_ctrl & 0xf}"
+    if dpp_ctrl == 0x140:
+        return "row_mirror"
+    if dpp_ctrl == 0x141:
+        return "row_half_mirror"
+    if 0x150 <= dpp_ctrl <= 0x15f:
+        return f"row_share:{dpp_ctrl & 0xf}"
+    if 0x160 <= dpp_ctrl <= 0x16f:
+        return f"row_xmask:{dpp_ctrl & 0xf}"
+    return None
+
+
+def _format_dpp8_ctrl(w1: int, fi: int) -> str:
+    """Format the 8-lane DPP8 selector list and optional fi:1 flag."""
+    lanes = ",".join(str((w1 >> (8 + 3 * k)) & 0x7) for k in range(8))
+    return f"dpp8:[{lanes}]{' fi:1' if fi else ''}"
+
+
+def _decode_vop1_dpp(w1: int, vdst: int, src0: int, op_name: str, comment: str) -> tuple[int, str, str, str]:
+    """Decode a GFX10 VOP1 DPP8 (src0=233/234) or DPP16 (src0=250) 8-byte instruction."""
+    is_dpp8 = src0 in (233, 234)
+    form = "DPP8" if is_dpp8 else "DPP16"
+    kind = "vop1_dpp8" if is_dpp8 else "vop1_dpp16"
+    src0_mods = _vop1_dpp_has_mods(op_name)
+    if src0_mods is None:
+        return (8, kind, f"{op_name} <unsupported {form}>", f"VOP1 {form} is not supported for this opcode")
+
+    src0_vgpr = w1 & 0xff
+    if is_dpp8:
+        fi = 1 if src0 == 234 else 0
+        if op_name == "v_nop":
+            if vdst == 0 and src0_vgpr == 0:
+                return (8, "v_nop", f"v_nop {_format_dpp8_ctrl(w1, fi)}", comment)
+            return (8, kind, f"{op_name} <unsupported DPP8>", "Invalid VOP1 DPP8 encoding")
+        dpp_name = f"{op_name[:-4]}_dpp" if op_name.endswith("_e32") else f"{op_name}_dpp"
+        return (8, dpp_name, f"{dpp_name} v{vdst}, v{src0_vgpr} {_format_dpp8_ctrl(w1, fi)}", comment)
+
+    dpp_ctrl = (w1 >> 8) & 0x1ff
+    dpp_ctrl_str = _format_dpp16_ctrl(dpp_ctrl)
+    if dpp_ctrl_str is None:
+        return (8, kind, f"{op_name} <unsupported DPP16>", "Invalid GFX10 DPP16 control")
+    fi = (w1 >> 18) & 1
+    bound_ctrl = (w1 >> 19) & 1
+    src0_neg = (w1 >> 20) & 1
+    src0_abs = (w1 >> 21) & 1
+    src1_neg = (w1 >> 22) & 1
+    src1_abs = (w1 >> 23) & 1
+    bank_mask = (w1 >> 24) & 0xf
+    row_mask = (w1 >> 28) & 0xf
+    if src1_neg or src1_abs or (not src0_mods and (src0_neg or src0_abs)):
+        return (8, kind, f"{op_name} <unsupported DPP16>", "Invalid VOP1 DPP16 modifier")
+    suffix = (f"{dpp_ctrl_str} row_mask:0x{row_mask:x} bank_mask:0x{bank_mask:x}"
+              f"{' bound_ctrl:1' if bound_ctrl else ''}{' fi:1' if fi else ''}")
+    if op_name == "v_nop":
+        if vdst == 0 and src0_vgpr == 0:
+            return (8, "v_nop", f"v_nop {suffix}", comment)
+        return (8, kind, f"{op_name} <unsupported DPP16>", "Invalid VOP1 DPP16 encoding")
+    dpp_name = f"{op_name[:-4]}_dpp" if op_name.endswith("_e32") else f"{op_name}_dpp"
+    src0_str = _format_operand_modifiers(f"v{src0_vgpr}", src0_abs, src0_neg)
+    return (8, dpp_name, f"{dpp_name} v{vdst}, {src0_str} {suffix}", comment)
+
+
+def _decode_vop2_dpp(w1: int, vdst: int, vsrc1: int, src0: int, op: int, op_name: str,
+                     comment: str) -> tuple[int, str, str, str]:
+    """Decode a GFX10 VOP2 DPP8 (src0=233/234) or DPP16 (src0=250) 8-byte instruction."""
+    is_dpp8 = src0 in (233, 234)
+    form = "DPP8" if is_dpp8 else "DPP16"
+    kind = "vop2_dpp8" if is_dpp8 else "vop2_dpp16"
+    mods = _vop2_dpp_mods(op, op_name)
+    if mods is None:
+        return (8, kind, f"{op_name} <unsupported {form}>", f"VOP2 {form} is not supported for this opcode")
+    src0_has_mods, src1_has_mods = mods
+    src0_vgpr = w1 & 0xff
+    dpp_name = f"{op_name[:-4]}_dpp" if op_name.endswith("_e32") else f"{op_name}_dpp"
+
+    if is_dpp8:
+        fi = 1 if src0 == 234 else 0
+        ctrl = _format_dpp8_ctrl(w1, fi)
+        src0_str = f"v{src0_vgpr}"
+        src1_str = f"v{vsrc1}"
+    else:
+        dpp_ctrl = (w1 >> 8) & 0x1ff
+        dpp_ctrl_str = _format_dpp16_ctrl(dpp_ctrl)
+        if dpp_ctrl_str is None:
+            return (8, kind, f"{op_name} <unsupported DPP16>", "Invalid GFX10 DPP16 control")
+        fi = (w1 >> 18) & 1
+        bound_ctrl = (w1 >> 19) & 1
+        src0_neg = (w1 >> 20) & 1
+        src0_abs = (w1 >> 21) & 1
+        src1_neg = (w1 >> 22) & 1
+        src1_abs = (w1 >> 23) & 1
+        bank_mask = (w1 >> 24) & 0xf
+        row_mask = (w1 >> 28) & 0xf
+        if (not src0_has_mods and (src0_neg or src0_abs)) or (not src1_has_mods and (src1_neg or src1_abs)):
+            return (8, kind, f"{op_name} <unsupported DPP16>", "Invalid VOP2 DPP16 modifier")
+        src0_str = _format_operand_modifiers(f"v{src0_vgpr}", src0_abs, src0_neg)
+        src1_str = _format_operand_modifiers(f"v{vsrc1}", src1_abs, src1_neg)
+        ctrl = (f"{dpp_ctrl_str} row_mask:0x{row_mask:x} bank_mask:0x{bank_mask:x}"
+                f"{' bound_ctrl:1' if bound_ctrl else ''}{' fi:1' if fi else ''}")
+
+    if op_name == "v_cndmask_b32_e32":
+        asm = f"{dpp_name} v{vdst}, {src0_str}, {src1_str}, vcc_lo {ctrl}"
+    elif op in (0x28, 0x29, 0x2a):
+        asm = f"{dpp_name} v{vdst}, vcc_lo, {src0_str}, {src1_str}, vcc_lo {ctrl}"
+    else:
+        asm = f"{dpp_name} v{vdst}, {src0_str}, {src1_str} {ctrl}"
+    return (8, dpp_name, asm, comment)
 
 
 def _vop_extension(data: bytes, offset: int, encoding: str, op_name: str, src0: int) -> tuple[int, str, str, str]:
@@ -1997,6 +2142,12 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         src0 = w0 & 0x1ff
         op_info = VOP1_OPS.get(op, (f"v_vop1_{op:02x}", "Unknown VOP1"))
         op_name, comment = op_info
+        if src0 in (233, 234, 250):
+            form = VOP_EXTENSION_FORMS[src0]
+            if offset + 8 > len(data):
+                return (4, "vop1_truncated", f"{op_name} <truncated>", f"Incomplete VOP1 {form}")
+            w1, = struct.unpack_from("<I", data, offset + 4)
+            return _decode_vop1_dpp(w1, vdst, src0, op_name, comment)
         if src0 in VOP_EXTENSION_FORMS:
             return _vop_extension(data, offset, "vop1", op_name, src0)
         length = 4
@@ -2068,6 +2219,12 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         src0 = w0 & 0x1ff
         op_info = VOP2_OPS.get(op, (f"v_vop2_{op:02x}", "Unknown VOP2"))
         op_name, comment = op_info
+        if src0 in (233, 234, 250):
+            form = VOP_EXTENSION_FORMS[src0]
+            if offset + 8 > len(data):
+                return (4, "vop2_truncated", f"{op_name} <truncated>", f"Incomplete VOP2 {form}")
+            w1, = struct.unpack_from("<I", data, offset + 4)
+            return _decode_vop2_dpp(w1, vdst, vsrc1, src0, op, op_name, comment)
         if src0 in VOP_EXTENSION_FORMS:
             return _vop_extension(data, offset, "vop2", op_name, src0)
         has_literal = src0 == 255 or op in (0x20, 0x21, 0x2c, 0x2d, 0x37, 0x38)

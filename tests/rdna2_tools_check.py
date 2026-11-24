@@ -946,12 +946,17 @@ class TestRdna2Disasm(unittest.TestCase):
         endpgm = bytes.fromhex("000081bf")
         cases = (
             ("f9160a7e01060600", "vop1_sdwa", "v_cvt_f32_f16_sdwa <unsupported SDWA>"),
-            ("fa020a7e01e40000", "vop1_dpp16", "v_mov_b32_dpp <unsupported DPP16>"),
-            ("e9020a7e0188c6fa", "vop1_dpp8", "v_mov_b32_dpp <unsupported DPP8>"),
-            ("ea020a7e0188c6fa", "vop1_dpp8", "v_mov_b32_dpp <unsupported DPP8>"),  # fi:1
+            ("fa020a7e01e40000", "v_mov_b32_dpp",
+             "v_mov_b32_dpp v5, v1 quad_perm:[0,1,2,3] row_mask:0x0 bank_mask:0x0"),
+            ("e9020a7e0188c6fa", "v_mov_b32_dpp",
+             "v_mov_b32_dpp v5, v1 dpp8:[0,1,2,3,4,5,6,7]"),
+            ("ea020a7e0188c6fa", "v_mov_b32_dpp",
+             "v_mov_b32_dpp v5, v1 dpp8:[0,1,2,3,4,5,6,7] fi:1"),
             ("f9040a0601060606", "vop2_sdwa", "v_add_f32_sdwa <unsupported SDWA>"),
-            ("fa040a1001e40000", "vop2_dpp16", "v_mul_f32_dpp <unsupported DPP16>"),
-            ("e9040a060188c6fa", "vop2_dpp8", "v_add_f32_dpp <unsupported DPP8>"),
+            ("fa040a1001e40000", "v_mul_f32_dpp",
+             "v_mul_f32_dpp v5, v1, v2 quad_perm:[0,1,2,3] row_mask:0x0 bank_mask:0x0"),
+            ("e9040a060188c6fa", "v_add_f32_dpp",
+             "v_add_f32_dpp v5, v1, v2 dpp8:[0,1,2,3,4,5,6,7]"),
             ("01070a6e21110000", "v_fmamk_f16", "v_fmamk_f16 v5, v1, 0x1121, v3"),
             ("01050a7021110000", "v_fmaak_f16", "v_fmaak_f16 v5, v1, v2, 0x1121"),
             # Issue #938: LLVM 15 prints SIMM16 0x1234 as hwreg(52, 8, 3).
@@ -1351,6 +1356,123 @@ class TestRdna2Disasm(unittest.TestCase):
             with self.subTest(llvm_refused=raw_hex):
                 with self.assertRaisesRegex(ValueError, "at byte 0$"):
                     llvm_disassemble(bytes.fromhex(raw_hex) + mov, resolved_lib)
+
+    # Golden GFX10 VOP1/VOP2 DPP16 and DPP8 encodings (matching LLVM 15.0.7 gfx1013 wave32).
+    VOP1_VOP2_DPP_DECODED = (
+        ("fa020a7e011b0000", "v_mov_b32_dpp v5, v1 quad_perm:[3,2,1,0] row_mask:0x0 bank_mask:0x0"),
+        ("fa020a7e01010100", "v_mov_b32_dpp v5, v1 row_shl:1 row_mask:0x0 bank_mask:0x0"),
+        ("fa020a7e011f0100", "v_mov_b32_dpp v5, v1 row_shr:15 row_mask:0x0 bank_mask:0x0"),
+        ("fa020a7e01210100", "v_mov_b32_dpp v5, v1 row_ror:1 row_mask:0x0 bank_mask:0x0"),
+        ("fa020a7e01400100", "v_mov_b32_dpp v5, v1 row_mirror row_mask:0x0 bank_mask:0x0"),
+        ("fa020a7e01410100", "v_mov_b32_dpp v5, v1 row_half_mirror row_mask:0x0 bank_mask:0x0"),
+        ("fa020a7e01500100", "v_mov_b32_dpp v5, v1 row_share:0 row_mask:0x0 bank_mask:0x0"),
+        ("fa020a7e016f0100", "v_mov_b32_dpp v5, v1 row_xmask:15 row_mask:0x0 bank_mask:0x0"),
+        ("fa020a7e011b0800", "v_mov_b32_dpp v5, v1 quad_perm:[3,2,1,0] row_mask:0x0 bank_mask:0x0 bound_ctrl:1"),
+        ("fa020a7e011b0c3a", "v_mov_b32_dpp v5, v1 quad_perm:[3,2,1,0] row_mask:0x3 bank_mask:0xa bound_ctrl:1 fi:1"),
+        ("fa0a0a7e011b0400", "v_cvt_f32_i32_dpp v5, v1 quad_perm:[3,2,1,0] row_mask:0x0 bank_mask:0x0 fi:1"),
+        ("fa100a7e011b3000", "v_cvt_i32_f32_dpp v5, -|v1| quad_perm:[3,2,1,0] row_mask:0x0 bank_mask:0x0"),
+        ("fa160a7e011b1000", "v_cvt_f32_f16_dpp v5, -v1 quad_perm:[3,2,1,0] row_mask:0x0 bank_mask:0x0"),
+        ("fa84027e001b0000", "v_movreld_b32_dpp v1, v0 quad_perm:[3,2,1,0] row_mask:0x0 bank_mask:0x0"),
+        ("fa86027e001b0400", "v_movrels_b32_dpp v1, v0 quad_perm:[3,2,1,0] row_mask:0x0 bank_mask:0x0 fi:1"),
+        ("fa90027e001b0000", "v_movrelsd_2_b32_dpp v1, v0 quad_perm:[3,2,1,0] row_mask:0x0 bank_mask:0x0"),
+        ("fa040a02011b00ff", "v_cndmask_b32_dpp v5, v1, v2, vcc_lo quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf"),
+        ("fa040a06011b9000", "v_add_f32_dpp v5, -v1, |v2| quad_perm:[3,2,1,0] row_mask:0x0 bank_mask:0x0"),
+        ("fa040a3e011b2000", "v_mac_f32_dpp v5, |v1|, v2 quad_perm:[3,2,1,0] row_mask:0x0 bank_mask:0x0"),
+        ("fa040a50011b0400", "v_add_co_ci_u32_dpp v5, vcc_lo, v1, v2, vcc_lo quad_perm:[3,2,1,0] row_mask:0x0 bank_mask:0x0 fi:1"),
+        ("fa040a56011b4000", "v_fmac_f32_dpp v5, v1, -v2 quad_perm:[3,2,1,0] row_mask:0x0 bank_mask:0x0"),
+        ("fa040a6c011b0400", "v_fmac_f16_dpp v5, v1, v2 quad_perm:[3,2,1,0] row_mask:0x0 bank_mask:0x0 fi:1"),
+        ("fa040a76011b1400", "v_ldexp_f16_dpp v5, -v1, v2 quad_perm:[3,2,1,0] row_mask:0x0 bank_mask:0x0 fi:1"),
+        ("e9020a7e0188c6fa", "v_mov_b32_dpp v5, v1 dpp8:[0,1,2,3,4,5,6,7]"),
+        ("ea020a7e0188c6fa", "v_mov_b32_dpp v5, v1 dpp8:[0,1,2,3,4,5,6,7] fi:1"),
+        ("e904000201773905", "v_cndmask_b32_dpp v0, v1, v2, vcc_lo dpp8:[7,6,5,4,3,2,1,0]"),
+        ("ea00005000773905", "v_add_co_ci_u32_dpp v0, vcc_lo, v0, v0, vcc_lo dpp8:[7,6,5,4,3,2,1,0] fi:1"),
+        ("e9040a3e01773905", "v_mac_f32_dpp v5, v1, v2 dpp8:[7,6,5,4,3,2,1,0]"),
+        ("ea84007e01773905", "v_movreld_b32_dpp v0, v1 dpp8:[7,6,5,4,3,2,1,0] fi:1"),
+    )
+
+    VOP1_VOP2_DPP_LLVM_REFUSED = (
+        ("fa040a7e011b0000", "vop1_dpp16"),  # v_readfirstlane_b32 has no DPP16 form
+        ("e982007e0088c6fa", "vop1_dpp8"),   # v_clrexcp has no DPP8 form
+        ("fa200a7e011b0000", "vop1_dpp16"),  # v_cvt_f64_f32 has no DPP16 form
+        ("fa040a0c011b0000", "vop2_dpp16"),  # v_mac_legacy_f32 has no DPP16 form
+        ("e9040a0c0188c6fa", "vop2_dpp8"),   # v_mac_legacy_f32 has no DPP8 form
+        ("fa040a40011b0000", "vop2_dpp16"),  # v_madmk_f32 has no DPP16 form
+        ("fa020a7e01300100", "vop1_dpp16"),  # wave_shl:1 is refused on GFX10
+        ("fa020a7e01340100", "vop1_dpp16"),  # wave_rol:1 is refused on GFX10
+        ("fa020a7e01380100", "vop1_dpp16"),  # wave_shr:1 is refused on GFX10
+        ("fa020a7e013c0100", "vop1_dpp16"),  # wave_ror:1 is refused on GFX10
+        ("fa020a7e01420100", "vop1_dpp16"),  # row_bcast:15 is refused on GFX10
+        ("fa020a7e01430100", "vop1_dpp16"),  # row_bcast:31 is refused on GFX10
+        ("fa020a7e01000100", "vop1_dpp16"),  # row_shl:0 (0x100) is invalid
+        ("fa020a7e01100100", "vop1_dpp16"),  # row_shr:0 (0x110) is invalid
+        ("fa020a7e01200100", "vop1_dpp16"),  # row_ror:0 (0x120) is invalid
+        ("fa020a7e011b1000", "vop1_dpp16"),  # v_mov_b32_dpp forbids src0_neg
+        ("fa0a0a7e011b2000", "vop1_dpp16"),  # v_cvt_f32_i32_dpp (VOPProfileI2F) forbids src0_abs
+        ("fa160a7e011b4000", "vop1_dpp16"),  # VOP1 DPP16 forbids src1 modifiers
+        ("fa040a4a011b1000", "vop2_dpp16"),  # v_add_nc_u32_dpp forbids src0_neg
+        ("fa040a02011b4000", "vop2_dpp16"),  # v_cndmask_b32_dpp forbids src1_neg
+        ("fa040a50011b1000", "vop2_dpp16"),  # v_add_co_ci_u32_dpp forbids src0_neg
+        ("fa040a76011b4000", "vop2_dpp16"),  # v_ldexp_f16_dpp forbids src1_neg on i32 src1
+        ("fa84027e001b1000", "vop1_dpp16"),  # v_movreld_b32_dpp forbids src0_neg
+    )
+
+    def test_vop1_and_vop2_dpp_decoding(self):
+        """Decode GFX10 VOP1/VOP2 DPP8 and DPP16 instructions and keep stream alignment on refused forms."""
+        mov = bytes.fromhex("0403067e")  # v_mov_b32_e32 v3, v4
+        for raw_hex, expected in self.VOP1_VOP2_DPP_DECODED:
+            with self.subTest(raw=raw_hex):
+                insns = disasm_rdna2(bytes.fromhex(raw_hex) + mov)
+                self.assertEqual(
+                    [(i["offset"], i["length"], i["opcode"], i["assembly"]) for i in insns],
+                    [(0, 8, expected.split()[0], expected), (8, 4, "v_mov_b32_e32", "v_mov_b32_e32 v3, v4")],
+                )
+        nop_dpp16 = disasm_rdna2(bytes.fromhex("fa00007e000109a1") + mov)
+        self.assertEqual(
+            [(i["length"], i["opcode"], i["assembly"]) for i in nop_dpp16],
+            [(8, "v_nop", "v_nop row_shl:1 row_mask:0xa bank_mask:0x1 bound_ctrl:1"),
+             (4, "v_mov_b32_e32", "v_mov_b32_e32 v3, v4")],
+        )
+        nop_dpp8 = disasm_rdna2(bytes.fromhex("e900007e0088c6fa") + mov)
+        self.assertEqual(
+            [(i["length"], i["opcode"], i["assembly"]) for i in nop_dpp8],
+            [(8, "v_nop", "v_nop dpp8:[0,1,2,3,4,5,6,7]"),
+             (4, "v_mov_b32_e32", "v_mov_b32_e32 v3, v4")],
+        )
+        for bad_hex, bad_kind in self.VOP1_VOP2_DPP_LLVM_REFUSED + (
+            ("fa00007e01010100", "vop1_dpp16"),  # v_nop DPP16 with nonzero src0
+            ("e9fe0a7e0188c6fa", "vop1_dpp8"),   # unknown VOP1 opcode
+            ("fa040a78011b0000", "vop2_dpp16"),  # v_pk_fmac_f16 (no DPP16)
+        ):
+            with self.subTest(refused=bad_hex):
+                insns = disasm_rdna2(bytes.fromhex(bad_hex) + mov)
+                self.assertEqual(
+                    [(i["offset"], i["length"], i["opcode"]) for i in insns],
+                    [(0, 8, bad_kind), (8, 4, "v_mov_b32_e32")],
+                )
+                expected_tag = "<unsupported DPP8>" if bad_kind.endswith("dpp8") else "<unsupported DPP16>"
+                self.assertIn(expected_tag, insns[0]["assembly"])
+                self.assertEqual(insns[1]["assembly"], "v_mov_b32_e32 v3, v4")
+
+    def test_vop1_vop2_dpp_llvm_round_trip(self):
+        """VOP1/VOP2 DPP8 and DPP16 golden encodings and refusals match LLVM 15."""
+        if not os.environ.get("LLVM_LIB"):
+            self.skipTest("LLVM_LIB environment variable not set; verified against golden vectors")
+        resolved_lib = resolve_llvm_lib(os.environ["LLVM_LIB"])
+        mov = bytes.fromhex("0403067e")
+        for raw_hex, expected in self.VOP1_VOP2_DPP_DECODED:
+            with self.subTest(llvm_decoded=raw_hex):
+                self.assertEqual(llvm_disassemble(bytes.fromhex(raw_hex) + mov, resolved_lib, offsets=True),
+                                 [(0, expected), (8, "v_mov_b32_e32 v3, v4")])
+        for raw_hex, _ in self.VOP1_VOP2_DPP_LLVM_REFUSED:
+            with self.subTest(llvm_refused=raw_hex):
+                with self.assertRaisesRegex(ValueError, "at byte 0$"):
+                    llvm_disassemble(bytes.fromhex(raw_hex) + mov, resolved_lib)
+        assembler, objcopy = resolve_llvm_assembler_tools()
+        if not assembler or not objcopy:
+            self.skipTest("LLVM_MC/LLVM_OBJCOPY environment variables not set; checked decode only")
+        source = [asm for _, asm in self.VOP1_VOP2_DPP_DECODED] + ["s_endpgm"]
+        emitted = assemble_with_llvm_mc(source, assembler, objcopy)
+        self.assertEqual([rec["assembly"] for rec in disasm_rdna2(emitted)], source)
 
     def test_sop2_absdiff_opcode_table_synthetic_forms(self):
         from disasm_rdna2 import SOP2_OPS
