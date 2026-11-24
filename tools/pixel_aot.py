@@ -6087,7 +6087,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         raise ValueError("Program ends inside a masked region")
     if gather_mips is not None and sample_kind != "gather":
         raise ValueError("Expected one gather for the declared view")
-    if not ended or sampled_textures != set(bindings.values()) or (not bindings and samples):
+    if not ended or sampled_textures != set(bindings.values()):
         raise ValueError("Unexpected sample count or missing color export")
     if helpers:
         defs = [body for name, body in SALU_HELPERS.items() if name in helpers]
