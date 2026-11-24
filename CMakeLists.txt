@@ -44,9 +44,13 @@ add_test(NAME desktop_bvh_root_flags COMMAND d3d12_sdk_check bvh-flags)
 add_executable(era_heap_check tests/era_heap_check.cpp src/era_heap.cpp)
 target_include_directories(era_heap_check PRIVATE src)
 target_compile_features(era_heap_check PRIVATE cxx_std_20)
-foreach(scenario IN ITEMS allocation failure concurrency caller_layout reuse observed_words large_alignment graphics_types)
+foreach(scenario IN ITEMS allocation failure concurrency caller_layout reuse observed_words large_alignment graphics_types
+        decode_fields)
     add_test(NAME era_heap_${scenario} COMMAND era_heap_check ${scenario})
 endforeach()
+# Negative control: expects a 13-bit object type, so the widest object type must make it fail.
+add_test(NAME era_heap_decode_fields_control COMMAND era_heap_check decode_fields_control)
+set_tests_properties(era_heap_decode_fields_control PROPERTIES WILL_FAIL TRUE)
 
 add_executable(memory_query_check tests/memory_query_check.cpp)
 target_compile_features(memory_query_check PRIVATE cxx_std_17)
@@ -462,10 +466,21 @@ foreach(mutation IN ITEMS tight wrap size-image)
     add_test(NAME startup_draw_bmp_${mutation}_control COMMAND startup_draw_bmp_check --mutate ${mutation})
     set_tests_properties(startup_draw_bmp_${mutation}_control PROPERTIES WILL_FAIL TRUE)
 endforeach()
+# Names the x2w-noop log gives to command list slots (src/startup_stubs/command_list_slot_names.h, #870).
+add_executable(startup_command_list_slot_names tests/startup_command_list_slot_names.cpp)
+target_compile_features(startup_command_list_slot_names PRIVATE cxx_std_17)
+add_test(NAME startup_command_list_slot_names COMMAND startup_command_list_slot_names)
 # Game-save stand-in storage (src/startup_stubs/save_store.h): a blob written by one process is read by a second.
 add_executable(startup_gamesave_persist tests/startup_gamesave_persist.cpp)
 target_compile_features(startup_gamesave_persist PRIVATE cxx_std_17)
 add_test(NAME startup_gamesave_persist COMMAND startup_gamesave_persist)
+# Enumeration of the same store (Store::list_containers, Store::list_blobs): exact names, sizes and
+# order, what is not listed, the busy and untouched-output rules, and a second process that
+# publishes two-blob updates while this one lists.
+add_executable(startup_gamesave_enumerate tests/startup_gamesave_enumerate.cpp)
+target_compile_features(startup_gamesave_enumerate PRIVATE cxx_std_17)
+add_test(NAME startup_gamesave_enumerate COMMAND startup_gamesave_enumerate)
+set_tests_properties(startup_gamesave_enumerate PROPERTIES TIMEOUT 120)
 # Publication of a multi-blob update: a second process sees the whole old generation or the whole
 # new one. The test is built from two generated copies of the store headers, each with a pause
 # point at every step of the publication (the `x2w-seam` comments). In the second copy the file lock
@@ -625,6 +640,15 @@ foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_list_resubmit_untracked_${backend} COMMAND startup_list_resubmit ${backend} untracked)
     set_tests_properties(startup_list_resubmit_untracked_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
         ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1;X2W_TEST_SUBMIT_FENCE_FAIL=1")
+endforeach()
+
+add_executable(startup_upload_arena tests/startup_upload_arena.cpp)
+target_compile_features(startup_upload_arena PRIVATE cxx_std_17)
+target_include_directories(startup_upload_arena PRIVATE src)
+target_link_libraries(startup_upload_arena PRIVATE d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_upload_arena_${backend} COMMAND startup_upload_arena ${backend})
+    set_tests_properties(startup_upload_arena_${backend} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 endforeach()
 
 # GPU writes the dispatch record that the desktop command processor consumes (Refs #1412).
@@ -1751,6 +1775,16 @@ if(EXISTS "${INTAKE_PYTHON}")
     # gfx2hlsl run-time sampler heap indexing (#1143): translation controls, then a desktop draw with
     # DXC ps_6_0 and, when the Windows SDK's FXC is found, the ps_5_1 the startup tools compile with.
     find_program(STARTUP_FXC fxc HINTS "${DXC_BIN_DIR}")
+    # gfx2hlsl conversion operations: translation controls, then a draw of the translated pairs with
+    # reference words and one mutated lowering per operation (v_cvt_f16_f32 through DXC only).
+    add_test(NAME startup_gfx2hlsl_cvt_alu_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_cvt_alu_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_cvt_alu_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_cvt_alu_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_gfx2hlsl_cvt_alu_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    endforeach()
     add_test(NAME startup_sampler_heap_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_sampler_heap_check.py")
     add_test(NAME startup_vertex_fetch_formats_controls COMMAND "${INTAKE_PYTHON}" -B

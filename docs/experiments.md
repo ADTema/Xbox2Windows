@@ -6363,6 +6363,7 @@ What is measured is the desktop behavior above. Under the ERA layout, the two re
 | `era_heap_graphics_types` | Each graphics memory type 1–6 with 4 KB and 64 KB pages and alignment exponents 0, 4, 8 and 16, at 1 byte and one allocation granularity plus one byte. Exponent 16 is the 64 KiB granularity boundary itself. Each block must start on the granularity, be zeroed and writable, and be reported by `VirtualQuery` as the base of its own committed private read/write allocation. After release with the same attributes the address must be `MEM_FREE`. For every type, 4 MB pages, exponent 17 and page-size value 3 return a null pointer. The output reports 96 served and 18 rejected cases at granularity 65,536 on Windows 11 build 26200. Changing the granularity comparison from `>` to `>=` fails exponent 16 with 4 KB pages, and narrowing the graphics range to types 1–5 fails type 6; `era_heap_observed_words` catches only the first change. These are desktop policy checks; the console semantics of the six graphics types remain unconfirmed. |
 | `era_heap_concurrency` | Four threads run 100 rounds each. They hold simultaneous allocations, write distinct values, compare every byte and release the memory. |
 | `era_heap_caller_layout` | Owned desktop storage covers all 32 base residues at eight payload sizes. Each Bink-style wrapper recovers its original base after a payload write and preserves the surrounding guard bytes. Ten AMD-style requests check 256-byte size rounding and the unused tail. These cases establish caller-side arithmetic. The Bink-style storage uses the recorded Bink word. |
+| `era_heap_decode_fields` | `decode` reads each field of the layout at its widest value with the other fields zero: object type `0x3fff`, page size 3, allocator `0xff`, alignment `0x1f`, memory type `0xf` and 31 reserved bits. It also reads an all-ones word and one word with a distinct value in every field. The recorded words leave the object type and the reserved bits at 0. So without this scenario, a 12-bit object-type mask and a reserved field taken from bit 32 both decoded them unchanged and passed every other scenario. `era_heap_decode_fields_control` expects a 13-bit object type and must fail. |
 
 `desktop_memory_query` supplies Windows observations for `XMemVirtualQuery` and `XMemGetWorkingSetStatistics`. The test reserves memory, commits and writes 1,024 pages, checks the read-only/writable boundary, then decommits. It verifies residency of a locked page and records working set, peak working set and private commit at three points. Values vary between runs. Scarlett structure layout, units and accounting scope remain unconfirmed. [Windows working sets](https://learn.microsoft.com/en-us/windows/win32/memory/working-set)
 
@@ -10680,6 +10681,33 @@ checked against LLVM 19.1.7 only, and that check skips itself when the LLVM in u
 Scope: decoding and scanner recognition only. None of these forms is lowered by a translator, and no
 measurement on hardware or in a Windows run backs the descriptions. `v_interp_p1_f32_e64` and `v_interp_p2_f32_e64`
 (0x200 and 0x201 on gfx1013) are not decoded by this change.
+
+## Startup translator: conversion operations
+
+The previous draw fixtures did not run the plain conversion operations in `tools/startup/gfx2hlsl.py` before: `v_cvt_f32_u32`, `v_cvt_f32_i32`, `v_cvt_u32_f32`, `v_cvt_f32_ubyte0` to `3`, `v_cvt_f32_f16` and `v_cvt_f16_f32`. `tests/startup_gfx2hlsl_cvt_alu_check.py` draws them with the shared runner `tests/startup_gfx2hlsl_lane_alu.py`. Each draw applies one operation to each of four pixels' flat inputs, alternating the `_e32` and `_e64` spellings, and compares the four result words exactly.
+
+The references follow the AMD RDNA 2 ISA reference:
+- integer to binary32 rounds to nearest even: `0x80000001` gives 2^31, `0xffffffff` gives 2^32, and `0x01000001` gives 2^24 by ties to even;
+- `v_cvt_u32_f32` truncates toward zero and reads 0 for a negative value, -0 or a NaN;
+- the `ubyte` forms convert byte N;
+- `v_cvt_f32_f16` reads S0[15:0], with other values in the high half;
+- `v_cvt_f16_f32` writes bits 15:0 and clears bits 31:16.
+
+Each operation also has a wrong lowering whose first draw must read its own mutated words:
+- signed and unsigned exchanged;
+- rounding instead of truncation;
+- the wrong byte or a 7-bit mask;
+- the high binary16 half;
+- a negated source.
+
+On WARP 10.0.26100.9818 and on an AMD Radeon RX 6600 (driver 32.0.21045.29003), all 34 draws matched and all 17 mutated draws read their mutated words. Eight operations are drawn through FXC `ps_5_1` and DXC `ps_6_0`; `v_cvt_f16_f32` is drawn through DXC only. Its result words are binary32 denormals in the fixture's float target. The FXC `ps_5_1` output of that pixel stage read `00000000` in all four channels on both adapters, even when one channel exported a constant conversion. The same words with `0x3f800000` ORed in at the export read back exactly, so the conversion itself is right, and the zeros come from the FXC output of denormal bit patterns.
+
+Not covered:
+- `v_cvt_u32_f32` at or above 2^32 and of +inf, where the HLSL conversion of an out-of-range value is not pinned;
+- binary16 denormal inputs;
+- binary32 values that `v_cvt_f16_f32` has to round.
+
+Tests: `startup_gfx2hlsl_cvt_alu_controls`, `startup_gfx2hlsl_cvt_alu_warp` and `startup_gfx2hlsl_cvt_alu_hardware`.
 
 ## Startup translator: explicit-LOD image sampling
 
