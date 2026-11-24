@@ -1570,6 +1570,16 @@ Like the Windows loader, `pe_map` finds the TLS directory by its address and doe
 ctest --preset dev --no-tests=error -R '^cpu_native_tls$' -V
 ```
 
+The carrier directory, and the carrier file inside it, are created under `GetTempPathW` with a protected DACL for the
+process user (`private_descriptor` in [`tools/pe_map.cpp`](../tools/pe_map.cpp)). On a host where a built executable
+may not create a file under that directory, every carrier case fails at that step with `cannot create the TLS carrier
+directory (error 5)`, and the other carrier-based fixtures fail the same way (`cpu_exe_aot_convert`,
+`cpu_native_tls_value`, `cpu_native_exe_tls`, `cpu_native_exe_tls_slot0`, `cpu_native_exe_tls_slot0_enroll`). Point
+`TMP` and `TEMP` at a writable directory before running them. Measured on a host that refused creation anywhere on
+its system volume: a plain `CreateDirectoryW` under `%TEMP%`, `%USERPROFILE%\Documents` and `C:\Windows\Temp`
+returned `error 5` while the same call under `D:\` succeeded, and with `TMP`/`TEMP` on `D:` all six cases passed on
+the same build. The rejection expectations are unrelated: a host that cannot create the directory never reaches them.
+
 ### Implicit TLS values on the main and worker threads
 
 `cpu_tls_value` is a source-built DLL with one `__declspec(thread)` value (`7`) and an 8 KiB `__declspec(thread)` array of distinct words in the same initialized template, so the template spans at least one 4 KiB page boundary. Two TLS callbacks, in `.CRT$XLB` (caller 1) and `.CRT$XLM` (caller 3), and the entry point (caller 2) each report the observed state in the sink's reserved slot: the value in the low 16 bits and the number of array words that differ from the template above them, so a block copied from the template reports 7. `cpu_native_tls_value` first checks with `pefile` that the array crosses a page boundary inside the template and that both callbacks appear in the callback table in that order. It then loads the image with `LoadLibraryW` and maps it with `pe_map`, each in a fresh child process. The child checks that the template in the loaded image matches the file, observes the main thread's copy and writes 20 to it, then runs two workers that are alive at the same time: worker A observes, writes 50 and waits, worker B starts after A's write, observes, writes 60 and waits, and then both observe again. Workers are joined with a 10 s limit. Sink events are kept in call order with raw thread IDs translated to `main`, `a` and `b`. A worker timeout, a missing callback, an unexpected value or a changed template fails the test. The empty-template `cpu_tls_original` fixture is the control: it must load under both loaders.
