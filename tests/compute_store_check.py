@@ -3253,6 +3253,59 @@ def mubuf_exchange_draw(directory, compiler, renderer, backend, wide=False):
     return 0
 
 
+def mubuf_counter_cases(wide=False):
+    for op in ("inc", "dec"):
+        name = f"buffer_atomic_{op}{'_x2' if wide else ''}"
+        data = "v[10:11]" if wide else "v10"
+        lines = ["s_mov_b32 s12, s7", "s_mov_b32 s13, 0",
+                 "s_load_dwordx4 s[20:23], s[12:13], 0x30", "s_waitcnt lgkmcnt(0)",
+                 "v_mov_b32_e32 v10, 8"]
+        if wide:
+            lines += ["v_mov_b32_e32 v11, 1"]
+        lines += [f"{name} {data}, off, s[20:23], 0 offset:8", "s_endpgm"]
+        yield name, lines, {k: v for k, v in DS_BINDING.items() if k != "stride"}
+
+
+def mubuf_counter_draw(directory, compiler, renderer, backend, wide=False):
+    src, cso, case = (directory / f"mubuf-counter.{ext}" for ext in ("hlsl", "cso", "case"))
+    compile_shader = [compiler, "-T", "cs_6_6" if wide else "cs_6_0", "-E", "main", "-Fo", cso, src]
+    runner = "--compute-store-case-atomic64" if wide else "--compute-store-case"
+    run = [renderer, backend, runner, cso, case]
+    accepted = []
+    for name, lines, binding in mubuf_counter_cases(wide):
+        print(name, flush=True)
+        kernel = aot.lower(lines, 32, **binding)
+        src.write_text(kernel, encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        for groups in (1, 2):
+            words = [SENTINEL] * 320
+            # The first operation moves the above-limit sentinel to the start of the cycle.
+            limit = (1 << 32) + 8 if wide else 8
+            remaining = (32 * groups - 1) % (limit + 1)
+            value = remaining if "_inc" in name else limit - remaining
+            words[2] = value & 0xffffffff
+            if wide:
+                words[3] = value >> 32
+            case.write_bytes(struct.pack("<321I", groups, *words))
+            result = subprocess.run(run)
+            if result.returncode:
+                return result.returncode
+        mutant = kernel.replace("while (observed != expected)", "while (false)")
+        assert mutant != kernel
+        src.write_text(mutant, encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        bad = subprocess.run(run, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word=2 expected={words[2]:08x} actual={SENTINEL:08x}" not in bad.stderr:
+            raise AssertionError(f"{name}: missing CAS retry escaped detection\n{bad.stderr}")
+        print(bad.stderr, end="")
+        accepted.append(name)
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(accepted) + "\n", encoding="utf-8")
+    return 0
+
+
 def scalar_alu_binary(directory, assembler, objcopy, library):
     """The assembled scalar chain decodes to the same program as its text."""
     src, obj, raw = [directory / x for x in ("scalar.s", "scalar.o", "scalar.bin")]
@@ -3310,6 +3363,7 @@ def binary(directory, assembler, objcopy, library):
         gfx1030_binary(directory, assembler, objcopy, library, mubuf_reduction_cases(wide), "buffer_atomic_")
         mubuf_exchange_controls(wide)
         gfx1030_binary(directory, assembler, objcopy, library, mubuf_exchange_cases(wide), "buffer_atomic_")
+        gfx1030_binary(directory, assembler, objcopy, library, mubuf_counter_cases(wide), "buffer_atomic_")
     mubuf_subword_controls()
     gfx1030_binary(directory, assembler, objcopy, library, mubuf_subword_cases(), "buffer_load_")
     mubuf_vector_controls()
@@ -5458,6 +5512,8 @@ if __name__ == "__main__":
         modes = {"binary": binary, "draw": draw,
                  "draw-mubuf-subword": mubuf_subword_draw,
                  "draw-mubuf-reduction": mubuf_reduction_draw,
+                 "draw-mubuf-counter": mubuf_counter_draw,
+                 "draw-mubuf-counter-x2": lambda d, *a: mubuf_counter_draw(d, *a, wide=True),
                  "draw-mubuf-exchange": mubuf_exchange_draw,
                  "draw-mubuf-exchange-x2": lambda d, *a: mubuf_exchange_draw(d, *a, wide=True),
                  "draw-mubuf-reduction-x2": lambda d, *a: mubuf_reduction_draw(d, *a, wide=True),

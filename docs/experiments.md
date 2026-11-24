@@ -3720,6 +3720,29 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_exchange' -V
 ```
 
+### gfx1030 fixed-address MUBUF atomic counters
+
+The compute store profile lowers `buffer_atomic_inc`, `buffer_atomic_dec`
+and their `_x2` forms with `glc` clear. The
+[AMD RDNA 2 Shader ISA](https://gpuopen.com/download/rdna2-shader-instruction-set-architecture.pdf)
+defines increment as wrapping to zero at or above the unsigned limit.
+Decrement wraps to the limit from zero or from above the limit. The HLSL
+compares and exchanges the candidate word or pair and retries with the
+observed value if another lane has updated it. The fixed-address and
+sole-UAV-access rules apply. Compile `_x2` with `cs_6_6`.
+
+One and two wave32 groups contend on the same counter with an identical
+limit. The initial value exceeds the limit. The 32-bit fixture wraps
+several times, and the 64-bit decrement crosses a DWORD boundary. Both
+sizes compare all 320 words with a CPU reference. A shader that omits the
+retry must fail at word 2. The LLVM 15 test checks assembly and the
+compute-container CLI. The GPU fixtures execute translated DXIL.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_counter' -V
+```
+
 ### Indexed gfx1030 raw vector reads
 
 The compute store profile also lowers `buffer_load_dwordx2`,
