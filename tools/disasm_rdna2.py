@@ -1753,22 +1753,38 @@ def _decode_interp_f16(op: int, w0: int, w1: int) -> tuple[int, str, str, str]:
     return (8, name, asm, comment)
 
 
-def _decode_mimg_bvh(op: int, w0: int, w1: int, length: int) -> tuple[int, str, str, str]:
+def _packed_addr_regs(count: int) -> int:
+    """Registers LLVM 15 prints for a packed (non-NSA) MIMG address of count dwords.
+
+    LLVM 15 has no tuple class for 9 to 15 registers and prints those as 16, so the printed tuple is wider than the
+    number of address dwords the instruction consumes.
+    """
+    return count if count <= 8 else 16
+
+
+def _decode_mimg_bvh(op: int, w0: int, w1: int, length: int, data: bytes = b"",
+                     offset: int = 0) -> tuple[int, str, str, str]:
     """Decode image_bvh_intersect_ray and image_bvh64_intersect_ray.
 
-    The hardware fixes every modifier field of these ops, so anything else is
-    reported as unsupported with the record length intact.
+    The hardware fixes every modifier field of these ops except the non-sequential-address length in w0[2:1], so
+    anything else is reported as unsupported with the record length intact. A non-sequential-address form lists
+    one VGPR per address dword, the first from the instruction word and the rest from the appended bytes.
     """
     op_name, addr_dwords, addr_dwords_a16 = MIMG_BVH_OPS[op]
     a16 = (w1 >> 30) & 1
-    if (w0 & ~(0x7f << 18)) != MIMG_BVH_W0 or (w1 >> 31) or (w1 >> 21) & 0x1f:
+    if (w0 & ~((0x7f << 18) | 0x6)) != MIMG_BVH_W0 or (w1 >> 31) or (w1 >> 21) & 0x1f:
         return (length, f"{op_name}_unsupported", f"{op_name} <unsupported MIMG modifier bits>",
                 "Modifier bits the ray-intersection encoding does not allow")
     vaddr = w1 & 0xff
     vdata = (w1 >> 8) & 0xff
     srsrc = ((w1 >> 16) & 0x1f) * 4
     count = addr_dwords_a16 if a16 else addr_dwords
-    asm = (f"{op_name} v[{vdata}:{vdata + 3}], v[{vaddr}:{vaddr + count - 1}], "
+    if (w0 >> 1) & 0x3:
+        appended = list(data[offset + 8:offset + length])
+        vaddr_str = "[" + ", ".join(f"v{r}" for r in [vaddr] + appended[:count - 1]) + "]"
+    else:
+        vaddr_str = f"v[{vaddr}:{vaddr + _packed_addr_regs(count) - 1}]"
+    asm = (f"{op_name} v[{vdata}:{vdata + 3}], {vaddr_str}, "
            f"s[{srsrc}:{srsrc + 3}]" + (" a16" if a16 else ""))
     return (length, op_name, asm, "Ray-box and ray-triangle intersection against a BVH")
 
@@ -2108,7 +2124,7 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         w1, = struct.unpack_from("<I", data, offset + 4)
         op = ((w0 >> 18) & 0x7f) | ((w0 & 1) << 7)
         if op in MIMG_BVH_OPS:
-            return _decode_mimg_bvh(op, w0, w1, length)
+            return _decode_mimg_bvh(op, w0, w1, length, data, offset)
         op_name, has_sampler, extra_addrs = MIMG_OPS.get(op, (f"image_mimg_{op:02x}", False, 0))
         dmask = (w0 >> 8) & 0xf
         dim_code = (w0 >> 3) & 0x7
@@ -2119,7 +2135,8 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             deriv_addrs = 0
         addr_count = base_addrs + extra_addrs + deriv_addrs
         d16 = (w1 >> 31) & 1
-        n_data = max(1, bin(dmask).count("1"))
+        # A gather returns the four texels of the selected component whatever the one-hot mask is.
+        n_data = 4 if op_name.startswith("image_gather4") else max(1, bin(dmask).count("1"))
         if d16:
             n_data = (n_data + 1) // 2
         vaddr0 = w1 & 0xff
@@ -2133,7 +2150,8 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             addrs = [vaddr0] + extra_bytes[:max(0, addr_count - 1)]
             vaddr_str = "[" + ", ".join(f"v{r}" for r in addrs) + "]"
         else:
-            vaddr_str = f"v{vaddr0}" if addr_count == 1 else f"v[{vaddr0}:{vaddr0 + addr_count - 1}]"
+            addr_regs = _packed_addr_regs(addr_count)
+            vaddr_str = f"v{vaddr0}" if addr_regs == 1 else f"v[{vaddr0}:{vaddr0 + addr_regs - 1}]"
         srsrc_width = 4 if r128 else 8
         srsrc_str = f"s[{srsrc}:{srsrc + srsrc_width - 1}]"
         operands = [vdata_str, vaddr_str, srsrc_str]

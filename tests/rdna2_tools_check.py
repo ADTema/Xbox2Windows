@@ -1343,7 +1343,12 @@ class TestRdna2Disasm(unittest.TestCase):
             ("080f20f104102303", "image_gather4_c",
              "image_gather4_c v[16:19], v[4:6], s[12:19], s[100:103] dmask:0xf dim:SQ_RSRC_IMG_2D"),
             ("100fa8f004102303", "image_sample_c_d",
-             "image_sample_c_d v[16:19], v[4:13], s[12:19], s[100:103] dmask:0xf dim:SQ_RSRC_IMG_3D"),
+             "image_sample_c_d v[16:19], v[4:19], s[12:19], s[100:103] dmask:0xf dim:SQ_RSRC_IMG_3D"),
+            # One-hot gather: four texels of the selected component, two registers with d16.
+            ("080120f104102303", "image_gather4_c",
+             "image_gather4_c v[16:19], v[4:6], s[12:19], s[100:103] dmask:0x1 dim:SQ_RSRC_IMG_2D"),
+            ("080120f104102383", "image_gather4_c",
+             "image_gather4_c v[16:17], v[4:6], s[12:19], s[100:103] dmask:0x1 dim:SQ_RSRC_IMG_2D d16"),
             ("1103a8f004102303", "image_sample_c_d_g16",
              "image_sample_c_d_g16 v[16:17], v[4:11], s[12:19], s[100:103] dmask:0x3 dim:SQ_RSRC_IMG_3D"),
             ("0101b8f104102303", "image_sample_c_cd_o_g16",
@@ -1352,11 +1357,15 @@ class TestRdna2Disasm(unittest.TestCase):
              "image_load_pck v[16:19], v[4:5], s[12:19] dmask:0xf dim:SQ_RSRC_IMG_2D"),
             ("310f00f004100300", "image_msaa_load",
              "image_msaa_load v[16:19], v[4:6], s[12:19] dmask:0xf dim:SQ_RSRC_IMG_2D_MSAA"),
-            ("019f98f100040100", "image_bvh_intersect_ray", "image_bvh_intersect_ray v[4:7], v[0:10], s[4:7]"),
+            # The printed tuple is LLVM 15's (9 to 15 address dwords print as 16 registers), not the dword count.
+            ("019f98f100040100", "image_bvh_intersect_ray", "image_bvh_intersect_ray v[4:7], v[0:15], s[4:7]"),
             ("019f98f100040140", "image_bvh_intersect_ray", "image_bvh_intersect_ray v[4:7], v[0:7], s[4:7] a16"),
-            ("019f9cf100040100", "image_bvh64_intersect_ray", "image_bvh64_intersect_ray v[4:7], v[0:11], s[4:7]"),
+            ("019f9cf100040100", "image_bvh64_intersect_ray", "image_bvh64_intersect_ray v[4:7], v[0:15], s[4:7]"),
             ("019f9cf100040140", "image_bvh64_intersect_ray",
-             "image_bvh64_intersect_ray v[4:7], v[0:8], s[4:7] a16"),
+             "image_bvh64_intersect_ray v[4:7], v[0:15], s[4:7] a16"),
+            # Non-sequential addressing (w0[2:1] = 1): one VGPR per address dword.
+            ("079f98f100040100020406080a0c0e1012140000", "image_bvh_intersect_ray",
+             "image_bvh_intersect_ray v[4:7], [v0, v2, v4, v6, v8, v10, v12, v14, v16, v18, v20], s[4:7]"),
         ]
         for hex_bytes, opcode, assembly in vectors:
             with self.subTest(assembly=assembly):
@@ -1413,13 +1422,16 @@ class TestRdna2Disasm(unittest.TestCase):
         for op, name in ops.items():
             # Dimensions 0..6: LLVM decodes a five-dword address on the MSAA array dimension as a
             # different operand shape, so that dimension is left out of the comparison.
+            # A gather also gets a one-hot mask, with and without d16: it returns four texels (two with d16).
+            masks = [(0xf, 0)] + ([(0x1, 0), (0x1, 1)] if "gather4" in name else [])
             for dim in range(7):
-                word0 = (0xf0000000 | ((op & 0x7f) << 18) | ((op >> 7) & 1) | (0xf << 8) | (dim << 3))
-                word1 = ((5 << 21) if op in has_sampler else 0) | (2 << 16) | 4
-                code += struct.pack("<II", word0, word1)
-                names.append(name)
-        # LLVM 15 (the CI pin) prints a 9..15-register packed address as a 16-register tuple; newer LLVM and the
-        # decoder print the exact width. Widen both sides so the comparison holds on either LLVM version.
+                for dmask, d16 in masks:
+                    word0 = (0xf0000000 | ((op & 0x7f) << 18) | ((op >> 7) & 1) | (dmask << 8) | (dim << 3))
+                    word1 = ((5 << 21) if op in has_sampler else 0) | (2 << 16) | 4 | (d16 << 31)
+                    code += struct.pack("<II", word0, word1)
+                    names.append(name)
+        # LLVM 15 (the CI pin) prints a 9..15-register packed address as a 16-register tuple and the decoder follows
+        # it; newer LLVM prints the exact width, so widen its spelling to compare on either LLVM version.
         def widen(line):
             def fix(m):
                 lo, hi = int(m.group(1)), int(m.group(2))
@@ -1428,12 +1440,14 @@ class TestRdna2Disasm(unittest.TestCase):
         llvm_lines = [widen(line) for line in llvm_disassemble(bytes(code), resolved_lib)]
         records = disasm_rdna2(bytes(code))
         self.assertEqual(len(llvm_lines), len(names))
-        self.assertEqual([widen(r["assembly"]) for r in records], llvm_lines)
+        self.assertEqual([r["assembly"] for r in records], llvm_lines)
         self.assertEqual([r["opcode"] for r in records], names)
 
         bvh = bytes.fromhex("019f98f100040100" "019f98f100040140" "019f9cf100040100" "019f9cf100040140")
-        self.assertEqual([widen(r["assembly"]) for r in disasm_rdna2(bvh)],
+        self.assertEqual([r["assembly"] for r in disasm_rdna2(bvh)],
                          [widen(line) for line in llvm_disassemble(bvh, resolved_lib)])
+        nsa = bytes.fromhex("079f98f100040100020406080a0c0e1012140000")
+        self.assertEqual([r["assembly"] for r in disasm_rdna2(nsa)], llvm_disassemble(nsa, resolved_lib))
 
     def test_binary_scan_names_newly_decoded_mimg_ops(self):
         """Issue #938: the scan report names gather, compare-sample and ray-intersection ops as LLVM does."""
