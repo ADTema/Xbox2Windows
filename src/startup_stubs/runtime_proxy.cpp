@@ -9,14 +9,17 @@
 // X2W_FAKE_USER=1 additionally answers the user API for one local user (see fake_user below).
 #include "startup_stubs/api_trace.h"
 #include "startup_stubs/local_log.h"
+#include "startup_stubs/save_blob_pack.h"
 #include "startup_stubs/save_store.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <intrin.h>
+#include <new>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace {
 using u64 = std::uint64_t;
@@ -360,11 +363,11 @@ bool user_call(int slot, u64* args, u64* result)
 // ---- local game saves -----------------------------------------------------------------------
 // Slot numbers follow the order of the public XGameSave.h (hypothesis, checked against the logged
 // argument shapes). Containers and blob writes are kept on disk (save_store.h, below
-// storage_path()/x2w-gamesave); enumerations and reads still report nothing and the calls whose
-// argument layout is not known are accepted and dropped. Asynchronous calls are completed by starting the real
-// "add default user silently" operation on the caller's async block: it fails quickly inside the
-// runtime and runs the caller's completion callback on its task queue; the matching Result call is
-// then answered here.
+// storage_path()/x2w-gamesave). Enumerations still report nothing, and the synchronous read (20)
+// still reports no blob. Slots 21 and 22 read through the system XAsync service (see async_read).
+// The other asynchronous calls are completed by starting the real "add default user silently"
+// operation on the caller's async block: it fails quickly inside the runtime and runs the caller's
+// completion callback on its task queue; the matching Result call is then answered here.
 constexpr u64 save_provider_handle = 0x58325753'00000001ull, save_container_handle = 0x58325743'00000001ull,
               save_update_handle = 0x58325755'50000001ull;
 // Container and update handles keep their fixed base; the low bits count from 1 and index these tables.
@@ -471,6 +474,183 @@ u64 async_submit(int slot, u64 update, u64 block)
     reinterpret_cast<Complete>(methods[10])(service, async, status, 0);
     return S_OK;
 }
+
+// XGameSaveReadBlobDataAsync / Result. Same XAsync service as submit, different identity, so a
+// read block is not a submit block. Begin is attempted before any read: a rejection leaves the
+// store untouched. The snapshot is packed only after acceptance. Complete can run the caller's
+// callback before it returns, so no save lock is held across it. A failed read completes with no
+// payload (the runtime then drops the context); the bytes are copied into the caller's buffer only
+// when slot 22 asks, and only if that buffer is large enough.
+constexpr char read_identity[] = "local XGameSaveReadBlobData";
+constexpr u64 small_buffer = 0x80830007;
+struct AsyncProviderData {
+    void* async;
+    std::size_t buffer_size;
+    void* buffer;
+    void* context;
+};
+static_assert(sizeof(AsyncProviderData) == 32 && offsetof(AsyncProviderData, context) == 24, "XAsyncProviderData");
+struct ReadAsync {
+    void* block = nullptr;
+    std::uint32_t count = 0;
+    std::size_t bytes = 0;
+    std::vector<x2w_save_pack::Piece> pieces;
+};
+struct ReadRecord { void* block; std::uint32_t count; std::size_t bytes; };
+std::vector<ReadRecord> read_records;  // accepted reads whose payload is still outstanding
+SRWLOCK read_records_lock = SRWLOCK_INIT;
+void remember_read(const ReadAsync& state)
+{
+    AcquireSRWLockExclusive(&read_records_lock);
+    struct Unlock { ~Unlock() { ReleaseSRWLockExclusive(&read_records_lock); } } unlock;
+    read_records.push_back({state.block, state.count, state.bytes});
+}
+void forget_read(void* block)
+{
+    AcquireSRWLockExclusive(&read_records_lock);
+    struct Unlock { ~Unlock() { ReleaseSRWLockExclusive(&read_records_lock); } } unlock;
+    for (std::size_t i = 0; i < read_records.size(); ++i)
+        if (read_records[i].block == block) {
+            read_records.erase(read_records.begin() + static_cast<std::ptrdiff_t>(i));
+            break;
+        }
+}
+bool pending_read(void* block, std::uint32_t& count, std::size_t& bytes)
+{
+    AcquireSRWLockShared(&read_records_lock);
+    struct Unlock { ~Unlock() { ReleaseSRWLockShared(&read_records_lock); } } unlock;
+    for (const ReadRecord& record : read_records)
+        if (record.block == block) {
+            count = record.count;
+            bytes = record.bytes;
+            return true;
+        }
+    return false;
+}
+HRESULT WINAPI read_provider(unsigned op, const void* raw)
+{
+    if (op == 0) return S_OK;  // Begin: the read runs after XAsyncBegin accepts the block
+    if (!raw) return S_OK;
+    const auto* data = static_cast<const AsyncProviderData*>(raw);
+    auto* state = static_cast<ReadAsync*>(data->context);
+    if (op == 2 && state && data->buffer && state->bytes <= data->buffer_size)
+        x2w_save_pack::write(state->pieces, data->buffer);  // GetResult
+    if (op == 4 && state) {  // Cleanup, including the runtime's cleanup of a failed read
+        forget_read(state->block);
+        delete state;
+    }
+    return S_OK;
+}
+// Names and bytes of one accepted read. The save lock is not held on return.
+u64 snapshot_read(ReadAsync& state, u64 container, u64 names_pointer, std::uint32_t count)
+{
+    std::string container_name;
+    {
+        AcquireSRWLockShared(&save_lock);
+        struct Unlock { ~Unlock() { ReleaseSRWLockShared(&save_lock); } } unlock;
+        if (container >= save_container_handle && container - save_container_handle < max_save_handles)
+            container_name = save_table.container_name(static_cast<std::size_t>(container - save_container_handle));
+    }
+    if (container_name.empty()) return e_invalidarg;
+    if (count > SIZE_MAX / sizeof(const char*)) return e_invalidarg;
+    if (count && x2w_local::probe_readable(static_cast<std::uintptr_t>(names_pointer), sizeof(const char*) * count) != sizeof(const char*) * count)
+        return e_invalidarg;
+    const auto* names = reinterpret_cast<const char* const*>(names_pointer);
+    std::vector<std::string> wanted;
+    wanted.reserve(count);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        std::string name;
+        if (!names[i] || !read_save_name(reinterpret_cast<u64>(names[i]), name) || !x2w_save::valid_name(name))
+            return e_invalidarg;
+        wanted.push_back(std::move(name));
+    }
+    std::vector<std::vector<unsigned char>> data;
+    const x2w_save::Status status = save_store().read_blobs(container_name, wanted, data);
+    if (status != x2w_save::Status::ok) return save_status(status);
+    if (data.size() != wanted.size() || data.size() > 0xffffffffu) return e_fail;
+    state.pieces.resize(data.size());
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        state.pieces[i].name = std::move(wanted[i]);
+        state.pieces[i].bytes = std::move(data[i]);
+    }
+    state.count = static_cast<std::uint32_t>(state.pieces.size());
+    if (!x2w_save_pack::bytes_needed(state.pieces, state.bytes)) return e_fail;
+    return 0;
+}
+u64 async_read(int slot, u64 container, u64 names, u64 count_or_size, u64 block_or_buffer, u64 count_pointer)
+{
+    if (!real_query) return e_fail;
+    void* service = nullptr;
+    const auto query = real_query(&submit_async_family, &submit_async_family, &service);
+    if (FAILED(query)) return static_cast<unsigned>(query);
+    if (!service) return e_fail;
+    auto** methods = *static_cast<void***>(service);
+    struct ApiRef {
+        void* object;
+        ULONG (WINAPI* release)(void*);
+        ~ApiRef() { release(object); }
+    } api{service, reinterpret_cast<ULONG (WINAPI*)(void*)>(methods[2])};
+    if (slot == 22) {
+        auto* async = reinterpret_cast<void*>(container);  // XGameSaveReadBlobDataResult(async, size, data, &count)
+        if (!async) return e_fail;
+        const auto out = [](u64 pointer, std::size_t bytes) {
+            return pointer && x2w_local::writable(reinterpret_cast<void*>(pointer), bytes);
+        };
+        std::uint32_t count = 0;
+        std::size_t bytes = 0;
+        if (pending_read(async, count, bytes)) {
+            // A short or unusable buffer must not consume the result or change the caller's memory.
+            if (count_or_size < bytes) return small_buffer;
+            if (!out(count_pointer, sizeof(std::uint32_t)) || !out(block_or_buffer, bytes) ||
+                block_or_buffer % alignof(x2w_save_pack::Blob)) return e_invalidarg;
+            using Result = HRESULT(WINAPI*)(void*, void*, const void*, size_t, void*, size_t*);
+            const auto hr = reinterpret_cast<Result>(methods[11])(
+                service, async, read_identity, static_cast<std::size_t>(count_or_size),
+                reinterpret_cast<void*>(block_or_buffer), nullptr);
+            if (FAILED(hr)) return static_cast<unsigned>(hr);
+            *reinterpret_cast<std::uint32_t*>(count_pointer) = count;
+            return 0;
+        }
+        // No payload was kept: a missing blob or other failure, or a read of no blobs. The caller's
+        // buffer is not passed through, so a failure cannot change it. A success with no blobs
+        // reports a count of zero.
+        using Result = HRESULT(WINAPI*)(void*, void*, const void*, size_t, void*, size_t*);
+        const auto hr = reinterpret_cast<Result>(methods[11])(service, async, read_identity, 0, nullptr, nullptr);
+        if (FAILED(hr)) return static_cast<unsigned>(hr);
+        if (!out(count_pointer, sizeof(std::uint32_t))) return e_invalidarg;
+        *reinterpret_cast<std::uint32_t*>(count_pointer) = 0;
+        return 0;
+    }
+    auto* async = reinterpret_cast<void*>(block_or_buffer);
+    if (!async) return e_fail;
+    auto* state = new (std::nothrow) ReadAsync;
+    if (!state) return e_outofmemory;
+    using Begin = HRESULT(WINAPI*)(void*, void*, void*, const void*, const char*, decltype(&read_provider));
+    const auto begun = reinterpret_cast<Begin>(methods[7])(service, async, state, read_identity, read_identity, read_provider);
+    if (FAILED(begun)) {
+        delete state;  // rejection: the runtime has not taken the context, and nothing was read
+        return static_cast<unsigned>(begun);
+    }
+    using Complete = void(WINAPI*)(void*, void*, HRESULT, size_t);
+    const auto complete = reinterpret_cast<Complete>(methods[10]);
+    try {
+        state->block = async;
+        const u64 status = snapshot_read(*state, container, names, static_cast<std::uint32_t>(count_or_size));
+        if (status) {
+            complete(service, async, static_cast<HRESULT>(status), 0);  // no payload; context is released by Cleanup
+            return S_OK;
+        }
+        if (state->bytes) remember_read(*state);
+        complete(service, async, S_OK, state->bytes);
+        return S_OK;
+    } catch (const std::bad_alloc&) {
+        complete(service, async, static_cast<HRESULT>(e_outofmemory), 0);
+        return S_OK;
+    } catch (const std::filesystem::filesystem_error&) {
+        complete(service, async, static_cast<HRESULT>(e_fail), 0);
+        return S_OK;
+    }
+}
 u64 complete_async(u64 async_block)
 {
     Proxy* user = user_provider >= 0 ? proxies[user_provider] : nullptr;
@@ -540,10 +720,10 @@ bool save_call(int slot, u64* args, u64* result)
         *result = blob_not_found;
         return true;
     case 21:  // XGameSaveReadBlobDataAsync(container, names, count, async)
-        *result = complete_async(args[3]);
+        *result = async_read(slot, args[0], args[1], args[2], args[3], 0);
         return true;
     case 22:  // XGameSaveReadBlobDataResult(async, size, data, &count)
-        *result = blob_not_found;
+        *result = async_read(slot, args[0], 0, args[1], args[2], args[3]);
         return true;
     case 23: {  // XGameSaveCreateUpdate(container, display name, &update)
         u64 handle = 0;
