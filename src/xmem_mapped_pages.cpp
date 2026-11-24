@@ -239,15 +239,16 @@ struct MappingThread {
     ~MappingThread() { mapping_thread = false; }
 };
 
-// The handler is process-wide and Windows offers no way to remove one that also waits for every
-// dispatch already under way, so it is never removed. Instead the module is pinned when the handler
-// is registered: from then on FreeLibrary leaves xmem.dll, the handler's code and this state in
-// place until the process ends, and a callback can never run in unloaded code. Nothing is waited
-// for and nothing is torn down at DLL detach.
+// Shared views are opt-in: X2W_XMEM_SHARED_VIEWS=1, read once by the first mapping call. Without
+// it every page has a view of its own, as before: unmapping a page never takes a neighbour away,
+// no handler is registered, and the module unloads like any DLL.
 //
-// Shared views exist only under that guarantee. If the handler cannot be registered or the module
-// cannot be pinned, every page gets a view of its own (the layout before views were shared), where
-// unmapping one page never takes a neighbour away and no handler is needed.
+// With it, the first mapping call registers the handler and pins the module. The handler is
+// process-wide and Windows offers no way to remove one that also waits for every dispatch already
+// under way, so it is never removed; the pin keeps xmem.dll, the handler's code and this state in
+// place until the process ends, also across a host's FreeLibrary and LoadLibrary. Nothing is
+// waited for or torn down at DLL detach. If the handler cannot be registered or the module cannot
+// be pinned, the opt-in is refused and pages get a view each.
 struct FaultRetry {
     SRWLOCK lock = SRWLOCK_INIT;
     bool tried = false;
@@ -267,11 +268,14 @@ struct FaultRetry {
             }
 #endif
             HMODULE pinned = nullptr;
-            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+            if (!x2w_local::env_on("X2W_XMEM_SHARED_VIEWS")) {
+                // The default: one view per page, nothing process-wide, unloadable.
+            } else if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
                                    reinterpret_cast<LPCWSTR>(&retry_remapped_page), &pinned) &&
-                AddVectoredExceptionHandler(1, retry_remapped_page))
+                AddVectoredExceptionHandler(1, retry_remapped_page)) {
                 guaranteed = true;
-            else
+                x2w_local::logf("x2w-xmem shared views are on (X2W_XMEM_SHARED_VIEWS): xmem.dll stays loaded until the process ends");
+            } else
                 x2w_local::logf("x2w-xmem shared views are off: the fault handler could not be set up (error %lu)", GetLastError());
         }
         const bool result = guaranteed;

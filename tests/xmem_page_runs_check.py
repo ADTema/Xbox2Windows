@@ -287,10 +287,37 @@ def handled_exception():
     return False
 
 
+def default_unload(path):
+    """The default mode (X2W_XMEM_SHARED_VIEWS unset): pages have a view each, a page can be
+    unmapped without touching its neighbours, and after ordinary mapping the shim unloads."""
+    assert "X2W_XMEM_SHARED_VIEWS" not in os.environ
+    shim = Shim(path)
+    base = shim.whole + PAGE
+    tokens = shim.pages(16)
+    assert shim.contiguous(base, 16, tokens) == base
+    mark(base, 16, 0x44440000)
+    for page in (0, 7, 15):
+        assert shim.query(base + page * PAGE)[2] == PAGE, "pages share a view without the opt-in"
+    assert shim.unmap([base + 5 * PAGE]) and marked(base, 16, 0x44440000, skip={5})
+    assert shim.scatter((shim.pointer * 1)(base + 5 * PAGE), 1, (shim.number * 1)(tokens[5])) and marked(base, 16, 0x44440000)
+    assert shim.contiguous(base, 16, None) == base and shim.release(16, tokens)
+    assert shim.free_library(), "the default shim stayed loaded after FreeLibrary"
+    assert handled_exception(), "the access violation was not delivered after the default shim was unloaded"
+    # A second load starts clean and can still choose either mode before its first map.
+    shim = Shim(path)
+    tokens = shim.pages(4)
+    base = shim.whole + PAGE
+    assert shim.contiguous(base, 4, tokens) == base and shim.query(base)[2] == PAGE
+    assert shim.contiguous(base, 4, None) == base and shim.release(4, tokens)
+    assert shim.free_library(), "the reloaded default shim stayed loaded after FreeLibrary"
+    print("child: default shim unloaded after mapping, twice", flush=True)
+
+
 def lifetime(path):
-    """The handler's lifetime. Until a mapping call needs it the shim unloads like any DLL. From
-    then on the module is pinned: FreeLibrary leaves it loaded, an unrelated handled exception is
-    still delivered to its own handler, and the shim and its handler keep working."""
+    """The opt-in mode (X2W_XMEM_SHARED_VIEWS=1). Until the first mapping call the shim unloads
+    like any DLL. From then on the module is pinned: FreeLibrary leaves it loaded, an unrelated
+    handled exception is still delivered to its own handler, and the shim and its handler keep
+    working."""
     shim = Shim(path)
     assert shim.free_library(), "a shim that never mapped a page stayed loaded after FreeLibrary"
     assert handled_exception(), "the access violation was not delivered after an unused shim was unloaded"
@@ -369,6 +396,9 @@ def concurrent_shutdown(path, exit_while_running):
 
 
 def child(path, mode):
+    if mode == "default-unload":
+        default_unload(path)
+        return 0
     if mode == "lifetime":
         lifetime(path)
         return 0
@@ -414,6 +444,9 @@ def expect_clean(path, mode, marker):
 
 
 def main(path, controls, total=6000):
+    # The mode is chosen before the first mapping call. Everything below is the opt-in mode except
+    # the default-unload child, which runs without the variable.
+    os.environ["X2W_XMEM_SHARED_VIEWS"] = "1"
     shim = Shim(path)
     base = shim.whole + PAGE
     try:
@@ -444,11 +477,17 @@ def main(path, controls, total=6000):
     assert result.returncode == 0 and "child: reader survived" in result.stdout, (
         f"the deployed shim honoured X2W_XMEM_NO_FAULT_RETRY: {result.returncode & 0xFFFFFFFF:#x} {result.stdout!r}")
     # Lifetime of the handler, on the deployed shim, each in a process of its own.
+    default = {k: v for k, v in os.environ.items() if k != "X2W_XMEM_SHARED_VIEWS"}
+    result = subprocess.run([sys.executable, "-B", __file__, "--child", "default-unload", str(path)], capture_output=True,
+                            text=True, timeout=120, env=default)
+    assert result.returncode == 0 and "child: default shim unloaded after mapping, twice" in result.stdout, (
+        f"default-unload: exit code {result.returncode & 0xFFFFFFFF:#x}: {result.stdout!r} {result.stderr[-600:]!r}")
     expect_clean(path, "lifetime", "child: shim and handler work after FreeLibrary")
     expect_clean(path, "concurrent-shutdown", "child: threads stopped cleanly")
     expect_clean(path, "concurrent-exit", "child: exiting with threads running")
     print(f"xmem_page_runs: PASS ({total} pages mapped in {mapped_in * 1000:.0f} ms, {holes} holes, VirtualQuery before and "
-          f"after a split, two views, 3 refused steps, {toggles} neighbour toggles under {reads} reads, pinned lifetime, "
+          f"after a split, two views, 3 refused steps, {toggles} neighbour toggles under {reads} reads, default mode unloads after mapping, "
+          f"opt-in stays pinned, "
           f"FreeLibrary and process exit under running threads, 2 access-violation controls)")
 
 

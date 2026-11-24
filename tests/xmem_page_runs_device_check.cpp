@@ -80,6 +80,7 @@ int main(int argc, char** argv)
     const bool warp = std::strcmp(argv[1], "warp") == 0;
     bool unmatched = false;
     SetEnvironmentVariableW(L"X2W_D3D12_PERMISSIVE", L"1");
+    SetEnvironmentVariableW(L"X2W_XMEM_SHARED_VIEWS", L"1");  // the mode under test; read by the first mapping call
     auto wrapper = create_device(warp, unmatched, create_wrapper);
     if (!wrapper) return warp || unmatched ? 1 : 77;
 
