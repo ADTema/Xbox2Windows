@@ -14,6 +14,16 @@ ID = r"%[A-Za-z0-9_]+"
 CAST = re.compile(rf"({ID}) = OpConvertUToPtr %_ptr_PSB_(arr|uint) ({ID})")
 ACCESS = re.compile(rf"({ID}) = OpAccessChain %_ptr_PSB_uint ({ID}) ({ID})")
 POINTER = re.compile(rf"({ID}) = OpTypePointer (\w+) ({ID})")
+WORD_ATOMIC_OPERANDS = {
+    "OpAtomicIAdd": 4,
+    "OpAtomicExchange": 4,
+    "OpAtomicUMin": 4,
+    "OpAtomicUMax": 4,
+    "OpAtomicAnd": 4,
+    "OpAtomicOr": 4,
+    "OpAtomicXor": 4,
+    "OpAtomicCompareExchange": 6,
+}
 
 
 def word_pointer(dst, base, index):
@@ -133,7 +143,11 @@ def lower(assembly):
             fields = line.split()
             reads_word = fields[1:4] == ["=", "OpLoad", "%uint"] and fields[4] in used
             writes_word = fields[0] == "OpStore" and fields[1] in used
-            if not (reads_word or writes_word) or len(used) != 1:
+            # The checked access chain retains the pointer ID. Keep the atomic's
+            # result and operands, including scope and memory semantics, intact.
+            atomic_word = (len(fields) >= 5 and fields[1] == "=" and fields[3] == "%uint"
+                           and fields[4] in used and WORD_ATOMIC_OPERANDS.get(fields[2]) == len(fields) - 4)
+            if not (reads_word or writes_word or atomic_word) or len(used) != 1:
                 raise ValueError("unhandled physical word pointer use")
         if line == model:
             line = "OpMemoryModel Logical GLSL450"

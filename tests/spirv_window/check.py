@@ -25,6 +25,24 @@ direct = original.replace(
 assert direct != original
 assert "%x2w_address_p1_low = OpBitwiseAnd %ulong %a1 %x2w_mask" in window.lower(direct).splitlines()
 
+# Exercise atomics on both a direct word cast and an indexed physical address.
+atomic_instructions = (
+    "%old_add = OpAtomicIAdd %uint %p1 %c1 %atomic_rmw %d",
+    "%old_exchange = OpAtomicExchange %uint %p2 %c1 %atomic_rmw %old_add",
+    "%old_min = OpAtomicUMin %uint %p2 %c1 %atomic_rmw %old_exchange",
+    "%old_max = OpAtomicUMax %uint %p2 %c1 %atomic_rmw %old_min",
+    "%old_and = OpAtomicAnd %uint %p2 %c1 %atomic_rmw %old_max",
+    "%old_or = OpAtomicOr %uint %p2 %c1 %atomic_rmw %old_and",
+    "%old_xor = OpAtomicXor %uint %p2 %c1 %atomic_rmw %old_or",
+    "%old_cmp = OpAtomicCompareExchange %uint %p2 %c1 %atomic_rmw %atomic_fail %d %old_xor",
+)
+atomics = (direct
+    .replace("%main = OpFunction",
+             "%atomic_rmw = OpConstant %uint 72\n"  # AcquireRelease | UniformMemory
+             "%atomic_fail = OpConstant %uint 66\n"  # Acquire | UniformMemory
+             "%main = OpFunction", 1)
+    .replace("OpStore %p2 %d Aligned 4", "\n".join(atomic_instructions) + "\nOpStore %p0 %old_cmp Aligned 4", 1))
+
 # Add a ballot read whose bit controls the value written through the physical address.
 combined = (original
     .replace("OpCapability Shader\n", "OpCapability Shader\nOpCapability GroupNonUniformBallot\n", 1)
@@ -45,6 +63,7 @@ for source, reason in (
      "descriptor sets"),
     (original.replace("OpStore %p2 %d", "%leak = OpConvertPtrToU %ulong %p2\nOpStore %p2 %d"),
      "physical word pointer"),
+    (atomics.replace("OpAtomicIAdd", "OpAtomicISub"), "physical word pointer"),
     (original.replace("OpTypePointer PhysicalStorageBuffer %uint", "OpTypePointer PhysicalStorageBuffer %ulong"),
      "scalar layout"),
     (original.replace("OpDecorate %UserData Block",
@@ -81,7 +100,8 @@ with tempfile.TemporaryDirectory() as directory:
     # This input name previously overlapped the temporaries for %ballot_bit.
     renamed = combined.replace("%p2 ", "%ballot_ballot_bit ")
     assert renamed != combined
-    for label, source in (("combined", combined), ("renamed_pointer", renamed), ("direct", direct)):
+    for label, source in (("combined", combined), ("renamed_pointer", renamed), ("direct", direct),
+                          ("atomics", atomics)):
         mixed = Path(directory) / f"{label}.spvasm"
         mixed.write_text(source, encoding="utf-8")
         mixed_target = Path(directory) / f"{label}.spv"
@@ -91,4 +111,11 @@ with tempfile.TemporaryDirectory() as directory:
     assert "OpMemoryModel Logical GLSL450" in lowered
     assert "OpGroupNonUniformBallotBitExtract" not in lowered
     assert "OpConvertUToPtr" not in lowered
-print("physical, logical and combined SPIR-V validated; rejection cases passed")
+
+    lowered_atomics = window.lower(atomics).splitlines()
+    for pointer in ("p1", "p2"):
+        assert any(line.startswith(f"%{pointer} = OpAccessChain ")
+                   and line.endswith(f"%x2w_heap %c0 %x2w_address_{pointer}_selected")
+                   for line in lowered_atomics)
+    assert [line for line in lowered_atomics if " = OpAtomic" in line] == list(atomic_instructions)
+print("physical, logical and combined SPIR-V validated; 8 atomics and rejection cases passed")
