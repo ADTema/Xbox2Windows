@@ -3743,8 +3743,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     # by Windows and started with pe_map_run; the startup log and exit code must match (Refs #165, #870).
     # The _early variant starts a thread inside its first process-attach callback (mapped only).
     foreach(target IN ITEMS cpu_exe_tls cpu_exe_tls_early)
-        add_executable(${target} tests/cpu/exe_tls.cpp)
-        target_compile_options(${target} PRIVATE /GS- /Zl)
+        add_executable(${target} tests/cpu/exe_tls.cpp tests/cpu/exe_tls_template.asm)
+        target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/GS-;/Zl;/Zc:tlsGuards->")
         target_link_options(${target} PRIVATE /ENTRY:exe_entry /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE
             /INCREMENTAL:NO)
         target_link_libraries(${target} PRIVATE kernel32)
@@ -3759,8 +3759,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # The _pause variant leaves a worker paused inside the image for the release refusal (mapped only). The
     # _enroll variant starts a probe worker whose enrollment or installation the host makes fail.
     foreach(target IN ITEMS cpu_exe_tls_slot0 cpu_exe_tls_slot0_pause cpu_exe_tls_slot0_enroll)
-        add_executable(${target} tests/cpu/exe_tls_slot0.cpp)
-        target_compile_options(${target} PRIVATE /GS- /Zl /GA)
+        add_executable(${target} tests/cpu/exe_tls_slot0.cpp tests/cpu/exe_tls_template.asm)
+        target_compile_definitions(${target} PRIVATE $<$<COMPILE_LANGUAGE:ASM_MASM>:TLS_SLOT0_ARRAY>)
+        target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/GS-;/Zl;/GA;/Zc:tlsGuards->")
         target_link_options(${target} PRIVATE /ENTRY:exe_entry /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE
             /INCREMENTAL:NO)
         target_link_libraries(${target} PRIVATE kernel32)
