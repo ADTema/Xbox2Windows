@@ -946,15 +946,21 @@ class Stage:
             # image_load_mip addresses x, y, [slice or z] and then the mip, so a 2D array is four registers
             # and Texture2DArray.Load takes int4(x, y, slice, mip) like a volume's int4(x, y, z, mip).
             axes = 3 if three else 2
-            mip = '0'
-            if how == 'load_mip':
-                unsupported = [m for m in mods if not m.startswith(('dim:', 'dmask:'))
-                               and m not in ('unorm', 'glc', 'slc', 'dlc')]
-                if unsupported or len(cs) != axes + 1 or not dmask:
-                    raise Unsupported('image_load_mip address or modifiers: %s' % ' '.join(mods))
-                mip = self.u(cs[axes])
-            address = [self.u(c) for c in cs[:axes]] + [mip]
-            call = '%s.Load(int%d(%s))' % (tex, axes + 1, ', '.join(address))
+            packed_2d = how == 'load' and dim == 'SQ_RSRC_IMG_2D' and 'a16' in mods
+            allowed = ('unorm', 'glc', 'slc', 'dlc')
+            if packed_2d:
+                allowed += ('a16',)
+            unsupported = any(not m.startswith(('dim:', 'dmask:')) and m not in allowed for m in mods)
+            wrong_address = (packed_2d and len(cs) != 1) or (how == 'load_mip' and len(cs) != axes + 1)
+            if unsupported or wrong_address or not dmask:
+                raise Unsupported('image_%s address or modifiers: %s' % (how, ' '.join(mods)))
+            if packed_2d:
+                packed = self.u(cs[0])
+                address = ['%s & 0xffffu' % packed, '%s >> 16' % packed]
+            else:
+                address = [self.u(c) for c in cs[:axes]]
+            mip = self.u(cs[axes]) if how == 'load_mip' else '0'
+            call = '%s.Load(int%d(%s))' % (tex, axes + 1, ', '.join(address + [mip]))
         else:
             heap = self.heap_sampler(ops[3])
             words = None if heap else self.const_words(ops[3])
@@ -1615,7 +1621,7 @@ def fnv(data, h=1469598103934665603):
 
 def pipeline_key(vs_code, ps_code, root_blob, layout=b''):
     """Hash the startup translation revision and the three blobs in runtime order, then a stream's input layout."""
-    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-4'))))
+    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-5'))))
     return fnv(layout, key) if layout else key
 
 
