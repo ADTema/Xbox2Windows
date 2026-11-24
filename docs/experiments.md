@@ -5363,6 +5363,14 @@ Run `ctest --preset dev --no-tests=error -R '^vm_copy_queue_' -V`.
 
 Run `ctest --preset dev --no-tests=error -R '^vm_page_provenance_' -V`.
 
+`vm_raw_srv_warp` and `vm_raw_srv_hardware` select 1024 words straddling a 64 KiB boundary using a GPU byte address and a separate first element. A compute shader reads the native raw buffer SRV through a descriptor table. Readback checks the intended span and a second valid descriptor shifted by four elements. The second span has to match its own expected contents and differ from every word of the first span. The view builder rejects misaligned addresses and views outside the declared buffer.
+
+Run `cmake --build --preset dev --target vm_copy_queue_check` and `ctest --preset dev --no-tests=error -R '^vm_raw_srv_' -V`.
+
+`vm_raw_uav_warp` and `vm_raw_uav_hardware` store through two logical address windows. Each window maps a 2040-byte range that starts 256 or 512 bytes into its own 4 KiB buffer, and each buffer holds distinct sentinel words. `resolve_raw_uav_store` (`src/raw_buffer_uav.h`) maps a logical address to the window that contains it and returns a raw UAV covering exactly that window, plus the store's byte offset. It requires the declared alignment (4 bytes for a scalar DWORD store, 16 bytes for a four-DWORD store) and the whole store inside one window. Seven requests are refused before any descriptor is created: a 16-byte-aligned vector that runs 8 bytes past its window, the first byte after a window, a 4-byte-aligned vector, a misaligned scalar, an address between the windows, an address just before a window, and an undeclared 8-byte width. Four metadata controls also reject a shader offset beyond 32 bits, a misaligned logical base, an address range that wraps and an ambiguous overlapping window. The descriptor result is unchanged on refusal. A compute shader then performs the accepted scalar store in the last DWORD of window 0 and the accepted vector store 24 bytes before the end of window 1. Readback matches both full buffers against the five positions fixed by the fixture, independently of the resolved offsets. A second pass reloads the sentinels and swaps the two window bindings. The stores then land at the matching offsets of the other buffer, and the five intended words keep their sentinels.
+
+Run `cmake --build --preset dev --target vm_copy_queue_check` and `ctest --preset dev --no-tests=error -R '^vm_raw_uav_' -V`.
+
 #### Xbox frame events and token wait semantics (#874)
 
 The source-built frame events fixture (`tests/cpu/frame_events_caller.asm`, `tests/cpu/frame_events_provider.cpp`, `tests/cpu/frame_events_check.py`, CTest `cpu_native_frame_events`) models the scheduling and wait semantics of the Xbox frame-pacing extensions in `d3d12_xs.dll`:
