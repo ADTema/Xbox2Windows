@@ -108,6 +108,7 @@ jobs:
           python -B tests/startup_image_sample_l_check.py
           python -B tests/startup_image_3d_check.py
           python -B tests/startup_image_2d_array_check.py
+          python -B tests/startup_host_cpu_check.py
           python -B tests/startup_translator_check.py
           python -B tests/startup_flat_param_check.py
           python -B tests/startup_inline_sampler_check.py

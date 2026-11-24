@@ -2323,7 +2323,7 @@ cmake --build --preset dev --target cpu_switch_bit_tests_lifted cpu_register_pro
 ctest --preset dev --no-tests=error -R '^cpu_aot_switch_bit_tests$' -V
 ```
 
-`POPCNT`, `LZCNT` and `TZCNT` take a 16-, 32- or 64-bit register or memory source, and `LZCNT` and `TZCNT` return the operand width for a zero source. Following the Intel SDM entries for these instructions, `POPCNT` sets ZF for a zero source and clears OF, SF, AF, CF and PF, so all 16 conditions may read it. `LZCNT` and `TZCNT` set CF for a zero source and ZF for a zero result and leave OF, SF, AF and PF undefined, so only `B`, `AE`, `E`, `NE`, `BE` and `A` may read them; other conditions are refused. `cpu_aot_switch_bit_counts` builds [`switch_bit_counts.asm`](../tests/cpu/switch_bit_counts.asm): 22 exports cover the three instructions at 16, 32 and 64 bits with register and memory sources, every permitted condition through `SETcc`, `JB`, `JE` and `JNE`, and `CMOVA` and a 32-bit `CMOVLE` after a flag-neutral `MOV`. It runs 19,734 comparisons of the original, the translation and a Python reference, and 9 rejection controls, including `BSWAP`, which the translator does not lift. A host whose CPUID lacks POPCNT, BMI1 or ABM runs `LZCNT` and `TZCNT` as `BSR` and `BSF`, so the test reports a capability skip (77) there. Measured on Linux x86-64 with `llvm-ml` 18, `lld-link` and `clang++` at `-O0` and `-O2`; the planted faults `TZCNT` of 0 one short of the width and CF taken from the result after `LZCNT` each fail it.
+`POPCNT`, `LZCNT` and `TZCNT` take a 16-, 32- or 64-bit register or memory source, and `LZCNT` and `TZCNT` return the operand width for a zero source. Following the Intel SDM entries for these instructions, `POPCNT` sets ZF for a zero source and clears OF, SF, AF, CF and PF, so all 16 conditions may read it. `LZCNT` and `TZCNT` set CF for a zero source and ZF for a zero result and leave OF, SF, AF and PF undefined, so only `B`, `AE`, `E`, `NE`, `BE` and `A` may read them; other conditions are refused. `cpu_aot_switch_bit_counts` builds [`switch_bit_counts.asm`](../tests/cpu/switch_bit_counts.asm): 22 exports cover the three instructions at 16, 32 and 64 bits with register and memory sources, every permitted condition through `SETcc`, `JB`, `JE` and `JNE`, and `CMOVA` and a 32-bit `CMOVLE` after a flag-neutral `MOV`. It runs 19,734 comparisons of the original, the translation and a Python reference, and 8 rejection controls, including `XLATB`, which the translator does not lift. A host whose CPUID lacks POPCNT, BMI1 or ABM runs `LZCNT` and `TZCNT` as `BSR` and `BSF`, so the test reports a capability skip (77) there. Measured on Linux x86-64 with `llvm-ml` 18, `lld-link` and `clang++` at `-O0` and `-O2`; the planted faults `TZCNT` of 0 one short of the width and CF taken from the result after `LZCNT` each fail it.
 
 ```powershell
 cmake --build --preset dev --target cpu_switch_bit_counts_lifted cpu_register_probe
@@ -2335,6 +2335,13 @@ ctest --preset dev --no-tests=error -R '^cpu_aot_switch_bit_counts$' -V
 ```powershell
 cmake --build --preset dev --target cpu_switch_bit_scans_original_lifted cpu_switch_bit_scans_swapped_lifted cpu_register_probe
 ctest --preset dev --no-tests=error -R '^cpu_aot_switch_bit_scans$' -V
+```
+
+`BSWAP` takes a 32- or 64-bit register and reverses its bytes in place. A 32-bit `BSWAP` zero-extends its result into the 64-bit register like any other 32-bit write, and no flag changes, so a `SETcc`, `Jcc` or `CMOVcc` after it reads the flags of the instruction before it. The 16-bit form (operand-size prefix) is refused, because the Intel SDM leaves its result undefined, as are `BSWAP RSP` (a dynamic frame), an unwritten register and a repeat prefix. `cpu_aot_switch_bswap` builds [`switch_bswap.asm`](../tests/cpu/switch_bswap.asm): 30 exports reverse the bytes of each of 15 registers (`RAX` to `R15` except `RSP`) at 32 and 64 bits, between two `CMP`s whose sixteen conditions are stored afterwards, and 3 more cover a 64-bit then 32-bit `BSWAP`, `JB` and `CMOVL` after `BSWAP`. They are run on the original, the translation and a Python reference built from `int.to_bytes` and `int.from_bytes` over 829 inputs each: zero, one, `0x80`, `0x0123456789abcdef`, all ones, single bits, values whose upper bytes are zero, and pseudo-random words. 4 rejection controls cover the refused forms. Five faults, run as references, must disagree with the original in their own words only: swapping only 32 bits for a 64-bit register, keeping the upper half for a 32-bit register, swapping 16-bit words instead of bytes, leaving the register unswapped, and flags taken from the result. The same five faults planted in the generated C++ each fail the test at the first input that exposes them. Measured on Linux x86-64 with `llvm-ml` 19, `lld-link` 19 and `clang++` 19 at `-O0` and `-O2`, with the original mapped into memory and called through the Windows x64 convention; MSVC, ML64 and Wine were not run.
+
+```powershell
+cmake --build --preset dev --target cpu_switch_bswap_lifted cpu_register_probe
+ctest --preset dev --no-tests=error -R '^cpu_aot_switch_bswap$' -V
 ```
 
 The supported functions take three integer words in RCX, RDX and R8 and return RAX, of which only the low bytes described below are compared. An entry can instead be translated with a fourth integer word in R9, as described below. Stack arguments (the fifth and later) and floating-point arguments are not supported. A leaf function without a `.pdata` entry is bounded by its executable section. Its walk may not enter an interval owned by another function's unwind entry.
@@ -3513,6 +3520,30 @@ ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_reduction_' -V
 python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```
 
+### gfx1030 fixed-address MUBUF atomic x2 reductions
+
+The same reduction profile supports the `_x2` forms of all nine integer
+operations. The instruction supplies two consecutive VGPRs, low word
+first, and targets an eight-byte-aligned address. The caller provides an
+aligned, in-range raw UAV and the same linear descriptor as for the 32-bit
+forms. The lowering combines both words into one 64-bit operand and uses
+a single interlocked operation. Addition and subtraction wrap at 64 bits,
+and min/max use the matching signedness. The caller compiles this HLSL
+with `cs_6_6`. The D3D12 fixture returns a capability skip if the adapter
+lacks SM 6.6 or `Int64ShaderOps`.
+
+The CPU reference reduces distinct word pairs and compares all 320
+readback words, including the neighboring words, for one and two groups.
+Changing the operation or signedness must produce a difference in the
+low or high word of the atomic target. The rejection controls cover
+unverified VGPR pairs, four-byte-only alignment and `glc`. LLVM 15
+assembles each `_x2` form and checks the compute-container CLI.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_reduction_x2_' -V
+```
+
 ### Indexed gfx1030 raw vector reads
 
 The compute store profile also lowers `buffer_load_dwordx2`,
@@ -4317,28 +4348,29 @@ another compare must change the line. On a Linux host only the LLVM part and the
 reference pictures were run; no WARP or GPU readback of these four forms exists yet.
 
 The program may also apply the one-source binary32 forms `v_rcp_f32_e32`,
-`v_rsq_f32_e32`, `v_sqrt_f32_e32`, `v_floor_f32_e32`, `v_trunc_f32_e32` and
-`v_rndne_f32_e32` (VGPR destination; constant, scalar word or VGPR source). They
-lower to `1.0f / x`, `rsqrt`, `sqrt`, `floor`, `trunc` and `round` (half to
-even). Source modifiers, `clamp`, output modifiers and a second source reject
-translation. The precision of reciprocal, reciprocal square root
-and square root is not claimed, since D3D allows each an error, and a zero or
-negative operand of the last two, NaN, infinity, denormals and signed zero are not
-exercised. `depth_mask_unary_draw_*` (`unary` mode) therefore feeds the three
-approximate forms an input whose exact result is an integer (1/8, 1/4 and 9), through
+`v_rsq_f32_e32`, `v_sqrt_f32_e32`, `v_floor_f32_e32`, `v_trunc_f32_e32`,
+`v_rndne_f32_e32`, `v_ceil_f32_e32`, `v_exp_f32_e32` and `v_log_f32_e32` (VGPR
+destination; constant, scalar word or VGPR source). They lower to `1.0f / x`,
+`rsqrt`, `sqrt`, `floor`, `trunc`, `round` (half to even), `ceil`, `exp2` and `log2`. Source modifiers, `clamp`, output modifiers and a second source reject
+translation. The precision of reciprocal, reciprocal square root,
+square root, `exp2` and `log2` is not claimed, since D3D allows each an error, and a zero or
+negative operand of those, `log2` of zero or a negative value, an `exp2` overflow, NaN, infinity,
+denormals, denormal flushing and signed zero are not exercised. `depth_mask_unary_draw_*` (`unary` mode) therefore feeds the five
+approximate forms an input whose exact result is an integer (1/8, 1/4, 9, 5 for `exp2`
+and 32 for `log2`), through
 a zero the compiler cannot prove (`v7 - v7`) so the opcode really runs on WARP, rounds
-the result (add 0.5, floor) and scales v7 by it. Floor, truncation and round-to-even
+the result (add 0.5, floor) and scales v7 by it. Floor, ceiling, truncation and round-to-even
 are compared exactly on `4 * (v7 - 0.5)`, an odd multiple of 1/16 that is never a tie
 or an integer, with thresholds where each sibling gives different pixels. The CPU
 reference is written with Python arithmetic, and every other form's reference must
 fail on exactly the pixels where the two differ. LLVM CI also assembles each form,
 translates it through the CLI, pins the lowered line, and changing that one
-instruction word to each of the other five forms must change the line. On a Linux
+instruction word to each of the other eight forms must change the line. On a Linux
 host only the LLVM part (LLVM 19; LLVM 15 was not run) and the reference pictures
-were run; no WARP readback of these six forms exists yet.
+were run; no WARP readback of the ceil, exp and log forms exists yet.
 
 Every form above also has a plain VOP3 spelling that translates: `v_add_f32_e64`
-and the other five binary32 operations, the six one-source forms, `v_fract_f32_e64`,
+and the other five binary32 operations, the nine one-source forms, `v_fract_f32_e64`,
 `v_mul_legacy_f32_e64`, `v_fmac_f32_e64` and the four `v_cmpx_*_f32_e64`
 compares (the destination of a VOP3 `v_cmpx` is the implicit EXEC; LLVM 19 prints
 `v_cmpx_lt_f32_e64 s31, v7`). The translator rewrites the spelling to its e32 form
@@ -4439,7 +4471,7 @@ Not covered by this experiment: the 28 packed-integer forms carved out to `cpu_v
 
 [The AVX bit-move leaf translator](../tools/cpu_avx_move_aot.py) lifts bounded straight-line Windows x64 leaf functions covering 50 bit-transfer, shuffle, blend, broadcast, lane, permute, unpack, logical and masked load/store forms in `docs/coverage/x64_zen2.tsv` group `AVX` (excluding the 5 move forms `vmovdqa`, `vmovups`, `vmovaps`, `vmovq` and `vmovd` carved out to `cpu_vex_aot.py (PR #325)`; `vmovdqu` remains here as transport glue):
 
-- Logical bitwise ops: `vandpd`, `vandps`, `vandnpd`, `vandnps`, `vorpd`, `vorps`, `vxorpd`, `vxorps` (XMM and YMM widths)
+- Logical bitwise ops: `vandpd`, `vandps`, `vandnpd`, `vandnps`, `vorpd`, `vorps`, `vxorpd`, `vxorps` (XMM and YMM widths; the last source is a register or a flat `m128`/`m256` memory operand)
 - Blends: `vblendpd`, `vblendps` (`imm8`), `vblendvpd`, `vblendvps` (sign-bit mask) across XMM and YMM widths
 - Broadcasts: `vbroadcastf128` (`m128`), `vbroadcastsd` (`m64` and `xmm`), `vbroadcastss` (`m32` and `xmm`, XMM and YMM destinations)
 - Lane ops: `vextractf128`, `vinsertf128`, `vextractps` (`r32`/`r64`), `vinsertps`
@@ -4448,31 +4480,33 @@ Not covered by this experiment: the 28 packed-integer forms carved out to `cpu_v
 - Vector and scalar moves: `vmovapd`, `vmovupd` (128/256-bit load, store and register copy), `vlddqu`, `vmovntdq`, `vmovntdqa`, `vmovntpd`, `vmovntps`, `vmovddup`, `vmovshdup`, `vmovsldup`, `vmovhlps`, `vmovlhps`, `vmovhpd`, `vmovhps`, `vmovlpd`, `vmovlps`, `vmovsd`, `vmovss`, `vmovmskpd`, `vmovmskps`
 - Masked loads and stores: `vmaskmovpd`, `vmaskmovps` (all 8 VEX encodings across XMM/YMM load and store forms)
 
-Each lifted export takes `(word rcx, word rdx, word r8)` pointing to caller-owned flat buffers with 16-byte-aligned bases and returns `void`. The caller supplies live buffers for the whole invocation and keeps them private to the executing thread. This fixture uses the default MXCSR controls (masked exceptions, round-to-nearest-even, DAZ and FTZ disabled) and compares result bytes. Memory forms using a full 128-bit operand require a displacement divisible by 16. For transport and ABI glue the translator accepts `vmovdqu` (128/256-bit flat load, store and register copy), flat argument-rooted 32/64-bit `mov` between volatile scratch GPRs (`rax`/`eax`, `r9`/`r9d`, `r10`/`r10d`, `r11`/`r11d`) and `[base + disp]`, `vzeroupper`, and terminal `ret`.
+Each lifted export takes `(word rcx, word rdx, word r8)` pointing to caller-owned flat buffers with 16-byte-aligned bases and returns `void`. The caller supplies live buffers for the whole invocation and keeps them private to the executing thread. This fixture uses the default MXCSR controls (masked exceptions, round-to-nearest-even, DAZ and FTZ disabled) and compares result bytes. Memory forms using a full 128-bit operand require a displacement divisible by 16, except the memory source of the eight logical ops, which has no alignment or displacement-multiple requirement. For transport and ABI glue the translator accepts `vmovdqu` (128/256-bit flat load, store and register copy), flat argument-rooted 32/64-bit `mov` between volatile scratch GPRs (`rax`/`eax`, `r9`/`r9d`, `r10`/`r10d`, `r11`/`r11d`) and `[base + disp]`, `vzeroupper`, and terminal `ret`.
 
 ### State model, bit-transparent semantics and explicit rejections
 
 YMM registers `ymm0`..`ymm5` use a portable `struct Vec256 { std::uint64_t q[4]; }` value model, so the generated C++ compiles with default x64 MSVC flags without `/arch:AVX`. All 50 instructions transfer or combine raw bits with no FP arithmetic, no NaN canonicalization and no MXCSR involvement; `vcmp*`, `vtest*`, `vcomis*` and `vucomis*` are out of scope. Every VEX write to an XMM destination zeroes bits `128..255` of the corresponding YMM register; `vmovss` (`m32`) and `vmovsd` (`m64`) zero-extend into their destination XMM register; `vmovmskpd`, `vmovmskps` and `vextractps` zero-extend to 64 bits; variable `vpermilpd` inspects bit 1 of each 64-bit control lane; `vinsertps` applies `ZMask` after inserting `CountS` into `CountD`; and non-temporal moves (`vmovnt*`) lower as plain loads/stores. `vmaskmovps` and `vmaskmovpd` check the MSB of each mask lane inside an `if` guard so masked-off lanes never dereference memory, zero masked-off load lanes and preserve the mask register.
 
-Memory operands are allowed as flat `[base + disp]` rooted in `rcx`, `rdx` or `r8` only where the form requires memory (loads, stores, broadcasts, half/scalar memory moves, non-temporal moves, masked loads/stores and transport `vmovdqu`/`mov` glue). The translator explicitly rejects:
+Memory operands are allowed as flat `[base + disp]` rooted in `rcx`, `rdx` or `r8` only where the form requires memory (loads, stores, broadcasts, half/scalar memory moves, non-temporal moves, masked loads/stores, transport `vmovdqu`/`mov` glue) and as the last source of the eight logical ops. The memory source of `vandpd`, `vandps`, `vandnpd`, `vandnps`, `vorpd`, `vorps`, `vxorpd` and `vxorps` is the second source: the result is `op(register source, memory)`, so `vandn*` inverts the register operand and never the memory operand, and the VEX.128 forms zero bits `128..255` of the destination. The translator explicitly rejects:
 
-- memory operands on all 28 register-domain AVX forms that have memory encodings (`vand*`, `vor*`, `vxor*`, `vblend*`, `vextractf128`, `vinsertf128`, `vextractps`, `vinsertps`, `vperm2f128`, `vpermil*`, `vshuf*`, `vunpck*`, `vmovddup`, `vmovshdup`, `vmovsldup`);
+- memory operands on the 20 register-domain AVX forms that have memory encodings and are not logical ops (`vblend*`, `vextractf128`, `vinsertf128`, `vextractps`, `vinsertps`, `vperm2f128`, `vpermil*`, `vshuf*`, `vunpck*`, `vmovddup`, `vmovshdup`, `vmovsldup`);
 - the carved-out move forms owned by `cpu_vex_aot.py (PR #325)` (`vmovdqa`, `vmovups`, `vmovaps`, `vmovq`, `vmovd`);
 - out-of-scope ops (`vcmp*`, `vtest*`, `vcomis*`, `vucomis*`, FP/integer arithmetic, AVX2-only ops, legacy SSE, branches);
 - EVEX encodings, instruction prefixes, nonvolatile vector (`xmm6`..`xmm15` / `ymm6`..`ymm15`) or GPR (`rbx`, `rbp`, `rsi`, `rdi`, `r12`..`r15`) registers, clobbering argument GPRs, reg-to-reg `mov`, reads of undefined vector or scratch GPR registers, RIP-relative/indexed/32-bit/`rsp`/non-argument memory operands, missing terminal `ret` and unreachable instructions after `ret`.
 
 ```powershell
-cmake --build --preset dev --target cpu_avx_move_regs_original cpu_avx_move_regs_original_lifted cpu_avx_move_regs_altered_lifted
-ctest --preset dev --no-tests=error -R '^cpu_aot_avx_move_regs$' -V
+cmake --build --preset dev --target cpu_avx_move_regs_original cpu_avx_move_regs_original_lifted cpu_avx_move_regs_altered_lifted cpu_avx_move_mem_original cpu_avx_move_mem_original_lifted cpu_avx_move_mem_altered_lifted
+ctest --preset dev --no-tests=error -R '^cpu_aot_avx_move_(mem|regs)$' -V
 ```
 
 ### Measured results and open scope
 
 The [MASM fixture](../tests/cpu/avx_move_regs.asm) builds 150 exports covering all 50 surviving AVX forms across XMM and YMM widths, memory and register encoding variants, all 4 `vbroadcastsd` (`m64`) and all 8 `vbroadcastss` (`m32`) lane offsets, ignored immediate bits, `vperm2f128` lane-zeroing bits, `vinsertps` `CountS`/`CountD`/`ZMask` interactions (including zeroing `CountD`), `vpermilpd` bit-1 vs bit-0 variable control, IEEE-754 special bit patterns (`+0`, `-0`, subnormals, infinities, sNaN and qNaN), 32-byte aligned buffers for aligned and non-temporal moves, unaligned `+1`/`+3`/`+7` byte offsets for `vmovupd`/`vlddqu`/scalar/broadcast/half-XMM paths, GPR zero-extension checks (`vmovmskpd`, `vmovmskps`, `vextractps`), `vzeroupper`, a chained `op_pipeline` function, full/partial/zero/non-MSB-noise masks, and Windows `VirtualAlloc` + `PAGE_NOACCESS` guard-page fault-suppression checks for all 8 `vmaskmovps`/`vmaskmovpd` exports. [The Windows test](../tests/cpu/avx_move_regs_check.py) checks 2,418 differential cases (1,845 standard across 137 exports + 192 unaligned across 16 exports + 192 variable-blend across 4 exports + 176 `vmaskmov` across 8 exports + 13 negative-displacement across 1 export) and 16 guard-page fault-suppression cases with 32-byte pre/post guards against both the native MASM DLL and an independent Python reference model.
 
-An `ALTER_IMM` variant changes immediates or memory displacements on 10 exports (`op_blendpd_ymm`, `op_blendps_ymm`, `op_broadcastf128`, `op_insertps_s3d2_zmask`, `op_perm2f128_mix`, `op_permilpd_imm_ymm`, `op_permilps_imm_ymm`, `op_shufpd_ymm`, `op_shufps_ymm`, `op_maskmovps_load_ymm`), matching the altered reference while diverging from the original on 13, 13, 11, 10, 11, 11, 11, 11, 11 and 10 cases respectively. An output-mutation negative control flips one bit of `op_pipeline` and confirms the comparator fails. Unit and end-to-end controls cover 7 alternate-encoding lift checks (`0F 11` reg-reg `vmovsd`/`vmovss`, `W1` 64-bit `vmovmskpd`/`vmovmskps`/`vextractps`), 79 unit rejection controls (30 register-domain memory encodings across all 28 register-only forms, 13 carved-out move encodings, 13 out-of-scope ops, 23 EVEX/ABI/state/addressing/prefix violations) and 11 PE-patched DLL rejection controls. In `tools/form_coverage.py`, `avx_move_regs.asm` accounts for all 50 surviving AVX forms (plus `vmovdqu` and `vzeroupper` ABI glue, 52 AVX forms total), advancing x64 Zen 2 `AVX` group coverage alone from 7/256 to 57/256 (+50 net new forms; total x64 Zen 2 from 55/948 to 105/948). Together, `avx_int_regs.asm` and `avx_move_regs.asm` advance x64 Zen 2 `AVX` group coverage from 7/256 to 146/256 (+139 net new forms; total x64 Zen 2 from 55/948 to 194/948).
+An `ALTER_IMM` variant changes immediates or memory displacements on 10 exports (`op_blendpd_ymm`, `op_blendps_ymm`, `op_broadcastf128`, `op_insertps_s3d2_zmask`, `op_perm2f128_mix`, `op_permilpd_imm_ymm`, `op_permilps_imm_ymm`, `op_shufpd_ymm`, `op_shufps_ymm`, `op_maskmovps_load_ymm`), matching the altered reference while diverging from the original on 13, 13, 11, 10, 11, 11, 11, 11, 11 and 10 cases respectively. An output-mutation negative control flips one bit of `op_pipeline` and confirms the comparator fails. Unit and end-to-end controls cover 7 alternate-encoding lift checks (`0F 11` reg-reg `vmovsd`/`vmovss`, `W1` 64-bit `vmovmskpd`/`vmovmskps`/`vextractps`), 71 unit rejection controls (22 register-domain memory encodings across all 20 register-only forms, 13 carved-out move encodings, 13 out-of-scope ops, 23 EVEX/ABI/state/addressing/prefix violations) and 11 PE-patched DLL rejection controls. In `tools/form_coverage.py`, `avx_move_regs.asm` accounts for all 50 surviving AVX forms (plus `vmovdqu` and `vzeroupper` ABI glue, 52 AVX forms total), advancing x64 Zen 2 `AVX` group coverage alone from 7/256 to 57/256 (+50 net new forms; total x64 Zen 2 from 55/948 to 105/948). Together, `avx_int_regs.asm` and `avx_move_regs.asm` advance x64 Zen 2 `AVX` group coverage from 7/256 to 146/256 (+139 net new forms; total x64 Zen 2 from 55/948 to 194/948).
 
-Not covered by this experiment: the 5 move forms carved out to `cpu_vex_aot.py (PR #325)`, memory operands on the 28 register-only AVX forms, FP arithmetic/compare/convert/test instructions, control flow or calls mixed with AVX state, nonvolatile `XMM6`..`XMM15` save/restore prologues, and title CPU code execution.
+Not covered by this experiment: the 5 move forms carved out to `cpu_vex_aot.py (PR #325)`, memory operands on the 20 register-only AVX forms (the memory source of the eight logical ops is covered by `cpu_aot_avx_move_mem` below), FP arithmetic/compare/convert/test instructions, control flow or calls mixed with AVX state, nonvolatile `XMM6`..`XMM15` save/restore prologues, and title CPU code execution.
+
+`cpu_aot_avx_move_mem` ([source](../tests/cpu/avx_move_mem.asm), [check](../tests/cpu/avx_move_mem_check.py)) covers the memory-source forms of the eight logical ops, `(xmm, xmm, m128)` and `(ymm, ymm, m256)`, in 16 exports. The memory operand is `[rcx+disp]`, `[rdx+disp]` or `[r8+disp]` with displacements 0, 8, 16, 32, 40, 48 and 64, and the register source is loaded as a full 256-bit vector so its upper half is live. Half of the exports use the destination as the register source, the others a separate destination preloaded with nonzero upper bytes. The check builds 4,864 cases (all 256 pairs of 16 bit patterns, with quiet and signaling NaNs of both widths, negative zero, all-ones, all-zero and differing lanes in the upper 128 bits, then 48 random cases per export) and compares native, lifted and an independent model on the raw bytes, with the pointers shifted by 0, 1, 7 and 16 bytes and with guards around every buffer. An `ALTER_MUT` build takes the register source of the four `vandn*` exports from memory (the swapped operand order) and keeps the old upper half in `op_orpd_mem128` and `op_xorps_mem128`; the lifted altered build must match the altered model and diverge from the unaltered result on every one of those six exports. Wrong-behavior models (the other base register, a shifted displacement, every other operation, the swapped `vandn*` order, a kept upper half) must each contradict the native result. The translator controls lift 288 memory forms (8 ops, both widths, `rcx`/`rdx`/`r8`, displacements 0, 0x20, 0x7f, 0x80, 0x12340 and -0x20) and refuse EVEX with and without a mask, index and scale, RIP-relative, 32-bit address-size bases, `rsp`, `rax` and `r9` bases, a segment prefix, an undefined source, a nonvolatile destination, the memory form of five forms that stay register-only and the memory form of `vaddps`, in 19 unit controls and 4 controls patched into a built PE. The test checks the translator controls first and exits 77 on a host without AVX. It is outside the `pr` preset. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_avx_move_mem$' -V`. The same instruction sequences were assembled with LLVM 19 (`llvm-ml-19`, `lld-link-19`), translated with `translate()`, compiled with MinGW g++ at -O0 and -O2 and run under Wine on an AVX2 host with a throwaway loader; native, lifted and the model agreed on all 4,864 cases in both builds, and a lifted build with the `vandn*` operands swapped and one with the VEX.128 upper half kept from the register source were both rejected by the check. The MSVC and ML64 build and the Windows run of this test have not been run.
 
 ## AVX packed string compare leaf recompilation
 

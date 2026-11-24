@@ -137,6 +137,7 @@ ID3D12Resource* sampled_address_texture(Wrapper* resource)
             if (first_calls(failures, 8)) log("x2w-d3d12 failed to materialize tiled memory SRV: 0x%08lx", hr);
             return nullptr;
         }
+        x2w_startup::mark_packed_stand_in(sampled.desktop.Get(), desktop_format(sampled.desc.Format));
     }
     return sampled.desktop.Get();
 }

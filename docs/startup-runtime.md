@@ -38,6 +38,46 @@ requested view. This applies only to Texture2D views with no resource or counter
 `ctest --test-dir out/bin --no-tests=error -R "^startup_null_views_" -V` against your build
 directory to exercise both slots on hardware and WARP.
 
+## 16-bit packed targets
+
+A description that asks for a B5G5R5A1_UNORM or B4G4R4A4_UNORM render target is created as
+R8G8B8A8_UNORM when the adapter lacks that use for the packed format and has it for
+R8G8B8A8_UNORM (`src/startup_stubs/packed_target_format.h`). Without this the description is
+refused, its allocation-info answer is all ones and the executable gets no texture. The first
+four stand-ins are logged.
+
+The rule covers the roles that were measured and nothing else: a single-sample 2D texture with
+one array slice that is a render target, alone or with unordered access. Other dimensions,
+arrays, multisampled textures and textures without the render-target flag keep their format.
+
+A stand-in texture carries the format it was asked for as private data. A view that names that
+format on that texture is created as R8G8B8A8_UNORM, both when the executable creates the view
+and when the draw path builds its own view from the recorded description. A packed view of any
+other texture of a different format is refused and logged: of a plain R8G8B8A8_UNORM texture, of
+the stand-in for the other packed format, or of a texture in the other packed format.
+
+Limits:
+
+- Quantization. The stand-in keeps 8 bits a channel where the packed formats keep 5, 4 or 1.
+  Rendered values are not rounded to the packed precision, so a read of the target can differ
+  from the console's in the low bits: a channel cleared to 0.45 reads 115 from the stand-in and
+  119 from B4G4R4A4.
+- CPU-authored texels. Data the executable writes or reads itself in the 16-bit layout (uploads,
+  copies to or from buffers, mapped reads) is not converted. Only textures that are rendered to
+  and then sampled are covered.
+- Unordered-access writes to a stand-in are not exercised by a fixture.
+
+Checks:
+
+- `ctest --preset release --no-tests=error -R '^startup_packed_target$' -V`: the selection rule
+  against adapters described by their support bits, and the view verdicts, without a device.
+- `ctest --preset release --no-tests=error -R '^startup_packed_target_draw_' -V`: through the
+  wrapper, a texture of each packed format is created (slot 133), cleared through a render-target
+  view, sampled in a draw and read back. The expected pixel follows the format this adapter
+  gets, so the check holds with and without the stand-in. B5G6R5_UNORM and R8G8B8A8_UNORM are
+  drawn as controls and never substituted; a packed view of a plain R8G8B8A8_UNORM texture and a
+  B5G5R5A1 view of a B4G4R4A4 target must be refused.
+
 ## Null bindings in translated draws
 
 The `x2w-render totals` line reports `null bindings N`, then the same count split by cause as
@@ -142,6 +182,7 @@ ctest --preset release --no-tests=error -R '^startup_launch$' -V
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
 | `X2W_XG_BC7_4K_S_LAYOUT=1` | enables the BC7 tiled layout, copy and draw upload when `X2W_D3D12_PERMISSIVE=1` |
 | `X2W_TRAP_CONTINUE=<exports>` | lets listed trap exports return 0 instead of ending the process |
+| `X2W_HOST_CPU=1` (`run.ps1 -HostCpu`) | the startup debugger rewrites main-image instructions the host processor lacks at their first fault: see [Host processors without the console's instructions](#host-processors-without-the-consoles-instructions) |
 
 The startup shader cache key includes the translator revision. After updating from
 an earlier translation revision, run the recording build once to emit
@@ -243,6 +284,13 @@ These are measured on one executable; treat them as hypotheses for others.
   still treated as Signals. The slot numbers are inferred from that layout; no title call to slot
   17 has been logged yet. Run
   `ctest --preset dev --no-tests=error -R "^startup_queue_wait_"`.
+- **Resubmitted lists.** In render mode a closed list can be submitted again until its own Reset.
+  Each title allocator stands for a pool of desktop allocators. The title's Reset resets the current
+  one only if no list holds a recording on it and every queue has passed its last submit; otherwise
+  the title continues on an idle allocator from the pool, or a new one. A recording therefore
+  survives its allocator's Reset, as on the console. If the fence that tracks a submit cannot be
+  created or signalled, that submit's allocator is never reset or reused again. Run
+  `ctest --preset dev --no-tests=error -R "^startup_list_resubmit_"`.
 - **Inline samplers.** Pixel shaders build sampler descriptors from constants (`s_movk_i32`,
   `s_bfm_b32`, 64-bit moves); the translator folds those into static samplers. A source-built
   pixel stage checks all four manifest words, rejects a mask width from a root constant, and
@@ -410,6 +458,48 @@ the stand-in path; the texture format used in the reported video remains to be c
 cmake --build --preset release --target startup_nv12_draw d3d12_xs_shim
 ctest --preset release --no-tests=error -R '^startup_nv12_draw_' -V
 ```
+
+## Host processors without the console's instructions
+
+A console executable is built for one processor. On a host that lacks CLWB, CLZERO, MONITORX,
+MWAITX or SSE4a, the first such instruction ends a startup run with an illegal-instruction
+exception. With `X2W_HOST_CPU=1` the startup debugger rewrites the faulting instruction in the
+running process and continues; the executable on disk is not changed, and each site costs one
+debugger round trip.
+
+| Instruction | Rewritten as |
+|---|---|
+| `CLWB m8` | `CLFLUSHOPT m8` (one ModRM bit); one `NOP` of the same length once a `CLFLUSHOPT` has faulted on this host |
+| `MONITORX`, `MWAITX` | a 3-byte `NOP`; `PAUSE` and `NOP` (the wait may end at any time) |
+| `CLZERO` | a jump to a stub that stores 64 zero bytes at `rax & ~63` |
+| `INSERTQ xmm, xmm, len, idx`, `EXTRQ xmm, len, idx` (xmm0-7) | a jump to a stub that does the field move in integer registers |
+| `MOVNTSS m32, xmm`, `MOVNTSD m64, xmm` | `MOVSS`, `MOVSD` stores (one opcode byte; the non-temporal hint is dropped) |
+| `RDPRU` | `RDTSC`; `NOP` (the time-stamp counter stands in for MPERF and APERF, so their ratio reads 1) |
+| `RDPID r64` | a jump to a stub that runs `RDTSCP` and moves its `ecx` to the register |
+| `SHA1RNDS4`, `SHA1NEXTE`, `SHA1MSG1`, `SHA1MSG2`, `SHA256RNDS2`, `SHA256MSG1`, `SHA256MSG2` | not rewritten: performed by the debugger on the stopped thread at every hit, counted as `sha (per hit)` |
+
+The stubs keep the other registers and the flags. Instructions that the 5-byte jump overwrites
+are re-encoded behind the stub with iced-x86. `events.txt` names the first 40 rewritten sites and
+the summary counts them by instruction. `tools/startup/host_cpu.py` lists the forms that are
+refused (register-count `INSERTQ`/`EXTRQ`, xmm8-15, fields past bit 63).
+
+`python -B tests/startup_host_cpu_check.py` assembles source-built functions, patches them the same
+way and calls them on the host: 288 `INSERTQ`/`EXTRQ` results against a model, `CLZERO` with a
+moved `lea` and a moved rip-relative load, and decoded `CLWB` and wait rewrites, including the
+`NOP` form for every addressing mode. The fall-back from `CLFLUSHOPT` to `NOP` in the debugger is
+not exercised here: it needs a host without `CLFLUSHOPT`. Stubs that zero 56
+or 72 bytes, and a stub for another bit offset, fail it. On a processor that has SSE4a or CLZERO
+the unpatched functions are compared as well. It exits 77 on a host that is not x86-64.
+
+The SHA instructions cost a debugger round trip each, which is acceptable for an occasional
+digest and too slow for bulk hashing. `python -B tests/startup_host_cpu_check.py` computes SHA-1
+and SHA-256 of four messages through the seven operations and compares them with `hashlib`, and
+`ctest --preset release --no-tests=error -R '^startup_host_cpu_debug$' -V` runs the debugger on a
+source-built probe that executes SHA-256 and `RDPID` instructions.
+
+Measured so far on one host without these instructions; the rewrites of `EXTRQ` have only run in
+the check. A thread that is executing inside the bytes of a jump site while another thread faults
+on it is not handled.
 
 ## Startup memory accounting
 
