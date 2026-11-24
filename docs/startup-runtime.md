@@ -38,6 +38,17 @@ requested view. This applies only to Texture2D views with no resource or counter
 `ctest --test-dir out/bin --no-tests=error -R "^startup_null_views_" -V` against your build
 directory to exercise both slots on hardware and WARP.
 
+## Typeless presented surfaces
+
+The window presenter reads the presented surface through a shader resource view, which needs a
+typed format. A surface created as R8G8B8A8, B8G8R8A8, B8G8R8X8 or R10G10B10A2 `_TYPELESS` is viewed
+as the UNORM member of its family (`src/startup_stubs/present_view_format.h`); no sRGB conversion
+is added. Any other typeless format (16 or 32 bits a channel, depth/stencil planes, block-compressed)
+is ambiguous: the surface is not shown and the first four are logged. Typed formats pass unchanged.
+Build `startup_present_view_check` and run
+`ctest --preset dev --no-tests=error -R '^startup_present_view' -V`; the identity and sRGB runs are
+negative controls and must fail.
+
 ## 16-bit packed targets
 
 A description that asks for a B5G5R5A1_UNORM or B4G4R4A4_UNORM render target is created as

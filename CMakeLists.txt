@@ -634,6 +634,21 @@ add_executable(startup_memory_srv_report_check tests/startup_memory_srv_report_c
 target_include_directories(startup_memory_srv_report_check PRIVATE src)
 target_compile_features(startup_memory_srv_report_check PRIVATE cxx_std_17)
 add_test(NAME startup_memory_srv_report COMMAND startup_memory_srv_report_check)
+
+# View format of the window presenter's read of typeless textures (src/startup_stubs/present_view_format.h);
+# the identity run is the old behaviour and the sRGB run is a wrong view; both are negative controls.
+add_executable(startup_present_view_check tests/startup_present_view_check.cpp)
+target_include_directories(startup_present_view_check PRIVATE src)
+target_compile_features(startup_present_view_check PRIVATE cxx_std_17)
+target_link_libraries(startup_present_view_check PRIVATE d3d12 dxgi d3dcompiler)
+add_test(NAME startup_present_view COMMAND startup_present_view_check)
+add_test(NAME startup_present_view_identity_control COMMAND startup_present_view_check --mutate identity)
+foreach(adapter IN ITEMS warp hardware)
+    add_test(NAME startup_present_view_${adapter} COMMAND startup_present_view_check ${adapter})
+endforeach()
+add_test(NAME startup_present_view_srgb_control COMMAND startup_present_view_check warp --mutate srgb)
+set_tests_properties(startup_present_view_identity_control startup_present_view_srgb_control PROPERTIES WILL_FAIL TRUE)
+set_tests_properties(startup_present_view_hardware PROPERTIES SKIP_RETURN_CODE 77)
 # Console allocation sizes for depth-with-stencil and multisampled textures
 # (src/startup_stubs/console_plane_size.h); the mutated run is the negative control.
 add_executable(startup_plane_size_check tests/startup_plane_size_check.cpp)
