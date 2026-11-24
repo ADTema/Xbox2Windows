@@ -19,10 +19,31 @@ if(DSTORAGE_SDK_ROOT)
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${dstorage_native}/bin/x64/dstorage.dll"
             "${dstorage_native}/bin/x64/dstoragecore.dll" "$<TARGET_FILE_DIR:dstorage_rfc1950_check>"
         VERBATIM)
-    foreach(scenario IN ITEMS success truncated checksum trailing oversize undersize)
+    foreach(scenario IN ITEMS success truncated checksum trailing oversize undersize refusals)
         add_test(NAME dstorage_rfc1950_${scenario} COMMAND dstorage_rfc1950_check ${scenario})
         set_tests_properties(dstorage_rfc1950_${scenario} PROPERTIES TIMEOUT 30)
     endforeach()
+    # Negative control for the refusals case: a build-tree copy of the adapter without the 32-bit
+    # bound on SrcSize. The check must report that request as decoded instead of refused.
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS src/dstorage_rfc1950.cpp)
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/dstorage_rfc1950.cpp" dstorage_rfc1950_text)
+    string(REPLACE "request.SrcSize > ULONG_MAX || " "" dstorage_rfc1950_control_text "${dstorage_rfc1950_text}")
+    if(dstorage_rfc1950_control_text STREQUAL dstorage_rfc1950_text)
+        message(FATAL_ERROR "dstorage_rfc1950.cpp lost the anchor used by dstorage_rfc1950_refusals_truncation_control")
+    endif()
+    set(dstorage_rfc1950_control "${CMAKE_CURRENT_BINARY_DIR}/dstorage_rfc1950_control/dstorage_rfc1950.cpp")
+    file(WRITE "${dstorage_rfc1950_control}" "${dstorage_rfc1950_control_text}")
+    add_executable(dstorage_rfc1950_truncation_control tests/dstorage_rfc1950_check.cpp "${dstorage_rfc1950_control}")
+    target_compile_features(dstorage_rfc1950_truncation_control PRIVATE cxx_std_17)
+    target_include_directories(dstorage_rfc1950_truncation_control PRIVATE src "${dstorage_native}/include")
+    target_link_libraries(dstorage_rfc1950_truncation_control PRIVATE "${dstorage_native}/lib/x64/dstorage.lib" ZLIB::ZLIB)
+    add_custom_command(TARGET dstorage_rfc1950_truncation_control POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${dstorage_native}/bin/x64/dstorage.dll"
+            "${dstorage_native}/bin/x64/dstoragecore.dll" "$<TARGET_FILE_DIR:dstorage_rfc1950_truncation_control>"
+        VERBATIM)
+    add_test(NAME dstorage_rfc1950_refusals_truncation_control COMMAND dstorage_rfc1950_truncation_control refusals)
+    set_tests_properties(dstorage_rfc1950_refusals_truncation_control PROPERTIES TIMEOUT 30
+        PASS_REGULAR_EXPRESSION "FAIL: refusals src_over_ulong_max: status 0x8007000d")
 endif()
 add_executable(guest_content_root_check tests/guest_content_root_check.cpp)
 target_compile_features(guest_content_root_check PRIVATE cxx_std_17)
@@ -100,9 +121,27 @@ target_compile_definitions(era_physical_lenient PRIVATE ERA_PHYSICAL_LENIENT_REL
 add_executable(era_physical_check tests/era_physical_check.cpp src/era_physical.cpp $<TARGET_OBJECTS:era_physical_lenient>)
 target_include_directories(era_physical_check PRIVATE src)
 target_compile_features(era_physical_check PRIVATE cxx_std_17)
-foreach(scenario IN ITEMS controls lifetime)
+foreach(scenario IN ITEMS controls lifetime owns)
     add_test(NAME era_physical_${scenario} COMMAND era_physical_check ${scenario})
 endforeach()
+# Control for era_physical_owns: the same check built against a configure-time copy of
+# era_physical.cpp whose owns() refuses the last page number, which the full registry must catch.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS src/era_physical.cpp)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/era_physical.cpp" era_physical_text)
+string(FIND "${era_physical_text}" "return page && page <= capacity_pages && " era_physical_anchor)
+if(era_physical_anchor LESS 0)
+    message(FATAL_ERROR "era_physical.cpp lost the anchor used by era_physical_owns_last_page_control")
+endif()
+string(REPLACE "return page && page <= capacity_pages && " "return page && page < capacity_pages && "
+    era_physical_text "${era_physical_text}")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/era_physical_last_page/era_physical.cpp" "${era_physical_text}")
+add_executable(era_physical_last_page_check tests/era_physical_check.cpp
+    "${CMAKE_CURRENT_BINARY_DIR}/era_physical_last_page/era_physical.cpp" $<TARGET_OBJECTS:era_physical_lenient>)
+target_include_directories(era_physical_last_page_check PRIVATE src)
+target_compile_features(era_physical_last_page_check PRIVATE cxx_std_17)
+add_test(NAME era_physical_owns_last_page_control COMMAND era_physical_last_page_check owns)
+set_tests_properties(era_physical_owns_last_page_control PROPERTIES PASS_REGULAR_EXPRESSION
+    "FAIL: owns: last page")
 
 # Desktop xmem.dll for native and mapped callers.
 add_library(xmem_shim SHARED src/xmem_shim.cpp src/xmem_shim.def src/xmem_gpu_usage.cpp src/adapter_identity.cpp src/era_heap.cpp src/era_query.cpp src/era_physical.cpp
@@ -199,6 +238,42 @@ foreach(mutation_and_check
     TIMEOUT 30
     PASS_REGULAR_EXPRESSION "${expected_output}"
     FAIL_REGULAR_EXPRESSION "unknown mutation|xmem_commit_protection: PASS")
+endforeach()
+
+# Startup blocks below 2^40 (#1758, under #874): X2W_XMEM_STARTUP_BELOW_40=1 places the 0x283 large-page
+# startup blocks entirely below 2^40 or refuses them. The check loads xmem.dll by path; the deployed
+# shim must ignore the test-build mutants, and each mutant in the test-controls build must make the
+# named check fail.
+add_executable(xmem_startup_below_40_check tests/xmem_startup_below_40_check.cpp)
+target_link_libraries(xmem_startup_below_40_check PRIVATE OneCore)
+target_compile_features(xmem_startup_below_40_check PRIVATE cxx_std_17)
+add_dependencies(xmem_startup_below_40_check xmem_shim xmem_shim_test_controls)
+add_test(NAME xmem_startup_below_40 COMMAND xmem_startup_below_40_check "$<TARGET_FILE:xmem_shim>")
+add_test(NAME xmem_startup_below_40_deployed_ignores_mutants
+         COMMAND xmem_startup_below_40_check "$<TARGET_FILE:xmem_shim>")
+set_tests_properties(xmem_startup_below_40 xmem_startup_below_40_deployed_ignores_mutants PROPERTIES
+    TIMEOUT 60 PASS_REGULAR_EXPRESSION "xmem_startup_below_40: PASS")
+set_tests_properties(xmem_startup_below_40_deployed_ignores_mutants PROPERTIES
+    ENVIRONMENT "X2W_XMEM_TEST_BELOW_40=no_limit+no_check+no_release")
+# Each entry: mutant @ output that must appear @ output that must not. Without the limit the check
+# after the allocation still refuses and releases the high block (no NULL or leak failure); without
+# the check the high block is returned; without the release it stays allocated.
+foreach(entry
+        "no_limit@check_failed: exhausted_host_refusal@xmem_startup_below_40: PASS|check_failed: exhausted_(null|no_leak)"
+        "no_limit+no_check@check_failed: exhausted_null@xmem_startup_below_40: PASS"
+        "no_limit+no_release@check_failed: exhausted_no_leak@xmem_startup_below_40: PASS|check_failed: exhausted_null")
+  string(REPLACE "@" ";" fields "${entry}")
+  list(GET fields 0 mutant)
+  list(GET fields 1 expected_output)
+  list(GET fields 2 forbidden_output)
+  string(REPLACE "+" "_" mutant_name "${mutant}")
+  add_test(NAME xmem_startup_below_40_mutant_${mutant_name}
+           COMMAND xmem_startup_below_40_check "$<TARGET_FILE:xmem_shim_test_controls>")
+  set_tests_properties(xmem_startup_below_40_mutant_${mutant_name} PROPERTIES
+    TIMEOUT 60
+    ENVIRONMENT "X2W_XMEM_TEST_BELOW_40=${mutant}"
+    PASS_REGULAR_EXPRESSION "${expected_output}"
+    FAIL_REGULAR_EXPRESSION "${forbidden_output}")
 endforeach()
 
 add_executable(windows_placeholder_partition_check tests/windows_placeholder_partition_check.cpp)
@@ -373,6 +448,12 @@ add_executable(startup_gameinput_history tests/startup_gameinput_history.cpp)
 target_compile_features(startup_gameinput_history PRIVATE cxx_std_17)
 add_test(NAME startup_gameinput_history COMMAND startup_gameinput_history "$<TARGET_FILE:startup_stub_gameinput>")
 set_tests_properties(startup_gameinput_history PROPERTIES RUN_SERIAL TRUE)
+add_executable(startup_gameinput_script tests/startup_gameinput_script.cpp)
+target_compile_features(startup_gameinput_script PRIVATE cxx_std_17)
+foreach(mode IN ITEMS long entries)
+    add_test(NAME startup_gameinput_script_${mode} COMMAND startup_gameinput_script "$<TARGET_FILE:startup_stub_gameinput>" ${mode})
+    set_tests_properties(startup_gameinput_script_${mode} PROPERTIES RUN_SERIAL TRUE)
+endforeach()
 add_executable(startup_placement_alloc tests/startup_placement_alloc.cpp)
 target_compile_features(startup_placement_alloc PRIVATE cxx_std_17)
 target_include_directories(startup_placement_alloc PRIVATE src)
@@ -428,6 +509,20 @@ add_test(NAME startup_storage_failure_counts COMMAND startup_storage_failure_cou
 add_test(NAME startup_storage_failure_counts_one_bucket_control COMMAND startup_storage_failure_counts --mutate one-bucket)
 set_tests_properties(startup_storage_failure_counts startup_storage_failure_counts_one_bucket_control PROPERTIES TIMEOUT 60)
 set_tests_properties(startup_storage_failure_counts_one_bucket_control PROPERTIES WILL_FAIL TRUE)
+# Page-destination requests counted by where page_offset + destination_size ends against the first 64 KiB
+# page (inside, at its end, past it), each as completed or failed, for the heartbeat (#1198). The test
+# compiles the stand-in's source into itself and loads the xmem shim for page writes; the one-bucket
+# expectations are the negative control.
+add_executable(startup_storage_page_end_counts tests/startup_storage_page_end_counts.cpp)
+target_compile_features(startup_storage_page_end_counts PRIVATE cxx_std_17)
+target_include_directories(startup_storage_page_end_counts PRIVATE src)
+target_link_libraries(startup_storage_page_end_counts PRIVATE psapi)
+add_dependencies(startup_storage_page_end_counts xmem_shim)
+add_test(NAME startup_storage_page_end_counts COMMAND startup_storage_page_end_counts "$<TARGET_FILE:xmem_shim>")
+add_test(NAME startup_storage_page_end_counts_one_bucket_control
+         COMMAND startup_storage_page_end_counts "$<TARGET_FILE:xmem_shim>" --mutate one-bucket)
+set_tests_properties(startup_storage_page_end_counts startup_storage_page_end_counts_one_bucket_control PROPERTIES TIMEOUT 60)
+set_tests_properties(startup_storage_page_end_counts_one_bucket_control PROPERTIES WILL_FAIL TRUE)
 # A queue whose worker cannot start (both CreateThread attempts fail, or the construction of its work
 # throws std::bad_alloc) completes status entries and fences at Submit, never inside Enqueue (#1199).
 # The test compiles the stand-in's source into itself so it can redirect CreateThread and operator new.
@@ -1055,6 +1150,29 @@ target_sources(offscreen_check PRIVATE tests/bvh_reads_waves.cpp tests/bvh_hits.
 target_sources(offscreen_check PRIVATE tests/bvh_atomics.cpp tests/bvh_numeric.cpp)
 # A title graphics allocation opened as a D3D12 heap and addressed through translated GPU addresses.
 target_sources(offscreen_check PRIVATE tests/gpu_alias.cpp src/era_gpu_alias.cpp src/era_title_va.cpp src/era_heap.cpp)
+# The same open without a GPU: spans it must refuse before calling D3D12, and spans that must reach
+# the device, against a recording fake device. The control builds a generated copy of
+# era_gpu_alias.cpp that no longer compares the allocation base, which the interior pointer must catch.
+add_executable(era_gpu_alias_check tests/era_gpu_alias_check.cpp tests/era_gpu_alias_fake_device.cpp
+    src/era_gpu_alias.cpp)
+target_include_directories(era_gpu_alias_check PRIVATE src tests)
+target_compile_features(era_gpu_alias_check PRIVATE cxx_std_17)
+add_test(NAME era_gpu_alias_open COMMAND era_gpu_alias_check)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS src/era_gpu_alias.cpp)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/era_gpu_alias.cpp" gpu_alias_text)
+string(FIND "${gpu_alias_text}" "info.AllocationBase != base || " gpu_alias_anchor)
+if(gpu_alias_anchor LESS 0)
+    message(FATAL_ERROR "era_gpu_alias.cpp lost the anchor used by era_gpu_alias_open_base_control")
+endif()
+string(REPLACE "info.AllocationBase != base || " "" gpu_alias_text "${gpu_alias_text}")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/gpu_alias_base_control/era_gpu_alias.cpp" "${gpu_alias_text}")
+add_executable(era_gpu_alias_base_control_check tests/era_gpu_alias_check.cpp tests/era_gpu_alias_fake_device.cpp
+    "${CMAKE_CURRENT_BINARY_DIR}/gpu_alias_base_control/era_gpu_alias.cpp")
+target_include_directories(era_gpu_alias_base_control_check PRIVATE src tests)
+target_compile_features(era_gpu_alias_base_control_check PRIVATE cxx_std_17)
+add_test(NAME era_gpu_alias_open_base_control COMMAND era_gpu_alias_base_control_check)
+set_tests_properties(era_gpu_alias_open_base_control PROPERTIES PASS_REGULAR_EXPRESSION
+    "FAIL: interior pointer: passed to D3D12")
 # A title buffer window: two 64 KiB pages, a non-page-aligned offset, copies in both directions and
 # named rejects for an outside address, a misaligned page run and an uncommitted page.
 target_sources(offscreen_check PRIVATE tests/gpu_alias_window.cpp)
@@ -6144,6 +6262,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-dpp "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(compute_store_aot_dpp_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME compute_store_aot_readlane_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-readlane "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(compute_store_aot_readlane_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
         add_test(NAME compute_store_aot_guard_read_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-guard-read "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -6161,6 +6283,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-mbcnt "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(compute_store_aot_mbcnt_${adapter} PROPERTIES TIMEOUT 45)
+        add_test(NAME compute_store_aot_bcnt_exec_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-bcnt-exec "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(compute_store_aot_bcnt_exec_${adapter} PROPERTIES TIMEOUT 45)
         add_test(NAME compute_store_aot_mubuf_reduction_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-mubuf-reduction "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})

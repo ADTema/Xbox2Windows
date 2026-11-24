@@ -122,7 +122,10 @@ def check_example():
     for spelling in ("3", "3h", "03h"):
         assert fc.masm_mnemonics(f"    int {spelling}\n    ud2\n") == {"int3", "ud2"}, spelling
     assert fc.masm_mnemonics("    int 29h\n") == {"int"}
+    # ML64 assembles FSETPM as DB E4 with no WAIT, the reference's fnsetpm; FCLEX keeps its 9B WAIT.
+    assert fc.masm_mnemonics("    fsetpm\n    FSETPM\n    fclex\n") == {"fnsetpm", "fclex"}
     reference = fc.load_reference("x64_zen2.tsv")
+    assert fc.x64_forms({"fnsetpm"}, reference) == {("x87", "fnsetpm")}
     assert fc.x64_forms(branch, reference) == {("Integer", m) for m in branch}
 
     with tempfile.TemporaryDirectory() as tmp:
