@@ -318,6 +318,12 @@ KNOWN_RDNA2_BASE_OPCODES = {
 }
 
 
+# Scalar-memory store, cache-control, timer and probe forms the disassembler decodes: recognition only, no lowering.
+KNOWN_RDNA2_BASE_OPCODES |= {
+    "s_buffer_store_dword", "s_buffer_store_dwordx2", "s_buffer_store_dwordx4", "s_gl1_inv", "s_dcache_inv",
+    "s_dcache_wb", "s_memtime", "s_memrealtime", "s_atc_probe", "s_atc_probe_buffer",
+}
+
 KNOWN_RDNA2_BASE_OPCODES |= (
     SUPPORTED_ALU
     | {f"v_{name}" for name in PIXEL_INTEGER}
