@@ -36,9 +36,12 @@ The presenter only samples non-empty single-sample 2D surfaces without
 closing its command list fails.
 When a present cannot show its surface, the GDI fallback selects a visible,
 unowned guest window in the same process. If only the presenter is visible,
-the fallback leaves it alone. To exercise both z-orders with source-built
+the fallback leaves it alone. With two visible guests it draws into the upper
+one in z-order. To exercise both z-orders with source-built
 windows, build `startup_overlay_window` and run
 `ctest --preset release --no-tests=error -R '^startup_overlay_window$' -V`.
+The same run raises each of two guests in turn and checks that the raised one is
+selected.
 
 ## Null Texture2D descriptors
 
