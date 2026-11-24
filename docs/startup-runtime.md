@@ -725,6 +725,15 @@ These are measured on one executable; treat them as hypotheses for others.
   others and `UNUSED_PRESERVE` keeping them. The selection helpers match `tools/pixel_aot.py`, which
   already lowers the same forms. Float SDWA forms and a `dst_unused:UNUSED_SEXT` destination still
   stop translation rather than translating to something inexact. [#1141](https://github.com/R0Y00/Xbox2Windows/issues/1141)
+  The VOPC SDWA compares (`v_cmp_*_sdwa`, `v_cmpx_*_sdwa`) of the existing 32-bit compare table lower
+  too: i32 and u32 sources take their `src0_sel`/`src1_sel` field, sign-extended under `sext()`, and
+  the compare reads the extended value as its type. f32 SDWA compares stay refused (#1920). The
+  result goes to `vcc_lo`, the printed SGPR, or EXEC for `v_cmpx`, as in the non-SDWA forms. Class
+  compares, f32 compares and any other SDWA modifier are refused. Run
+  `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_vopc_sdwa"`: the controls evaluate every
+  integer form against an integer reference, and the draws on WARP and hardware check 16 x 16 pixels
+  that a `v_cmpx_le_i32_sdwa` on a sign-extended byte keeps or discards, with translations that drop
+  the select or `sext()` as failing controls. [#1906](https://github.com/R0Y00/Xbox2Windows/issues/1906)
 - **Soft asserts.** Retail code keeps `int3` instructions followed by a continuation. Without a
   debugger the title's handler steps over them; under the startup debugger use
   `-ContinueAsserts N`. One of them fires about ten times a second in the texture-streaming path

@@ -525,7 +525,8 @@ class Stage:
         if handler:
             return handler(ops, mods)
         if base.startswith('v_cmp'):
-            return self.compare(base, ops)
+            # Before the VOP1/VOP2 SDWA route below: VOPC SDWA names also end in _sdwa.
+            return self.compare(base, ops, mods)
         if base.endswith('_sdwa'):
             return self.sdwa(base[:-len('_sdwa')], ops, mods)
         if base in VEC_F:
@@ -1296,27 +1297,64 @@ class Stage:
     def op_v_cvt_pkrtz_f16_f32(self, ops, mods):
         self.set_v(reg_range(ops[0])[1], 'f32tof16(%s) | (f32tof16(%s) << 16)' % (self.f(ops[1]), self.f(ops[2])))
 
-    def compare(self, base, ops):
+    # VOPC with sub-dword addressing (tools/disasm_rdna2.py _decode_vopc_sdwa prints it): each source
+    # reads its src0_sel/src1_sel field, zero-extended or, under sext(), sign-extended, and the
+    # compare then reads that 32-bit value as its type. Integer compares only (see compare()).
+    def compare_sdwa_sources(self, base, typ, ops, mods):
+        fields = {}
+        for m in mods:
+            key, _, value = m.partition(':')
+            if key not in ('src0_sel', 'src1_sel') or value not in SDWA_SEL or key in fields:
+                raise Unsupported('%s with SDWA modifier %s' % (base, m))
+            fields[key] = value
+        sources = []
+        for index, token in enumerate(ops):
+            selection = fields.get('src%d_sel' % index)
+            if not selection:
+                raise Unsupported('%s SDWA without src%d_sel' % (base, index))
+            sext = token.startswith('sext(') and token.endswith(')')
+            if sext:
+                token = token[len('sext('):-1]
+            word = sdwa_source(self.u(token), selection, sext)
+            sources.append('int(%s)' % word if typ == 'i32' else word)
+        return sources
+
+    def compare(self, base, ops, mods=()):
         m = re.fullmatch(r'v_cmp(x?)_(\w+?)_(f32|u32|i32)(_sdwa)?', base)
-        if not m or m.group(4):
+        if not m:
             raise Unsupported(base)
-        writes_exec, cond, typ = m.group(1) == 'x', m.group(2), m.group(3)
+        writes_exec, cond, typ, sdwa = m.group(1) == 'x', m.group(2), m.group(3), bool(m.group(4))
+        table = {'lt': '{0} < {1}', 'eq': '{0} == {1}', 'le': '{0} <= {1}', 'gt': '{0} > {1}', 'lg': '{0} != {1}', 'ne': '{0} != {1}',
+                 'ge': '{0} >= {1}', 'neq': '!({0} == {1})', 'nlt': '!({0} < {1})', 'nle': '!({0} <= {1})', 'ngt': '!({0} > {1})',
+                 'nge': '!({0} >= {1})', 'nlg': '!({0} != {1})', 'o': '({0} == {0} && {1} == {1})', 'u': '({0} != {0} || {1} != {1})',
+                 't': 'true', 'f': 'false'}
+        # Conditions outside the table, v_cmp_class_* among them, stay refused in both forms.
+        if cond not in table:
+            raise Unsupported(base)
+        if sdwa and typ == 'f32':
+            # The f32 predicates are shared with the non-SDWA forms, whose lg/nlg do not yet follow the
+            # ordered RDNA 2 definition for NaN (#1920). SDWA keeps them refused until that is verified.
+            raise Unsupported('%s: f32 SDWA compares are not lowered' % base)
+        if sdwa:
+            # v_cmpx_*_sdwa prints its two sources and writes EXEC (gfx10 forbids sdst_en there);
+            # v_cmp_*_sdwa first prints vcc_lo or the SGPR it writes.
+            if len(ops) != (2 if writes_exec else 3):
+                raise Unsupported('%s with %d operands' % (base, len(ops)))
+            if not writes_exec and ops[0] not in ('vcc', 'vcc_lo', 'exec', 'exec_lo') and not (
+                    reg_range(ops[0]) and reg_range(ops[0])[0] == 's'):
+                raise Unsupported('%s into %s' % (base, ops[0]))
         if len(ops) == 3:
             dst, a, b = ops
         else:
             dst, (a, b) = ('exec' if writes_exec else 'vcc'), ops
-        if typ == 'f32':
+        if sdwa:
+            x, y = self.compare_sdwa_sources(base, typ, [a, b], mods)
+        elif typ == 'f32':
             x, y = self.f(a), self.f(b)
         elif typ == 'i32':
             x, y = 'int(%s)' % self.u(a), 'int(%s)' % self.u(b)
         else:
             x, y = self.u(a), self.u(b)
-        table = {'lt': '{0} < {1}', 'eq': '{0} == {1}', 'le': '{0} <= {1}', 'gt': '{0} > {1}', 'lg': '{0} != {1}', 'ne': '{0} != {1}',
-                 'ge': '{0} >= {1}', 'neq': '!({0} == {1})', 'nlt': '!({0} < {1})', 'nle': '!({0} <= {1})', 'ngt': '!({0} > {1})',
-                 'nge': '!({0} >= {1})', 'nlg': '!({0} != {1})', 'o': '({0} == {0} && {1} == {1})', 'u': '({0} != {0} || {1} != {1})',
-                 't': 'true', 'f': 'false'}
-        if cond not in table:
-            raise Unsupported(base)
         expr = '((%s) ? 1u : 0u)' % table[cond].format(x, y)
         if not self.exec_known:
             expr = '(exec & %s)' % expr
