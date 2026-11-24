@@ -194,6 +194,10 @@ std::uint32_t sample_keys(KeyState* out, std::size_t capacity)
         KeyState ks{};
         // _EX keeps the 0xE0/0xE1 prefix, so Left Arrow (0xE04B) differs from keypad 4 (0x4B).
         ks.scanCode = static_cast<std::uint32_t>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX));
+        // The navigation cluster shares scan codes with keypad keys and is reported unprefixed by some Windows builds.
+        const bool extended_key = (vk >= VK_PRIOR && vk <= VK_DOWN) || vk == VK_INSERT || vk == VK_DELETE ||
+                                  vk == VK_DIVIDE || vk == VK_LWIN || vk == VK_RWIN || vk == VK_APPS;
+        if (extended_key && ks.scanCode != 0 && (ks.scanCode & 0xFF00u) == 0) ks.scanCode |= 0xE000u;
         const UINT ch = MapVirtualKeyW(vk, MAPVK_VK_TO_CHAR);
         if ((ch & 0x80000000u) == 0 && (ch & 0xFFFFu) != 0) ks.codePoint = ch & 0xFFFFu;
         ks.virtualKey = vkey;
