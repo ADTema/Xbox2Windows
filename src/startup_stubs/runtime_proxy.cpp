@@ -33,6 +33,8 @@ struct Proxy {
     void** vtable;
     void* real;
     int provider;
+    const GUID* local_iid = nullptr;
+    LONG rejected_iid = 0;
 };
 GUID provider_ids[max_providers];
 Proxy* proxies[max_providers];
@@ -68,6 +70,52 @@ int user_provider = -1, save_provider = -1;
 // provider cef4fac0), not as the main user object, whose slot 3 duplicates a handle.
 int gamertag_provider = -1;
 constexpr unsigned long gamertag_iid_data1 = 0xcef4fac0;
+
+struct ApiPair { GUID provider, iid; };
+constexpr ApiPair local_pairs[] = {
+    {{0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0}},
+     {0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0}}},
+    {{0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0}},
+     {0xcef4fac0, 0x7676, 0x4a94, {0xa1, 0x19, 0x4c, 0x43, 0xf9, 0xeb, 0x5b, 0x74}}},
+    {store_provider_id,
+     {0x2d42fea5, 0xe71d, 0x4b76, {0x97, 0xcd, 0xc5, 0x0a, 0xfb, 0xb3, 0xae, 0x5d}}},
+    {store_provider_id,
+     {0xb09d803c, 0x2414, 0x4a05, {0x82, 0xc6, 0x66, 0xdf, 0xdc, 0x9e, 0x9a, 0x44}}},
+    {{0x37e56907, 0x2f10, 0x41e8, {0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a}},
+     {0xbf2346b2, 0x39af, 0x4658, {0xb5, 0xea, 0x44, 0x71, 0x3c, 0x7e, 0x83, 0xb3}}},
+    {{0x704c3f58, 0xe629, 0x4cc2, {0xb1, 0x97, 0x30, 0x51, 0x1b, 0x99, 0x6f, 0xe2}},
+     {0x1bfff3af, 0xf14a, 0x40a3, {0x8e, 0x35, 0x9a, 0xda, 0x90, 0x65, 0x93, 0xf9}}},
+    {{0x973a344e, 0x24bf, 0x4d0f, {0x84, 0x57, 0x56, 0xc5, 0x34, 0x89, 0x2b, 0x29}},
+     {0x2549f142, 0x6419, 0x4a06, {0x97, 0xb5, 0x93, 0x1a, 0xab, 0x7c, 0x2f, 0x34}}},
+    {{0xaf406016, 0xe850, 0x4aa8, {0xa8, 0x8d, 0x2f, 0x3d, 0xcb, 0x9d, 0xac, 0x7e}},
+     {0x0b9d556e, 0xab70, 0x43f4, {0xba, 0xa0, 0x99, 0x99, 0xac, 0x4c, 0xb0, 0x40}}},
+};
+// Storage has its own object and remains available under the fake-user gate alone.
+constexpr ApiPair storage_pair{
+    {0xf4faf4d4, 0x2d04, 0x4fce, {0xb3, 0xe0, 0x47, 0x4a, 0x71, 0x3a, 0x3e, 0x84}},
+    {0x41a4e10c, 0x5a7e, 0x41d9, {0x8c, 0x37, 0x37, 0xbd, 0xe6, 0x2a, 0x07, 0xd6}}
+};
+constexpr GUID iunknown_iid{0x00000000, 0x0000, 0x0000, {0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};  // IID_IUnknown
+
+bool matches_pair(const ApiPair& pair, const GUID* provider, const GUID* iid)
+{
+    return provider && iid && IsEqualGUID(pair.provider, *provider) && IsEqualGUID(pair.iid, *iid);
+}
+
+HRESULT local_query_interface(void* self, unsigned long provider, const GUID* implemented,
+                              const GUID* iid, void** out, LONG& rejected)
+{
+    if (!out || !x2w_local::writable(out, sizeof(*out))) return E_POINTER;
+    if (iid && x2w_local::readable(iid, sizeof(*iid)) &&
+        (IsEqualGUID(*iid, iunknown_iid) || (implemented && IsEqualGUID(*iid, *implemented)))) {
+        *out = self;
+        return S_OK;
+    }
+    *out = nullptr;
+    if (InterlockedCompareExchange(&rejected, 1, 0) == 0)
+        x2w_local::logf("x2w-runtime local: %08lx::QueryInterface refused IID, E_NOINTERFACE", provider);
+    return E_NOINTERFACE;
+}
 // Async blocks completed on behalf of a local answer (see complete_async): calls that mention them
 // are always logged, and the borrowed operation's own failure code is not passed on for them.
 u64 tracked_blocks[64];
@@ -183,14 +231,10 @@ __declspec(noinline) u64 forward(Proxy* self, u64 a, u64 b, u64 c, u64 s0, u64 s
     if (!handled && !self->real) {
         // A local object (X2W_RUNTIME_LOCAL) has no runtime object behind it.
         handled = true;
-        if (N == 0) {  // QueryInterface(iid, &object): the same local object
-            if (b && x2w_local::writable(reinterpret_cast<void*>(b), 8)) {
-                *reinterpret_cast<u64*>(b) = reinterpret_cast<u64>(self);
-                result = 0;
-            } else {
-                result = 0x80004003;  // E_POINTER
-            }
-        } else if (N == 1 || N == 2) {  // AddRef, Release
+        if (N == 0) {  // QueryInterface(iid, &object)
+            result = static_cast<unsigned>(local_query_interface(self, provider_ids[self->provider].Data1,
+                self->local_iid, reinterpret_cast<const GUID*>(a), reinterpret_cast<void**>(b), self->rejected_iid));
+        } else if (N == 1 || N == 2) {  // AddRef, Release keep local objects for the process lifetime.
             result = 1;
         } else {
             result = 0x80004001;  // E_NOTIMPL
@@ -240,28 +284,29 @@ void fill_slots(std::index_sequence<I...>)
 HRESULT __stdcall proxy_query(const GUID* provider, const GUID* iid, void** out)
 {
     const HRESULT hr = real_query(provider, iid, out);
-    if (FAILED(hr) && out && provider && provider->Data1 == 0xf4faf4d4 && fake_user()) {
+    if (FAILED(hr) && out) *out = nullptr;
+    if (FAILED(hr) && out && fake_user() && matches_pair(storage_pair, provider, iid)) {
         // Persistent local storage: the system runtime has none for an unpackaged process.
         static LONG logged;
         if (x2w_local::first_calls(logged, 2)) x2w_local::logf("x2w-runtime persistent local storage: local object instead of 0x%08lx", static_cast<unsigned long>(hr));
         *out = storage_object();
         return S_OK;
     }
-    bool local = false;
-    if (FAILED(hr) && out && provider && fake_user() && InterlockedCompareExchange(&local_active, 0, 0)) {
-        // The providers the fake layer answers: user (its gamertag interface included), game save, package,
-        // title, connectivity and store.
-        static constexpr unsigned long answered[] = {user_provider_data1, save_provider_data1, 0xaf406016, 0x973a344e,
-                                                     0x37e56907, 0x0dd112ac};
-        for (unsigned long id : answered) local = local || provider->Data1 == id;
+    const ApiPair* local = nullptr;
+    if (FAILED(hr) && out && fake_user() && InterlockedCompareExchange(&local_active, 0, 0)) {
+        for (const auto& pair : local_pairs) {
+            if (matches_pair(pair, provider, iid)) {
+                local = &pair;
+                break;
+            }
+        }
         if (local) {
             static LONG logged;
             if (x2w_local::first_calls(logged, 24))
                 x2w_local::logf("x2w-runtime local: provider %08lx real 0x%08lx -> local object", provider->Data1, static_cast<unsigned long>(hr));
-            *out = nullptr;
         }
     }
-    if ((FAILED(hr) && !local) || !out || (!*out && !local) || !provider) return hr;
+    if (!out || !provider || (!local && (FAILED(hr) || !*out))) return hr;
     GUID key = *provider;
     const bool gamertag = provider->Data1 == user_provider_data1 && iid && iid->Data1 == gamertag_iid_data1;
     if (gamertag) key.Data1 = gamertag_iid_data1;
@@ -280,7 +325,15 @@ HRESULT __stdcall proxy_query(const GUID* provider, const GUID* iid, void** out)
     }
     Proxy* proxy = nullptr;
     if (index >= 0) {
-        if (!proxies[index] || proxies[index]->real != *out) proxies[index] = new Proxy{slot_table, *out, index};
+        if (local) {
+            // Each pair keeps its own interface identity even when two IIDs share a provider index.
+            static Proxy* local_proxies[sizeof(local_pairs) / sizeof(*local_pairs)];
+            auto& entry = local_proxies[local - local_pairs];
+            if (!entry) entry = new Proxy{slot_table, nullptr, index, &local->iid};
+            proxies[index] = entry;
+        } else if (!proxies[index] || proxies[index]->real != *out) {
+            proxies[index] = new Proxy{slot_table, *out, index};
+        }
         proxy = proxies[index];
     }
     ReleaseSRWLockExclusive(&proxy_lock);
@@ -289,8 +342,8 @@ HRESULT __stdcall proxy_query(const GUID* provider, const GUID* iid, void** out)
     return hr;
 }
 
-// X2W_RUNTIME_LOCAL: the title's InitializeApiImpl* calls. The real export runs once; if it fails, the
-// initialisation is reported as done and later calls are answered without the real runtime.
+// X2W_RUNTIME_LOCAL: the first failed InitializeApiImpl* call is reported as S_OK. Once latched,
+// every later initialisation call returns S_OK without calling the real export.
 template <int K>
 u64 __stdcall proxy_init(u64 a, u64 b, u64 c, u64 d)
 {
@@ -1098,8 +1151,12 @@ const char* storage_path()
     }, nullptr, nullptr);
     return path;
 }
-HRESULT __stdcall storage_query(StorageObject* self, const GUID*, void** out) { if (out) *out = self; return S_OK; }
-u64 __stdcall storage_ref(StorageObject*) { return 1; }
+HRESULT __stdcall storage_query(StorageObject* self, const GUID* iid, void** out)
+{
+    static LONG rejected;
+    return local_query_interface(self, storage_pair.provider.Data1, &storage_pair.iid, iid, out, rejected);
+}
+u64 __stdcall storage_ref(StorageObject*) { return 1; }  // Process-lifetime object.
 HRESULT __stdcall storage_path_size(StorageObject*, std::size_t* out)
 {
     if (out) *out = std::strlen(storage_path()) + 1;
