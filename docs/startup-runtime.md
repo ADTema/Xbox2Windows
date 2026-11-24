@@ -212,6 +212,32 @@ on, for each flag alone, both and neither: a plain desktop list with the same ro
 produce one ID 1419 per flag first (otherwise the run skips with 77), and through the stand-in no such message may
 appear while the translated draw keeps its colour.
 
+## Render target binds and clears
+
+Command-list slot 50 (desktop `OMSetRenderTargets` plus four) takes the render target handles either as an array or,
+with `RTsSingleHandleToDescriptorRange` true, as the first handle only. In the single-range form the other handles follow
+the first at the title's own descriptor stride (`title_descriptor_stride`, the same stride the descriptor copies use), for
+a count of one as well as for several. The desktop call always receives the resolved array. Before this change a true
+single-range flag dropped the bind without a message, so every later draw on the list was skipped as not drawn.
+
+A bind is refused, as before, when a handle holds a view of the wrong kind, a depth view has one read-only plane, a depth
+handle resolves to nothing, or the count is above eight. What changed is that the refusals are visible: each handle
+that holds no view (render target or depth), and a count above eight, adds to `target binds N (unresolved M)` in
+the `x2w-render totals` line and logs one line (the first six of each kind), for example
+`OMSetRenderTargets refused: render target 1 (0x...) holds no view`. A depth pointer whose handle maps to no
+descriptor still binds no depth, now with a count and a log line.
+
+Slot 52 (`ClearRenderTargetView`) resolves its view the way the bind does: through the descriptor's shadow record,
+so a render target view the title copied with `CopyDescriptors` or `CopyDescriptorsSimple` clears the resource it
+now holds, with the creation-time table as the fallback for a handle with no record. A handle that resolves to nothing
+adds to the unresolved count and logs one line (`ClearRenderTargetView skipped: view 0x... is not a known render target
+view`); a depth view passed there is reported as not a render target view.
+
+`startup_rtv_bind_{warp,hardware}` records the bind forms (array, single range with one and two handles, an empty view
+inside the range, an empty view alone) and reads the counters through the `x2w_d3d12_render_target_stats` export,
+then copies a view into an empty slot, clears the copy red and reads the target back. It does not draw. The export reads
+the same counters the totals line prints.
+
 ## Composite provenance fixture
 
 Issue #1628 asks whether a uniform colour left in a composite's destination came from the composite or was
