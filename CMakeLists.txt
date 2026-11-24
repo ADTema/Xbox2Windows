@@ -1555,6 +1555,22 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_avx_int_regs_original>"
         "$<TARGET_FILE:cpu_avx_int_regs_original_lifted>"
         "$<TARGET_FILE:cpu_avx_int_regs_altered_lifted>")
+    set(cpu_avx_int_ymm_addsub_exports
+        "op_vpaddb_ymm,op_vpaddw_ymm,op_vpaddd_ymm,op_vpaddq_ymm,"
+        "op_vpsubb_ymm,op_vpsubw_ymm,op_vpsubd_ymm,op_vpsubq_ymm,"
+        "op_vpcmpeqb_ymm,op_vpcmpeqw_ymm,op_vpcmpeqd_ymm,op_vpcmpeqq_ymm,"
+        "op_vpcmpgtb_ymm,op_vpcmpgtw_ymm,op_vpcmpgtd_ymm,op_vpcmpgtq_ymm,"
+        "op_vpsubq_ymm_dst_src1,op_vpsubd_ymm_dst_src2,op_vpcmpgtq_ymm_dst_src2,op_vpaddw_ymm_all,"
+        "op_vpcmpeqd_ymm_all,op_vpcmpgtb_ymm_all,op_vpaddq_ymm_then_xmm_subb,op_vpcmpeqw_ymm_then_xmm_addb,"
+        "op_chain_ymm")
+    string(CONCAT cpu_avx_int_ymm_addsub_exports ${cpu_avx_int_ymm_addsub_exports})
+    cpu_asm_fixture(cpu_avx_int_ymm_addsub avx_int_ymm_addsub)
+    cpu_translation(cpu_avx_int_ymm_addsub cpu_avx_int_aot "${cpu_avx_int_ymm_addsub_exports}")
+    add_test(NAME cpu_aot_avx_int_ymm_addsub COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/avx_int_ymm_addsub_check.py"
+        "$<TARGET_FILE:cpu_avx_int_ymm_addsub>"
+        "$<TARGET_FILE:cpu_avx_int_ymm_addsub_lifted>")
+    set_tests_properties(cpu_aot_avx_int_ymm_addsub PROPERTIES SKIP_RETURN_CODE 77)
     set(cpu_avx_move_exports
         "op_andpd_xmm,op_andpd_ymm,op_andps_xmm,op_andps_ymm,op_andnpd_xmm,op_andnpd_ymm,"
         "op_andnps_xmm,op_andnps_ymm,op_orpd_xmm,op_orpd_ymm,op_orps_xmm,op_orps_ymm,"
