@@ -207,10 +207,15 @@ if PIXEL_INT_COMPARE:
     )
 else:
     INT64_COMPARE_PATTERN = None
-# Plain binary16 e32 forms whose result keeps only the low half (pixel_aot proves finite sources and results).
+# Plain binary16 e32 and e64 forms whose result keeps only the low half (pixel_aot proves finite sources and results).
+# The e32 src1 must be a VGPR; the e64 spelling takes any source that the e32 src0 accepts. Neither takes a modifier.
 if PIXEL_VOP2_F16:
+    _vop2_f16 = "|".join(map(re.escape, PIXEL_VOP2_F16))
     SUPPORTED_INSTRUCTIONS_REGEX.append(
-        rf"v_(?:{'|'.join(map(re.escape, PIXEL_VOP2_F16))})_f16_e32\s+{INT16_VGPR},\s+{F16_ARITH_SOURCE},\s+{INT16_VGPR}"
+        rf"v_(?:{_vop2_f16})_f16_e32\s+{INT16_VGPR},\s+{F16_ARITH_SOURCE},\s+{INT16_VGPR}"
+    )
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_(?:{_vop2_f16})_f16_e64\s+{INT16_VGPR},\s+{F16_ARITH_SOURCE},\s+{F16_ARITH_SOURCE}"
     )
 # The accumulating v_fmac_f16 and the scaling v_ldexp_f16 have the same e32 shape; pixel_aot additionally needs the accumulator
 # and the exponent to be statically proven.
@@ -219,8 +224,9 @@ if PIXEL_VOP2_F16_FUSED_SCALE:
         rf"v_(?:{'|'.join(map(re.escape, PIXEL_VOP2_F16_FUSED_SCALE))})_f16_e32\s+{INT16_VGPR},\s+{F16_ARITH_SOURCE},\s+{INT16_VGPR}"
     )
 if PIXEL_VOP1_F16_ROUND:
+    _vop1_f16_round = "|".join(map(re.escape, PIXEL_VOP1_F16_ROUND))
     SUPPORTED_INSTRUCTIONS_REGEX.append(
-        rf"v_(?:{'|'.join(map(re.escape, PIXEL_VOP1_F16_ROUND))})_f16_e32\s+{INT16_VGPR},\s+{F16_ARITH_SOURCE}"
+        rf"v_(?:{_vop1_f16_round})_f16_(?:e32|e64)\s+{INT16_VGPR},\s+{F16_ARITH_SOURCE}"
     )
 if pixel_aot is not None:
     SUPPORTED_INSTRUCTIONS_REGEX.append(
