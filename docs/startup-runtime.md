@@ -134,7 +134,10 @@ the five parts add up to N:
 The classification lives in `src/startup_stubs/null_binding_cause.h`. The source-built
 `startup_null_views_check` fixture checks every cause, that the parts sum to the total, and that
 valid bindings add nothing. It does not draw, so the counters in the totals line itself are checked
-by reading a render log.
+by reading a render log. The device prints the counts by cause value, so
+`ctest --preset dev --no-tests=error -R "^startup_null_cause_labels(_buffer_token_control)?$" -V`
+checks without a device that each cause lands in the slot printed under its label, and that the
+header's names follow the same order. The control swaps the buffer and token slots and must fail.
 
 ## What is measured
 

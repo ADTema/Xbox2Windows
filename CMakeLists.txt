@@ -318,6 +318,14 @@ foreach(adapter IN ITEMS hardware warp)
     add_test(NAME startup_null_views_${adapter} COMMAND startup_null_views_check ${adapter})
 endforeach()
 set_tests_properties(startup_null_views_hardware PROPERTIES SKIP_RETURN_CODE 77)
+# The slot and label of the x2w-render totals line each null-binding cause is counted under
+# (src/startup_stubs/null_binding_cause.h). The mutated run is the negative control.
+add_executable(startup_null_cause_labels_check tests/startup_null_cause_labels_check.cpp)
+target_include_directories(startup_null_cause_labels_check PRIVATE src)
+target_compile_features(startup_null_cause_labels_check PRIVATE cxx_std_17)
+add_test(NAME startup_null_cause_labels COMMAND startup_null_cause_labels_check)
+add_test(NAME startup_null_cause_labels_buffer_token_control COMMAND startup_null_cause_labels_check --mutate buffer-token)
+set_tests_properties(startup_null_cause_labels_buffer_token_control PROPERTIES WILL_FAIL TRUE)
 # The opt-in API trace reads only declared outputs; this checks the decision about what it observed
 # (argument index 0, two outputs, exact and short buffers, same value, partial comparison).
 add_executable(api_trace_check tests/api_trace_check.cpp)
