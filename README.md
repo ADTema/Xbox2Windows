@@ -29,6 +29,7 @@ Use `#dev-coordination` on Discord to find a reviewer and `#windows-testing` to 
 | **Windows runtime** | Bink frame-buffer allocations reach the Windows heap through the shared provider. The FidelityFX experiment follows scratch writes from two passes through the RCAS output on an 8×4 tile. [Allocation, failure and retry](docs/experiments.md#frame-buffers-through-the-shared-windows-heap) · [Upscaler pixel comparison](docs/experiments.md#last-writers-of-the-pass-26-scratch-reads) |
 
 The pixel translator also supports [vector bitfield extraction, bit scans, reversal and population counts](docs/experiments.md#vector-bit-operations-in-pixel-shaders), checked by twelve source-built instruction forms.
+The [pixel readback checks](docs/experiments.md#offline-pixel-shader-recompilation) also cover `v_sat_pk_u8_i16` in e32 and e64 on hardware and WARP.
 
 ### Instruction coverage
 
