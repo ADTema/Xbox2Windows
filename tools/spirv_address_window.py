@@ -171,6 +171,10 @@ def lower(assembly):
     wide_words = {}
     valid_of = {}
     label = None
+    origin = None
+    # A QWORD access splits its block, so a successor phi must name the block that now ends in the terminator.
+    final_label = {}
+    source_phis = []
     wide_accesses = 0
     physical_words = set()
     physical_qwords = set()
@@ -232,7 +236,7 @@ def lower(assembly):
             output.extend(new)
             continue
         if opened := re.fullmatch(rf"({ID}) = OpLabel", line):
-            label = opened[1]
+            label = origin = opened[1]
         ids = set(re.findall(ID, line))
         wide_used = ids & physical_qwords
         if wide_used:
@@ -248,6 +252,7 @@ def lower(assembly):
             pointer = fields[4] if wide_load else fields[1]
             stem = "%x2w_" + (f"load_{fields[0][1:]}" if wide_load else f"store_{wide_accesses}")
             new, label = wide_access(kind, stem, valid_of[pointer], label, wide_words[pointer], fields)
+            final_label[origin] = label
             output.extend(new)
             continue
         used = ids & physical_words
@@ -290,7 +295,13 @@ def lower(assembly):
             line = line.replace("PushConstant", "StorageBuffer")
         elif any(word in line for word in ("PhysicalStorageBuffer", "OpConvertUToPtr", "OpConvertPtrToU", "%_ptr_PSB_arr")):
             raise ValueError("unhandled physical pointer operation")
+        if " = OpPhi " in line:
+            source_phis.append(len(output))
         output.append(line)
+    for at in source_phis:
+        fields = output[at].split()
+        fields[5::2] = [final_label.get(parent, parent) for parent in fields[5::2]]
+        output[at] = " ".join(fields)
     return merge_pointer_types(output)
 
 

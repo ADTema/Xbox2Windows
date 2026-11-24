@@ -196,6 +196,16 @@ for mutation, (old, new) in {
     else:
         raise AssertionError(f"QWORD lowering mutation not caught: {mutation}")
 
+# A successor phi that names the block holding a QWORD access must follow the block's terminator into the merge block.
+phi_qword = qword.replace("OpReturn\nOpFunctionEnd", "OpBranch %exit\n%exit = OpLabel\n"
+                          "%copied = OpPhi %ulong %result %entry\nOpStore %target %copied Aligned 8\nOpReturn\nOpFunctionEnd")
+assert phi_qword != qword
+with tempfile.TemporaryDirectory() as folder:
+    validate_sampler(Path(folder), "phi_qword_original", phi_qword)
+    phi_lowered = window.lower(phi_qword)
+    assert "%copied = OpPhi %ulong %result %x2w_store_2_merge" in phi_lowered.splitlines()
+    validate_sampler(Path(folder), "phi_qword_lowered", phi_lowered)
+
 for source, reason in (
     (qword.replace("%value = OpLoad %ulong %source Aligned 8", "%value = OpAtomicIAdd %ulong %source %c1 %c0 %increment"),
      "physical word pointer"),
