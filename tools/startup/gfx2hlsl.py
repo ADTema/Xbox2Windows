@@ -477,7 +477,7 @@ class Stage:
     def one(self, name, asm):
         _, ops, mods = parse(asm)
         base = re.sub(r'_e(32|64)$', '', name)
-        if self.fetched:
+        if getattr(self, 'fetched', False):  # unit probes build a Stage without __init__
             # Behind a fetch call the definite-assignment guard relies on exec_known: every exec write must clear it.
             # s_wqm of exec into itself only adds lanes, so it stays a no-op; other s_wqm forms (a no-op here) and
             # exec writes outside the handlers that clear exec_known are refused. Other programs keep their handling.
