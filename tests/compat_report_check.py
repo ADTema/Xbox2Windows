@@ -10,7 +10,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "tools" / "compat_report.py"
 sys.path.insert(0, str(ROOT / "tools"))
-from compat_report import POLICY_VERSION, classify  # noqa: E402
+from import_routing import POLICY_VERSION, classify  # noqa: E402
 
 
 SECTION_RVA = 0x1000
@@ -20,6 +20,7 @@ IMAGE_BASE = 0x180000000
 
 POSITIVE_IMPORTS = [
     ("normal", "kernel32.dll", "ExitProcess"),
+    ("normal", "winhttp.dll", "WinHttpOpen"),
     ("normal", "xmem.dll", "XMemAlloc"),
     ("normal", "xmem.dll", 7),
     # Synthetic ordinal: no checked-in xmem export table is consulted.
@@ -162,16 +163,21 @@ def run_tool(image, out_dir, stem):
 
 
 def check_policy():
-    assert POLICY_VERSION == 1
+    assert POLICY_VERSION == 2
     assert classify("xmem.dll")[0] == "hle"
     assert classify("XMem.DLL")[0] == "hle"
     assert classify("d3d12_xs.dll")[0] == "hle"
     assert classify("xgameruntime.dll") == (
-        "stub", "GDK runtime module; no Xbox2Windows shim in this tree")
+        "stub", "GDK runtime module; no implemented Xbox2Windows provider in this tree")
     assert classify("xg_xs.dll") == (
         "stub", "GDK console GPU module; no Xbox2Windows shim in this tree")
     assert classify("xaudio2_8.dll") == ("windows", "Windows system DLL")
     assert classify("xaudio2_9.dll") == ("windows", "Windows system DLL")
+    for module in ("winhttp.dll", "mfplat.dll", "mfreadwrite.dll", "gameinput.dll", "GameInput.dll"):
+        assert classify(module) == ("windows", "Windows system DLL"), module
+    # Exact names only: a near miss or the GDK redistributable name keeps no route.
+    assert classify("winhttp2.dll") == ("unsupported", "no matching policy entry")
+    assert classify("gameinputredist.dll") == ("unsupported", "no matching policy entry")
     assert classify("kernel32.dll")[0] == "windows"
     assert classify("api-ms-win-core-file-l1-1-0.dll")[0] == "windows"
     assert classify("api-ms-win-fixture-l1-1-0.dll") == (
@@ -209,11 +215,11 @@ def check_positive():
         assert "prove a provider" in routing["scope"].lower()
         assert routing["summary"] == {
             "images": 1,
-            "imports": 7,
-            "normal": 5,
+            "imports": 8,
+            "normal": 6,
             "delay": 2,
             "by_ordinal": 3,
-            "routes": {"hle": 3, "windows": 2, "stub": 2, "unsupported": 0},
+            "routes": {"hle": 3, "windows": 3, "stub": 2, "unsupported": 0},
             "route_kind": "candidate",
             "resolution": "not_checked",
             "stub_rows": 2,
@@ -225,6 +231,7 @@ def check_positive():
         assert rows == [
             ("normal", "api-ms-win-fixture-l1-1-0.dll", "FabricatedApi", "windows"),
             ("normal", "kernel32.dll", "ExitProcess", "windows"),
+            ("normal", "winhttp.dll", "WinHttpOpen", "windows"),
             ("normal", "xmem.dll", "#7", "hle"),
             ("normal", "xmem.dll", "#65535", "hle"),
             ("normal", "xmem.dll", "XMemAlloc", "hle"),
