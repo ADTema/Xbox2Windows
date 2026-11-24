@@ -190,7 +190,8 @@ target_link_options(xgameruntime_preflight_exe PRIVATE /ENTRY:fixture_entry /NOD
 find_program(DXC_EXECUTABLE dxc REQUIRED)
 get_filename_component(DXC_BIN_DIR "${DXC_EXECUTABLE}" DIRECTORY)
 target_compile_definitions(root_probe PRIVATE SDK_DXC_DIR=L"${DXC_BIN_DIR}/")
-add_executable(offscreen_check tests/offscreen_check.cpp tests/compute_check.cpp tests/dxr_check.cpp tests/buffer_ops.cpp)
+add_executable(offscreen_check tests/offscreen_check.cpp tests/compute_check.cpp tests/dxr_check.cpp tests/buffer_ops.cpp
+    tests/descriptor_heap_paging.cpp)
 target_sources(offscreen_check PRIVATE tests/spirv_window/readback.cpp tests/spirv_window/sampler_readback.cpp
     tests/spirv_window/compaction_readback.cpp tests/spirv_window/compare_sampler.cpp
     tests/spirv_window/raw_uav_dump.cpp)
@@ -579,6 +580,15 @@ set_tests_properties(offscreen_invalid_operation_warp PROPERTIES TIMEOUT 45)
 
 add_test(NAME offscreen_capability_table_self_test COMMAND offscreen_check --self-test)
 set_tests_properties(offscreen_capability_table_self_test PROPERTIES TIMEOUT 45)
+foreach(adapter IN ITEMS hardware warp)
+    add_test(NAME descriptor_heap_paging_${adapter} COMMAND offscreen_check ${adapter} --descriptor-heap-paging)
+    add_test(NAME descriptor_heap_paging_swapped_${adapter}
+        COMMAND offscreen_check ${adapter} --descriptor-heap-paging-swapped)
+    set_tests_properties(descriptor_heap_paging_${adapter} descriptor_heap_paging_swapped_${adapter}
+        PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    set_tests_properties(descriptor_heap_paging_swapped_${adapter}
+        PROPERTIES FAIL_REGULAR_EXPRESSION "descriptor_paging swapped=0")
+endforeach()
 
 set(SIMPLE_TRIANGLE_DIR "${CMAKE_SOURCE_DIR}/out/reference/b1e77b6ac10f95b07296025fda171ca2ddc42dbe/Samples/IntroGraphics/SimpleTriangle"
     CACHE PATH "Microsoft SimpleTriangle sample directory")

@@ -29,6 +29,8 @@ __declspec(dllexport) const char* D3D12SDKPath = ".\\D3D12\\";
 using Microsoft::WRL::ComPtr;
 constexpr UINT side = 64;
 
+void check_descriptor_heap_paging(ID3D12Device* device, bool swapped);
+
 bool contains_ignoring_case(const wchar_t* text, const wchar_t* part)
 {
     const size_t length = std::wcslen(part);
@@ -892,6 +894,13 @@ OperationResult run_wave_shuffle(const OperationContext& ctx)
         "skip: wave shuffle fixture requires SM 6.6 and a supported forced wave width");
 }
 
+template<bool Swapped>
+OperationResult run_descriptor_heap_paging(const OperationContext& ctx)
+{
+    check_descriptor_heap_paging(ctx.device, Swapped);
+    return {OutcomeKind::pass, nullptr};
+}
+
 constexpr CapabilityGate kNoGate{};
 constexpr CapabilityGate kGateSm60BufferOps{
     D3D_SHADER_MODEL_6_0, false, false, 0,
@@ -1036,6 +1045,8 @@ const OperationSpec kOperations[] = {
     {"--gpu-alias-atomic-waterfall", 3, 3, nullptr, kGateSm60AtomicWaterfall, run_gpu_alias_atomic_waterfall},
     {"--gpu-alias-registry", 3, 3, nullptr, kNoGate, run_gpu_alias_registry},
     {"--buffer-ops", 3, 3, nullptr, kGateSm60BufferOps, run_buffer_ops},
+    {"--descriptor-heap-paging", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_heap_paging<false>},
+    {"--descriptor-heap-paging-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_heap_paging<true>},
     {"--wave-shuffle", 3, 3, nullptr, kGateWaveShuffle, run_wave_shuffle},
 };
 
