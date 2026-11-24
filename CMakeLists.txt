@@ -407,6 +407,11 @@ set_tests_properties(startup_storage_refusal_order PROPERTIES TIMEOUT 60)
 # A queue whose worker cannot start (both CreateThread attempts fail, or the construction of its work
 # throws std::bad_alloc) completes status entries and fences at Submit, never inside Enqueue (#1199).
 # The test compiles the stand-in's source into itself so it can redirect CreateThread and operator new.
+add_executable(startup_dstorage_destination_check tests/startup_dstorage_destination_check.cpp)
+target_compile_features(startup_dstorage_destination_check PRIVATE cxx_std_17)
+add_dependencies(startup_dstorage_destination_check startup_stub_xcrdapi)
+add_test(NAME startup_dstorage_destination COMMAND startup_dstorage_destination_check "$<TARGET_FILE:startup_stub_xcrdapi>")
+set_tests_properties(startup_dstorage_destination PROPERTIES TIMEOUT 60)
 add_executable(startup_storage_worker_start tests/startup_storage_worker_start.cpp)
 target_compile_features(startup_storage_worker_start PRIVATE cxx_std_17)
 target_include_directories(startup_storage_worker_start PRIVATE src)

@@ -318,6 +318,16 @@ starts a byte earlier is rejected before it copies anything. No GPU and no game 
 ctest --preset release --no-tests=error -R '^startup_inflate$' -V
 ```
 
+## DirectStorage destinations that are not writable
+
+A request whose destination (a plain pointer, not 64 KiB page tokens) is not writable up to its declared capacity fails before any byte is written: the stand-in walks the destination with `VirtualQuery`, and a page that is uncommitted, read-only, `PAGE_GUARD` or `PAGE_NOACCESS` refuses the whole request. The log line ends `destination not writable`, `requests_failed` counts it, the next status entry reports `E_FAIL` and the queue goes on with later requests. Before this check, a destination shorter in memory than its declared capacity faulted inside the stand-in's copy (#870). The check covers the whole declared capacity, not only the bytes the request would write. Cost: one `VirtualQuery` per region the destination spans, per request that reaches the copy.
+
+`tests/startup_dstorage_destination_check.cpp` (ctest `startup_dstorage_destination`) sends memory-source requests through the real queue: a read-only, a guard and a no-access middle page, and a capacity one page past the committed pages. Each must fail with the process alive and the bytes of the pages before the bad one still `0xAA`. Afterwards, requests into a fully writable (`PAGE_READWRITE`) buffer and a copy-on-write (`PAGE_WRITECOPY`) mapped view on the same queue must write every byte:
+
+```powershell
+ctest --preset release --no-tests=error -R '^startup_dstorage_destination$' -V
+```
+
 ## Local switches, logging, and memory probing
 
 `tests/startup_local_log_check.cpp` (device-free ctest `startup_local_log`, with negative
