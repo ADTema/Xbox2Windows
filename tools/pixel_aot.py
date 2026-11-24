@@ -1865,6 +1865,63 @@ def require_proven_i32_f32_range(base, has_abs, has_neg, scalar, vector, known_s
     return eff_bits
 
 
+CVT_F64_F32_INLINE = {"0": 0x00000000, "0.5": 0x3f000000, "-0.5": 0xbf000000, "1.0": 0x3f800000, "-1.0": 0xbf800000,
+                      "2.0": 0x40000000, "-2.0": 0xc0000000, "4.0": 0x40800000, "-4.0": 0xc0800000,
+                      "0.15915494": 0x3e22f983}
+CVT_F64_F32_E64_SOURCE = re.compile(r"neg\((0x[0-9a-f]{1,8})\)|(-?)(\|?)([vs]\d+|0x[0-9a-f]{1,8})(\|?)")
+
+
+def cvt_f64_f32_words(bits):
+    """Return the (low, high) binary64 words of the exact conversion of binary32 bits, or raise ValueError.
+
+    Exact for every finite normal value: sign kept, exponent rebased from 127 to 1023, the 23-bit fraction placed at
+    the top of the 52-bit fraction. Zero keeps its sign (hi 0x80000000 for -0) and infinity maps to exponent 0x7ff
+    with a zero fraction. A subnormal input is refused because the f32 denorm mode (MODE[5:4]) has no declared
+    profile in this translator, and a NaN is refused (issue 312).
+    """
+    sign, exponent, fraction = bits >> 31, (bits >> 23) & 0xff, bits & 0x7fffff
+    if exponent == 0xff and fraction:
+        raise ValueError(f"v_cvt_f64_f32 source 0x{bits:08x} is a NaN")
+    if exponent == 0 and fraction:
+        raise ValueError(f"v_cvt_f64_f32 source 0x{bits:08x} is a subnormal")
+    if exponent == 0:
+        return 0, sign << 31
+    if exponent == 0xff:
+        return 0, (sign << 31) | 0x7ff00000
+    return (fraction & 7) << 29, (sign << 31) | ((exponent - 127 + 1023) << 20) | (fraction >> 3)
+
+
+def cvt_f64_f32_source_bits(base, scalar, vector, pending, sample_dest, known_ssa_bits):
+    """Return the statically known binary32 bits of the source of v_cvt_f64_f32, or raise ValueError.
+
+    The domain is the one of require_proven_i32_f32_range: a hex literal, a binary32 inline constant, a SGPR that
+    holds a tracked integer, or a VGPR whose bits known_ssa_bits records. Any other register is an unproven runtime
+    input. An integer inline constant other than 0 is a subnormal (1..64) or an all-ones NaN pattern (-16..-1),
+    never a float, and is refused with the other unlisted spellings.
+    """
+    if base in CVT_F64_F32_INLINE:
+        return CVT_F64_F32_INLINE[base]
+    if re.fullmatch(r"0x[0-9a-f]{1,8}", base):
+        return int(base, 16)
+    if not (m := re.fullmatch(r"([vs])(\d+)", base)):
+        raise ValueError(f"Unsupported v_cvt_f64_f32 source {base}")
+    if int(m.group(2)) > (255 if m.group(1) == "v" else 105):
+        raise ValueError(f"Register out of range: {base}")
+    if base in pending:
+        raise ValueError("Constant read before load completion")
+    if base in sample_dest:
+        raise ValueError("Sample used before vmcnt wait")
+    if m.group(1) == "s":
+        value = scalar.get(base)
+        if not isinstance(value, int):
+            raise ValueError(f"Unproven runtime input {base} at v_cvt_f64_f32")
+        return value & 0xffffffff
+    ssa = vector.get(base)
+    if not isinstance(ssa, str) or ssa not in known_ssa_bits:
+        raise ValueError(f"Unproven runtime input {base} at v_cvt_f64_f32")
+    return known_ssa_bits[ssa] & 0xffffffff
+
+
 def fp_operand(token, scalar, vector, pending, sample_dest, *,
                quad_values: dict[str, bool] | None = None, ignore_sign=False):
     if re.fullmatch(r"-\d+", token):
@@ -4408,6 +4465,40 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    uint c{i}f = (c{i}u << (31u - c{i}n)) & 0x7fffffffu;")
             lines.append(f"    precise float alu{i}l = asfloat(c{i}u == 0u ? 0u : c{i}f << 21);")
             lines.append(f"    precise float alu{i}h = asfloat(c{i}u == 0u ? 0u : c{i}s | ((1023u + c{i}n) << 20) | (c{i}f >> 11));")
+            vector[names[0]], vector[names[1]] = f"alu{i}l", f"alu{i}h"
+        elif m := match(r"v_cvt_f64_f32(_e32|_e64)? v\[(0|[1-9]\d*):(0|[1-9]\d*)\], ([^,\s]+)"):
+            # Exact binary32 to binary64 conversion into a VGPR pair v[d:d+1], for a statically known source only
+            # (cvt_f64_f32_source_bits). Both result words are computed here, in Python, and emitted as constants:
+            # no HLSL double, no runtime input. Finite normal values, +-0 and +-infinity convert exactly;
+            # subnormals, NaNs and unproven registers are refused. LLVM 15 prints the unmodified VOP1 form as _e32;
+            # the only VOP3 (_e64) spellings it prints for this opcode are -x, |x|, -|x| and neg(0xLITERAL), and
+            # those are accepted here (abs is applied first, then neg, as in require_proven_i32_f32_range; the order is not checked against the ISA document). An _e64 form without a
+            # modifier, clamp, omod, DPP and SDWA are left to the fall-through.
+            suffix, first, last, src = m.groups()
+            first, last = int(first), int(last)
+            names = (f"v{first}", f"v{last}")
+            if (mask != "entry" or last != first + 1 or last > 255 or any(name in sample_dest for name in names)):
+                raise ValueError("Invalid 32-bit float to binary64 conversion")
+            has_abs = has_neg = False
+            if suffix == "_e64":
+                parts = CVT_F64_F32_E64_SOURCE.fullmatch(src)
+                if not parts:
+                    raise ValueError(f"Unsupported v_cvt_f64_f32_e64 source {src}")
+                if parts.group(1):
+                    src, has_neg = parts.group(1), True
+                else:
+                    neg, bar_open, src, bar_close = parts.groups()[1:]
+                    if bar_open != bar_close or (neg == "" and bar_open == "") or (neg and not bar_open and src.startswith("0x")):
+                        raise ValueError(f"Unsupported v_cvt_f64_f32_e64 source {src}")
+                    has_abs, has_neg = bool(bar_open), bool(neg)
+            bits = cvt_f64_f32_source_bits(src, scalar, vector, pending, sample_dest, known_ssa_bits)
+            if has_abs:
+                bits &= 0x7fffffff
+            if has_neg:
+                bits ^= 0x80000000
+            low, high = cvt_f64_f32_words(bits)
+            lines.append(f"    precise float alu{i}l = asfloat({low}u);")
+            lines.append(f"    precise float alu{i}h = asfloat({high}u);")
             vector[names[0]], vector[names[1]] = f"alu{i}l", f"alu{i}h"
         elif m := match(rf"v_(add|sub|subrev)_co_ci_u32_(e32|e64) (v\d+), {LANE_MASK}, ([^,\s]+), ([^,\s]+), {LANE_MASK}"):
             # The carry-out add and subtracts above with a carry or borrow of each lane read from a lane mask.

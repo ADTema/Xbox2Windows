@@ -21,6 +21,12 @@ building `startup_stream_consumer`. The source-built shader writes to half of an
 On A8 the parent preserves the zero clear and the child writes alpha 255. R8 records red 0 or
 255 according to the input shader. The untouched half stays zero in all four cases.
 
+The patch scan itself also has a device-free check. Build `startup_derived_blend_check` and run
+`ctest --preset dev --no-tests=error -R "^startup_derived_blend(_first_wins_control)?$" -V`.
+It covers what the draw cannot observe: the logged descriptor offset (4 bytes into the record),
+a byte-for-byte copy of the descriptor, and refusal of a null list or one that is not whole
+records. The control expects the first blend patch to win and must fail.
+
 ## Output window and fallback diagnostics
 
 The desktop swap chain has its own top-level window, class `X2WOutputWindow`.
@@ -395,7 +401,11 @@ These are measured on one executable; treat them as hypotheses for others.
   an RTX 3060), so any failure of an oversized shader-visible view heap takes this path. The measured
   limits so far are 1,000,000 descriptors on both adapters. Reproduce with
   `ctest --preset release --no-tests=error -R '^startup_(view_heap|logical_view)_' -V`, which skips (77) on an
-  adapter that accepts the full request.
+  adapter that accepts the full request. WARP 10.0.26100.9818 and an RX 6600 (driver 32.0.21045.29003)
+  accept it, so those draws do not reach the table bounds there. `ctest --preset dev --no-tests=error -R '^startup_logical_view_table$' -V` checks
+  `src/startup_stubs/logical_view_table.h` without a device. It covers the first and last records, one
+  past the end, handles inside a record or below the heap, missing heap fields, memory that wraps past
+  the top of the address space, and records crossing the end of a window.
 - BCPack DirectStorage requests are decoded for BC7 and BC1 streams into destination memory as single atomic texture payloads; each request decompresses a complete multi-lane rANS chunk directly into its destination buffer and is excluded from chunk continuation caching. Unhandled formats fall back to zero-filled destinations.
 - The XG stand-in normally uses desktop copyable footprints. Its opt-in BC7 diagnostic
   reports standard GFX10 4 KiB tiled geometry for a single-slice, single-mip, non-MSAA

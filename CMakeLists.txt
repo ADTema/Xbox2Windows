@@ -640,6 +640,21 @@ add_executable(startup_memory_srv_report_check tests/startup_memory_srv_report_c
 target_include_directories(startup_memory_srv_report_check PRIVATE src)
 target_compile_features(startup_memory_srv_report_check PRIVATE cxx_std_17)
 add_test(NAME startup_memory_srv_report COMMAND startup_memory_srv_report_check)
+
+# View format of the window presenter's read of typeless textures (src/startup_stubs/present_view_format.h);
+# the identity run is the old behaviour and the sRGB run is a wrong view; both are negative controls.
+add_executable(startup_present_view_check tests/startup_present_view_check.cpp)
+target_include_directories(startup_present_view_check PRIVATE src)
+target_compile_features(startup_present_view_check PRIVATE cxx_std_17)
+target_link_libraries(startup_present_view_check PRIVATE d3d12 dxgi d3dcompiler)
+add_test(NAME startup_present_view COMMAND startup_present_view_check)
+add_test(NAME startup_present_view_identity_control COMMAND startup_present_view_check --mutate identity)
+foreach(adapter IN ITEMS warp hardware)
+    add_test(NAME startup_present_view_${adapter} COMMAND startup_present_view_check ${adapter})
+endforeach()
+add_test(NAME startup_present_view_srgb_control COMMAND startup_present_view_check warp --mutate srgb)
+set_tests_properties(startup_present_view_identity_control startup_present_view_srgb_control PROPERTIES WILL_FAIL TRUE)
+set_tests_properties(startup_present_view_hardware PROPERTIES SKIP_RETURN_CODE 77)
 # Console allocation sizes for depth-with-stencil and multisampled textures
 # (src/startup_stubs/console_plane_size.h); the mutated run is the negative control.
 add_executable(startup_plane_size_check tests/startup_plane_size_check.cpp)
@@ -648,6 +663,15 @@ target_compile_features(startup_plane_size_check PRIVATE cxx_std_17)
 add_test(NAME startup_plane_size COMMAND startup_plane_size_check)
 add_test(NAME startup_plane_size_packed_control COMMAND startup_plane_size_check --mutate packed)
 set_tests_properties(startup_plane_size_packed_control PROPERTIES WILL_FAIL TRUE)
+# The blend patch a slot 55 derivation applies (src/startup_stubs/derived_blend.h): the last part-2
+# record, its descriptor offset and bytes, and lists that are not whole records. The mutated run is
+# the negative control.
+add_executable(startup_derived_blend_check tests/startup_derived_blend_check.cpp)
+target_include_directories(startup_derived_blend_check PRIVATE src)
+target_compile_features(startup_derived_blend_check PRIVATE cxx_std_17)
+add_test(NAME startup_derived_blend COMMAND startup_derived_blend_check)
+add_test(NAME startup_derived_blend_first_wins_control COMMAND startup_derived_blend_check --mutate first-wins)
+set_tests_properties(startup_derived_blend_first_wins_control PROPERTIES WILL_FAIL TRUE)
 # The same rule through the device wrapper: allocation-info slots 25 and 108, then a placed texture
 # (slot 133) over memory of the answered size.
 add_executable(startup_plane_size_device_check tests/startup_plane_size_device_check.cpp)
@@ -674,6 +698,12 @@ add_executable(startup_state_block_blend_check tests/startup_state_block_blend_c
 target_include_directories(startup_state_block_blend_check PRIVATE src)
 target_compile_features(startup_state_block_blend_check PRIVATE cxx_std_17)
 add_test(NAME startup_state_block_blend COMMAND startup_state_block_blend_check)
+# Root table handles resolved against a logical view heap, and the records a translated draw reads
+# from the window (src/startup_stubs/logical_view_table.h).
+add_executable(startup_logical_view_table_check tests/startup_logical_view_table_check.cpp)
+target_include_directories(startup_logical_view_table_check PRIVATE src)
+target_compile_features(startup_logical_view_table_check PRIVATE cxx_std_17)
+add_test(NAME startup_logical_view_table COMMAND startup_logical_view_table_check)
 
 # Colour-blend register decoding (src/startup_stubs/cb_blend.h, #1216): decoder table plus draws
 # compared with a CPU model of the register fields.
@@ -2362,7 +2392,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "op_discarded_read,op_xrstor64_xsavec,op_xrstor64_xsavec64,"
         "op_xrstor64_xsavec64_sse,op_xrstor64_xsavec64_x87_avx,op_xsavec64_dynmask,"
         "op_xrstor64_xsaveopt,op_xrstor64_xsaveopt64,op_xrstor64_xsaveopt64_sse,"
-        "op_xrstor64_xsaveopt64_x87_avx,op_xrstor64_xsaveopt64_avx,op_xsaveopt64_dynmask")
+        "op_xrstor64_xsaveopt64_x87_avx,op_xrstor64_xsaveopt64_avx,op_xsaveopt64_dynmask,"
+        "op_xrstor64_avx_xsaveopt64_avx")
     string(CONCAT cpu_xsave_state_original_exports ${cpu_xsave_state_original_exports})
     set(cpu_xsave_state_altered_exports
         "op_xrstor64_xsave64,op_xrstor_xsave64,op_xrstor64_disp,op_pipeline,"
@@ -2374,11 +2405,30 @@ if(EXISTS "${INTAKE_PYTHON}")
         cpu_translation(cpu_xsave_state_${variant} cpu_xsave_aot "${cpu_xsave_state_${variant}_exports}")
     endforeach()
     target_compile_definitions(cpu_xsave_state_altered PRIVATE ALTER_OP)
+    set(cpu_xsave_state_compacted_exports
+        "op_xrstor64_sse_compacted_avx_xsaveopt64_avx,"
+        "op_xsavec_xrstor_all,op_xsavec_xrstor_x87_avx,op_xsavec_xrstor_x87_sse,"
+        "op_xsavec_xrstor_avx_only,op_xsavec_xrstor_sse_only,op_xrstor64_compacted_dynmask")
+    string(CONCAT cpu_xsave_state_compacted_exports ${cpu_xsave_state_compacted_exports})
+    set(cpu_xsave_state_compacted_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_xsave_state_compacted_lifted.cpp")
+    add_custom_command(OUTPUT "${cpu_xsave_state_compacted_cpp}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_xsave_aot.py"
+            "$<TARGET_FILE:cpu_xsave_state_original>" "${cpu_xsave_state_compacted_exports}"
+            "${cpu_xsave_state_compacted_cpp}" --compacted-xrstor
+        DEPENDS cpu_xsave_state_original tools/cpu_xsave_aot.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_xsave_state_compacted_lifted SHARED "${cpu_xsave_state_compacted_cpp}")
+    set(cpu_xsave_state_compacted_altered_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_xsave_state_compacted_altered_lifted.cpp")
+    add_custom_command(OUTPUT "${cpu_xsave_state_compacted_altered_cpp}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_xsave_aot.py"
+            "$<TARGET_FILE:cpu_xsave_state_altered>" "op_xsavec_xrstor_all,op_xsavec_xrstor_avx_only"
+            "${cpu_xsave_state_compacted_altered_cpp}" --compacted-xrstor
+        DEPENDS cpu_xsave_state_altered tools/cpu_xsave_aot.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_xsave_state_compacted_altered_lifted SHARED "${cpu_xsave_state_compacted_altered_cpp}")
     set(cpu_xsave_state_canonical_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_xsave_state_canonical_lifted.cpp")
     add_custom_command(OUTPUT "${cpu_xsave_state_canonical_cpp}"
         COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_xsave_aot.py"
-            "$<TARGET_FILE:cpu_xsave_state_original>" "op_xsave_only,op_xsave64_only"
-            "${cpu_xsave_state_canonical_cpp}" --entry-state canonical
+            "$<TARGET_FILE:cpu_xsave_state_original>" "op_xsave_only,op_xsave64_only,op_xrstor64_avx_xsaveopt64_avx"
+            "${cpu_xsave_state_canonical_cpp}" --entry-state canonical --compacted-xrstor
         DEPENDS cpu_xsave_state_original tools/cpu_xsave_aot.py tools/cpu_leaf_aot.py VERBATIM)
     add_library(cpu_xsave_state_canonical_lifted SHARED "${cpu_xsave_state_canonical_cpp}")
     set(cpu_xsave_state_canonical_altered_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_xsave_state_canonical_altered_lifted.cpp")
@@ -2395,7 +2445,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_xsave_state_altered_lifted>"
         "$<TARGET_FILE:cpu_xsave_state_canonical_lifted>"
         "$<TARGET_FILE:cpu_xsave_state_canonical_altered_lifted>"
-        "$<TARGET_FILE:cpu_xsave_state_altered>")
+        "$<TARGET_FILE:cpu_xsave_state_altered>"
+        "$<TARGET_FILE:cpu_xsave_state_compacted_lifted>"
+        "$<TARGET_FILE:cpu_xsave_state_compacted_altered_lifted>")
     set_tests_properties(cpu_aot_xsave_state PROPERTIES SKIP_RETURN_CODE 77)
     set(cpu_pcmpstr64_exports
         "pcmpestri64_ub_eqany_pos_lsb,pcmpestri64_sw_ranges_neg_msb,"
@@ -2421,6 +2473,29 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(cpu_aot_pcmpstr64 PROPERTIES
         SKIP_RETURN_CODE 77
         ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_pcmpstr64.txt")
+    set(cpu_sse4a_exports
+        "op_extrq_imm_basic,op_extrq_imm_zero_len,op_extrq_imm_high_bit,"
+        "op_extrq_imm_mid,op_extrq_imm_bits76,"
+        "op_extrq_reg_basic,op_extrq_reg_self,op_extrq_reg_xmm4_xmm5,"
+        "op_insertq_imm_basic,op_insertq_imm_zero_len,op_insertq_imm_high_bit,"
+        "op_insertq_imm_self,"
+        "op_insertq_reg_basic,op_insertq_reg_self,op_insertq_reg_xmm4_xmm5,"
+        "op_movntsd_aligned,op_movntsd_disp8,op_movntsd_unaligned,"
+        "op_movntss_aligned,op_movntss_disp12,op_movntss_unaligned,"
+        "op_pipeline,op_discarded_read,op_sse4a_discarded_read")
+    string(CONCAT cpu_sse4a_exports ${cpu_sse4a_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_sse4a_${variant} sse4a)
+        cpu_translation(cpu_sse4a_${variant} cpu_sse4a_aot "${cpu_sse4a_exports}")
+    endforeach()
+    target_compile_definitions(cpu_sse4a_altered PRIVATE ALTER_IMM)
+    add_test(NAME cpu_aot_sse4a COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/sse4a_check.py"
+        "$<TARGET_FILE:cpu_sse4a_original>"
+        "$<TARGET_FILE:cpu_sse4a_original_lifted>"
+        "$<TARGET_FILE:cpu_sse4a_altered_lifted>")
+    set_tests_properties(cpu_aot_sse4a PROPERTIES
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_sse4a.txt")
     set(cpu_sse2_exports
         "op_cmppd_0,op_cmppd_1,op_cmppd_2,op_cmppd_3,op_cmppd_4,op_cmppd_5,op_cmppd_6,op_cmppd_7,"
         "op_cmppd_mem,"
@@ -5940,6 +6015,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_cvt_f64_int_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_cvt_f64_int_${adapter}.txt")
+        add_test(NAME pixel_aot_cvt_f64_f32_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-cvt-f64-f32 "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_cvt_f64_f32_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_cvt_f64_f32_${adapter}.txt")
         add_test(NAME pixel_aot_sad_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-sad "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
