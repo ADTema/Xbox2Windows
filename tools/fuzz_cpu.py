@@ -5,6 +5,7 @@ import ctypes
 from dataclasses import dataclass, field
 from pathlib import Path
 import random
+import re
 import sys
 
 WIDTHS = {
@@ -22,6 +23,12 @@ class Function:
     name: str
     lines: list[str]
     prolog: list[str] = field(default_factory=list)
+    # Names of the functions this one calls or jumps to, printed with it when it fails.
+    uses: list[str] = field(default_factory=list)
+    # A callee that is only reached from other functions of the image is not exported.
+    export: bool = True
+    # Only AL is defined in RAX when it returns.
+    narrow: bool = False
 
     def asm(self):
         head = [f"    {line}" for line in self.prolog]
@@ -287,7 +294,155 @@ def generate_frames(seed, count):
     return [frame_function(f"fuzz_frame_{index}", rng) for index in range(count)]
 
 
-AREAS = {"leaf": (generate, "cpu_fuzz"), "frames": (generate_frames, "cpu_fuzz_frames")}
+# Call shapes. Each exported function is fn(x, y, out) with x in RCX, y in RDX and the output buffer in R8.
+# The callees are not exported: they live in a pool that every exported function shares, so one callee
+# is reached by several callers, by calls at different depths and by tail jumps. Callee i only calls a
+# callee below it, so the pool has no cycles.
+CALLEE_KINDS = ("mix", "branch", "narrow", "store", "dword", "mid_registers", "mid_spill")
+# Output words 0 to 7 belong to the exported functions. A storing callee writes its own word above them.
+CALLEE_STORE_OFFSET = 0x40
+MAX_CHAIN_CALLS = 4
+
+
+def callee_leaf(name, kind, index, rng):
+    imm = rng.choice((1, 5, 0x21, 0x7f))
+    count = rng.choice((1, 3, 5, 9))
+    if kind == "mix":
+        lines = ["lea rax, [rcx+rcx*2]", "add rax, rdx", f"xor rax, {imm}", f"rol rax, {count}", "ret"]
+    elif kind == "branch":
+        label = f"{name}_below"
+        lines = ["cmp rcx, rdx", f"jb {label}", "mov rax, rcx", "sub rax, rdx", f"add rax, {imm}", "ret",
+                 f"{label}:", "mov rax, rdx", "sub rax, rcx", f"xor rax, {imm}", "ret"]
+    elif kind == "narrow":
+        # Only AL is defined at the RET, so every caller must widen it before use.
+        lines = ["mov al, cl", "add al, dl", f"xor al, {imm}", "ret"]
+    elif kind == "store":
+        lines = ["mov rax, rcx", "add rax, rdx", f"mov QWORD PTR [r8+{CALLEE_STORE_OFFSET + 8 * index}], rax",
+                 f"xor rax, {imm}", "ret"]
+    else:
+        # Writing EAX clears the upper half of RAX.
+        lines = ["lea eax, [rcx+rdx*4]", f"rol eax, {count}", "ret"]
+    return Function(name, lines, narrow=kind == "narrow")
+
+
+def call_lines(callee):
+    """A call followed by the widening that a byte-sized return needs."""
+    return [f"call {callee.name}", *(["movzx eax, al"] if callee.narrow else [])]
+
+
+def callee_mid(name, kind, pool, rng):
+    """A callee with its own frame that calls one or two callees below it and combines the results."""
+    targets = [rng.choice(pool) for _ in range(rng.choice((1, 2)))]
+    if kind == "mid_registers":
+        pushed, size, keep, spill = ["rbx", "rsi"], 0x28, "rbx", None
+    else:
+        pushed, size, keep, spill = ["rsi"], 0x30, None, "[rsp+20h]"
+    prolog = []
+    for register in pushed:
+        prolog += [f"push {register}", f".pushreg {register}"]
+    prolog += [f"sub rsp, {size}", f".allocstack {size}"]
+    lines = [f"mov {keep}, rdx" if keep else f"mov QWORD PTR {spill}, rdx", "mov rsi, r8"]
+    held = keep or "r10"
+    for position, callee in enumerate(targets):
+        if position == 0:
+            lines.append(rng.choice(("xor rcx, rdx", "lea rcx, [rcx+rdx*2]", "add rcx, rdx")))
+        else:
+            lines += ["mov rcx, rax", f"mov rdx, {keep}" if keep else f"mov rdx, QWORD PTR {spill}"]
+        lines += ["mov r8, rsi", *call_lines(callee)]
+        if keep is None:
+            lines.append(f"mov r10, QWORD PTR {spill}")
+        lines.append(rng.choice((f"add rax, {held}", f"xor rax, {held}", f"sub rax, {held}")))
+    lines += [f"add rsp, {size}", *[f"pop {register}" for register in reversed(pushed)], "ret"]
+    return Function(name, lines, prolog, uses=[callee.name for callee in targets])
+
+
+def callee_pool(rng):
+    pool = []
+    for index, kind in enumerate(CALLEE_KINDS):
+        name = f"fuzz_callee_{index}"
+        if kind.startswith("mid"):
+            pool.append(callee_mid(name, kind, pool, rng))
+        else:
+            pool.append(callee_leaf(name, kind, index, rng))
+        pool[-1].export = False
+    return pool
+
+
+def argument_setup(rng, held_x, held_y, first):
+    """RCX and RDX for the next call: from the previous result in RAX, or from the saved arguments."""
+    if first:
+        rcx = rng.choice((f"mov rcx, {held_x}", f"lea rcx, [{held_x}+7]", f"lea rcx, [{held_x}+{held_x}*2]"))
+    else:
+        rcx = rng.choice(("mov rcx, rax", f"lea rcx, [rax+{held_x}]", "lea rcx, [rax+rax*4]"))
+    rdx = [f"mov rdx, {held_y}"]
+    if rng.random() < 0.5:
+        rdx.append("add rdx, 11")
+    return [rcx, *rdx]
+
+
+def call_chain(name, pool, rng, conditional):
+    """Two to four calls from a frame that keeps the output pointer, x and y across them."""
+    registers = rng.sample(NONVOLATILE, 3)
+    use_registers = rng.random() < 0.6
+    pushed = registers if use_registers else registers[:2]
+    out, held_x = pushed[0], pushed[1]
+    held_y = pushed[2] if use_registers else "QWORD PTR [rsp+20h]"
+    size = 0x20 if use_registers else 0x28
+    prolog = []
+    for register in pushed:
+        prolog += [f"push {register}", f".pushreg {register}"]
+    prolog += [f"sub rsp, {size}", f".allocstack {size}"]
+    lines = [f"mov {out}, r8", f"mov {held_x}, rcx", f"mov {held_y}, rdx"]
+    calls = rng.randint(2, MAX_CHAIN_CALLS)
+    used = []
+    for position in range(calls):
+        callee = rng.choice(pool)
+        used.append(callee.name)
+        body = [*argument_setup(rng, held_x, held_y, position == 0), f"mov r8, {out}", *call_lines(callee),
+                f"mov QWORD PTR [{out}+{8 * position}], rax",
+                rng.choice((f"add {held_x}, rax", f"xor {held_x}, rax", f"lea {held_x}, [{held_x}+rax*2]"))]
+        if conditional and position > 0 and rng.random() < 0.6:
+            skip = f"{name}_skip{position}"
+            body = [f"test {part(held_x, 1)}, 1", f"jz {skip}", *body, f"{skip}:"]
+        lines += body
+    lines += [f"mov rax, {held_x}", f"add rsp, {size}", *[f"pop {register}" for register in reversed(pushed)], "ret"]
+    return Function(name, lines, prolog, uses=used)
+
+
+def tail_function(name, pool, rng, shape):
+    """A function that ends in a jump to another function's entry instead of a RET."""
+    tails = [callee for callee in pool if not callee.narrow]
+    first, second = rng.choice(tails), rng.choice(tails)
+    imm = rng.choice((3, 5, 9, 0x10))
+    if shape == "plain":
+        lines = [f"add rcx, {imm}", f"xor rdx, {imm + 1}", f"jmp {first.name}"]
+        return Function(name, lines, uses=[first.name])
+    if shape == "frame":
+        # The saved register is popped before the jump, so the callee returns straight to the caller.
+        lines = ["mov rbx, rcx", "mov QWORD PTR [r8], rbx", f"lea rcx, [rbx+{imm}]", "xor rdx, rbx", "pop rbx",
+                 f"jmp {first.name}"]
+        return Function(name, lines, ["push rbx", ".pushreg rbx"], uses=[first.name])
+    odd = f"{name}_odd"
+    lines = ["test cl, 1", f"jnz {odd}", f"add rcx, {imm}", f"jmp {first.name}",
+             f"{odd}:", "lea rdx, [rdx+rcx*2]", f"jmp {second.name}"]
+    return Function(name, lines, uses=[first.name, second.name])
+
+
+def generate_calls(seed, count):
+    rng = random.Random(seed)
+    pool = callee_pool(rng)
+    recipes = (("chain", False), ("tail", "plain"), ("chain", True), ("tail", "frame"), ("chain", True),
+               ("tail", "arms"))
+    functions = []
+    for index in range(count):
+        kind, option = recipes[index % len(recipes)]
+        name = f"fuzz_call_{index}"
+        functions.append(call_chain(name, pool, rng, option) if kind == "chain" else tail_function(name, pool, rng, option))
+    return [*pool, *functions]
+
+
+AREAS = {"leaf": (generate, "cpu_fuzz"), "frames": (generate_frames, "cpu_fuzz_frames"),
+         "calls": (generate_calls, "cpu_fuzz_calls")}
 
 
 def inputs_for(seed):
@@ -321,7 +476,8 @@ def run_check(seed, count, native, lifted, o2, only=None, input_index=None, area
     if first_difference(b"\x01\x02", b"\x01\x03") != 1:
         raise SystemExit("comparator self-test failed on a changed byte")
 
-    functions = AREAS[area][0](seed, count)
+    everything = AREAS[area][0](seed, count)
+    functions = [function for function in everything if function.export]
     inputs = inputs_for(seed)
     libraries = [(native, ""), (lifted, "lifted_"), (o2, "lifted_")]
     if mutant is not None:
@@ -367,7 +523,8 @@ def run_check(seed, count, native, lifted, o2, only=None, input_index=None, area
                         print(f"first differing byte={difference} (output offset {difference - 16})", file=sys.stderr)
                         print(f"native {buffer_text(native_buffer.raw, low, high)}", file=sys.stderr)
                         print(f"lifted {buffer_text(lifted_buffer.raw, low, high)}", file=sys.stderr)
-                    print(function.asm(), file=sys.stderr)
+                    for shown in [function, *(item for item in everything if item.name in function.uses)]:
+                        print(shown.asm(), file=sys.stderr)
                     command = (f"python -B tools/fuzz_cpu.py check {seed:#x} {count} {native} {lifted} {o2} "
                                f"--area {area} --only {function.name} --input {index}")
                     print(f"reproduce: {command}", file=sys.stderr)
@@ -393,7 +550,7 @@ def run_check(seed, count, native, lifted, o2, only=None, input_index=None, area
                 if native_return != mutant_return or native_buffer.raw != mutant_buffer.raw:
                     mismatches += 1
                     failing.add(function.name)
-        print(f"mutant {MUTANT_NAME}: {mismatches}/{total} mismatches in {len(failing)}/{len(selected)} functions")
+        print(f"mutant {MUTANTS[area].name}: {mismatches}/{total} mismatches in {len(failing)}/{len(selected)} functions")
         if not mismatches:
             print("the planted translator fault was not detected", file=sys.stderr)
             return 1
@@ -404,12 +561,10 @@ def emit(seed, count, asm_path, def_path, area="leaf"):
     generator, library = AREAS[area]
     functions = generator(seed, count)
     asm = ".code\n\n" + "\n\n".join(function.asm() for function in functions) + "\n\nEND\n"
-    definition = f"LIBRARY {library}\nEXPORTS\n" + "".join(f"    {function.name}\n" for function in functions)
+    definition = (f"LIBRARY {library}\nEXPORTS\n"
+                  + "".join(f"    {function.name}\n" for function in functions if function.export))
     Path(asm_path).write_text(asm, encoding="utf-8")
     Path(def_path).write_text(definition, encoding="utf-8")
-
-
-MUTANT_NAME = "reload_shift"
 
 
 def plant_reload_shift(cpu_switch_aot):
@@ -433,13 +588,40 @@ def plant_reload_shift(cpu_switch_aot):
     cpu_switch_aot.Lifter.slot = slot
 
 
+CALL_SITE = re.compile(r"\b(rax = |return )(fn_[0-9a-f]+)\(rcx, rdx, ")
+
+
+def swap_call_arguments(source):
+    """Pass RDX first and RCX second at every direct call and tail jump of the translation."""
+    return CALL_SITE.sub(lambda match: f"{match.group(1)}{match.group(2)}(rdx, rcx, ", source)
+
+
+@dataclass(frozen=True)
+class Mutant:
+    """A planted translator fault for the negative control of one area."""
+    name: str
+    plant: object = None
+    rewrite: object = None
+
+
+MUTANTS = {
+    "leaf": Mutant("none"),
+    "frames": Mutant("reload_shift", plant=plant_reload_shift),
+    "calls": Mutant("swapped_call_arguments", rewrite=swap_call_arguments),
+}
+
+
 def translate(seed, count, image, output, area="leaf", mutant=False):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import cpu_switch_aot
 
+    fault = MUTANTS[area]
     if mutant:
-        plant_reload_shift(cpu_switch_aot)
-    functions = AREAS[area][0](seed, count)
+        if fault.plant is None and fault.rewrite is None:
+            raise SystemExit(f"area {area} has no planted fault")
+        if fault.plant is not None:
+            fault.plant(cpu_switch_aot)
+    functions = [function for function in AREAS[area][0](seed, count) if function.export]
     names = [function.name for function in functions]
     try:
         source, _ = cpu_switch_aot.translate(Path(image), names)
@@ -453,6 +635,11 @@ def translate(seed, count, image, output, area="leaf", mutant=False):
                 print(function.asm(), file=sys.stderr)
                 break
         return 1
+    if mutant and fault.rewrite is not None:
+        rewritten = fault.rewrite(source)
+        if rewritten == source:
+            raise SystemExit(f"the {fault.name} fault found nothing to change")
+        source = rewritten
     Path(output).write_text(source, encoding="utf-8")
     return 0
 
@@ -473,7 +660,7 @@ def main(argv=None):
     translate_parser.add_argument("output", type=Path)
     translate_parser.add_argument("--area", choices=AREAS, default="leaf")
     translate_parser.add_argument("--mutant", action="store_true",
-                                  help=f"plant the {MUTANT_NAME} translator fault for the negative control")
+                                  help="plant the area's translator fault for the negative control")
     check_parser = commands.add_parser("check")
     check_parser.add_argument("seed", type=lambda value: int(value, 0))
     check_parser.add_argument("count", type=int)
