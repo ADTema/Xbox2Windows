@@ -3646,6 +3646,11 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_native_exe_tls_slot0_enroll COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/native_exe_tls_slot0_check.py" enroll "$<TARGET_FILE:pe_map>"
         "$<TARGET_FILE:cpu_exe_tls_slot0_enroll>" "$<TARGET_FILE:cpu_exe_tls_slot0_host>")
+    # pe_run_package starts the same /GA EXE as the package's main image; its log must equal the Windows launch.
+    add_test(NAME cpu_package_main_image COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/package_main_image_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_exe_tls_slot0>")
+    set_tests_properties(cpu_package_main_image PROPERTIES TIMEOUT 60)
     # Lifecycle fixtures: two DLLs with the static MSVC runtime (B imports A) and a CRT-free event sink.
     add_library(cpu_life_sink SHARED tests/cpu/life_sink.cpp)
     target_compile_options(cpu_life_sink PRIVATE /GS- /Zl)
