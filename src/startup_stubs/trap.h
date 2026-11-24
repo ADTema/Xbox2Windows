@@ -61,12 +61,19 @@ inline volatile LONG& log_opens() noexcept
     return count;
 }
 
+// After a failed open, ordinary lines wait this long before the next open attempt (trap lines do not).
+constexpr ULONGLONG log_retry_ms = 250;
+
 // Appends one line to %X2W_TRAP_LOG% with one WriteFile. Under the startup launcher every file
-// open is a traced call that stops the process, so the first path a module logs to is opened once
-// (append access, shared read/write/delete so readers and cleanup still work) and the handle is
-// kept; a failed open is kept too, so it is not retried per line. A line for another path (the variable changed in-process) is appended the
-// old way: open, write, close. Nothing is written when the variable is unset or too long. flush
-// asks for FlushFileBuffers before returning (the trap path, which may end the process next).
+// open is a traced call that stops the process, so the first path a module opens successfully is
+// kept open (append access, shared read/write/delete so readers and cleanup still work). A failed
+// open is not kept: while no handle is kept, the next open is attempted after log_retry_ms, so a
+// path that is missing or locked for good costs at most one open attempt per log_retry_ms, and a
+// path that becomes available is used again. Ordinary lines in that wait are dropped, as the old
+// per-line writer dropped a line it could not open for. flush (the trap path, which may end the
+// process next) always attempts the open and asks for FlushFileBuffers. A line for another path
+// than the kept one (the variable changed in-process) is appended the old way: open, write,
+// close. Nothing is written when the variable is unset or too long.
 inline void append_log(const char* line, DWORD size, bool flush) noexcept
 {
     struct Log {
@@ -74,6 +81,7 @@ inline void append_log(const char* line, DWORD size, bool flush) noexcept
         wchar_t path[MAX_PATH];
     };
     static Log* volatile kept = nullptr;
+    static volatile LONG64 retry_at = 0;  // GetTickCount64 before which no ordinary line opens
 
     wchar_t path[MAX_PATH];
     const DWORD length = GetEnvironmentVariableW(L"X2W_TRAP_LOG", path, MAX_PATH);
@@ -82,19 +90,22 @@ inline void append_log(const char* line, DWORD size, bool flush) noexcept
     Log* current = static_cast<Log*>(InterlockedCompareExchangePointer(
         reinterpret_cast<void* volatile*>(&kept), nullptr, nullptr));
     if (current && !std::wcscmp(current->path, path)) {
-        if (current->handle == INVALID_HANDLE_VALUE) return;
         write_all(current->handle, line, size);
         if (flush) FlushFileBuffers(current->handle);
         return;
     }
 
+    const ULONGLONG now = GetTickCount64();
+    if (!current && !flush && now < static_cast<ULONGLONG>(InterlockedCompareExchange64(&retry_at, 0, 0))) return;
     InterlockedIncrement(&log_opens());
     HANDLE out = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (out != INVALID_HANDLE_VALUE) {
-        write_all(out, line, size);
-        if (flush) FlushFileBuffers(out);
+    if (out == INVALID_HANDLE_VALUE) {
+        if (!current) InterlockedExchange64(&retry_at, static_cast<LONG64>(now + log_retry_ms));  // x2w-seam: failed-open
+        return;
     }
+    write_all(out, line, size);
+    if (flush) FlushFileBuffers(out);
     if (!current) {
         if (Log* const fresh = static_cast<Log*>(HeapAlloc(GetProcessHeap(), 0, sizeof(Log)))) {
             fresh->handle = out;
@@ -104,7 +115,7 @@ inline void append_log(const char* line, DWORD size, bool flush) noexcept
             HeapFree(GetProcessHeap(), 0, fresh);  // another thread published first
         }
     }
-    if (out != INVALID_HANDLE_VALUE) CloseHandle(out);
+    CloseHandle(out);
 }
 
 inline bool continues(const char* name) noexcept { return listed("X2W_TRAP_CONTINUE", name); }

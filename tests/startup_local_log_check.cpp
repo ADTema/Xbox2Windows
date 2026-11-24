@@ -1,6 +1,7 @@
 // Checks src/startup_stubs/local_log.h without a GPU device: GetLastError-preserving env_on
 // gating, atomic first_calls countdown, logf formatting/truncation/X2W_TRAP_LOG append,
-// one X2W_TRAP_LOG open per module under 8 concurrent writers (in a child process),
+// one X2W_TRAP_LOG open per module under 8 concurrent writers (in a child process), recovery
+// after a first open into a missing directory or of a locked file fails (in child processes),
 // probe_readable page truncation and PAGE_GUARD re-arming, and readable/writable boundary checks.
 #include "startup_stubs/local_log.h"
 
@@ -240,6 +241,107 @@ DWORD test_concurrency(bool reopen)
     return code;
 }
 
+// Child process body for the open-failure recovery cases, on the inherited %X2W_TRAP_LOG% whose
+// directory does not exist yet. missing: the first opens fail, the directory is created, and a line
+// after the retry interval must land. locked: the file is held without sharing, then released.
+// trap: right after a failed open, a flush (trap) line must still try and land. The recovery check
+// is the one a module that keeps its failed open forever fails; when it is the child's only failure
+// the exit code is 3 (used by startup_local_log_cache_failure_control).
+enum class Recovery { missing, locked, trap };
+int recovery_child(Recovery kind)
+{
+    HANDLE null_err = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    check(null_err != INVALID_HANDLE_VALUE && SetStdHandle(STD_ERROR_HANDLE, null_err) != FALSE,
+          "recovery child sends stderr copies to NUL");
+    wchar_t path[MAX_PATH]{};
+    const DWORD path_len = GetEnvironmentVariableW(L"X2W_TRAP_LOG", path, MAX_PATH);
+    check(path_len > 0 && path_len < MAX_PATH, "recovery child inherits X2W_TRAP_LOG");
+    if (!path_len || path_len >= MAX_PATH) return 1;
+    const std::wstring file(path);
+    const std::wstring dir = file.substr(0, file.rfind(L'\\'));
+    check(GetFileAttributesW(dir.c_str()) == INVALID_FILE_ATTRIBUTES, "the log directory does not exist yet");
+    check(x2w_trap::log_opens() == 0, "recovery child starts with no trap log open");
+
+    HANDLE exclusive = INVALID_HANDLE_VALUE;
+    if (kind == Recovery::locked) {
+        check(CreateDirectoryW(dir.c_str(), nullptr) != FALSE, "create the log directory");
+        exclusive = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        check(exclusive != INVALID_HANDLE_VALUE, "hold the log file without sharing");
+    }
+    x2w_local::logf("lost-first");
+    check(x2w_trap::log_opens() == 1, "the first line attempts one open");
+    check(read_file_bytes(path).empty(), "the line of a failed open is dropped");
+
+    if (kind == Recovery::trap) {
+        check(CreateDirectoryW(dir.c_str(), nullptr) != FALSE, "create the log directory");
+        x2w_trap::append_log("trap-line\r\n", 11, true);  // inside the retry wait: a trap line still tries
+        x2w_local::logf("after-trap");
+        check(read_file_bytes(path) == "trap-line\r\nafter-trap\r\n", "a trap line opens the log during the retry wait");
+        check(x2w_trap::log_opens() == 2, "the trap line's open is kept");
+    } else {
+        // A path that stays unusable costs at most one open attempt per retry interval.
+        const ULONGLONG start = GetTickCount64();
+        int lines = 0;
+        while (GetTickCount64() - start < 1000) x2w_local::logf("lost-%d", lines++);
+        const ULONGLONG elapsed = GetTickCount64() - start;
+        const LONG attempts = x2w_trap::log_opens() - 1;
+        std::printf("recovery child: %d lines on an unusable path in %llu ms took %ld open attempts\n", lines,
+                    static_cast<unsigned long long>(elapsed), static_cast<long>(attempts));
+        check(attempts >= 0 && static_cast<ULONGLONG>(attempts) <= elapsed / x2w_trap::log_retry_ms + 1,
+              "an unusable path costs at most one open attempt per retry interval");
+
+        if (kind == Recovery::missing) check(CreateDirectoryW(dir.c_str(), nullptr) != FALSE, "create the log directory");
+        if (exclusive != INVALID_HANDLE_VALUE) CloseHandle(exclusive);
+        Sleep(static_cast<DWORD>(x2w_trap::log_retry_ms) + 100);
+        x2w_local::logf("recovered");
+        const LONG opens_after_recovery = x2w_trap::log_opens();
+        const int before = failures;
+        check(read_file_bytes(path) == "recovered\r\n", "a later line reaches the log once the path is usable");
+        const bool recovery_failed = failures != before;
+        if (!recovery_failed) {
+            std::string expected = "recovered\r\n";
+            for (int i = 0; i < 100; ++i) {
+                x2w_local::logf("after-%d", i);
+                expected += "after-" + std::to_string(i) + "\r\n";
+            }
+            check(read_file_bytes(path) == expected, "lines after recovery land in order");
+            check(x2w_trap::log_opens() == opens_after_recovery, "the recovered path is opened once and kept");
+        }
+        std::fflush(stdout);
+        if (failures - (recovery_failed ? 1 : 0)) return 1;
+        return recovery_failed ? 3 : 0;
+    }
+    std::fflush(stdout);
+    return failures ? 1 : 0;
+}
+
+// Runs recovery_child in a fresh process with %X2W_TRAP_LOG% inside a directory that does not exist,
+// then removes what the child created. Returns the child's exit code.
+DWORD test_recovery(const wchar_t* phase)
+{
+    wchar_t temp_dir[MAX_PATH]{};
+    const DWORD dir_len = GetTempPathW(MAX_PATH, temp_dir);
+    check(dir_len > 0 && dir_len < MAX_PATH, "GetTempPathW succeeds for the recovery log");
+    if (!dir_len || dir_len >= MAX_PATH) return MAXDWORD;
+    const auto folder = std::wstring(temp_dir) + L"x2w_trap_recovery_" + std::to_wstring(GetCurrentProcessId());
+    const auto sub = folder + L"\\later";
+    const auto log_path = sub + L"\\trap.log";
+    if (log_path.size() + 2 >= MAX_PATH || !CreateDirectoryW(folder.c_str(), nullptr)) {
+        check(false, "create the recovery log folder");
+        return MAXDWORD;
+    }
+    wchar_t prev[MAX_PATH]{};
+    const DWORD prev_len = GetEnvironmentVariableW(L"X2W_TRAP_LOG", prev, MAX_PATH);
+    SetEnvironmentVariableW(L"X2W_TRAP_LOG", log_path.c_str());
+    const DWORD code = run_self(std::wstring(L"--phase ") + phase);
+    SetEnvironmentVariableW(L"X2W_TRAP_LOG", prev_len > 0 && prev_len < MAX_PATH ? prev : nullptr);
+    DeleteFileW(log_path.c_str());
+    RemoveDirectoryW(sub.c_str());
+    check(RemoveDirectoryW(folder.c_str()) != FALSE, "clean up the recovery log folder");
+    return code;
+}
+
 void test_logf()
 {
     wchar_t prev_trap_log[MAX_PATH]{};
@@ -470,6 +572,9 @@ int main(int argc, char** argv)
     if (two_args && std::strcmp(argv[1], "--phase") == 0) {
         if (std::strcmp(argv[2], "concurrency") == 0) return concurrency_child(false);
         if (std::strcmp(argv[2], "concurrency-reopen") == 0) return concurrency_child(true);
+        if (std::strcmp(argv[2], "recovery-missing") == 0) return recovery_child(Recovery::missing);
+        if (std::strcmp(argv[2], "recovery-locked") == 0) return recovery_child(Recovery::locked);
+        if (std::strcmp(argv[2], "recovery-trap") == 0) return recovery_child(Recovery::trap);
     }
     // --mutate guard-drop: negative control expecting PAGE_GUARD to be dropped rather than re-armed.
     const bool guard_drop_mutate =
@@ -479,7 +584,13 @@ int main(int argc, char** argv)
     // that run (lost or torn lines, a crash, a child that never started) makes the control fail.
     const bool reopen_mutate =
         two_args && std::strcmp(argv[1], "--mutate") == 0 && std::strcmp(argv[2], "reopen") == 0;
-    if (argc > 1 && !guard_drop_mutate && !reopen_mutate) {
+    // --mutate cache-failure: negative control, run by a build whose append_log keeps a failed open
+    // forever (a generated copy of trap.h). The whole check runs; it exits 1 only when the two
+    // recovery cases fail on their recovery check alone (child exit 3) and nothing else fails, so the
+    // unmodified build, or any other fault, makes the control fail.
+    const bool cache_failure_mutate =
+        two_args && std::strcmp(argv[1], "--mutate") == 0 && std::strcmp(argv[2], "cache-failure") == 0;
+    if (argc > 1 && !guard_drop_mutate && !reopen_mutate && !cache_failure_mutate) {
         std::printf("unknown mutation\n");
         return 2;
     }
@@ -494,9 +605,21 @@ int main(int argc, char** argv)
     test_first_calls();
     const DWORD child = test_concurrency(false);
     check(child == 0, "concurrent logging child passes");
+    const DWORD want = cache_failure_mutate ? 3 : 0;
+    const DWORD missing = test_recovery(L"recovery-missing");
+    check(missing == want, "recovery after a missing directory child passes");
+    const DWORD locked = test_recovery(L"recovery-locked");
+    check(locked == want, "recovery after a locked file child passes");
+    check(test_recovery(L"recovery-trap") == 0, "trap line during the retry wait child passes");
+    std::printf("recovery children: missing exit %lu, locked exit %lu\n", static_cast<unsigned long>(missing),
+                static_cast<unsigned long>(locked));
     test_logf();
     test_probe_and_access(guard_drop_mutate);
 
+    if (cache_failure_mutate) {
+        std::printf("startup_local_log cache-failure control: parent failures %d\n", failures);
+        return failures == 0 ? 1 : 0;
+    }
     if (failures) {
         std::printf("startup_local_log: %d of %d FAILED\n", failures, cases);
         return 1;
