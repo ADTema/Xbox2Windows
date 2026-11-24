@@ -184,8 +184,12 @@ __declspec(noinline) u64 forward(Proxy* self, u64 a, u64 b, u64 c, u64 s0, u64 s
         // A local object (X2W_RUNTIME_LOCAL) has no runtime object behind it.
         handled = true;
         if (N == 0) {  // QueryInterface(iid, &object): the same local object
-            if (b && x2w_local::writable(reinterpret_cast<void*>(b), 8)) *reinterpret_cast<u64*>(b) = reinterpret_cast<u64>(self);
-            result = 0;
+            if (b && x2w_local::writable(reinterpret_cast<void*>(b), 8)) {
+                *reinterpret_cast<u64*>(b) = reinterpret_cast<u64>(self);
+                result = 0;
+            } else {
+                result = 0x80004003;  // E_POINTER
+            }
         } else if (N == 1 || N == 2) {  // AddRef, Release
             result = 1;
         } else {
@@ -370,7 +374,7 @@ bool user_call(int slot, u64* args, u64* result)
         *result = args[0] == args[1] ? 0 : 1;
         return true;
     case 7:  // XUserAddAsync(options, async): with a local runtime there is no real operation to borrow
-        if (!InterlockedCompareExchange(&local_active, 0, 0)) return false;
+        if (!InterlockedCompareExchange(&local_active, 0, 0)) break;  // unchanged without a local runtime
         *result = local_user_add(args[1]);
         return true;
     case 8:  // XUserAddResult(async, &handle): the real operation ends with "no default user"; answer with the local user
@@ -768,13 +772,11 @@ u64 complete_async(u64 async_block)
 {
     Proxy* user = user_provider >= 0 ? proxies[user_provider] : nullptr;
     if (!user || !async_block) return 0x80004005;
-    if (!user->real) {  // a local object (X2W_RUNTIME_LOCAL): there is no runtime operation to borrow
-        static LONG logged;
-        if (x2w_local::first_calls(logged, 4)) x2w_local::logf("x2w-runtime local: async completion needs the real runtime, E_NOTIMPL");
-        return 0x80004001;
-    }
     const LONG index = InterlockedIncrement(&tracked_count) - 1;
     if (index < 64) tracked_blocks[index] = async_block;
+    // A local user object (X2W_RUNTIME_LOCAL) has no runtime operation to borrow: complete the block
+    // through the XAsync service directly, as the local XUserAddAsync does.
+    if (!user->real) return local_user_add(async_block);
     const Method add = reinterpret_cast<Method>((*reinterpret_cast<void***>(user->real))[7]);
     return add(user->real, 1 /* add default user silently */, async_block, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 }

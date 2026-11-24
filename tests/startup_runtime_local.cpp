@@ -50,6 +50,7 @@ constexpr HRESULT query_failure = E_NOINTERFACE;
 u64 init_result = init_failure;
 unsigned init_calls[3]{}, provider_queries{}, async_queries{};
 bool init_arguments_ok = true;
+bool control = false;
 
 template<int Index>
 u64 WINAPI fixture_init(u64 a, u64 b, u64 c, u64 d)
@@ -182,7 +183,7 @@ const char* run()
     if (local_active || activation_logs || !query_fails(query, providers[0]))
         return "switch off activated the fallback";
 
-    if (!set_switch("X2W_RUNTIME_LOCAL", true)) return "could not enable local runtime";
+    if (!set_switch("X2W_RUNTIME_LOCAL", !control)) return "could not enable local runtime";
     if (hooked_get_proc_address(nullptr, "QueryApiImpl") != query_addr ||
         hooked_get_proc_address(nullptr, "UnrelatedExport") != fixture_get_proc_address(nullptr, "UnrelatedExport") ||
         hooked_get_proc_address(nullptr, "MissingExport"))
@@ -259,12 +260,24 @@ const char* run()
         return "XUserAddAsync did not complete the caller's block through XAsync";
     if (seen.result != S_OK || seen.handle != local_user_handle)
         return "XUserAddResult did not return the local handle from the completion callback";
+
+    // Blocks completed on behalf of a local answer (game save, package) go through the same service
+    // when the user object is local, and are tracked so their result calls stay local.
+    Block other{};
+    expected_block = &other;
+    if (complete_async(address(&other)) != S_OK || begins != 2 || completions != 2 || releases != 2 ||
+        !async_arguments_ok || pending || completion_status != S_OK || !tracked(address(&other)))
+        return "complete_async did not complete a block through XAsync for a local user object";
+    if (invoke(user, 0, address(&providers[0]), 0) != static_cast<unsigned>(E_POINTER))
+        return "local QueryInterface accepted a null out pointer";
     return nullptr;
 }
 }
 
-int main()
+int main(int argc, char** argv)
 {
+    // --control: the local runtime switch stays off where the test enables it, so the run must fail.
+    control = argc > 1 && std::strcmp(argv[1], "--control") == 0;
     if (const char* reason = run()) {
         std::printf("FAIL: %s\n", reason);
         return 1;
