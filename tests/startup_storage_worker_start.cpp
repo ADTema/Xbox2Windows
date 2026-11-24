@@ -548,6 +548,104 @@ bool entries_keep_their_order(Fixture& f)
     return true;
 }
 
+// Suffix completions are serialized behind the submitted prefix. The prefix is one fence signal that the
+// control holds at an event (inside the worker); the suffix is a status entry and a second fence whose
+// storage failed at Enqueue. While the prefix is held Submit must not complete either of them; after
+// the release the prefix fence, the status entry and the suffix fence become visible in queue order.
+struct HoldFence {
+    void** vtable;
+    std::atomic<int> signals{0};
+    std::atomic<int> order{0};
+};
+std::atomic<int> completion_counter{0};
+HANDLE hold_entered = nullptr;
+HANDLE hold_release = nullptr;
+bool hold_prefix = false;
+
+long __stdcall held_signal(void* self, std::uint64_t)
+{
+    auto* fence = static_cast<HoldFence*>(self);
+    if (hold_prefix) {
+        SetEvent(hold_entered);
+        WaitForSingleObject(hold_release, completion_timeout_ms);
+    }
+    fence->order = ++completion_counter;
+    ++fence->signals;
+    return 0;
+}
+
+struct SubmitThread {
+    Fixture* f;
+    Fixture::Queue* q;
+    static DWORD WINAPI run(void* parameter)
+    {
+        auto* self = static_cast<SubmitThread*>(parameter);
+        self->f->submit(*self->q);
+        return 0;
+    }
+};
+
+bool suffix_waits_for_prefix(Fixture& f)
+{
+    void* hold_vtable[11] = {};
+    hold_vtable[10] = reinterpret_cast<void*>(&held_signal);
+    hold_entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    hold_release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    int suffix_cases = 0;
+    for (int fail_nth = 1; fail_nth <= 14; ++fail_nth) {
+        sweep_name = "suffix_order";
+        sweep_n = fail_nth;
+        sweep_m = 0;
+        Fixture::Queue q;
+        if (!f.create(q, f.vtables)) return fail("cannot create the queue");
+        HoldFence prefix_fence, suffix_fence;
+        prefix_fence.vtable = hold_vtable;
+        suffix_fence.vtable = hold_vtable;
+        ResetEvent(hold_entered);
+        ResetEvent(hold_release);
+        hold_prefix = false;
+        try {
+            arm(fail_nth);
+            reinterpret_cast<EnqueueSignalFn>(q.queue->vtable[5])(q.queue, &prefix_fence, 1);
+            f.status_entry(q, 0);
+            reinterpret_cast<EnqueueSignalFn>(q.queue->vtable[5])(q.queue, &suffix_fence, 2);
+            disarm();
+        } catch (...) {
+            disarm();
+            return fail("an exception left an Enqueue call");
+        }
+        // Only the runs where an entry after the first one lost its place in the queue list are a suffix.
+        if (!q.queue->work || q.queue->work->waiting.empty() || !has_unrecorded(q.queue)) {
+            hold_prefix = false;
+            f.submit(q);
+            continue;
+        }
+        ++suffix_cases;
+        completion_counter = 0;
+        hold_prefix = true;
+        SubmitThread submitter{&f, &q};
+        HANDLE thread = CreateThread(nullptr, 0, SubmitThread::run, &submitter, 0, nullptr);
+        if (!thread) return fail("cannot start the Submit thread");
+        const bool held = WaitForSingleObject(hold_entered, completion_timeout_ms) == WAIT_OBJECT_0;
+        if (held) Sleep(200);  // time for a Submit that does not wait to complete the suffix
+        const bool early = f.complete(q, 0) || suffix_fence.signals != 0;
+        SetEvent(hold_release);
+        WaitForSingleObject(thread, completion_timeout_ms);
+        CloseHandle(thread);
+        hold_prefix = false;
+        if (!held) return fail("the worker never reached the held prefix fence");
+        if (early) return fail("a status entry or fence of the failed suffix completed before the held prefix");
+        if (!f.complete(q, 0) || prefix_fence.signals != 1 || suffix_fence.signals != 1)
+            return fail("the prefix and the suffix did not both complete");
+        if (prefix_fence.order >= suffix_fence.order) return fail("the suffix fence was signaled before the prefix fence");
+    }
+    CloseHandle(hold_entered);
+    CloseHandle(hold_release);
+    if (suffix_cases == 0) return fail("the control never produced a failed suffix behind a submitted prefix");
+    std::printf("suffix completes behind the prefix: %d cases\n", suffix_cases);
+    return true;
+}
+
 // A crash is never silent: whatever ends the process names the stage it was in.
 const char* volatile current_stage = "start";
 
@@ -668,6 +766,7 @@ int main()
     if (!stage("every_allocation_on_every_thread_can_fail", every_allocation_on_every_thread_can_fail, f)) return 1;
     if (!stage("page_tokens_allocation_fails", page_tokens_allocation_fails, f)) return 1;
     if (!stage("entries_keep_their_order", entries_keep_their_order, f)) return 1;
+    if (!stage("suffix_waits_for_prefix", suffix_waits_for_prefix, f)) return 1;
     std::puts("a queue that cannot start its worker or allocate completes status and fences at Submit, and recovers");
     return 0;
 }

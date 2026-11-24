@@ -92,6 +92,9 @@ struct QueueWork {
     std::mutex mutex;
     std::condition_variable wake;
     std::deque<Entry> waiting, submitted;
+    std::condition_variable drained;  // signaled when the worker finishes an entry
+    u64 submitted_total = 0;          // entries ever moved to `submitted`, guarded by mutex
+    u64 finished_total = 0;           // entries the worker has finished running, guarded by mutex
     bool worker_started = false;  // guarded by the setup mutex
     u64 next_entry_id = 0;
     u64 next_submission_id = 0;
@@ -637,8 +640,11 @@ void fail_entry(Object* self, const Entry& entry, const char* reason) noexcept
             entry.type == Entry::request ? *reinterpret_cast<const unsigned long long*>(entry.bytes) : 0ull);
 }
 
+thread_local bool on_queue_worker = false;  // Submit from a worker must not wait for itself
+
 DWORD WINAPI queue_worker(void* parameter)
 {
+    on_queue_worker = true;
     auto* const self = static_cast<Object*>(parameter);
     QueueWork& work = *self->work;
     for (;;) {
@@ -674,7 +680,9 @@ DWORD WINAPI queue_worker(void* parameter)
             if (work.submitted.empty()) {
                 work.cached_streams.clear();
             }
+            ++work.finished_total;
         }
+        work.drained.notify_all();
     }
 }
 
@@ -765,9 +773,8 @@ void fail_unstarted(Object* self, Entry::Type type, Object* array, unsigned inde
 // deferred, every later entry until the next Submit is deferred too, even if it could be stored:
 // the stored entries (`waiting`) are an in-order prefix and the deferred ones an in-order suffix.
 // Submit handles the prefix first (moves it to the worker, or fails it), then fails the suffix.
-// Limitation: when the prefix runs on the worker, a status entry in the suffix fails synchronously
-// inside Submit and cannot see a failure the worker finds later in the prefix; the next status entry
-// will. After the first allocation failure the rest of the batch fails with E_OUTOFMEMORY even if
+// When the prefix runs on the worker, Submit waits for the worker to finish it before it fails the
+// suffix, so suffix completions are visible in queue order and see the prefix's failures. After the first allocation failure the rest of the batch fails with E_OUTOFMEMORY even if
 // memory has recovered, which is acceptable under out-of-memory and preferable to reordering.
 bool has_unrecorded(Object* self)
 {
@@ -837,6 +844,7 @@ void submit(Object* self)
         return;
     }
     bool all_moved = true;
+    u64 prefix_end = 0;
     {
         const std::lock_guard guard(work->mutex);
         const u64 submission_id = ++work->next_submission_id;
@@ -846,13 +854,23 @@ void submit(Object* self)
                 Entry& entry = work->waiting.front();
                 entry.submission_id = submission_id;
                 work->submitted.push_back(std::move(entry));
+                ++work->submitted_total;
                 work->waiting.pop_front();
             }
         } catch (const std::bad_alloc&) {
             all_moved = false;
         }
+        prefix_end = work->submitted_total;
     }
     work->wake.notify_one();
+    // Entries completed here (the rest of `waiting`, the suffix) come after the prefix on the worker, so
+    // they wait until the worker has finished that prefix: a status entry or fence then cannot complete
+    // ahead of an earlier request, and cannot consume the pending failure before the worker reports it.
+    // Nothing allocates, and nothing waits when there is nothing to complete here.
+    if ((!all_moved || has_unrecorded(self)) && !on_queue_worker) {
+        std::unique_lock lock(work->mutex);
+        work->drained.wait(lock, [&] { return work->finished_total >= prefix_end; });
+    }
     if (!all_moved) fail_waiting(self, work);
     fail_unrecorded(self);
 }
