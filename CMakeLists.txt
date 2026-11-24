@@ -96,9 +96,27 @@ target_compile_definitions(era_physical_lenient PRIVATE ERA_PHYSICAL_LENIENT_REL
 add_executable(era_physical_check tests/era_physical_check.cpp src/era_physical.cpp $<TARGET_OBJECTS:era_physical_lenient>)
 target_include_directories(era_physical_check PRIVATE src)
 target_compile_features(era_physical_check PRIVATE cxx_std_17)
-foreach(scenario IN ITEMS controls lifetime)
+foreach(scenario IN ITEMS controls lifetime owns)
     add_test(NAME era_physical_${scenario} COMMAND era_physical_check ${scenario})
 endforeach()
+# Control for era_physical_owns: the same check built against a configure-time copy of
+# era_physical.cpp whose owns() refuses the last page number, which the full registry must catch.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS src/era_physical.cpp)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/era_physical.cpp" era_physical_text)
+string(FIND "${era_physical_text}" "return page && page <= capacity_pages && " era_physical_anchor)
+if(era_physical_anchor LESS 0)
+    message(FATAL_ERROR "era_physical.cpp lost the anchor used by era_physical_owns_last_page_control")
+endif()
+string(REPLACE "return page && page <= capacity_pages && " "return page && page < capacity_pages && "
+    era_physical_text "${era_physical_text}")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/era_physical_last_page/era_physical.cpp" "${era_physical_text}")
+add_executable(era_physical_last_page_check tests/era_physical_check.cpp
+    "${CMAKE_CURRENT_BINARY_DIR}/era_physical_last_page/era_physical.cpp" $<TARGET_OBJECTS:era_physical_lenient>)
+target_include_directories(era_physical_last_page_check PRIVATE src)
+target_compile_features(era_physical_last_page_check PRIVATE cxx_std_17)
+add_test(NAME era_physical_owns_last_page_control COMMAND era_physical_last_page_check owns)
+set_tests_properties(era_physical_owns_last_page_control PROPERTIES PASS_REGULAR_EXPRESSION
+    "FAIL: owns: last page")
 
 # Desktop xmem.dll for native and mapped callers.
 add_library(xmem_shim SHARED src/xmem_shim.cpp src/xmem_shim.def src/xmem_gpu_usage.cpp src/adapter_identity.cpp src/era_heap.cpp src/era_query.cpp src/era_physical.cpp
