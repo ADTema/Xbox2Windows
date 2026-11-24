@@ -12,6 +12,7 @@ Microsoft::WRL::ComPtr<ID3D12Resource> resource(ID3D12Device* device, const D3D1
     D3D12_HEAP_TYPE heap, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear = nullptr);
 void check_compute(ID3D12Device* device, bool tables);
 void check_sampler_views(ID3D12Device* device, const char* shader_path);
+bool check_startup_sampler_x(ID3D12Device* device, bool swapped);
 void dump_raw_uav(ID3D12Device* device, const char* shader_path, const char* groups,
                   const char* bytes, const char* out_path);
 void check_spirv_window(ID3D12Device* device, const char* shader_path);
@@ -70,12 +71,14 @@ void check_bvh_hits(ID3D12Device* device);
 bool check_bvh_differential(ID3D12Device* device, bool forcePipeline);
 bool check_bvh_waves(ID3D12Device* device, bool force64);
 bool check_gpu_alias(ID3D12Device* device);
+bool check_gpu_alias_window(ID3D12Device* device);
 bool check_gpu_alias_lookup(ID3D12Device* device);
 bool check_gpu_alias_lookup_writes(ID3D12Device* device);
 bool check_gpu_alias_atomic_waterfall(ID3D12Device* device);
 bool check_gpu_alias_registry(ID3D12Device* device);
 bool check_wave_shuffle(ID3D12Device* device);
 void check_wave64_emulate(ID3D12Device* device);
+bool check_shader_wave(ID3D12Device* device, unsigned forced);
 bool check_dxr_rays(ID3D12Device* device, bool usePipeline);
 bool check_dxr_update(ID3D12Device* device, bool usePipeline);
 bool check_dxr_facing(ID3D12Device* device, bool usePipeline);

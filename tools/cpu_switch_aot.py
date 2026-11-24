@@ -4,7 +4,9 @@ Each export takes three integer words in RCX, RDX and R8 and returns RAX. The
 translator follows branches and jump-table entries from the export, so data
 placed after the code (as MSVC does with its tables) is never decoded. An
 indirect JMP is accepted only at the end of one of these sequences, reached by
-the fallthrough of an unsigned bound check on the index:
+the fallthrough of an unsigned bound check on the index (JA or JAE to the default),
+or by the taken branch of the inverted form (JB or JBE to the dispatch block,
+which a JMP to the default precedes and no other edge enters):
 
     mov E32, [B+I*4+table]; add E, B; jmp E   B = image base (MSVC)
     movsxd E, [B+I*4];      add E, B; jmp E   B = table      (LLVM)
@@ -695,20 +697,33 @@ class Function:
         else:
             raise ValueError(f"unrecognized table load at RVA {load.ip:#x}")
 
-        # The bound check must fall through into the dispatch block.
+        # The bound check falls through into the dispatch block, or (inverted) branches to it with a
+        # JMP to the default in front of it.
         bound = load
         between = []
+        inverted = False
         while True:
             bound = self.ending.get(bound.ip)
             if bound is None:
                 raise ValueError(f"unbounded jump-table index at RVA {ip:#x}")
             if bound.flow_control == FlowControl.CONDITIONAL_BRANCH:
                 break
+            if (bound.flow_control == FlowControl.UNCONDITIONAL_BRANCH and bound.is_jmp_short_or_near
+                    and not inverted):
+                inverted = True
+                first = between[-1] if between else load
+                bound = self.ending.get(bound.ip)
+                if (bound is None or bound.flow_control != FlowControl.CONDITIONAL_BRANCH
+                        or not bound.is_jcc_short_or_near or bound.near_branch_target != first.ip):
+                    raise ValueError(f"unbounded jump-table index at RVA {ip:#x}")
+                break
             if bound.flow_control != FlowControl.NEXT or len(between) >= 8:
                 raise ValueError(f"unbounded jump-table index at RVA {ip:#x}")
             between.append(bound)
         compare = self.ending.get(bound.ip)
-        if bound.condition_code not in (CC.A, CC.AE):
+        # The branch that enters the table is the one the index passed: JA/JAE when the default is
+        # taken, JB/JBE when the table is.
+        if bound.condition_code not in ((CC.B, CC.BE) if inverted else (CC.A, CC.AE)):
             raise ValueError(f"jump-table bound is not an unsigned upper limit at RVA {bound.ip:#x}")
         if (compare is None or compare.mnemonic != M.CMP or compare.op0_kind != OpKind.REGISTER
                 or compare.op1_kind not in (OpKind.IMMEDIATE8TO32, OpKind.IMMEDIATE8TO64,
@@ -716,7 +731,7 @@ class Function:
                 or RegisterExt.size(compare.op0_register) not in (4, 8)):
             raise ValueError(f"unbounded jump-table index at RVA {bound.ip:#x}")
         limit = compare.immediate(1) & ((1 << RegisterExt.size(compare.op0_register) * 8) - 1)
-        count = limit + 1 if bound.condition_code == CC.A else limit
+        count = limit + 1 if bound.condition_code in (CC.A, CC.BE) else limit
         if not 0 < count <= MAX_CASES:
             raise ValueError(f"unsupported jump-table size {count} at RVA {compare.ip:#x}")
         entries = struct.unpack(f"<{count}{'I' if kind == 'image' else 'i'}",
@@ -730,7 +745,14 @@ class Function:
 
     def prove(self, ip, edges, constants):
         index, _, sequence, window, _, (compare, bound, base, anchor) = self.dispatches[ip]
-        if any(address in edges for address in (bound.ip, *(i.ip for i in window), *sequence, ip)):
+        block = [*(i.ip for i in window), *sequence, ip]
+        if bound.condition_code in (CC.B, CC.BE):
+            # The inverted bound branch is the one way into the block, and it enters at the top.
+            entries = {source for source, targets in self.successors.items() if block[0] in targets}
+            if entries != {bound.ip}:
+                raise ValueError(f"second entry into the dispatch block at RVA {ip:#x}")
+            block = block[1:]
+        if any(address in edges for address in (bound.ip, *block)):
             raise ValueError(f"second entry into the dispatch block at RVA {ip:#x}")
         if constants.get(sequence[0], {}).get(base) != anchor:
             raise ValueError(f"table base {NAMES[base]} differs on another path to RVA {sequence[0]:#x}")

@@ -17,9 +17,14 @@
 #include "triangle_vs.h"
 #include "triangle_ps.h"
 #include "ffx_provider_loop.h"
+#include "dispatch_index_cs.h"
+#include "group_index_cs.h"
 #include "desktop_gpu.h"
 
 void check_spirv_window_atomic(ID3D12Device* device, const char* shader_path);
+void check_sampler_index_control(ID3D12Device* device,
+                                const unsigned char* dispatch_bytecode, unsigned int dispatch_size,
+                                const unsigned char* group_bytecode, unsigned int group_size);
 
 #ifdef OFFSCREEN_AGILITY_620
 extern "C" {
@@ -500,6 +505,19 @@ OperationResult run_spirv_sampler_views(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// Two builds of one shader that differ only in the sampler descriptor index source (#1115). The
+// SV_DispatchThreadID build must match the shared expected words; the SV_GroupID build is printed
+// for the record, because an adapter that folds the index still matches on some drivers.
+OperationResult run_sampler_index_control(const OperationContext& ctx)
+{
+    (void)ctx;
+    check_sampler_index_control(ctx.device, sampler_index_dispatch_cs,
+                                static_cast<unsigned int>(sizeof(sampler_index_dispatch_cs)),
+                                sampler_index_group_cs,
+                                static_cast<unsigned int>(sizeof(sampler_index_group_cs)));
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_raw_uav_dump(const OperationContext& ctx)
 {
     dump_raw_uav(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], ctx.argv[6]);
@@ -884,6 +902,11 @@ OperationResult run_gpu_alias(const OperationContext& ctx)
     return skip_if_false(check_gpu_alias(ctx.device));
 }
 
+OperationResult run_gpu_alias_window(const OperationContext& ctx)
+{
+    return skip_if_false(check_gpu_alias_window(ctx.device));
+}
+
 OperationResult run_gpu_alias_lookup(const OperationContext& ctx)
 {
     return skip_if_false(check_gpu_alias_lookup(ctx.device));
@@ -918,6 +941,24 @@ OperationResult run_wave_shuffle(const OperationContext& ctx)
         "skip: wave shuffle fixture requires SM 6.6 and a supported forced wave width");
 }
 
+OperationResult run_shader_wave(const OperationContext& ctx)
+{
+    return skip_if_false(check_shader_wave(ctx.device, 0),
+                         "skip: shader wave fixture requires SM 6.0 and WaveOps");
+}
+
+OperationResult run_shader_wave32(const OperationContext& ctx)
+{
+    return skip_if_false(check_shader_wave(ctx.device, 32),
+                         "skip: shader wave32 fixture requires SM 6.6, WaveOps, and a 32-lane wave");
+}
+
+OperationResult run_shader_wave64(const OperationContext& ctx)
+{
+    return skip_if_false(check_shader_wave(ctx.device, 64),
+                         "skip: shader wave64 fixture requires SM 6.6, WaveOps, and a 64-lane wave");
+}
+
 template<bool Swapped>
 OperationResult run_descriptor_heap_paging(const OperationContext& ctx)
 {
@@ -929,6 +970,13 @@ OperationResult run_wave64_emulate(const OperationContext& ctx)
 {
     check_wave64_emulate(ctx.device);
     return {OutcomeKind::pass, nullptr};
+}
+
+template<bool Swapped>
+OperationResult run_startup_sampler_x(const OperationContext& ctx)
+{
+    return skip_if_false(check_startup_sampler_x(ctx.device, Swapped),
+                         "skip: R32_FLOAT does not report filtered sampling with mips");
 }
 
 constexpr CapabilityGate kNoGate{};
@@ -948,6 +996,18 @@ constexpr CapabilityGate kGateWaveShuffle{
     D3D_SHADER_MODEL_6_5, false, true, 0,
     "skip: wave shuffle fixture requires SM 6.5 and WaveOps",
     CapsDiagnostic::wave_6_6};
+constexpr CapabilityGate kGateShaderWave{
+    D3D_SHADER_MODEL_6_0, false, true, 0,
+    "skip: shader wave fixture requires SM 6.0 and WaveOps",
+    CapsDiagnostic::none};
+constexpr CapabilityGate kGateShaderWave32{
+    D3D_SHADER_MODEL_6_6, false, true, 32,
+    "skip: shader wave32 fixture requires SM 6.6, WaveOps, and a 32-lane wave",
+    CapsDiagnostic::wave_6_6};
+constexpr CapabilityGate kGateShaderWave64{
+    D3D_SHADER_MODEL_6_6, false, true, 64,
+    "skip: shader wave64 fixture requires SM 6.6, WaveOps, and a 64-lane wave",
+    CapsDiagnostic::wave_6_6};
 constexpr CapabilityGate kGateSm60MeshFallback{
     D3D_SHADER_MODEL_6_0, false, false, 0,
     "skip: mesh fallback requires SM 6.0",
@@ -960,7 +1020,10 @@ constexpr CapabilityGate kGateSm60CompareSampler{
     D3D_SHADER_MODEL_6_0, false, false, 0,
     "skip: comparison-sampler fixture requires SM 6.0",
     CapsDiagnostic::none};
-constexpr CapabilityGate kGateSm60RawUavDump{
+constexpr CapabilityGate kGateSm60SamplerIndexControl{
+    D3D_SHADER_MODEL_6_0, false, false, 0,
+    "skip: sampler index control requires SM 6.0",
+    CapsDiagnostic::none};constexpr CapabilityGate kGateSm60RawUavDump{
     D3D_SHADER_MODEL_6_0, false, false, 0,
     "skip: raw UAV dump requires SM 6.0",
     CapsDiagnostic::none};
@@ -1004,6 +1067,9 @@ const OperationSpec kOperations[] = {
     {"--ffx-immediate-conversion", 4, 4, nullptr, kNoGate, run_ffx_immediate_conversion},
     {"--compute-store-case", 5, 5, nullptr, kNoGate, run_compute_store_case},
     {"--spirv-sampler-views", 4, 4, nullptr, kGateSm60SamplerViews, run_spirv_sampler_views},
+    // Two builds that differ only in the sampler descriptor index source (#1115): the
+    // SV_DispatchThreadID build is asserted, the SV_GroupID build is recorded per swap.
+    {"--sampler-index-control", 3, 3, nullptr, kGateSm60SamplerIndexControl, run_sampler_index_control},
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},
     {"--spirv-address-window", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window},
@@ -1072,6 +1138,7 @@ const OperationSpec kOperations[] = {
     {"--ray-query", 3, 3, nullptr, kNoGate, run_ray_query},
     {"--dxr-pipeline", 3, 3, nullptr, kNoGate, run_dxr_pipeline},
     {"--gpu-alias", 3, 3, nullptr, kNoGate, run_gpu_alias},
+    {"--gpu-alias-window", 3, 3, nullptr, kNoGate, run_gpu_alias_window},
     {"--gpu-alias-lookup", 3, 3, nullptr, kNoGate, run_gpu_alias_lookup},
     {"--gpu-alias-lookup-writes", 3, 3, nullptr, kNoGate, run_gpu_alias_lookup_writes},
     {"--gpu-alias-atomic-waterfall", 3, 3, nullptr, kGateSm60AtomicWaterfall, run_gpu_alias_atomic_waterfall},
@@ -1079,8 +1146,13 @@ const OperationSpec kOperations[] = {
     {"--buffer-ops", 3, 3, nullptr, kGateSm60BufferOps, run_buffer_ops},
     {"--descriptor-heap-paging", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_heap_paging<false>},
     {"--descriptor-heap-paging-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_heap_paging<true>},
+    {"--startup-sampler-x", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<false>},
+    {"--startup-sampler-x-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<true>},
     {"--wave-shuffle", 3, 3, nullptr, kGateWaveShuffle, run_wave_shuffle},
     {"--wave64-emulate", 3, 3, nullptr, kNoGate, run_wave64_emulate},
+    {"--shader-wave", 3, 3, nullptr, kGateShaderWave, run_shader_wave},
+    {"--shader-wave32", 3, 3, nullptr, kGateShaderWave32, run_shader_wave32},
+    {"--shader-wave64", 3, 3, nullptr, kGateShaderWave64, run_shader_wave64},
 };
 
 struct DiagnosticTarget {
@@ -1260,6 +1332,8 @@ int run_self_test()
                    "Unknown GPU operation or invalid arguments: --compute-root-file")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--spirv-sampler-views"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --spirv-sampler-views")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--sampler-index-control", "extra"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --sampler-index-control")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--spirv-compare-sampler", "a.dxil", "5"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --spirv-compare-sampler")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--spirv-compare-sampler", "a.dxil", "5", "ref.bin", "baseline", "extra"},
