@@ -63,6 +63,12 @@ B4G4R4A4_UNORM, the wrapper uses an R8G8B8A8_UNORM null descriptor if that forma
 requested view. This applies only to Texture2D views with no resource or counter. Run
 `ctest --preset dev --no-tests=error -R '^startup_null_views_' -V` against your build
 directory to exercise both slots on hardware and WARP. On Windows 11 build 26300.9974 two adapters on one machine split. An RTX 5080 Laptop (32.0.15.8142) lacks the typed UAV and render-target support the rule keys on and reports `slot 19 format 86 -> 28; slot 20 format 115 -> 28`; an Intel Arc 140T (32.0.101.8132) has it, like in-box WARP 10.0.26100.9818, and both report `slot 19 format 86 -> 86; slot 20 format 115 -> 115`. Physical versus WARP is therefore not the discriminator; select the adapter with `XBOX2WINDOWS_ADAPTER=intel` or `XBOX2WINDOWS_ADAPTER=nvidia` and read the two lines.
+Because WARP keeps both formats, `startup_null_texture_view` checks the rule without a GPU: fake
+adapters answer the format queries, and the check covers a packed format with or without its use,
+one with only the other slot's use, R8G8B8A8 with one use or none, failed queries, and the other
+dimensions, formats, resources and counters that are left alone. A rewrite must keep every other
+field of the description. `startup_null_texture_view_unchecked_fallback_control` rewrites without
+asking about R8G8B8A8 and must fail.
 
 ## 16-bit packed targets
 
