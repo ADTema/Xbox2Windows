@@ -678,6 +678,27 @@ foreach ($adapter in 'hardware','warp') {
 }
 ```
 
+### gfx1030 2D image LOD queries
+
+The pixel translator lowers `image_get_lod` for a single 2D texture and an
+ordinary sampler. It accepts a contiguous pair of 32-bit UVs with quad
+provenance and `dmask:0x3`. The results are the sampler-clamped LOD followed
+by the raw LOD. A matching image and sampler descriptor must be ready before
+the query. Both result registers need `s_waitcnt vmcnt(0)` before use.
+
+The fixture draws an 8 by 8 viewport over a single-mip 8 by 8 texture. The
+CPU reference derives raw LOD from four power-of-two UV scales and compares
+all exported channels, including the clamped LOD of zero. Clamping the raw
+result first differs at pixel `(0, 0)`, channel 1 (`-1` expected, `0` actual).
+A two-mip draw also checks clamped LOD 1 and raw LOD 2. Removing the upper
+clamp gives 2 in the channel that should contain 1. LLVM 15 assembles both
+gfx1030 programs and round-trips them through the pixel container CLI. The GPU fixture executes the translated desktop DXIL.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^pixel_aot_get_lod_(warp|hardware)$' -V
+```
+
 ### Unsigned pixel conversion and entry inputs
 
 The plain gfx1013 `v_cvt_u32_f32_e32` path uses the binary32-to-uint helper from the FFX translator. It truncates positive fractions toward zero, maps NaN and negative inputs to zero, and saturates at `0xffffffff` for inputs at or above 2^32. Sources are a defined VGPR, a ready SGPR or a hexadecimal literal word. Whole-quad execution requires a source defined for helper lanes. A varying conversion cannot establish an affine texture coordinate. [AMD RDNA 2 ISA](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf) · [Shared conversion implementation](../src/ffx_float_to_int.hlsli)
