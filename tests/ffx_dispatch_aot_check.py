@@ -611,11 +611,13 @@ FLOAT_MATH = (
         (0x40400000, 0x00000000, 0x00000000),  # 3.0, 0 -> 0.0
         (0x3f000000, 0x00000000, 0x3f000000),  # 0.5, 0 -> 0.5
         (0xbe800000, 0x00000000, 0x3f400000),  # -0.25, 0 -> 0.75
+        (0xb0800000, 0x00000000, 0x3f7fffff),  # -2^-30, 0 -> largest binary32 below 1.0, not 1.0
     )),
     ("v_fract_f32_e64 v0, v1 clamp", (
         (0x40300000, 0x00000000, 0x3f400000),  # 2.75, 0 -> 0.75
         (0xc0300000, 0x00000000, 0x3e800000),  # -2.75, 0 -> 0.25
         (0x3f000000, 0x00000000, 0x3f000000),  # 0.5, 0 -> 0.5
+        (0xb0800000, 0x00000000, 0x3f7fffff),  # -2^-30, 0 -> largest binary32 below 1.0, not 1.0
     )),
     ("v_add_f32_e64 v0, v1, v2 clamp", (
         (0x3f000000, 0x3f400000, 0x3f800000),  # 0.5, 0.75 -> 1.0
@@ -675,6 +677,10 @@ def lower_only(text):
     return re.sub(r"asuint\(saturate\((.*)\)\);", r"asuint(max(\1,0.0));", text)
 
 
+def fract_without_upper_bound(text):
+    return re.sub(r"min\((frac\(asfloat\(v1\)\)),asfloat\(0x3f7fffffu\)\)", r"\1", text)
+
+
 def frac_as_x_minus_trunc(text):
     return re.sub(r"frac\((asfloat\(v1\))\)", r"(\1-trunc(\1))", text)
 
@@ -692,8 +698,10 @@ FLOAT_MUTATIONS = (
     ("v_floor_f32_e64 v0, v1 clamp", drop_saturate, [0, 1]),
     ("v_trunc_f32_e32 v0, v1", lambda s: s.replace("trunc(", "floor("), [1, 3]),
     ("v_trunc_f32_e64 v0, v1 clamp", drop_saturate, [0, 1]),
-    ("v_fract_f32_e32 v0, v1", frac_as_x_minus_trunc, [1, 4]),
-    ("v_fract_f32_e64 v0, v1 clamp", frac_as_x_minus_trunc, [1]),
+    ("v_fract_f32_e32 v0, v1", frac_as_x_minus_trunc, [1, 4, 5]),
+    ("v_fract_f32_e64 v0, v1 clamp", frac_as_x_minus_trunc, [1, 3]),
+    ("v_fract_f32_e32 v0, v1", fract_without_upper_bound, [5]),
+    ("v_fract_f32_e64 v0, v1 clamp", fract_without_upper_bound, [3]),
     ("v_add_f32_e64 v0, v1, v2 clamp", drop_saturate, [0, 1]),
     ("v_add_f32_e64 v0, v1, v2 clamp", upper_only, [1]),
     ("v_add_f32_e64 v0, v1, v2 clamp", lower_only, [0]),

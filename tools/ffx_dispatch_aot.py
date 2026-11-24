@@ -83,7 +83,7 @@ FLOAT = {
     "min_f32": "min({0},{1})", "max_f32": "max({0},{1})", "med3_f32": "median_f({0},{1},{2})",
     "fma_f32": "mad({0},{1},{2})", "fmamk_f32": "mad({0},{1},{2})", "fmac_f32": "mad({0},{1},{d})",
     "subrev_f32": "{1}-{0}", "sqrt_f32": "sqrt({0})", "rsq_f32": "rsqrt({0})",
-    "floor_f32": "floor({0})", "trunc_f32": "trunc({0})", "fract_f32": "frac({0})",
+    "floor_f32": "floor({0})", "trunc_f32": "trunc({0})", "fract_f32": "min(frac({0}),asfloat(0x3f7fffffu))",
 }
 # Source count of the operations added with the clamp modifier. A wrong count is refused
 # instead of silently dropping or inventing a source.
