@@ -443,7 +443,9 @@ void discard_draw_sampler_heaps(Wrapper* self)
     ReleaseSRWLockExclusive(&draw_lock);
 }
 
-// draw_lock held. The lists have already been executed on this queue.
+// draw_lock held. The lists have already been executed on this queue. A closed list can be
+// submitted again until its Reset, so each submit takes its own references and the recording
+// keeps its own until discard_draw_sampler_heaps.
 void retire_draw_sampler_heaps(ID3D12CommandQueue* queue, const std::vector<ID3D12CommandList*>& lists)
 {
     submitted_draw_sampler_heaps.erase(std::remove_if(submitted_draw_sampler_heaps.begin(),
@@ -454,8 +456,7 @@ void retire_draw_sampler_heaps(ID3D12CommandQueue* queue, const std::vector<ID3D
     for (auto* list : lists) {
         auto it = recorded_draw_sampler_heaps.find(list);
         if (it == recorded_draw_sampler_heaps.end()) continue;
-        for (auto& heap : it->second) batch.heaps.push_back(std::move(heap));
-        recorded_draw_sampler_heaps.erase(it);
+        for (const auto& heap : it->second) batch.heaps.push_back(heap);
     }
     if (batch.heaps.empty()) return;
     x2w_startup::ComPtr<ID3D12Device> device;
