@@ -364,6 +364,7 @@ int main(int argc, char** argv)
         }
         SetEnvironmentVariableA("X2W_INPUT_KEYS", "52");
         input->GetCurrentReading(kind_keyboard, kbd_device, &tmp);
+        const std::uint64_t key52 = tmp ? tmp->GetSequenceNumber(kind_keyboard) : 0;
         if (tmp) tmp->Release();
         tmp = nullptr;
         failures += check(input->GetNextReading(pad_a, kind_gamepad, pad_device, &tmp) == reading_not_found && tmp == nullptr,
@@ -384,8 +385,7 @@ int main(int argc, char** argv)
             IGameInputReading* kback = nullptr;
             failures += check(input->GetPreviousReading(pad_b, kind_keyboard, kbd_device, &kback) == S_OK && kback, "previous keyboard reading");
             if (kback) {
-                failures += check(kback->GetSequenceNumber(kind_keyboard) < pad_b->GetSequenceNumber(kind_keyboard) &&
-                                      kback->GetSequenceNumber(kind_keyboard) > key51, "previous keyboard reading skips pad-only entries");
+                failures += check(kback->GetSequenceNumber(kind_keyboard) == key52 - 1 && key52 > key51, "previous keyboard reading skips pad-only entries");
                 kback->Release();
             }
             pad_b->Release();
