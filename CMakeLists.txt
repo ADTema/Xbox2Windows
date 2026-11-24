@@ -574,6 +574,12 @@ add_dependencies(startup_xapu_queue_check startup_stub_xapu)
 add_test(NAME startup_xapu_queue COMMAND startup_xapu_queue_check "$<TARGET_FILE:startup_stub_xapu>")
 set_tests_properties(startup_xapu_queue PROPERTIES TIMEOUT 60)
 
+add_executable(startup_chad_check tests/startup_chad_check.cpp)
+target_compile_features(startup_chad_check PRIVATE cxx_std_17)
+add_dependencies(startup_chad_check startup_stub_chad)
+add_test(NAME startup_chad_check COMMAND startup_chad_check "$<TARGET_FILE:startup_stub_chad>")
+set_tests_properties(startup_chad_check PROPERTIES TIMEOUT 60)
+
 # BMP writer of the draw dumps (src/startup_stubs/draw_bmp.h); the mutated runs are negative controls.
 add_executable(startup_draw_bmp_check tests/startup_draw_bmp.cpp)
 add_test(NAME startup_draw_bmp COMMAND startup_draw_bmp_check)
