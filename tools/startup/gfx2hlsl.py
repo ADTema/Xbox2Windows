@@ -673,7 +673,7 @@ class Stage:
             return ('s%d' % r[1]) if r and r[0] == 's' and r[1] != r[2] else tok
         srcs = [low(t) for t in srcs]
         dname = low(ops[0])
-        word_complement = base in ('s_nand_b32', 's_nor_b32', 's_xnor_b32')
+        word_complement = base in ('s_nand_b32', 's_nor_b32', 's_xnor_b32') or base in SHIFT_ADD
         word_pack = base == 's_pack_hh_b32_b16'
         if word_complement or word_pack:
             # The per-lane mask cannot supply the full word needed by these operations.
@@ -728,6 +728,10 @@ class Stage:
             return None
         values = [self.u(t) for t in srcs]
         expr = text.format(*values)
+        if base in SHIFT_ADD:
+            # carry = bits shifted out of S0, or a wrap of the 32-bit sum; read before the destination is written
+            n = SHIFT_ADD[base]
+            self.emit('scc = (%s >> %d) != 0 || (%s) < %s;' % (values[0], 32 - n, expr, values[1]))
         if dname == 'm0':
             self.sym.pop('m0', None)
             self.emit('m0 = %s;' % expr)
@@ -1739,7 +1743,12 @@ SCA = {
     's_pack_hh_b32_b16': ('({0} >> 16) | ({1} & 0xffff0000u)', None),
     # s_bfm_b32: a mask of S0[4:0] ones shifted left by S1[4:0]; SCC unchanged.
     's_bfm_b32': ('(((1u << ({0} & 31)) - 1) << ({1} & 31))', None),
+    # s_lshlN_add_u32: (S0 << N) + S1. SCC is the carry out of the 33-bit-wide sum, written from SHIFT_ADD below.
+    's_lshl1_add_u32': ('({0} << 1) + {1}', None), 's_lshl2_add_u32': ('({0} << 2) + {1}', None),
+    's_lshl3_add_u32': ('({0} << 3) + {1}', None), 's_lshl4_add_u32': ('({0} << 4) + {1}', None),
 }
+# shift amount of the scalar shift-and-add forms; their SCC is a carry from the sources, not a rule over the result
+SHIFT_ADD = {'s_lshl1_add_u32': 1, 's_lshl2_add_u32': 2, 's_lshl3_add_u32': 3, 's_lshl4_add_u32': 4}
 for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt', '<'), ('le', '<=')):
     for _typ, _cast in (('i32', 'int({0}) %s int({1})'), ('u32', '{0} %s {1}')):
         def _make(op=_op, cast=_cast):
