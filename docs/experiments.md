@@ -15,6 +15,17 @@ that operand loses three patterns under optimized FXC.
 ctest --preset dev --no-tests=error -R '^startup_mrt_' -V
 ```
 
+## Typeless surfaces in the window presenter
+
+A presented texture in an 8-bit RGBA/BGRA/BGRX or 10:10:10:2 `_TYPELESS` format is sampled through its UNORM
+view; other typeless formats are refused, not guessed. `startup_present_view_check` compares a compute
+readback of 16 texels per family on WARP and hardware with a CPU decode of the uploaded bytes. The identity
+mapping (the old behaviour) fails the table; an sRGB view of the RGBA8 texture fails on the first texel (0x03 reads 0.0009, not 0.0118).
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_present_view' -V
+```
+
 ## CPU-written R8 planes across frames
 
 The startup draw uploader checks a single-mip, single-slice R8_UNORM texture of up to 32 MiB

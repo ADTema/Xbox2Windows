@@ -172,8 +172,14 @@ bool present_to_window(ID3D12CommandQueue* queue, ID3D12Resource* surface)
     const D3D12_RESOURCE_DESC desc = surface->GetDesc();
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1) return false;
     ID3D12Device* device = device_of(the_device);
+    const DXGI_FORMAT view_format = x2w_startup::present_view_format(desc.Format);
+    if (view_format == DXGI_FORMAT_UNKNOWN) {
+        static LONG refused;
+        if (first_calls(refused, 4)) log("x2w-present surface format %d has no single typed view; not shown (present_view_format.h)", desc.Format);
+        return false;
+    }
     D3D12_SHADER_RESOURCE_VIEW_DESC view{};
-    view.Format = desc.Format;
+    view.Format = view_format;
     view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     view.Texture2D.MipLevels = 1;
