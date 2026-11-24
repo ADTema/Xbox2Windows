@@ -405,6 +405,16 @@ It runs the debugger with `out/pe-env/Scripts/python.exe` when that environment 
 The debugger runs the process in a kill-on-close job with a memory cap, **offline**: file opens of
 socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do not).
 
+The file hooks that offline mode needs are always armed. The gaming-runtime call hooks
+(`QueryApiImpl`, `InitializeApiImpl*`, `XErrorReport`) and the movie-player call hooks (open,
+close, next frame, frame buffers, pause, skip) are armed only with `--trace-calls 1`
+(`run.ps1 -TraceCalls`), because every hooked call stops the whole process under the debugger.
+Without it those calls are not written to `files.txt`, and the movie-player report at the end of
+`<log>.out` (call counts, movie header, frame buffers and the luma-plane PNG) is absent; with it both
+are as before. The summary states `call tracing: on` or `off`. `startup_debug` checks that a
+source-built DLL loaded under the movie-player module name is not hooked by default and that each of
+its 7 export calls is counted with `--trace-calls 1`.
+
 A process that Windows creates under a debugger normally gets the debug heap: the loader sets the
 heap tail-check, free-check and parameter-validation flags and the low-fragmentation heap is not
 used, so every allocation and free costs more. The debugger starts the process with
