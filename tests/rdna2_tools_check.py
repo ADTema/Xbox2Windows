@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
@@ -2662,6 +2663,144 @@ class TestRdna2Disasm(unittest.TestCase):
                 plain = disasm_rdna2(self._vop3_word(op, **kwargs))[0]["assembly"]
                 self.assertEqual(disasm_rdna2(self._vop3_word(op, op_sel=0xf, **kwargs))[0]["assembly"], plain)
 
+    # Issue #1298: v_permlane16_b32 (VOP3 0x377) and v_permlanex16_b32 (0x378), assembled with llvm-mc 15.0.7
+    # for gfx1013. They cover both opcodes, the special SGPRs, inline constants and both op_sel flags.
+    VOP3_PERMLANE_VECTORS = (
+        ("000077d701050c00", "v_permlane16_b32 v0, v1, s2, s3"),
+        ("000078d701050c00", "v_permlanex16_b32 v0, v1, s2, s3"),
+        ("ff0078d7ffd3a401", "v_permlanex16_b32 v255, v255, s105, s105"),
+        ("000077d701d5fc01", "v_permlane16_b32 v0, v1, vcc_lo, exec_hi"),
+        ("000077d701d70c00", "v_permlane16_b32 v0, v1, vcc_hi, s3"),
+        ("000077d701f9f401", "v_permlane16_b32 v0, v1, m0, null"),
+        ("000077d701fbf801", "v_permlane16_b32 v0, v1, null, exec_lo"),
+        ("000077d701d90c00", "v_permlane16_b32 v0, v1, ttmp0, s3"),
+        ("000077d701030d00", "v_permlane16_b32 v0, v1, 1, s3"),
+        ("000077d701050403", "v_permlane16_b32 v0, v1, s2, -1"),
+        ("000078d701e10d00", "v_permlanex16_b32 v0, v1, 0.5, s3"),
+        ("000877d701050c00", "v_permlane16_b32 v0, v1, s2, s3 op_sel:[1,0]"),
+        ("001078d701050c00", "v_permlanex16_b32 v0, v1, s2, s3 op_sel:[0,1]"),
+        ("001878d701050c00", "v_permlanex16_b32 v0, v1, s2, s3 op_sel:[1,1]"),
+    )
+
+    def test_vop3_permlane_golden_vectors(self):
+        """Issue #1298: both lane permutes print as LLVM 15 does, with a two-element op_sel:[fi,bound_ctrl]."""
+        for encoding, assembly in self.VOP3_PERMLANE_VECTORS:
+            with self.subTest(assembly=assembly):
+                record, = disasm_rdna2(bytes.fromhex(encoding))
+                self.assertEqual(record["assembly"], assembly)
+                self.assertEqual(record["opcode"], assembly.split()[0])
+                self.assertEqual(record["length"], 8)
+
+    def test_vop3_permlane_llvm_round_trip(self):
+        """Issue #1298: the vectors assemble to these bytes and LLVM 15 disassembles them to the same strings."""
+        if not os.environ.get("LLVM_LIB"):
+            self.skipTest("LLVM_LIB environment variable not set; verified against golden vectors")
+        resolved_lib = resolve_llvm_lib(os.environ["LLVM_LIB"])
+        assembler = resolve_tool("LLVM_MC", ["llvm-mc-15", "llvm-mc"])
+        objcopy = resolve_tool("LLVM_OBJCOPY", ["llvm-objcopy-15", "llvm-objcopy"])
+        if not assembler or not objcopy:
+            self.fail(f"permlane round trip requires llvm-mc and llvm-objcopy (assembler={assembler}, objcopy={objcopy})")
+        source = [assembly for _, assembly in self.VOP3_PERMLANE_VECTORS]
+        expected = bytes.fromhex("".join(encoding for encoding, _ in self.VOP3_PERMLANE_VECTORS))
+        emitted = assemble_with_llvm_mc(source, assembler, objcopy)
+        self.assertEqual(emitted, expected)
+        decoded = [record["assembly"] for record in disasm_rdna2(emitted)]
+        self.assertEqual(decoded, llvm_disassemble(emitted, resolved_lib))
+        self.assertEqual(decoded, source)
+        self.assertEqual(assemble_with_llvm_mc(decoded, assembler, objcopy), emitted)
+
+    def test_vop3_permlane_fields_and_neighbours_differ(self):
+        """Negative control: the opcode, vdst and both op_sel flags each change the text; 0x376/0x379 stay distinct."""
+        base = bytes.fromhex("000077d701050c00")
+        for label, byte, mask in (("opcode low bit", 2, 0x01), ("vdst low bit", 0, 0x01),
+                                  ("fi", 1, 0x08), ("bound_ctrl", 1, 0x10)):
+            with self.subTest(mutation=label):
+                mutated = bytearray(base)
+                mutated[byte] ^= mask
+                self.assertNotEqual(disasm_rdna2(bytes(mutated))[0]["assembly"], disasm_rdna2(base)[0]["assembly"])
+        names = {op: disasm_rdna2(self._vop3_word(op, src0=0x101, src1=2, src2=3))[0]["opcode"]
+                 for op in (0x376, 0x377, 0x378, 0x379)}
+        self.assertEqual(names, {0x376: "v_sub_nc_i32", 0x377: "v_permlane16_b32",
+                                 0x378: "v_permlanex16_b32", 0x379: "v_vop3_379"})
+
+    def test_vop3_permlane_refuses_forms_the_llvm_15_assembler_cannot_produce(self):
+        """Issue #1298: words LLVM 15 drops bits from or cannot assemble keep their length and are reported refused."""
+        word = lambda **kw: self._vop3_word(0x377, **{"vdst": 0, "src0": 0x101, "src1": 2, "src2": 3, **kw})
+        refused = {
+            # LLVM 15's disassembler drops these bits and prints the plain instruction.
+            "abs on src0": word(abs_bits=1),
+            "abs on src2": word(abs_bits=4),
+            "neg on src0": word(neg=1),
+            "neg on src1": word(neg=2),
+            "op_sel[2]": word(op_sel=4),
+            "op_sel[3]": word(op_sel=8),
+            # LLVM 15 refuses these words.
+            "clamp": word(clamp=1),
+            "omod mul:2": word(omod=1),
+            "omod div:2": word(omod=3),
+            # LLVM 15 prints these, but its assembler rejects the operand.
+            "SGPR src0": word(src0=1),
+            "inline constant src0": word(src0=0x81),
+            "VGPR lane select src1": word(src1=0x102),
+            "VGPR lane select src2": word(src2=0x103),
+            "reserved code 209 in src1": word(src1=209),
+            "SDWA marker 249 in src2": word(src2=249),
+            "LDS direct in src1": word(src1=254),
+        }
+        end = struct.pack("<I", 0xbf810000)
+        for label, data in refused.items():
+            with self.subTest(form=label):
+                records = disasm_rdna2(data + end)
+                self.assertEqual([r["length"] for r in records], [8, 4])
+                self.assertEqual(records[0]["opcode"], "v_permlane16_b32_unsupported")
+                self.assertEqual(records[0]["assembly"], "v_permlane16_b32 <unsupported VOP3A encoding>")
+                self.assertEqual(records[1]["opcode"], "s_endpgm")
+        # A literal source is refused but keeps its twelve-byte record, so the next instruction stays aligned.
+        for field in ("src1", "src2"):
+            with self.subTest(form=f"literal {field}"):
+                literal = self._vop3_word(0x378, **{"vdst": 0, "src0": 0x101, "src1": 2, "src2": 3, field: 255})
+                records = disasm_rdna2(literal + struct.pack("<I", 0x12345678) + end)
+                self.assertEqual([r["length"] for r in records], [12, 4])
+                self.assertEqual(records[0]["opcode"], "v_permlanex16_b32_unsupported")
+                self.assertEqual(records[1]["opcode"], "s_endpgm")
+        truncated = disasm_rdna2(word(src1=255))
+        self.assertEqual([(r["length"], r["opcode"]) for r in truncated], [(8, "vop3_truncated")])
+
+    def test_vop3_permlane_modifier_and_source_grid_matches_the_llvm_15_assembler(self):
+        """Issue #1298: a decoded word disassembles as LLVM 15 prints it; LLVM only drops bits of a refused word."""
+        if not os.environ.get("LLVM_LIB"):
+            self.skipTest("LLVM_LIB environment variable not set; verified against golden vectors")
+        resolved_lib = resolve_llvm_lib(os.environ["LLVM_LIB"])
+        accepted = refused_but_printed = 0
+        for op in (0x377, 0x378):
+            for w0_bit in range(8, 16):
+                for w1_bit in (None, 27, 28, 29, 30, 31):
+                    word = bytearray(self._vop3_word(op, vdst=0, src0=0x101, src1=2, src2=3))
+                    w0, w1 = struct.unpack("<2I", word)
+                    w0 |= 1 << w0_bit
+                    if w1_bit is not None:
+                        w1 |= 1 << w1_bit
+                    data = struct.pack("<2I", w0, w1)
+                    record, = disasm_rdna2(data)
+                    try:
+                        expected = llvm_disassemble(data, resolved_lib)
+                    except ValueError:
+                        expected = None
+                    with self.subTest(op=hex(op), w0_bit=w0_bit, w1_bit=w1_bit):
+                        if not record["opcode"].endswith("_unsupported"):
+                            accepted += 1
+                            self.assertIsNone(w1_bit)
+                            self.assertIn(w0_bit, (11, 12))
+                            self.assertEqual([record["assembly"]], expected)
+                        elif expected is not None:
+                            # LLVM prints the word only by dropping abs, neg and op_sel[2:3]: its text is that of
+                            # the word without them, which this decoder accepts.
+                            refused_but_printed += 1
+                            kept = struct.pack("<2I", w0 & ~0xe700, w1 & ~0xe0000000)
+                            self.assertEqual(expected, [disasm_rdna2(kept)[0]["assembly"]])
+        self.assertEqual(accepted, 4)
+        self.assertGreater(refused_but_printed, 0)
+
     def test_vop3_mul_lo_i32_qsad_and_interp_mov_modifier_grid_matches_llvm(self):
         """Issue #938: every abs, neg, clamp, omod and op_sel combination is accepted or refused exactly as LLVM does."""
         if not os.environ.get("LLVM_LIB"):
@@ -4711,6 +4850,101 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertEqual(summary["total_shaders_scanned"], 2)
             self.assertEqual(summary["translator_accepted"], 1)
             self.assertEqual(summary["opcodes_recognized_translator_rejected"], 1)
+
+    def test_unbound_operand_counted_separately(self):
+        """Issue #1314: a read of an entry register the scan does not bind is counted apart from real rejections.
+
+        The record keeps its verdict, opcode columns and lower_error text; the cause and the register are added.
+        """
+        bound_sample = [
+            "s_mov_b64 s[50:51], exec",
+            "s_wqm_b64 exec, exec",
+            "s_mov_b32 m0, s24",
+            "v_interp_p1_f32_e32 v8, v0, attr0.x",
+            "v_interp_p1_f32_e32 v9, v0, attr0.y",
+            "v_interp_p2_f32_e32 v9, v1, attr0.y",
+            "v_interp_p2_f32_e32 v8, v1, attr0.x",
+            "s_and_b64 exec, exec, s[50:51]",
+            "s_mov_b32 s21, 0",
+            "s_load_dwordx8 s[28:35], s[20:21], null",
+            "s_mov_b32 s40, 1",
+            "s_mov_b32 s41, 2",
+            "s_mov_b32 s42, 3",
+            "s_mov_b32 s43, 4",
+            "s_waitcnt lgkmcnt(0)",
+            "image_sample v[12:15], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "s_waitcnt vmcnt(0)",
+            "v_cvt_pkrtz_f16_f32_e32 v16, v12, v13",
+            "v_cvt_pkrtz_f16_f32_e32 v17, v14, v15",
+            "exp mrt0 v16, v16, v17, v17 done compr vm",
+            "s_endpgm",
+        ]
+        unbound_sgpr = ["s_mov_b32 m0, s9" if line == "s_mov_b32 m0, s24" else line for line in bound_sample]
+        unbound_vgpr = ["v_mov_b32_e32 v2, v3", *bound_sample]
+        unknown_opcode = [bound_sample[0], "v_imaginary_op_xyz v2, v0", *bound_sample[1:]]
+        results = [
+            analyze_shader_instructions("bound_ps", bound_sample),
+            analyze_shader_instructions("unbound_sgpr_ps", unbound_sgpr),
+            analyze_shader_instructions("unbound_vgpr_ps", unbound_vgpr),
+            analyze_shader_instructions("unknown_opcode_ps", unknown_opcode),
+        ]
+        bound, sgpr, vgpr, unknown = results
+
+        self.assertTrue(bound["translator_accepted"])
+        self.assertEqual(bound["compatibility_category"], "accepted")
+        self.assertIsNone(bound.get("lower_error_kind"))
+        self.assertIsNone(bound.get("lower_unbound"))
+
+        # Unbound operands: still recognized opcodes rejected by the translator, with the reason kept.
+        for record, bank, register, index, line in (
+                (sgpr, "scalar", "s9", 2, "s_mov_b32 m0, s9"),
+                (vgpr, "vector", "v3", 0, "v_mov_b32_e32 v2, v3")):
+            self.assertFalse(record["translator_accepted"])
+            self.assertEqual(record["compatibility_category"], "opcode_recognized_translator_rejected")
+            self.assertEqual(record["unsupported_opcodes"], {})
+            self.assertEqual(record["lower_status"], "rejected")
+            self.assertEqual(record.get("lower_error_kind"), "unbound_operand")
+            self.assertEqual(record.get("lower_error_type"), "UnboundOperand")
+            self.assertEqual(record["lower_error"], f"Unbound {bank} operand {register} at instruction {index}: {line}")
+            self.assertEqual(record.get("lower_unbound"), {"bank": bank, "register": register, "instruction_index": index,
+                                                       "byte_offset": None, "instruction": line})
+
+        # An unsupported opcode is an opcode-column result and a plain translator rejection, not a missing binding.
+        self.assertEqual(unknown["compatibility_category"], "unsupported_opcodes")
+        self.assertEqual(unknown["unsupported_opcodes"], {"v_imaginary_op_xyz": 1})
+        self.assertEqual(unknown.get("lower_error_kind"), "translator_rejection")
+        self.assertEqual(unknown.get("lower_error_type"), "ValueError")
+        self.assertEqual(unknown["lower_error"], "Unsupported instruction 1: v_imaginary_op_xyz v2, v0")
+        self.assertIsNone(unknown.get("lower_unbound"))
+
+        # A bare KeyError from the translator is a translator fault, never counted as an unbound operand.
+        import scan_unsupported_shaders
+        with mock.patch.object(scan_unsupported_shaders.pixel_aot, "lower", side_effect=KeyError("s9")):
+            fault = analyze_shader_instructions("fault_ps", bound_sample)
+        self.assertEqual((fault["lower_status"], fault["lower_error"]), ("rejected", "'s9'"))
+        self.assertEqual((fault.get("lower_error_kind"), fault.get("lower_error_type")), ("unexpected_error", "KeyError"))
+        self.assertIsNone(fault.get("lower_unbound"))
+        results.append(fault)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_file, md_file = generate_reports(results, Path(tmp))
+            summary = json.loads(json_file.read_text(encoding="utf-8"))["summary"]
+            self.assertEqual(summary["translator_accepted"], 1)
+            self.assertEqual(summary["opcodes_recognized_translator_rejected"], 3)
+            self.assertEqual(summary["unsupported_opcodes_count"], 1)
+            self.assertEqual(summary["translator_rejections_by_cause"],
+                             {"unbound_scalar_operand": 1, "unbound_vector_operand": 1,
+                              "translator_rejection": 1, "unexpected_error": 1})
+            self.assertEqual(summary["translator_bindings"],
+                             {"texture_sgpr": 20, "interp_sgpr": 24, "sampler": [1, 2, 3, 4],
+                              "constant_descriptor": None})
+            report = md_file.read_text(encoding="utf-8")
+            self.assertIn("  - Unbound scalar operand under the scanned inputs: 1\n", report)
+            self.assertIn("  - Unbound vector operand under the scanned inputs: 1\n", report)
+            self.assertIn("  - Other translator rejection: 1\n", report)
+            self.assertIn("  - Unexpected translator error: 1\n", report)
+            self.assertIn("Acceptance and rejection totals are conditional on the fixed entry bindings", report)
+            self.assertIn("- **Rejection Cause:** `Unbound scalar operand s9 at instruction 2: s_mov_b32 m0, s9`", report)
 
     def test_detect_shader_stage(self):
         """Verify pipeline stage detection from file names and relative paths."""
