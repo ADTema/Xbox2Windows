@@ -21,6 +21,18 @@ BINARY_F32 = {
 }
 
 
+# Ordered binary32 compares that write EXEC with the lanes where the compare holds.
+# A lane for which src0 OP vsrc1 holds is discarded. Only the four ordered forms are
+# claimed: a NaN operand makes every one of them false, as the HLSL operators do. The
+# unordered (n*) forms are true for NaN and stay rejected, as do other widths and e64.
+CMPX_F32 = {
+    "v_cmpx_lt_f32_e32": "<",
+    "v_cmpx_le_f32_e32": "<=",
+    "v_cmpx_gt_f32_e32": ">",
+    "v_cmpx_ge_f32_e32": ">=",
+}
+
+
 def lower(decoded, tables):
     if (
         len(tables) != 2
@@ -166,7 +178,7 @@ def lower(decoded, tables):
     compare, invert, branch, restore, depth, end, empty, null, last = (
         s for _, s in tail
     )
-    cmp = re.fullmatch(r"v_cmpx_lt_f32_e32 (s\d+), (v\d+)", compare)
+    cmp = re.fullmatch(r"(v_cmpx_(?:lt|le|gt|ge)_f32_e32) (s\d+), (v\d+)", compare)
     inv = re.fullmatch(r"s_andn2_b64 (s\[(\d+):(\d+)\]), \1, exec", invert)
     take = re.fullmatch(r"s_cbranch_scc0 (-?\d+)", branch)
     mask = re.fullmatch(r"s_and_b64 exec, (s\[(\d+):(\d+)\]), (s\[\d+:\d+\])", restore)
@@ -192,7 +204,7 @@ def lower(decoded, tables):
         ]:
             raise ValueError("Expected the original entry mask")
     lines += [
-        f"    if ({fp(cmp[1])} < {fp(cmp[2])}) discard;",
+        f"    if ({fp(cmp[2])} {CMPX_F32[cmp[1]]} {fp(cmp[3])}) discard;",
         f"    return {fp(exp[1])};",
         "}",
     ]
