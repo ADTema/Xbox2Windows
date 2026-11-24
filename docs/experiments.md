@@ -6046,6 +6046,8 @@ What is measured is the desktop behavior above. Under the ERA layout, the two re
 
 The same test creates writable and copy-on-write views of a two-page, pagefile-backed mapping. After a write through the copy view, `VirtualQueryEx` reports `MEM_MAPPED` for both pages. With both pages locked and resident, `QueryWorkingSetEx` clears `Shared` only for the written copy page. Writes through the other view remain visible on the untouched page. [Windows copy-on-write queries](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualqueryex#remarks)
 
+On Windows 11 build 26300.9974, the fixture reports `query_bytes=48` with `tail_masks=7` and every predicate passing: `state=2000` with `protect=0` for the reserved range, then `state=1000` with `protect=4`, `2` and `1` as the range is committed, made read-only and restored. Its copy-on-write section reports `first_page_private=1`, `adjacent_page_shared=1` and `mapped_pages_per_view=2`. The working-set numbers were 4,263,936 bytes reserved, 8,466,432 touched with 4,882,432 private commit, and 4,272,128 after the decommit, with the peak staying at 8,466,432.
+
 `src/era_query.cpp` is a desktop handler for `XMemVirtualQuery`, shaped by the four BVH call sites. It writes the Win32 `MEMORY_BASIC_INFORMATION` to bytes `0x00`–`0x2F`; the callers read State at `+0x20` and Protect at `+0x24`, matching that layout. The byte at `+0x30` has no public definition: the Microsoft reference for `XMemVirtualQuery` and its result structure is restricted to the Xbox developer program.
 
 The handler therefore fills that byte by a desktop policy, not by a confirmed Scarlett field:
