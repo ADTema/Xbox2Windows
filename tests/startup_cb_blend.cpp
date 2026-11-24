@@ -98,6 +98,23 @@ void check_table()
     expect(off.ok && !off.desc.BlendEnable && off.desc.RenderTargetWriteMask == 0x5 && off.desc.SrcBlend == D3D12_BLEND_ONE,
            "disabled blend stays disabled");
     expect(!x2w_cb_blend::decode(0, 0x10, false).ok, "five-bit mask");
+    // Words reported in #1216 from captured state blocks (ENABLE, SEPARATE_ALPHA_BLEND and bit 31,
+    // DISABLE_ROP3, set). Bit 31 does not change the blend state.
+    struct Observed { std::uint32_t word; D3D12_BLEND s, d, sa, da; };
+    const Observed observed[] = {
+        {0xE5040504, D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_INV_SRC_ALPHA},
+        {0xE5010504, D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_ONE, D3D12_BLEND_INV_SRC_ALPHA},
+        {0xE5010501, D3D12_BLEND_ONE, D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_ONE, D3D12_BLEND_INV_SRC_ALPHA},
+        {0xE1000104, D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_ONE}};
+    for (const auto& o : observed) {
+        const auto d = x2w_cb_blend::decode(o.word, 0xF, false);
+        char name[32];
+        std::snprintf(name, sizeof(name), "observed %08x", o.word);
+        expect(d.ok && d.desc.BlendEnable && d.desc.SrcBlend == o.s && d.desc.DestBlend == o.d && d.desc.SrcBlendAlpha == o.sa &&
+                   d.desc.DestBlendAlpha == o.da && d.desc.BlendOp == D3D12_BLEND_OP_ADD && d.desc.BlendOpAlpha == D3D12_BLEND_OP_ADD,
+               name);
+        expect(x2w_cb_blend::decode(o.word & 0x7FFFFFFFu, 0xF, false).desc.SrcBlend == d.desc.SrcBlend, std::string(name) + " without bit 31");
+    }
     std::printf("startup_cb_blend table: %d factor forms accepted, %d refused; alpha forms, combine functions, "
                 "min/max, enable and mask checked\n", accepted, refused);
 }
@@ -258,6 +275,11 @@ int check_startup_cb_blend(ID3D12Device* device, bool swapped)
         {"blend, colour only", control_word(SRC_ALPHA, ADD, ONE_MINUS_SRC_ALPHA, 0, 0, 0, false, true), 0x7, false},
         {"disabled, red and alpha", control_word(SRC_ALPHA, ADD, ONE_MINUS_SRC_ALPHA, 0, 0, 0, false, false), 0x9, false},
         {"constant alpha", control_word(CONSTANT_ALPHA, ADD, ONE_MINUS_CONSTANT_ALPHA, 0, 0, 0, false, true), 0xF, true},
+        // The four words reported in #1216, as captured (bit 31 set).
+        {"observed e5040504", 0xE5040504u, 0xF, false},
+        {"observed e5010504", 0xE5010504u, 0xF, false},
+        {"observed e5010501", 0xE5010501u, 0xF, false},
+        {"observed e1000104", 0xE1000104u, 0xF, false},
     };
     // Exact in binary32 for every sum and product above. Source alpha 0.75 keeps SRC_ALPHA and
     // INV_SRC_ALPHA apart, so the swapped control can see the straight-alpha cases.
