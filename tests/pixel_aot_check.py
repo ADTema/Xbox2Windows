@@ -16476,6 +16476,64 @@ def _check_controls_inline(directory):
     else:
         raise AssertionError("Scalar movrel read an outstanding scalar load")
 
+    # SDWA v_movrel* (#1917): the selections apply to the indexed words; the refusals of v_mov_b32_sdwa hold.
+    sdwa_hlsl = translate_int(uncompressed_export(SDWA_MOVREL_BODY))
+    assert "dpp_soff" in sdwa_hlsl and "dpp_doff" in sdwa_hlsl and "QuadRead" not in sdwa_hlsl
+    sdwa_bank = ["v_mov_b32_e32 v24, 0x44332211", "v_mov_b32_e32 v25, 0x88776655"]
+    for bad_seq, message in (
+        (sdwa_bank + ["s_mov_b32 m0, 1",
+                      "v_movrels_b32_sdwa v40, v24 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_0"],
+         "UNUSED_PRESERVE needs a tracked numeric destination"),
+        (sdwa_bank + ["s_mov_b32 m0, 1",
+                      "v_movrels_b32_sdwa v12, v24 dst_sel:WORD_1 dst_unused:UNUSED_SEXT src0_sel:BYTE_0"],
+         "UNUSED_SEXT is not lowered"),
+        (sdwa_bank + ["v_movrels_b32_sdwa v12, v24 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD"],
+         "Unsupported m0 value for v_movrels_b32"),
+        (sdwa_bank + ["s_mov_b32 m0, s44",
+                      "v_movreld_b32_sdwa v24, v25 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD"],
+         "Dynamic m0 offset is unbounded for v_movreld_b32"),
+        (sdwa_bank + ["s_mov_b32 m0, 5",
+                      "v_movrels_b32_sdwa v12, v24 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD"],
+         "Expected a numeric VGPR at v29"),
+        (sdwa_bank + ["s_mov_b32 m0, 1",
+                      "v_movrels_b32_sdwa v12, s24 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD"],
+         "Unsupported instruction"),
+        # clamp is not part of the accepted spelling.
+        (sdwa_bank + ["s_mov_b32 m0, 1",
+                      "v_movrels_b32_sdwa v12, v24 clamp dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD"],
+         "Unsupported instruction"),
+        # A 16-bit integer result defines only its low half: neither an indexed source nor a PRESERVE destination.
+        (sdwa_bank + ["v_add_nc_u16 v26, v24, v25", "s_mov_b32 m0, 2",
+                      "v_movrels_b32_sdwa v12, v24 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0"],
+         "Expected a numeric VGPR at v26"),
+        (sdwa_bank + ["v_add_nc_u16 v26, v24, v25", "s_mov_b32 m0, 2",
+                      "v_movreld_b32_sdwa v24, v25 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:DWORD"],
+         "UNUSED_PRESERVE needs a tracked numeric destination"),
+    ):
+        try:
+            translate_int(uncompressed_export(bad_seq))
+        except ValueError as error:
+            assert message in str(error), (bad_seq, error)
+        else:
+            raise AssertionError(f"SDWA movrel accepted {bad_seq}")
+    # A dynamic PRESERVE move inside one bank: every reachable destination merges its own old word, read before
+    # the write, even where the source bank overlaps it.
+    overlap = translate_int(uncompressed_export(SDWA_MOVREL_BODY[:4] + [
+        "s_mov_b32 s84, s47", "s_mov_b32 s85, 0", "s_and_b64 s[84:85], s[84:85], 0x10001", "s_mov_b32 m0, s84",
+        "v_movrelsd_2_b32_sdwa v24, v24 dst_sel:BYTE_1 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_0"]))
+    merges = re.findall(r"precise float alu\d+_(\d) = \(dpp_doff\d+ == \1u\) \? asfloat\(\(\(asuint\((alu\d+)\) & "
+                        r"0xffff00ffu\) \| \(\(dpp_val\d+ & 0xffu\) << 8u\)\)\) : (alu\d+);", overlap)
+    assert len(merges) == 2 and all(old == kept for _, old, kept in merges), merges
+    quad = assembly(False)
+    at = quad.index("s_wqm_b64 exec, exec") + 1
+    try:
+        translate(quad[:at] + ["s_mov_b32 m0, 0",
+                               "v_movrels_b32_sdwa v20, v8 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD"] + quad[at:])
+    except ValueError as error:
+        assert "Invalid v_movrels_b32_sdwa outside entry mask" in str(error), error
+    else:
+        raise AssertionError("SDWA movrel accepted outside the entry mask")
+
     # v_swaprel_b32 (#1795): bounded selects on both sides, and the movrel refusals.
     assert "swap_doff" in translate(with_constants(SWAPREL_BODY))
     check_swaprel_exact()
@@ -17803,6 +17861,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((with_constants(PLAIN_MOVREL_BODY), translate))
     fixtures.append((with_constants(swap_movrel_encodings(PLAIN_MOVREL_BODY)), translate))
     fixtures.append((with_constants(SWAPREL_BODY), translate))
+    fixtures.append((uncompressed_export(SDWA_MOVREL_BODY), translate_int))
     fixtures.append((with_constants(SMOVREL_BODY), translate))
     fixtures.append((uncompressed_export(DPP_F16_CVT_LANES), translate_f16))
     fixtures.append((uncompressed_export(DPP_F16_CVT_WORDS), translate_f16))
@@ -21249,6 +21308,138 @@ def check_swaprel_exact():
     assert dynamic == SWAPREL_DYNAMIC_LINES, dynamic
 
 
+# SDWA v_movrel* (#1917), exported through the bit-exact integer target. Each channel runs one move with a dynamic
+# and then a static m0 over integer banks, mixing BYTE, WORD and DWORD selections, sext, PAD and PRESERVE.
+SDWA_MOVREL_BANK = (0x44332211, 0x88776655, 0xCCBBAA99, 0x00FFEEDD)
+SDWA_MOVREL_BODY = [
+    *(f"v_mov_b32_e32 v{24 + k}, {word:#x}" for k, word in enumerate(SDWA_MOVREL_BANK)),
+    # R (v12): v_movrels_b32_sdwa.
+    "v_mov_b32_e32 v12, 0x12345678",
+    "s_bfe_u32 s56, s44, 0x20000",
+    "s_mov_b32 m0, s56",
+    "v_movrels_b32_sdwa v12, v24 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_3",
+    "s_mov_b32 m0, 2",
+    "v_movrels_b32_sdwa v12, sext(v24) dst_sel:BYTE_0 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_1",
+    # G (v13): v_movreld_b32_sdwa into v28..v31.
+    "v_mov_b32_e32 v28, 0x10000001",
+    "v_mov_b32_e32 v29, 0x20000002",
+    "v_mov_b32_e32 v30, 0x30000003",
+    "v_mov_b32_e32 v31, 0x40000004",
+    "v_mov_b32_e32 v40, 0xa5b6c7d8",
+    "s_bfe_u32 s57, s45, 0x20000",
+    "s_mov_b32 m0, s57",
+    "v_movreld_b32_sdwa v28, sext(v40) dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_2",
+    "s_mov_b32 m0, 1",
+    "v_movreld_b32_sdwa v28, v40 dst_sel:BYTE_3 dst_unused:UNUSED_PAD src0_sel:WORD_1",
+    "v_add_nc_u32_e32 v13, v28, v29",
+    "v_xor_b32_e32 v13, v13, v30",
+    "v_add_nc_u32_e32 v13, v13, v31",
+    # B (v14): v_movrelsd_b32_sdwa into v36..v39.
+    "v_mov_b32_e32 v36, 0x0f0f0f0f",
+    "v_mov_b32_e32 v37, 0x1e1e1e1e",
+    "v_mov_b32_e32 v38, 0x2d2d2d2d",
+    "v_mov_b32_e32 v39, 0x3c3c3c3c",
+    "s_bfe_u32 s58, s46, 0x20000",
+    "s_mov_b32 m0, s58",
+    "v_movrelsd_b32_sdwa v36, v24 dst_sel:BYTE_2 dst_unused:UNUSED_PRESERVE src0_sel:WORD_0",
+    "s_mov_b32 m0, 3",
+    "v_movrelsd_b32_sdwa v36, sext(v24) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0",
+    "v_add_nc_u32_e32 v14, v36, v37",
+    "v_xor_b32_e32 v14, v14, v38",
+    "v_add_nc_u32_e32 v14, v14, v39",
+    # A (v15): v_movrelsd_2_b32_sdwa into v44..v47 (source m0[9:0], destination m0[25:16]).
+    "v_mov_b32_e32 v44, 0xaaaa5555",
+    "v_mov_b32_e32 v45, 0xbbbb6666",
+    "v_mov_b32_e32 v46, 0xcccc7777",
+    "v_mov_b32_e32 v47, 0xdddd8888",
+    "s_mov_b32 s84, s47",
+    "s_mov_b32 s85, 0",
+    "s_and_b64 s[84:85], s[84:85], 0x30003",
+    "s_mov_b32 m0, s84",
+    "v_movrelsd_2_b32_sdwa v44, v24 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_0",
+    "s_mov_b32 m0, 0x20001",
+    "v_movrelsd_2_b32_sdwa v44, v24 dst_sel:BYTE_0 dst_unused:UNUSED_PAD src0_sel:BYTE_3",
+    "v_add_nc_u32_e32 v15, v44, v45",
+    "v_xor_b32_e32 v15, v15, v46",
+    "v_add_nc_u32_e32 v15, v15, v47",
+]
+
+
+def sdwa_movrel_reference(w0, w1, w2, w3):
+    """Independent model of SDWA_MOVREL_BODY: SDWA source and destination selections on 32-bit words."""
+    sel = {"BYTE_0": (0, 8), "BYTE_1": (8, 8), "BYTE_2": (16, 8), "BYTE_3": (24, 8),
+           "WORD_0": (0, 16), "WORD_1": (16, 16), "DWORD": (0, 32)}
+
+    def source(word, name, sext):
+        offset, width = sel[name]
+        value = (word >> offset) & ((1 << width) - 1)
+        if sext and value >> (width - 1):
+            value -= 1 << width
+        return value & 0xffffffff
+
+    def dest(value, name, preserve, old):
+        offset, width = sel[name]
+        field = ((value & ((1 << width) - 1)) << offset) & 0xffffffff
+        keep = ~(((1 << width) - 1) << offset) & 0xffffffff
+        return (old & keep) | field if preserve else field
+
+    def mix(bank):
+        return ((((bank[0] + bank[1]) & 0xffffffff) ^ bank[2]) + bank[3]) & 0xffffffff
+
+    src = list(SDWA_MOVREL_BANK)
+    r = dest(source(src[w0 & 3], "BYTE_3", False), "WORD_1", True, 0x12345678)
+    r = dest(source(src[2], "BYTE_1", True), "BYTE_0", True, r)
+    g = [0x10000001, 0x20000002, 0x30000003, 0x40000004]
+    g[w1 & 3] = dest(source(0xA5B6C7D8, "BYTE_2", True), "WORD_0", True, g[w1 & 3])
+    g[1] = dest(source(0xA5B6C7D8, "WORD_1", False), "BYTE_3", False, g[1])
+    b = [0x0F0F0F0F, 0x1E1E1E1E, 0x2D2D2D2D, 0x3C3C3C3C]
+    b[w2 & 3] = dest(source(src[w2 & 3], "WORD_0", False), "BYTE_2", True, b[w2 & 3])
+    b[3] = dest(source(src[3], "BYTE_0", True), "DWORD", False, b[3])
+    a = [0xAAAA5555, 0xBBBB6666, 0xCCCC7777, 0xDDDD8888]
+    a[(w3 >> 16) & 3] = dest(source(src[w3 & 3], "WORD_0", False), "WORD_1", True, a[(w3 >> 16) & 3])
+    a[2] = dest(source(src[1], "BYTE_3", False), "BYTE_0", False, a[2])
+    return (r, mix(g), mix(b), mix(a))
+
+
+def check_sdwa_movrel_draw(directory, compiler, renderer, backend):
+    program = uncompressed_export(SDWA_MOVREL_BODY)
+    source = directory / "sdwa_movrel.hlsl"
+    shader = directory / "sdwa_movrel.cso"
+    references = [sdwa_movrel_reference(*words) for words in DPP_MOVREL_SETS]
+    if references[0] == references[1]:
+        raise AssertionError("The two constant sets do not tell the dynamic m0 offsets apart")
+
+    def case(name, words, expected):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        return write_case(directory / name, constants, tuple(as_float(w) for w in expected), integer_rt=True)
+
+    source.write_text(translate_int(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    run_pixel_batch(renderer, backend, shader,
+                    [(case(f"sdwa-movrel-{n}.case", words, expected), "pass")
+                     for n, (words, expected) in enumerate(zip(DPP_MOVREL_SETS, references))])
+    print("sdwa movrel: " + ", ".join(f"({', '.join(f'{w:#010x}' for w in ref)})" for ref in references))
+    good = case("sdwa-movrel-control.case", DPP_MOVREL_SETS[0], references[0])
+    for old, new, label in (
+        ("dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_3", "dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:DWORD",
+         "v_movrels_b32_sdwa with the source selection dropped"),
+        ("dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE", "dst_sel:WORD_0 dst_unused:UNUSED_PAD",
+         "v_movreld_b32_sdwa with PRESERVE turned into PAD"),
+        ("s_mov_b32 m0, s58", "s_mov_b32 m0, 0", "v_movrelsd_b32_sdwa with the dynamic m0 ignored"),
+        ("dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0", "dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1",
+         "v_movrelsd_b32_sdwa reading the wrong byte"),
+        ("v_movrelsd_b32_sdwa v36, sext(v24)", "v_movrelsd_b32_sdwa v36, v24", "v_movrelsd_b32_sdwa without sext"),
+    ):
+        mutated = [line.replace(old, new) for line in program]
+        assert sum(a != b for a, b in zip(mutated, program)) == 1, label
+        source.write_text(translate_int(mutated), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        run_pixel_batch(renderer, backend, shader, [(good, "mismatch")])
+        print(f"control {label}: pixel mismatch, as required")
+    return 0
+
+
 def check_swaprel_draw(directory, compiler, renderer, backend):
     program = with_constants(SWAPREL_BODY)
     source = directory / "swaprel.hlsl"
@@ -23817,13 +24008,14 @@ def main():
                     "draw-region-body", "draw-region-waits", "draw-region-scalar-alu", "draw-region-scalar-load", "draw-div-fmas",
                     "draw-cmp64", "draw-cmp-f64", "draw-shift64",
                     "draw-f16-arith", "draw-f16-round", "draw-f16-fmac-ldexp", "draw-f16-cvt-int16", "draw-f16-to-int16", "draw-flat-scratch", "draw-smem-pointers", "draw-sopk-hwreg",
-                    "draw-dpp-cvt", "draw-dpp-movrel", "draw-plain-movrel", "draw-swaprel", "draw-smovrel", "draw-dpp-f16", "draw-dpp-extra", "draw-pk-fmac"):
+                    "draw-dpp-cvt", "draw-dpp-movrel", "draw-plain-movrel", "draw-swaprel", "draw-sdwa-movrel", "draw-smovrel", "draw-dpp-f16", "draw-dpp-extra", "draw-pk-fmac"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-dpp-cvt": check_dpp_cvt_draw,
                         "draw-dpp-movrel": check_dpp_movrel_draw,
                         "draw-plain-movrel": check_plain_movrel_draw,
                         "draw-swaprel": check_swaprel_draw,
+                        "draw-sdwa-movrel": check_sdwa_movrel_draw,
                         "draw-smovrel": check_smovrel_draw,
                         "draw-dpp-extra": check_dpp_extra_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
