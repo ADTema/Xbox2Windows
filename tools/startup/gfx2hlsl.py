@@ -1158,7 +1158,11 @@ class Pipeline:
     def hlsl_ps(self):
         s = self.ps
         targets = sorted(int(k[3:]) for k in s.exports if k.startswith('mrt'))
-        out = self.common() + ['struct PSIn {'] + self.interface(True) + ['};', 'struct PSOut {']
+        out = self.common() + ['struct PSIn {'] + self.interface(True) + ['};']
+        if not targets:  # depth-only: no output struct, so the pipeline declares no SV_Target
+            out += ['void main(PSIn i) {'] + s.declarations() + s.body() + ['}']
+            return '\n'.join(out) + '\n'
+        out.append('struct PSOut {')
         for t in targets:
             kind = self.mrt_kind(t)
             out.append('    %s mrt%d : SV_Target%d;' % ({'int': 'int4', 'uint': 'uint4'}.get(kind, 'float4'), t, t))
@@ -1230,7 +1234,7 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
 
 def classify(blob):
     text = ' '.join(x[3] for x in decode(strip_header(blob)) if x[2] == 'exp')
-    return 'vs' if 'pos' in text else 'ps' if 'mrt' in text else 'other'
+    return 'vs' if 'pos' in text else 'ps' if 'mrt' in text or not text else 'other'  # no export: a depth-only pixel shader
 
 
 def translate_request(out_dir, key):
