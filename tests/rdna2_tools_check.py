@@ -3,6 +3,7 @@ import argparse
 from io import StringIO
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import struct
@@ -772,12 +773,14 @@ class TestRdna2Disasm(unittest.TestCase):
                 (4, 4, "sopk_truncated", "s_setreg_imm32_b32 <truncated>"),
             ],
         )
-        # A 32-bit literal equal to s_endpgm (0xbf810000) belongs to s_setreg_imm32_b32.
+        # Boundary control: a 32-bit literal equal to s_endpgm (0xbf810000) belongs to
+        # s_setreg_imm32_b32.  Trailing bytes after s_endpgm are still decoded and marked
+        # with after_endpgm=True (matches LLVM 15 decode-through-end behaviour).
         stream = bytes.fromhex(
             "810880ba000081bf"  # s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0xbf810000
             "01f804b9"          # s_getreg_b32 s4, hwreg(HW_REG_MODE)
             "000081bf"          # s_endpgm
-            "810884b9"          # s_setreg_b32 after s_endpgm is still in the supplied span
+            "810884b9"          # trailing instruction decoded past s_endpgm
         )
         insns = disasm_rdna2(stream)
         self.assertEqual(
@@ -903,6 +906,39 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertEqual(result["supported_instructions"], len(scan_source))
         self.assertFalse(result["translator_accepted"])
         self.assertEqual(result["lower_error"], "Instruction follows program end")
+
+    def test_decode_continues_past_s_endpgm(self):
+        """Issue #938 step 4: disasm_rdna2 must decode past s_endpgm (LLVM 15 behaviour).
+
+        Verifies that instructions after s_endpgm are decoded, and that the
+        after_endpgm field distinguishes pre/post terminator instructions.
+        """
+        # s_endpgm followed by a valid instruction — must NOT stop at offset 4.
+        stream = bytes.fromhex("000081bf" + "0103007e")  # s_endpgm | v_mov_b32_e32 v0, v1
+        insns = disasm_rdna2(stream)
+        self.assertEqual(len(insns), 2)
+        self.assertEqual(insns[0]["opcode"], "s_endpgm")
+        self.assertEqual(insns[1]["opcode"], "v_mov_b32_e32")
+        self.assertFalse(insns[0]["after_endpgm"])
+        self.assertTrue(insns[1]["after_endpgm"])
+
+        # Instruction sequence: v_mov_b32_e32 v0, v1 | s_nop 0 | s_endpgm | v_mov_b32_e32 v2, v3
+        stream2 = bytes.fromhex(
+            "0103007e" +  # v_mov_b32_e32 v0, v1
+            "000080bf" +  # s_nop 0
+            "000081bf" +  # s_endpgm
+            "0307007e"    # v_mov_b32_e32 v2, v3
+        )
+        insns2 = disasm_rdna2(stream2)
+        self.assertGreaterEqual(len(insns2), 4)
+        self.assertEqual(insns2[2]["opcode"], "s_endpgm")
+        self.assertEqual(insns2[3]["after_endpgm"], True)
+
+        # A second terminator cannot move the first boundary.
+        repeated = disasm_rdna2(stream + bytes.fromhex("000081bf0103007e"))
+        self.assertEqual([ins["after_endpgm"] for ins in repeated], [False, True, True, True])
+        unterminated = disasm_rdna2(bytes.fromhex("0103007e000080bf"))
+        self.assertEqual([ins["after_endpgm"] for ins in unterminated], [False, False])
 
     def test_second_dword_forms_keep_the_stream_aligned(self):
         # Independent GFX10 encodings from LLVM MC 15.0.7 test/MC/AMDGPU (gfx10_asm_vop1.s,
@@ -1422,6 +1458,139 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertEqual(decoded, llvm_lines)
         self.assertEqual(assemble_with_llvm_mc(decoded, assembler, objcopy), emitted)
 
+    def test_mimg_missing_gfx1013_ops_golden_encodings(self):
+        """Issue #938: sampling, gather, packed-load, MSAA-load and BVH ops decode to the LLVM spelling."""
+        vectors = [
+            ("0807a0f004102303", "image_sample_c",
+             "image_sample_c v[16:18], v[4:6], s[12:19], s[100:103] dmask:0x7 dim:SQ_RSRC_IMG_2D"),
+            ("080f20f104102303", "image_gather4_c",
+             "image_gather4_c v[16:19], v[4:6], s[12:19], s[100:103] dmask:0xf dim:SQ_RSRC_IMG_2D"),
+            ("100fa8f004102303", "image_sample_c_d",
+             "image_sample_c_d v[16:19], v[4:19], s[12:19], s[100:103] dmask:0xf dim:SQ_RSRC_IMG_3D"),
+            # One-hot gather: four texels of the selected component, two registers with d16.
+            ("080120f104102303", "image_gather4_c",
+             "image_gather4_c v[16:19], v[4:6], s[12:19], s[100:103] dmask:0x1 dim:SQ_RSRC_IMG_2D"),
+            ("080120f104102383", "image_gather4_c",
+             "image_gather4_c v[16:17], v[4:6], s[12:19], s[100:103] dmask:0x1 dim:SQ_RSRC_IMG_2D d16"),
+            ("1103a8f004102303", "image_sample_c_d_g16",
+             "image_sample_c_d_g16 v[16:17], v[4:11], s[12:19], s[100:103] dmask:0x3 dim:SQ_RSRC_IMG_3D"),
+            ("0101b8f104102303", "image_sample_c_cd_o_g16",
+             "image_sample_c_cd_o_g16 v16, v[4:8], s[12:19], s[100:103] dmask:0x1 dim:SQ_RSRC_IMG_1D"),
+            ("080f08f004100300", "image_load_pck",
+             "image_load_pck v[16:19], v[4:5], s[12:19] dmask:0xf dim:SQ_RSRC_IMG_2D"),
+            ("310f00f004100300", "image_msaa_load",
+             "image_msaa_load v[16:19], v[4:6], s[12:19] dmask:0xf dim:SQ_RSRC_IMG_2D_MSAA"),
+            # The printed tuple is LLVM 15's (9 to 15 address dwords print as 16 registers), not the dword count.
+            ("019f98f100040100", "image_bvh_intersect_ray", "image_bvh_intersect_ray v[4:7], v[0:15], s[4:7]"),
+            ("019f98f100040140", "image_bvh_intersect_ray", "image_bvh_intersect_ray v[4:7], v[0:7], s[4:7] a16"),
+            ("019f9cf100040100", "image_bvh64_intersect_ray", "image_bvh64_intersect_ray v[4:7], v[0:15], s[4:7]"),
+            ("019f9cf100040140", "image_bvh64_intersect_ray",
+             "image_bvh64_intersect_ray v[4:7], v[0:15], s[4:7] a16"),
+            # Non-sequential addressing (w0[2:1] = 1): one VGPR per address dword.
+            ("079f98f100040100020406080a0c0e1012140000", "image_bvh_intersect_ray",
+             "image_bvh_intersect_ray v[4:7], [v0, v2, v4, v6, v8, v10, v12, v14, v16, v18, v20], s[4:7]"),
+        ]
+        for hex_bytes, opcode, assembly in vectors:
+            with self.subTest(assembly=assembly):
+                records = disasm_rdna2(bytes.fromhex(hex_bytes))
+                self.assertEqual([(r["opcode"], r["assembly"]) for r in records], [(opcode, assembly)])
+
+    def test_mimg_bvh_refuses_modifier_bits_and_keeps_stream_alignment(self):
+        """Issue #938: a ray-intersection word with modifiers the encoding fixes is refused, not mis-decoded."""
+        # dmask 0xe instead of the fixed 0xf, then s_endpgm.
+        records = disasm_rdna2(bytes.fromhex("019e98f100040100" "000081bf"))
+        self.assertEqual(
+            [(r["offset"], r["opcode"]) for r in records],
+            [(0, "image_bvh_intersect_ray_unsupported"), (8, "s_endpgm")],
+        )
+        # d16 set in the second word.
+        records = disasm_rdna2(bytes.fromhex("019f98f1000401" "80" "000081bf"))
+        self.assertEqual(records[0]["opcode"], "image_bvh_intersect_ray_unsupported")
+        self.assertEqual(records[1]["opcode"], "s_endpgm")
+
+    def test_mimg_missing_gfx1013_ops_llvm_round_trip(self):
+        """Issue #938: every listed MIMG op decodes exactly as LLVM prints it, on every dimension LLVM models."""
+        if not os.environ.get("LLVM_LIB"):
+            self.skipTest("LLVM_LIB environment variable not set; verified against golden vectors")
+        resolved_lib = resolve_llvm_lib(os.environ["LLVM_LIB"])
+        ops = {
+            0x02: "image_load_pck", 0x03: "image_load_pck_sgn", 0x04: "image_load_mip_pck",
+            0x05: "image_load_mip_pck_sgn", 0x0a: "image_store_pck", 0x0b: "image_store_mip_pck",
+            0x23: "image_sample_d_cl", 0x29: "image_sample_c_cl", 0x2a: "image_sample_c_d",
+            0x2b: "image_sample_c_d_cl", 0x2e: "image_sample_c_b_cl", 0x31: "image_sample_cl_o",
+            0x32: "image_sample_d_o", 0x33: "image_sample_d_cl_o", 0x36: "image_sample_b_cl_o",
+            0x38: "image_sample_c_o", 0x39: "image_sample_c_cl_o", 0x3a: "image_sample_c_d_o",
+            0x3b: "image_sample_c_d_cl_o", 0x3c: "image_sample_c_l_o", 0x3d: "image_sample_c_b_o",
+            0x3e: "image_sample_c_b_cl_o", 0x3f: "image_sample_c_lz_o", 0x41: "image_gather4_cl",
+            0x45: "image_gather4_b", 0x46: "image_gather4_b_cl", 0x48: "image_gather4_c",
+            0x49: "image_gather4_c_cl", 0x4c: "image_gather4_c_l", 0x4d: "image_gather4_c_b",
+            0x4e: "image_gather4_c_b_cl", 0x4f: "image_gather4_c_lz", 0x50: "image_gather4_o",
+            0x51: "image_gather4_cl_o", 0x54: "image_gather4_l_o", 0x55: "image_gather4_b_o",
+            0x56: "image_gather4_b_cl_o", 0x57: "image_gather4_lz_o", 0x58: "image_gather4_c_o",
+            0x59: "image_gather4_c_cl_o", 0x5c: "image_gather4_c_l_o", 0x5d: "image_gather4_c_b_o",
+            0x5e: "image_gather4_c_b_cl_o", 0x5f: "image_gather4_c_lz_o", 0x68: "image_sample_cd",
+            0x69: "image_sample_cd_cl", 0x6a: "image_sample_c_cd", 0x6b: "image_sample_c_cd_cl",
+            0x6c: "image_sample_cd_o", 0x6d: "image_sample_cd_cl_o", 0x6e: "image_sample_c_cd_o",
+            0x6f: "image_sample_c_cd_cl_o", 0x80: "image_msaa_load", 0xa2: "image_sample_d_g16",
+            0xa3: "image_sample_d_cl_g16", 0xaa: "image_sample_c_d_g16", 0xab: "image_sample_c_d_cl_g16",
+            0xb2: "image_sample_d_o_g16", 0xb3: "image_sample_d_cl_o_g16", 0xba: "image_sample_c_d_o_g16",
+            0xbb: "image_sample_c_d_cl_o_g16", 0xe8: "image_sample_cd_g16", 0xe9: "image_sample_cd_cl_g16",
+            0xea: "image_sample_c_cd_g16", 0xeb: "image_sample_c_cd_cl_g16", 0xec: "image_sample_cd_o_g16",
+            0xed: "image_sample_cd_cl_o_g16", 0xee: "image_sample_c_cd_o_g16",
+            0xef: "image_sample_c_cd_cl_o_g16",
+        }
+        has_sampler = {0x23, 0x29, 0x2a, 0x2b, 0x2e, 0x31, 0x32, 0x33, 0x36, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x41, 0x45, 0x46, 0x48, 0x49, 0x4c, 0x4d, 0x4e, 0x4f, 0x50, 0x51, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5c, 0x5d, 0x5e, 0x5f, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0xa2, 0xa3, 0xaa, 0xab, 0xb2, 0xb3, 0xba, 0xbb, 0xe8, 0xe9, 0xea, 0xeb, 0xec, 0xed, 0xee, 0xef}
+        code = bytearray()
+        names = []
+        for op, name in ops.items():
+            # Dimensions 0..6: LLVM decodes a five-dword address on the MSAA array dimension as a
+            # different operand shape, so that dimension is left out of the comparison.
+            # A gather also gets a one-hot mask, with and without d16: it returns four texels (two with d16).
+            masks = [(0xf, 0)] + ([(0x1, 0), (0x1, 1)] if "gather4" in name else [])
+            for dim in range(7):
+                for dmask, d16 in masks:
+                    word0 = (0xf0000000 | ((op & 0x7f) << 18) | ((op >> 7) & 1) | (dmask << 8) | (dim << 3))
+                    word1 = ((5 << 21) if op in has_sampler else 0) | (2 << 16) | 4 | (d16 << 31)
+                    code += struct.pack("<II", word0, word1)
+                    names.append(name)
+        # LLVM 15 (the CI pin) prints a 9..15-register packed address as a 16-register tuple and the decoder follows
+        # it; newer LLVM prints the exact width, so widen its spelling to compare on either LLVM version.
+        def widen(line):
+            def fix(m):
+                lo, hi = int(m.group(1)), int(m.group(2))
+                return f"v[{lo}:{lo + 15}]" if 9 <= hi - lo + 1 <= 15 else m.group(0)
+            return re.sub(r"v\[(\d+):(\d+)\]", fix, line)
+        llvm_lines = [widen(line) for line in llvm_disassemble(bytes(code), resolved_lib)]
+        records = disasm_rdna2(bytes(code))
+        self.assertEqual(len(llvm_lines), len(names))
+        self.assertEqual([r["assembly"] for r in records], llvm_lines)
+        self.assertEqual([r["opcode"] for r in records], names)
+
+        bvh = bytes.fromhex("019f98f100040100" "019f98f100040140" "019f9cf100040100" "019f9cf100040140")
+        self.assertEqual([r["assembly"] for r in disasm_rdna2(bvh)],
+                         [widen(line) for line in llvm_disassemble(bvh, resolved_lib)])
+        nsa = bytes.fromhex("079f98f100040100020406080a0c0e1012140000")
+        self.assertEqual([r["assembly"] for r in disasm_rdna2(nsa)], llvm_disassemble(nsa, resolved_lib))
+
+    def test_binary_scan_names_newly_decoded_mimg_ops(self):
+        """Issue #938: the scan report names gather, compare-sample and ray-intersection ops as LLVM does."""
+        shader = bytes.fromhex(
+            "080f20f104102303"  # image_gather4_c
+            "0807a0f004102303"  # image_sample_c
+            "019f98f100040100"  # image_bvh_intersect_ray
+            "000081bf"          # s_endpgm
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            (tmp_path / "ps_mimg.bin").write_bytes(shader)
+            result = {r["shader_name"]: r for r in scan_directory_or_files([tmp_path])}["ps_mimg.bin"]
+        self.assertTrue(result["opcodes_recognized"])
+        self.assertEqual(result["unsupported_opcodes"], {})
+        self.assertEqual(
+            [d["raw"].split()[0] for d in result["unsupported_details"]],
+            ["image_gather4_c", "image_sample_c", "image_bvh_intersect_ray"],
+        )
+
     def test_sop2_lshl_add_opcode_table_synthetic_forms(self):
         from disasm_rdna2 import SOP2_OPS
         target_ops = {0x2e, 0x2f, 0x30, 0x31}
@@ -1433,6 +1602,38 @@ class TestRdna2Disasm(unittest.TestCase):
             self.assertEqual(len(insns), 1, f"Failed decoding SOP2 op 0x{op:02x}")
             self.assertEqual(insns[0]["opcode"], expected_name)
             self.assertEqual(insns[0]["length"], 4)
+
+    # Encodings and spellings from llvm-mc gfx1013 (identical text on LLVM 15 and 19).
+    SOP2_CARRY_LOGIC_PACK_FORMS = (
+            ("01020082", "s_addc_u32 s0, s1, s2"),
+            ("01028082", "s_subb_u32 s0, s1, s2"),
+            ("0102008b", "s_orn2_b32 s0, s1, s2"),
+            ("0204808b", "s_orn2_b64 s[0:1], s[2:3], s[4:5]"),
+            ("0102008c", "s_nand_b32 s0, s1, s2"),
+            ("0204808c", "s_nand_b64 s[0:1], s[2:3], s[4:5]"),
+            ("0102008d", "s_nor_b32 s0, s1, s2"),
+            ("0204808d", "s_nor_b64 s[0:1], s[2:3], s[4:5]"),
+            ("0102008e", "s_xnor_b32 s0, s1, s2"),
+            ("0204808e", "s_xnor_b64 s[0:1], s[2:3], s[4:5]"),
+            ("01020099", "s_pack_ll_b32_b16 s0, s1, s2"),
+            ("01028099", "s_pack_lh_b32_b16 s0, s1, s2"),
+            ("0102009a", "s_pack_hh_b32_b16 s0, s1, s2"),
+    )
+
+    def test_sop2_carry_logic_pack_forms(self):
+        """Issue #938: SOP2 carry, inverted-logic and 16-bit pack ops decode to LLVM's text and re-assemble to the same bytes."""
+        raw = b"".join(bytes.fromhex(h) for h, _ in self.SOP2_CARRY_LOGIC_PACK_FORMS)
+        expected = [text for _, text in self.SOP2_CARRY_LOGIC_PACK_FORMS]
+        self.assertEqual([rec["assembly"] for rec in disasm_rdna2(raw)], expected)
+        if not os.environ.get("LLVM_LIB"):
+            return
+        resolved_lib = resolve_llvm_lib(os.environ["LLVM_LIB"])
+        assembler = resolve_tool("LLVM_MC", ["llvm-mc-15", "llvm-mc"])
+        objcopy = resolve_tool("LLVM_OBJCOPY", ["llvm-objcopy-15", "llvm-objcopy"])
+        if not assembler or not objcopy:
+            self.fail(f"SOP2 round trip requires llvm-mc and llvm-objcopy (assembler={assembler}, objcopy={objcopy})")
+        self.assertEqual(assemble_with_llvm_mc(expected, assembler, objcopy), raw)
+        self.assertEqual(llvm_disassemble(raw, resolved_lib), expected)
 
     def test_vop2_integer_opcode_table_synthetic_forms(self):
         from disasm_rdna2 import VOP2_OPS
@@ -4240,6 +4441,48 @@ class TestRdna2Scanner(unittest.TestCase):
                      "v_lshlrev_b64 v[2:3], v1, 0x41", "v_lshlrev_b64 v[2:3], v1, v[4:5] clamp",
                      "v_lshlrev_b64_e32 v[2:3], v1, v[4:5]", "v_lshlrev_b64 v[2:3], -v1, v[4:5]"):
             self.assertFalse(is_instruction_supported(line), line)
+
+    def test_low16_binary16_e32_scanner_support(self):
+        """The ten plain binary16 e32 forms pixel_aot lowers (low 16 bits only) are supported; modifiers, e64 and
+        sources the translator refuses are not."""
+        supported = []
+        for op in ("add", "sub", "subrev", "mul"):
+            supported += [f"v_{op}_f16_e32 v24, v18, v19", f"v_{op}_f16_e32 v24, 1.0, v19",
+                          f"v_{op}_f16_e32 v24, -0.5, v19", f"v_{op}_f16_e32 v24, 0x3c00, v19",
+                          f"v_{op}_f16_e32 v24, s45, v19", f"v_{op}_f16_e32 v24, 0, v19"]
+        for op in ("floor", "ceil", "trunc", "rndne"):
+            supported += [f"v_{op}_f16_e32 v24, v18", f"v_{op}_f16_e32 v24, 2.0", f"v_{op}_f16_e32 v24, 0x4248"]
+        for kind in ("i16", "u16"):
+            supported += [f"v_cvt_f16_{kind}_e32 v24, v18", f"v_cvt_f16_{kind}_e32 v24, s45",
+                          f"v_cvt_f16_{kind}_e32 v24, 5", f"v_cvt_f16_{kind}_e32 v24, 0x1234"]
+        for line in supported:
+            self.assertTrue(is_instruction_supported(line), line)
+        refused = [
+            "v_add_f16_e32 v24, v18, 1.0",          # e32 src1 must be a VGPR
+            "v_add_f16_e32 v24, -v18, v19",         # source modifiers
+            "v_add_f16_e32 v24, |v18|, v19",
+            "v_add_f16_e32 v24, 3, v19",            # integer inline constant other than 0
+            "v_add_f16_e32 v24, 0x10000, v19",      # literal wider than 16 bits
+            "v_add_f16_e32 v24, 3.0, v19",          # not a binary16 inline constant
+            "v_add_f16_e32 v24, v256, v19",
+            "v_add_f16_e32 v24, v18, v19 clamp",
+            "v_mul_f16_e64 v24, v18, v19",
+            "v_add_f16 v24, v18, v19",
+            "v_add_f16_e32 v24, v18",
+            "v_floor_f16_e32 v24, -v18",
+            "v_floor_f16_e32 v24, v18 clamp",
+            "v_floor_f16_e64 v24, v18",
+            "v_fract_f16_e32 v24, v18",
+            "v_cvt_f16_i16_e32 v24, 65",
+            "v_cvt_f16_u16_e32 v24, 0x10000",
+            "v_cvt_f16_i16_e32 v24, 1.0",
+            "v_cvt_f16_u16_e32 v24, v18 clamp",
+            "v_cvt_f16_i16_e64 v24, v18",
+        ]
+        for line in refused:
+            self.assertFalse(is_instruction_supported(line), line)
+        for opcode in ("v_add_f16", "v_subrev_f16", "v_rndne_f16", "v_cvt_f16_u16"):
+            self.assertIn(opcode, KNOWN_RDNA2_BASE_OPCODES)
 
     def test_sopk_s_version(self):
         """s_version with a 16-bit immediate is supported and known; larger, negative and register operands are not."""

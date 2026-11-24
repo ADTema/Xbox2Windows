@@ -28,11 +28,23 @@ dumpbin /imports .\out\build\dev\d3d12_sdk_check.exe
 
 Build outputs and downloaded tool sources live under `out/`. [Microsoft xbdepends documentation](https://learn.microsoft.com/en-us/samples/microsoft/xbox-gdk-samples/xbdepends/)
 
-[`pe_run_package.py`](../tools/pe_run_package.py) starts a source-built x64 EXE with acyclic bundled DLL dependencies. Pass the path to `pe_map.dll`, a package directory and an EXE path relative to that directory. Use `--system kernel32.dll` or `--shim DLL PATH` for explicit external providers. `--preflight-only` resolves those external exports without mapping any guest image. In execution mode the runner attaches DLLs in dependency order, starts the EXE, and releases the images in reverse. A returning fixture must join any workers before it returns. The runner rejects cycles and self imports. It now resolves bundled ordinal imports,
+[`pe_run_package.py`](../tools/pe_run_package.py) starts a source-built x64 EXE with acyclic bundled DLL dependencies. Pass the path to `pe_map.dll`, a package directory and an EXE path relative to that directory. Use `--system kernel32.dll` or `--shim DLL PATH` for explicit external providers. `--preflight-only` resolves those external exports without mapping any guest image. In execution mode the runner attaches DLLs in dependency order, starts the EXE, and releases the images in reverse. The EXE is started as the main image with `pe_map_run_main` (see [Main-image TLS slot 0](#main-image-tls-slot-0)), and its host `CreateThread` imports (`kernel32.dll`, `kernelbase.dll` or an `api-ms-win-core-processthreads-*` contract) are bound to `pe_map_main_create_thread` on a default host route. An explicit `--shim` keeps its original export. `cpu_package_main_image` runs the `/GA` slot-0 EXE through the runner and requires the Windows launch's guest log and exit code. With the former `pe_map_run` start every slot-0 check failed, and without the `CreateThread` binding both workers' checks failed. A returning fixture must join any workers before it returns. The runner rejects cycles and self imports. It now resolves bundled ordinal imports,
 including ordinal-only (`NONAME`) DLL exports and forwarder chains ending in an
 ordinal, using `pe_map_export_ordinal` on the mapped provider. `cpu_native_startup` checks the same two-DLL fixture under this runner and the Windows loader.
 
 External providers with process-lifetime workers can use `--pin-shim DLL` alongside `--shim DLL PATH`. This pins the provider immediately before the first guest image loads, and only in execution mode. Run packages in a child process when using pinned providers. The guest must still join its own workers and quiesce any host calls into guest code before returning. `cpu_package_shim_lifetime` verifies that the selected provider remains loaded after the entry returns and the ordinary provider unloads.
+
+`--trap-callable DLL!SYMBOL` (or `DLL!#ORDINAL`, repeatable) is a diagnostic execution mode for finding the last startup stage a package reaches. By default the runner refuses any unresolved external before mapping. An import table entry names a symbol, but it does not say whether the caller calls it or reads it as data, so this mode binds only the unresolved externals the caller lists as callable. Each listed name gets a numbered trap, and the traps are listed on stderr in sorted `dll!symbol` order. Any unlisted unresolved external is still refused before mapping, and so is a listed name that is not an unresolved external. A trap never returns: it prints `trap N: <importers>: <dll>!<symbol>` and terminates the process with `0xE7A00000 | N`. The report is best effort, and termination does not depend on it. No DLL is written or loaded under the missing name, and a trap is not a provider. If the entry returns without reaching a trap, the JSON result adds `unhit_traps`. The option cannot be combined with `--preflight-only`, and `plan(report, allow_external=False)` still refuses the same package.
+
+`pe_run_package_trap_missing` checks this with two source-built EXEs that import from a module nothing provides: two functions in one, plus a data import in the other.
+- The default run is refused.
+- With both functions listed, calling either one ends the process with that import's trap code and name, and calling neither reports both traps as unhit.
+- A partial list, a stale or malformed name and the unlisted data import are refused before mapping.
+- A child process that closes fd 2 and replaces `sys.stderr` before calling a trap still ends with the trap's code.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^pe_run_package_trap_missing$' -V
+```
 
 ### Scoped content root on Windows
 
@@ -4104,6 +4116,90 @@ This covers only the two root-signature imports observed in the pre-executable D
 | `d3d12_xs_shim_deserialize` | Round-trips a sanitized blob from `d3d12_xs.dll` and reads the embedded `RTS0` part of `pso_compute_embedded`; rejects `pso_compute_stripped` and empty/null buffers with `E_INVALIDARG`. |
 | `d3d12_xs_shim_warp_root` | Serializes a v1.1 `SRV(t0),UAV(u0),RootConstants(16,b0)` descriptor tagged with `0x03000000` through `d3d12_xs.dll` (verified rejected by desktop `d3d12.dll`), creates a WARP `ID3D12RootSignature`, and builds a compute PSO with `pso_compute_stripped`. |
 
+#### D3D12XboxCreateDevice slot inventory and fixture
+
+`src/d3d12x_device_slots.h` and `.cpp` keep a source-owned, ordered inventory of device creation
+IIDs and observed vtable slots. The creation-IID rows are the only rows consulted by
+`D3D12XboxCreateDevice`: `IID_ID3D12Device` is implemented; `IID_ID3D12Device1`,
+`IID_ID3D12Device3` and the observed slots 14 (`+0x70`, `CreateDescriptorHeap`), 28 (`+0xe0`,
+`CreateHeap`) and 76 (`+0x260`, `CreateCommittedResource`) are recorded as documented or observed
+but not implemented. The vtable rows are diagnostic inventory, not a claimed console ABI. The
+public [Xbox-GDK-Samples DeviceResources.cpp](https://github.com/microsoft/Xbox-GDK-Samples/blob/main/Samples/Live/InGameStore/DeviceResources.cpp)
+passes `D3D12XBOX_CREATE_DEVICE_PARAMETERS` and `IID_GRAPHICS_PPV_ARGS`, which requests
+`IID_ID3D12Device1`; this path still accepts only `nullptr` parameters and `IID_ID3D12Device`.
+Accepting the public parameter block or `IID_ID3D12Device1` remains a follow-up decision.
+
+`tests/d3d12x_device_check.cpp` loads the built `d3d12_xs.dll` by explicit path, verifies that the
+resolved `D3D12XboxCreateDevice` belongs to that module, and runs a source-built WARP or hardware
+fixture with `parameters == nullptr`. The positive case checks a non-null device, the adapter LUID,
+`GetNodeCount() == 1` and `CreateFence(..., IID_PPV_ARGS(&fence)) == S_OK`. The negative case sends
+the fixture GUID `{7c0e1a10-5f2d-4b7a-9a51-3d9c6b2e8f01}` and requires `E_NOINTERFACE`, a cleared
+output and the line `D3D12XboxCreateDevice: unsupported IID {7c0e1a10-5f2d-4b7a-9a51-3d9c6b2e8f01}`.
+It also keeps a non-null parameter block at `E_INVALIDARG`.
+
+| CTest case | Inputs and checks |
+|---|---|
+| `d3d12x_device_create_warp`, `d3d12x_device_create_hardware` | Resolves `D3D12XboxCreateDevice` inside `d3d12_xs.dll`, creates a device with null parameters and `IID_ID3D12Device`, checks the adapter LUID, one node and a zero-valued fence. The hardware case skips (77) without a physical adapter. |
+| `d3d12x_device_negative_warp`, `d3d12x_device_negative_hardware` | A non-null parameter block returns `E_INVALIDARG`; the unknown fixture IID returns `E_NOINTERFACE`, clears the output and prints the exact lowercase GUID. The hardware case skips (77) without a physical adapter. |
+
+Run `ctest --preset dev --no-tests=error -R '^d3d12x_device_' -V`.
+
+#### D3D12.X static-sampler compute PSO (XCL-19)
+
+[`tests/d3d12x_pso.hlsl`](../tests/d3d12x_pso.hlsl) is a source-built `cs_6_0` shader with
+`Texture2D t0`, `RWTexture2D u0` and `SamplerState s0`. Its entry samples `t0` at LOD 0 and writes
+`u0`. The fixture compiles it with `-Qstrip_rootsignature`, so the PSO uses the signature
+serialized by the test instead of an embedded one.
+
+The test root is a v1.1 root signature with two one-descriptor tables, `SRV(t0)` and `UAV(u0)`, and
+one static sampler at `s0`. The tables are required because D3D12 root descriptors can only name
+raw or structured buffers, not textures. The sampler uses non-default values so a dropped or
+rewritten field shows up:
+
+| Field | Value |
+|---|---|
+| `Filter` | `D3D12_FILTER_MIN_MAG_MIP_LINEAR` (`0x15`) |
+| `AddressU`, `AddressV`, `AddressW` | `WRAP` (1), `CLAMP` (3), `BORDER` (4) |
+| `MipLODBias` | 2.5 |
+| `MaxAnisotropy` | 4 |
+| `ComparisonFunc` | `D3D12_COMPARISON_FUNC_GREATER_EQUAL` (7) |
+| `BorderColor` | `D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE` (2) |
+| `MinLOD`, `MaxLOD` | 1.5, 9.0 |
+| `ShaderRegister`, `RegisterSpace` | 0, 0 |
+| `ShaderVisibility` | `D3D12_SHADER_VISIBILITY_ALL` (0) |
+
+The descriptor carries the observed console root-signature flags `0x03000000`.
+`src/d3d12_xs_shim.cpp` clears only those two bits in a local copy and leaves the parameter types,
+static-sampler pointer and count untouched.
+
+The positive case first confirms that desktop `d3d12.dll` rejects the tagged descriptor with
+`E_INVALIDARG` and no blob, then serializes it through `d3d12_xs.dll` and compares that blob byte
+for byte with the desktop baseline whose flags are 0. It deserializes the shim blob through
+`d3d12_xs.dll!D3D12CreateRootSignatureDeserializer` and compares every static-sampler field listed
+above. It creates the device through `D3D12XboxCreateDevice` with `parameters == nullptr` and
+`IID_ID3D12Device`, then creates the root signature and the compute PSO, requiring `S_OK` and
+non-null objects.
+
+The reject case covers an unknown static-sampler `ShaderVisibility` (99), an unrecognized
+static-sampler `Filter` (`0x7fffffff`), unknown root-signature flag `0x04000000` and unknown
+`D3D12_ROOT_PARAMETER_TYPE` `0x7fffffff`. Desktop `d3d12.dll` must return `E_INVALIDARG` with no
+blob for each, and `d3d12_xs.dll` must return the same HRESULT with no blob. Creating a compute PSO
+with a null `pRootSignature` must also return `E_INVALIDARG` and no PSO.
+
+| CTest case | Inputs and checks |
+|---|---|
+| `d3d12x_pso_static_sampler_warp` | Runs the positive case on WARP. |
+| `d3d12x_pso_static_sampler_hardware` | Runs the positive case on the first non-software D3D12 adapter, or the one selected by `XBOX2WINDOWS_ADAPTER`; skips (77) without a physical adapter. |
+| `d3d12x_pso_reject_warp` | Runs the four serialization rejects and the null-root PSO reject on WARP. |
+
+Run `ctest --preset dev --no-tests=error -R '^d3d12x_pso_' -V`.
+
+This fixture covers creation only. It dispatches no work, binds no descriptor heap and reads nothing
+back, so it does not establish that a dispatch using this root signature produces correct results.
+It also makes no console descriptor or vtable claim: the public
+`D3D12XBOX_CREATE_DEVICE_PARAMETERS` block and `IID_ID3D12Device1` remain unimplemented on this
+device path.
+
 #### D3D12ConfigureVirtualMemoryX call shape (#874)
 
 The main executable imports `d3d12_xs.dll!D3D12ConfigureVirtualMemoryX` and calls it once, before the D3D12 device is created. A static read of the call site shows:
@@ -4406,6 +4502,20 @@ Build the same `xg_swizzle_select_check` target and run both factory tests with 
 The GPU check report includes the adapter's shader-visible CBV/SRV/UAV descriptor heap limit from D3D12 OPTIONS19. Compare the `max_view_descriptor_heap_size` line in `ctest --preset dev --no-tests=error -R '^offscreen_(hardware|warp)$' -V`. The report says `not reported` when the runtime does not provide a limit.
 
 The original test machine had Windows Graphics Tools installed. A second build in `out/build/agility` used Microsoft Agility SDK 1.620.2. Set `-DOFFSCREEN_AGILITY_620_DIR=<directory containing the x64 SDK DLLs>` to reproduce it. This configuration verifies debug interface activation. [Agility SDK package](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12/1.620.2)
+
+### Two logical heaps in one shader-visible descriptor heap
+
+`descriptor_heap_paging` gives two logical heaps three 256-slot pages each and shares a 1,024-slot shader-visible heap between them. The first touches allocate pages in A, B order. Copying two descriptors at logical slot 255 splits each copy at page 256 and allocates each heap's second page. The two copies land at physical slots `255,512` and `511,768`. Both third pages stay unmapped. The page size and allocation order belong to the fixture. It uses the on-demand publication idea in the public XCL paging comparison. [Tracking issue #874](https://github.com/R0Y00/Xbox2Windows/issues/874) · [XCL descriptor paging](https://github.com/ivall/xcl/pull/84)
+
+The Windows 10 22H2 `19045.6456` GTX 1060 6 GB (`32.0.15.6094`) and in-box WARP (`10.0.19041.5794`) both returned `S_OK` for the 1,024-slot heap. The four GPU reads returned `a00100ff,a0010100,b00200ff,b0020100`. The swapped-heap control bound the same shared heap and returned `b00200ff,b0020100,a00100ff,a0010100`. Debug and Release passed with no D3D12 warnings or errors. Tests skip on adapters without Shader Model 6.0.
+
+```powershell
+cmake --preset dev
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^descriptor_heap_paging_' -V
+```
+
+Repeat with `release`.
 
 ### Shader-visible descriptor windows across submissions
 
@@ -4942,6 +5052,37 @@ ctest --preset dev --no-tests=error -R '^cpu_native_xapu_queue$' -V
 ctest --preset release --no-tests=error -R '^cpu_native_xapu_queue$' -V
 ```
 
+### GameInput ordinal 1 caller and recorder
+
+A source-built caller ([`gameinput_caller.asm`](../tests/cpu/gameinput_caller.asm)) imports `GameInput.dll` ordinal 1 with no name, as the statically read console caller in #1056 does, plus one named query export of the test provider and `finish_exe` from `cpu_exe_io.dll`. It starts through [`exe_startup.asm`](../tests/cpu/exe_startup.asm). A test-only recording provider ([`gameinput_provider.cpp`](../tests/cpu/gameinput_provider.cpp)) exports `GameInputCreate` at ordinal 1 (`NONAME`) and serves the v0 objects. This is not a production `GameInput.dll`.
+
+- **Public evidence:** the v0 interfaces, method order, structures and error codes follow the Windows SDK header `um/GameInput.h` (10.0.26100.0) and the GameInput reference on Microsoft Learn, which documents the v0 header as static across the GDK, the NuGet package and the Windows SDK. The provider restates the declarations it needs and pins their sizes and offsets with `static_assert`.
+- **Observed call shapes reproduced (#1056):** ordinal 1 with one argument; `IGameInput` slots 4, 5, 6, 9, 13 and 16; `IGameInputReading` slots 14, 15 and 22; `IGameInputDevice` slots 3 and 10. The keyboard registration is made while the caller holds a recursive lock that its device callback takes again.
+- **Fixture policy (not console evidence):** one synthetic gamepad and one keyboard with fixed 32-byte IDs, three-entry reading histories, callbacks for blocking enumeration delivered synchronously on the registering thread, kinds other than gamepad and keyboard refused, and every refusal code.
+- **Verified cases** (identical under the Windows loader and `pe_map`):
+  1. A null output returns `E_POINTER`. Ordinal 1 returns an object, and a second call returns the same object.
+  2. The keyboard callback with blocking enumeration runs once during registration, on the registering thread, while the caller holds its lock. It sees the keyboard's ID at `GetDeviceInfo()` + `0x20`.
+  3. The gamepad callback runs once during registration with the caller's context and the gamepad's ID.
+  4. Registering the mouse kind returns `E_INVALIDARG` with the token untouched.
+  5. `GetGamepadState` fills the 28 zeroed bytes of the current reading. The reading before it, requested relative to the current one, returns the earlier state.
+  6. The current keyboard reading reports 3 keys in 12-byte entries, including an E0-prefixed scan code (`0xE04B`) and right Shift. The next reading returns `GAMEINPUT_E_READING_NOT_FOUND` (`0x838A0003`) with a null output.
+  7. `FindDeviceFromId` with the gamepad's own ID returns the same device, and `SetRumbleState` receives 0.5 for both motors and 0 for both triggers. An all-zero ID returns `GAMEINPUT_E_DEVICE_NOT_FOUND` (`0x838A0002`).
+  8. Unregistering with 5000 µs and with an infinite timeout returns `true`, and a second unregister returns `false`. Afterwards, the caller holds no references.
+  9. The checker reads back the provider records after the `pe_map` run: 3 create calls (1 refused), 3 registrations (1 refused), 2 callbacks with none on another thread, 4 reading requests (1 refused), 1 rumble call with zero trigger values, no calls to unused slots and no outstanding references.
+- **Controls:**
+  - A provider whose ordinal 1 fails stops the caller at Step 1 (`0xF01`).
+  - A provider that delivers the blocking-enumeration callback on another thread and waits for it stops the caller at Step 2 (`0xF02`). The caller's bounded lock spin reports it instead of deadlocking.
+  - A provider that writes the gamepad state 4 bytes late stops the caller at Step 5 (`0xF05`).
+  - Withholding ordinal 1 stops `pe_map` before entry with `unresolved import GameInput.dll!#1` and no provider calls. A provider that exports the function at ordinal 2 stops `pe_map` with the same diagnostic. The Windows loader refuses it with `0xC0000138` (`STATUS_ORDINAL_NOT_FOUND`).
+  - With no provider binding, `pe_map` stops before entry. The Windows loader then searches the system directory. On a machine with `System32\GameInput.dll`, it loads that DLL and refuses the test's named export (`0xC0000139`). Otherwise it reports `0xC0000135`.
+
+On success the caller exits with `0x6A1`, also with `CPU_CRC_TEST_LIVE_WORKER=1` under the Windows loader. The fixture shows that a provider satisfying these call shapes is distinguishable from one that breaks them under both loaders. It does not establish the console runtime's callback thread, history depth, scan-code encoding or refusal codes. Run:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^cpu_native_gameinput$' -V
+ctest --preset release --no-tests=error -R '^cpu_native_gameinput$' -V
+```
+
 ### DirectStorage factory and queue adapter
 
 This fixture exercises the DirectStorage initialization sequence and submission controls. The source-built caller ([`dstorage_caller.asm`](../tests/cpu/dstorage_caller.asm)) imports `DStorageGetFactory` by name from `xcrdapi.dll` and `finish_exe` from `cpu_exe_io.dll`, starting through [`exe_startup.asm`](../tests/cpu/exe_startup.asm). Under a controlled adapter provider ([`dstorage_provider.cpp`](../tests/cpu/dstorage_provider.cpp)), it verifies factory acquisition, staging buffer configuration, queue creation, delayed submission, and exact readback:
@@ -5464,6 +5605,15 @@ To test the published fixed-symbol rANS hypothesis against an isolated BCPack pr
 
 `tools/bc7_tiles.py` converts one padded GFX10 `SW_4K_S` surface of 16-byte BC7 blocks to desktop block rows. The caller supplies the pixel dimensions and the bytes of one mip level. Each 4 KiB tile contains 16 × 16 BC7 blocks. The address equation applies to the standard non-XOR mode. [AMD GFX10 swizzle tables](https://github.com/GPUOpen-Drivers/pal/blob/c5e800072a32f68b6ccc4422936d96167c6e0728/src/core/imported/addrlib/src/gfx10/gfx10SwizzlePattern.h)
 
+The same module provides the forward `tile_4k_s(blocks, width, height, pitch_blocks=None)` and the mip-chain packer `pack_4k_s_tail(levels, tile=None)`. They are the tested inverses of `linearize_4k_s` and `linearize_4k_s_tail`. The synthetic check builds a 64×64 BC7 surface with seven mips: mip 0 occupies exactly one 4 KiB tile, and mips 1–6 share one 4 KiB tail at slots 32×32→0, 16×16→1, 8×8→2, 4×4→3, 2×2→6 and 1×1→7, for 8 KiB total. Every 16-byte block carries a unique `(mip, x, y)` tag and padding is `0xff`. The test compares byte for byte with an independent bit-order and slot-origin oracle, then round-trips the linear surface and every tail mip.
+
+The controls use an 81×69 surface (21×18 visible blocks) with a 22-block source pitch. The visible blocks round-trip at pitch 22; `pitch_blocks=21` first differs at block (0, 1), and a pitch below the block width raises. A 32×32 mip read at level 1 raises, a 16×16 mip written at level 0 and read at level 1 differs at the first block, and a 4095- or 4097-byte tail raises. This covers one non-XOR, 16-byte-element `SW_4K_S` BC7 layout. It is tooling evidence for the address equations, not a runtime texture path, a full GFX10 tiling implementation or a console format claim. No GPU, game data or title input is used.
+
+```powershell
+python -B tests/gfx10_texture_roundtrip_check.py
+ctest --preset dev --no-tests=error -R '^gfx10_texture_roundtrip' -V
+```
+
 The desktop check uploads those rows as `DXGI_FORMAT_BC7_UNORM`, runs the translated copy shader, and checks its floating-point readback against CPU-decoded RGBA values after half-precision export. Its case file starts with `BC7C` and two little-endian 32-bit pixel dimensions, followed by tightly packed BC7 block rows and one reference RGBA8 value per texel. The base texture dimensions must be divisible by four. Each resident mip uses its logical dimensions, up to 4096 on either axis and 4 Mi pixels total, with one reference value per texel. Even a 1×1 mip occupies a complete 16-byte BC7 block.
 
 ```powershell
@@ -5668,9 +5818,15 @@ the host.
 The pass first looks for a directly loaded standalone sampler that feeds both kinds of
 sampling. Modules without one are returned byte-for-byte unchanged. That includes the
 indexed table above and unrelated samples on other samplers. For the sampler it splits,
-the profile covers direct, non-array float32 `Texture2D` sampling in one compute entry
+the profile covers direct float32 `Texture2D` and `Texture2DArray` sampling in one compute entry
 point at a constant LOD of zero. Other uses of that sampler, an occupied binding, a
 nonzero LOD and more than one mixed sampler are rejected with a specific diagnostic.
+
+A [synthetic arrayed variant](../tests/spirv_window/shared_sampler_array.spvasm) of the fixture below
+uses `Texture2DArray` images with a float3 coordinate at layer 0. The test splits it to the same
+bindings, validates both modules for Vulkan 1.2 and checks that SPIRV-Cross emits two
+`SampleCmpLevelZero` calls on the comparison sampler and one `SampleLevel` on the ordinary one.
+The GPU readback below runs only the `Texture2D` module.
 
 The [source-built fixture](../tests/spirv_window/shared_sampler.spvasm) compares
 references 0.25 and 0.75 against depth 0.5 with point-clamp `LESS_EQUAL`, and
@@ -6417,6 +6573,42 @@ omitting the 2Sum midpoint correction (double-rounding), or flushing intermediat
 subnormals (`ftz`) report pixel mismatches under `--check-pixel-case`.
 
 
+## Fixture-only XGameRuntime synchronous contracts
+
+The fixture-only `src/xgameruntime_shim.cpp` now distinguishes logged stubs from
+synchronous implementations in its single X-macro table. The synthetic XUser
+identity is `0x0009000000000001`; `XUserFindUserById`, `XUserGetId`,
+`XUserDuplicateHandle`, and `XUserCloseHandle` expose its handle lifecycle. The
+XGameSave synchronous subset (`XGameSaveInitializeProvider`,
+`XGameSaveCreateContainer`, `XGameSaveCreateUpdate`,
+`XGameSaveSubmitBlobWrite`, `XGameSaveSubmitUpdate`, `XGameSaveReadBlobData`, and
+the close functions) stores up to four blobs of 1,024 bytes per in-memory
+container. It does not persist to disk, synchronize with Xbox services, or claim
+the full provider semantics.
+
+Container data is keyed by provider scope and container name, separately from
+open container handles. A second `XGameSaveCreateContainer` call for `slot-a`
+opens the same in-memory data, and the data remains readable after all handles
+to that container are closed. An update records both its parent container-handle
+identity and the store identity. Submitting it after that parent handle is
+closed or its slot is reused fails with `E_GS_HANDLE_EXPIRED` (`0x8083000D`) and
+does not write into any newly created container such as `slot-b`. The contract
+test covers both controls plus independent `slot-a`/`slot-b` names on one
+provider.
+
+`XUserAddAsync` and `XGameSaveInitializeProviderAsync` remain explicit stubs.
+Their completion contract requires the public `XAsyncBlock`, `XUserAddResult`,
+and `XGameSaveInitializeProviderResult` queue/callback/result semantics, which
+this repository does not model without GDK headers. `xgameruntime_contracts`
+exercises the synchronous subset and checks that no XUser/XGameSave call logs
+`E_NOTIMPL`; it then calls XPackage and XGame stubs as negative controls. The
+DLL remains under `out/build/dev/fixture-shims/` and is loaded by explicit path.
+
+```powershell
+cmake --build --preset dev --target xgameruntime_shim xgameruntime_shim_check xgameruntime_contracts_check
+ctest --preset dev --no-tests=error -R '^xgameruntime_' -V
+```
+
 ## Offline package PE import closure
 
 `tools/pe_package_preflight.py` reads PE import and export tables from a
@@ -6442,10 +6634,10 @@ unverified. This is not a prediction that the image will start or run correctly.
 
 `pe_run_package.plan(report, allow_external=False)` adds a strict closed-package
 check. Every reachable import must terminate in a bundled export; an
-`external_unverified` import, including the fixture-only XGameRuntime stub, is
+`external_unverified` import, including the fixture-only XGameRuntime DLL, is
 refused before any image is loaded or mapped. The default `plan(report)` keeps
 the earlier permissive behavior because the offline preflight does not inspect
-host providers. The XGameRuntime skeleton is built under
+host providers. The XGameRuntime fixture is built under
 `out/build/dev/fixture-shims/`, never beside `xmem.dll` or `d3d12_xs.dll`. A
 source-built EXE importing `xgameruntime.dll!XUserAddAsync` is packaged with the
 normal shims but without that fixture DLL; `xgameruntime_preflight_stub_refused`
@@ -6577,33 +6769,38 @@ Not covered by this experiment: non-default MXCSR modes (FTZ/DAZ or unmasked exc
 non-temporal cache-bypass hints on `movntps`, control flow, nonvolatile `xmm6`..`xmm15`
 prologues, and title CPU code execution.
 
-## Legacy SSE/MMX conversion, shuffle, and non-temporal store
+## Legacy SSE/MMX conversion, shuffle, and masked/non-temporal stores
 
 [The SSE/MMX leaf translator](../tools/cpu_sse_mmx_aot.py) lifts bounded straight-line
-Windows x64 leaf functions covering five uncovered forms from `docs/coverage/x64_zen2.tsv`
-group `SSE`:
+Windows x64 leaf functions covering seven forms from `docs/coverage/x64_zen2.tsv`
+groups `SSE` and `SSE2`:
 
 - Integer-to-float conversion: `cvtpi2ps` (`mm` and `m64` sources, preserving `xmm[127:64]`)
 - Float-to-integer conversions: `cvtps2pi` (round-to-nearest-even) and `cvttps2pi` (truncate toward zero) on `xmm` and `m64` sources, returning `0x80000000` on NaN, `+/-Inf`, or out-of-`int32_t` range after rounding
 - Word permutation: `pshufw` (`imm8` 16-bit word shuffle on `mm` and `m64` sources)
 - Non-temporal store: `movntq` (`m64` store to `[r8 + disp]`, tested at aligned and unaligned addresses)
+- Conditional byte stores: `maskmovq` (`SSE`, `mm1, mm2` to implicit `[rdi]`, requiring `emms` before `ret`) and `maskmovdqu` (`SSE2`, `xmm1, xmm2` to implicit `[rdi]`), requiring nonvolatile `rdi` save/restore via a volatile scratch GPR around `mov rdi, r8`. For this portable first slice, `[rdi..rdi+7]` (`maskmovq`) or `[rdi..rdi+15]` (`maskmovdqu`) must be writable ordinary memory; the lifted helper writes only bytes with `(mask[i] & 0x80) != 0`
 
 Call with round-to-nearest-even, masked MXCSR exceptions, DAZ and FTZ off, and
 an empty x87 stack with no pending unmasked exceptions or live MMX values.
-The caller owns the buffers and reads the output after return. The `movntq`
-lowering preserves the eight output bytes. Caching hints, inter-thread
-visibility, floating-point status flags and physical x87 tags are outside
-the observed contract.
+The caller owns the buffers and reads the output after return. The `movntq`,
+`maskmovq`, and `maskmovdqu` lowerings preserve the written output bytes;
+caching hints, inter-thread visibility, implementation-dependent partial-page or
+all-zero-mask fault behavior, floating-point status flags, and physical x87 tags
+are outside the observed contract.
 
 Each lifted export uses the leaf ABI `void fn(word rcx, word rdx, word r8)` (`rcx`/`rdx`
 inputs, `r8` output), modeling `xmm0`..`xmm5` (`Vec128`), `mm0`..`mm7` (`std::uint64_t mm[8]`),
-and volatile scratch GPRs `rax`/`r9`/`r10`/`r11` for `movq` bridges alongside `movaps`/`movdqa`
-(16-byte aligned), `movdqu`, `emms`, and terminal `ret`. Touching any `mm` register sets
-`mmx_active`; `emms` clears it and invalidates `mm` definitions unconditionally, and `ret`
-rejects while `mmx_active` is true. Dead-read fault ordering uses `std::atomic_signal_fence`
-with volatile loads. Memory stores are restricted to `r8`-rooted flat `[r8 + disp]` operands,
-and VEX/EVEX encodings, nonvolatile registers, undefined reads/merges, prefixes, and
-unsupported instructions reject.
+and volatile scratch GPRs `rax`/`r9`/`r10`/`r11` for `movq` bridges and `rdi` save/restore
+slots alongside `movaps`/`movdqa` (16-byte aligned), `movdqu`, `emms`, and terminal `ret`.
+Touching any `mm` register sets `mmx_active`; `emms` clears it and invalidates `mm`
+definitions unconditionally, and `ret` rejects while `mmx_active` is true or `rdi` is
+unrestored. Volatile scratch GPRs holding saved `rdi` stay unavailable to `movq` reads
+until overwritten. Dead-read fault ordering uses `std::atomic_signal_fence` with volatile
+loads. Memory stores are restricted to `r8`-rooted flat `[r8 + disp]` operands (and
+`r8`-rooted `[rdi]` for `maskmovq`/`maskmovdqu`), and VEX/EVEX encodings, `67h` `edi`
+targets, nonvolatile registers, undefined reads/merges, prefixes, and unsupported
+instructions reject.
 
 ```powershell
 cmake --build --preset dev --target cpu_sse_mmx_original cpu_sse_mmx_original_lifted cpu_sse_mmx_altered cpu_sse_mmx_altered_lifted
@@ -6612,22 +6809,29 @@ ctest --preset dev --no-tests=error -R '^cpu_aot_sse_mmx$' -V
 
 ### Measured results and open scope
 
-The [MASM fixture](../tests/cpu/sse_mmx.asm) exports 19 functions covering register and
-displaced/unaligned `m64` forms of all five instructions, `movq` GPR bridges, `emms`
-re-entry, a discarded `cvtps2pi` fault-ordering read, and a chained pipeline.
-[The differential check](../tests/cpu/sse_mmx_check.py) verified 237 cases across the 18
+The [MASM fixture](../tests/cpu/sse_mmx.asm) exports 22 functions covering register and
+displaced/unaligned `m64` forms of the conversion/shuffle/non-temporal ops, `maskmovq`
+and `maskmovdqu` with `rdi` save/restore, `movq` GPR bridges, `emms` re-entry, a discarded
+`cvtps2pi` fault-ordering read, and chained pipelines (`op_pipeline`, `op_maskmov_pipeline`).
+[The differential check](../tests/cpu/sse_mmx_check.py) verified 339 cases across the 21
 differential exports bit-for-bit against both the native MASM DLL and an independent Python
-reference model (including `+/-0.0`, subnormals, ties-to-even, `2147483520.0`, `2147483648.0`,
-`-2147483648.0`, `-2147483904.0`, `+/-Inf`, qNaN/sNaN, `xmm[127:64]` preservation, and
-`pshufw` `imm8` edge patterns), plus the discarded-read fault-ordering test on both `dev`
-and `release` (`/O2`) presets. An `ALTER_IMM` variant swaps `cvtps2pi`/`cvttps2pi` and
-changes `pshufw` `imm8` on four exports (diverging on 3, 3, 7, and 7 cases); an
-output-mutation control confirmed single-bit mismatch detection; and rejection controls
-passed 7 alternate-encoding lift checks, 59 unit rejections (7 VEX/EVEX, 12 unsupported
-instructions, 40 ABI/state/addressing/prefix/stream), and 10 PE-patched DLL rejections.
+reference model with 32-byte pre/post buffer guards (including `+/-0.0`, subnormals,
+ties-to-even, `2147483520.0`, `2147483648.0`, `-2147483648.0`, `-2147483904.0`, `+/-Inf`,
+qNaN/sNaN, `xmm[127:64]` preservation, `pshufw` `imm8` edge patterns, and all 16-lane byte
+mask patterns), 24 `k=8`/`k=16` page-abutting writable checks against `PAGE_NOACCESS` and
+`PAGE_READONLY` guard pages, 54 native partial-edge observations (`k<8` and `k<16`), plus
+the discarded-read fault-ordering test on both `dev` and `release` (`/O2`) presets. An
+`ALTER_IMM` variant swaps `cvtps2pi`/`cvttps2pi`, changes `pshufw` `imm8`,
+and swaps `maskmovq`/`maskmovdqu` source and mask on six exports (diverging on 3, 3, 7, 7,
+22, and 30 cases); an output-mutation control confirmed single-bit mismatch detection; and
+rejection controls passed 9 alternate-encoding lift checks, 81 unit rejections (8 VEX/EVEX,
+12 unsupported instructions, 61 ABI/state/addressing/prefix/stream), and 16 PE-patched DLL
+rejections.
 
 Not covered by this experiment: non-default MXCSR rounding modes, non-temporal cache-bypass
-hints on `movntq`, x87/MMX aliasing across calls, control flow, and title CPU code execution.
+hints on `movntq`/`maskmovq`/`maskmovdqu`, implementation-dependent partial-page faults on
+`maskmovq`/`maskmovdqu`, x87/MMX aliasing across calls, control flow, and title CPU code
+execution.
 
 ## AVX quadword and masked-byte moves
 
@@ -6737,6 +6941,71 @@ binding that replaces the flag writer, and 11 end-to-end PE-patched DLL rejectio
 
 Not covered by this experiment: `sahf`, `inc`/`dec`/`neg`/`adc`/`sbb`, `pushf`/`popf`/
 `pushfq`/`popfq`, cross-block flag flow into `lahf`, and title CPU code execution.
+
+## Lowering primitive topology 0x11 (rectangle list) to triangle list
+
+[The rectangle list lowering tool](../tools/rectlist_topology.py) expands primitive
+topology `0x11` (`VGT_PRIMITIVE_TYPE_RECTLIST` in AMD GCN/RDNA hardware architecture)
+to desktop Direct3D 12 `D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST` (`0x4`).
+
+Console hardware accepts `0x11` representing rectangles specified by three vertices
+$(v_0, v_1, v_2)$ as a defined input precondition:
+- $v_0$ is the primary origin corner.
+- $v_1$ is an adjacent corner sharing an edge with $v_0$.
+- $v_2$ is diagonally opposite to $v_0$ and shares an edge with $v_1$.
+
+The primitive setup engine synthesizes the fourth corner algebraically as:
+$$v_3 = v_0 + v_2 - v_1$$
+
+Lowering transforms $N$ input rectangles ($3N$ vertices) into $2N$ triangles
+($6N$ vertices or indexed triangles $[0, 1, 2, 0, 2, 3]$) forming triangles
+$(v_0, v_1, v_2)$ and $(v_0, v_2, v_3)$ while linearly interpolating arbitrary
+vertex attributes (UVs, normals, vertex colors).
+
+The winding order of both lowered triangles strictly follows the input winding.
+In 2D screen space, substituting $v_3 - v_0 = v_2 - v_1$ into the cross product yields:
+$$\text{cross\_2d}(v_0, v_2, v_3) = (x_2 - x_0)(y_2 - y_1) - (y_2 - y_0)(x_2 - x_1) = \text{cross\_2d}(v_0, v_1, v_2)$$
+Both triangles possess algebraically identical signed area in magnitude and sign.
+A counter-clockwise (CCW, front-facing) input yields two CCW triangles; exchanging
+$v_0$ and $v_2$ yields clockwise (CW, back-facing) triangles, which are discarded
+under desktop D3D12 backface culling (`D3D12_CULL_MODE_BACK`).
+
+```powershell
+cmake --build --preset dev --target rectlist_draw_check
+ctest --preset dev --no-tests=error -R 'rectlist' -V
+```
+
+### Measured results and open scope
+
+[The topology check fixture](../tests/rectlist_topology_check.py) exercises 14 verification
+and negative control cases:
+- CCW rectangle geometry expansion and 4th vertex derivation ($v_3 = v_0 + v_2 - v_1$).
+- Algebraic proof of signed 2D area invariance between Triangle 0 and Triangle 1.
+- Input precondition validation (`validate_corner_order`) enforcing non-collinearity,
+  CCW winding, and optional edge orthogonality.
+- Multi-attribute linear interpolation for auxiliary vertex channels.
+- Full-screen viewport bounds ($[-1, 1] \times [-1, 1]$) with zero uncovered pixels.
+- Index buffer expansion for indexed draw streams ($3N$ indices to $6N$ indices).
+- Negative controls: rejection of vertex counts not divisible by 3.
+- Raster oracle mutant detection catching incorrect corner derivation, swapped winding order,
+  and dropped triangle vertices.
+
+[The D3D12 draw fixture](../tests/rectlist_draw_check.cpp) and [shaders](../tests/rectlist_quad.hlsl)
+render the actual output of the Python lowerer into a 64x64 target under Direct3D 12 WARP and physical hardware
+with backface culling enabled (`D3D12_CULL_MODE_BACK`):
+- Positive draw: renders lowered CCW triangles $(v_0, v_1, v_2)$ and $(v_0, v_2, v_3)$ with
+  distinct interpolated vertex colors (RGBA). Pixel readback matches the separate analytical
+  expected rectangle with 0 mismatches.
+- Reversed-winding mutant: swapping $v_0$ and $v_2$ produces clockwise winding. The GPU hardware
+  culling stage discards all triangles, leaving the render target clear and producing 900
+  culled mismatches against the expected rectangle.
+- Wrong-corner mutant ($v_3 = v_0 + v_2$): distorts Triangle 1 and leaves the top-left quadrant
+  unrendered, triggering 435 mismatches against the expected rectangle.
+- Raw desktop topology rejection: passing raw `0x11` to desktop `CreateGraphicsPipelineState`
+  is rejected with `0x80070057` (`E_INVALIDARG`).
+
+Not covered by this experiment: geometry or tessellation shader stages preceding the
+input assembler, primitive ID generation in pixel shaders, runtime driver hooking, and title CPU code execution.
 
 ## gfx1013 SOPK and SOPP decoding
 
