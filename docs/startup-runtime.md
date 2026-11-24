@@ -603,7 +603,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_D3D12_DUMP_SURFACE=<bmp>` | writes the last presented surface |
 | `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. At most 48 copies are pending or written; a copy whose fence reports device removal (`UINT64_MAX`) is released unwritten and frees its slot (`src/startup_stubs/draw_dump_tracking.h`, `ctest --preset dev --no-tests=error -R '^startup_dump_fence_(removed_control_)?warp$' -V`; the control must fail). |
-| `X2W_AUDIO_PERMISSIVE=1` | audio HAL / APU stand-ins accept their calls (no output) |
+| `X2W_AUDIO_PERMISSIVE=1` | enables the audio stand-ins. Without a DSP provider, `XDspActivate` clears valid outputs and reports unavailable resources, and failed `XDspSubmitCommand` calls leave the sequence unchanged. |
 | `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call |
 | `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user, and creates one offline store context for that user |
 | `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is UTF-8, with a trailing separator added when missing. If the path is invalid or exceeds 259 bytes including the separator, the proxy logs the refusal and uses `S:\` (`src/startup_stubs/storage_root_utf8.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`). |
