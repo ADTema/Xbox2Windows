@@ -3060,7 +3060,7 @@ python3 -B tools/compute_store_aot.py local.dxbc --llvm libLLVM-15.so.1 --table-
 python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```
 
-Build the emitted source with `dxc -T cs_6_0 -E main`. The Windows fixture reads back all 320 words, including gaps between records and the untouched tail, after one and three indexed groups. A wrong stored word and a wrong guard word must both fail. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_'`.
+Build the emitted source with `dxc -T cs_6_0 -E main`. The Windows fixture reads back all 320 words, including gaps between records and the untouched tail, after one and three indexed groups. A wrong stored word and a wrong guard word must both fail. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_'`. On Windows 11 build 26300.9974, the Intel Arc 140T (32.0.101.8132) matched all 320 words after one and after three indexed groups, with zero D3D12 debug errors and warnings.
 
 ### gfx1030 MUBUF cache-invalidation rejection
 
