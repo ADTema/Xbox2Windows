@@ -3347,6 +3347,8 @@ def binary(directory, assembler, objcopy, library):
     two_exits(directory, assembler, objcopy, library)
     mubuf_format_store_controls()
     mubuf_format_d16_store_controls()
+    gfx1030_binary(directory, assembler, objcopy, library, mubuf_format_store_cases(xyz=True),
+                   "buffer_store_format_d16_", group=16)
     for packed in (False, True):
         gfx1030_binary(directory, assembler, objcopy, library, mubuf_format_store_cases(packed),
                        "buffer_store_format_", group=16)
@@ -4004,8 +4006,12 @@ def mubuf_format_draw(directory, compiler, renderer, backend):
 MUBUF_STORE_WORDS = (0x89abcdef, 0x01234567, 0xdcbafed0, 0x76543210)
 
 
-def mubuf_format_store_cases(packed=False):
-    for components in ((1, 2, 4) if packed else range(1, 5)):
+def mubuf_format_store_cases(packed=False, *, xyz=False):
+    if xyz:
+        packed, widths = True, (3,)
+    else:
+        widths = (1, 2, 4) if packed else range(1, 5)
+    for components in widths:
         name = f"buffer_store_format_{'d16_' if packed else ''}{'xyzw'[:components]}"
         count = (components + 1) // 2 if packed else components
         component_format = "16_" if packed else "32_"
@@ -4014,8 +4020,12 @@ def mubuf_format_store_cases(packed=False):
                  "s_load_dwordx4 s[20:23], s[12:13], 0x30",
                  "v_lshl_add_u32 v8, s11, 4, v0", "s_waitcnt lgkmcnt(0)"]
         lines += [f"v_xor_b32_e32 v{10 + i}, {word:#x}, v8" for i, word in enumerate(MUBUF_STORE_WORDS[:count])]
-        yield name, [*lines, f"{name} {data}, v8, s[20:23], 0 idxen offset:4", "s_endpgm"], DS_BINDING | {
-            "stride": 4 * (count + 1), "output_format": f"BUF_FMT_{component_format * components}UINT"}
+        format_components = 4 if xyz else components
+        binding = DS_BINDING | {"stride": 4 * (count + 1),
+                                "output_format": f"BUF_FMT_{component_format * format_components}UINT"}
+        if xyz:
+            binding["mubuf_d16_xyz_mode"] = "preserve-w"
+        yield name, [*lines, f"{name} {data}, v8, s[20:23], 0 idxen offset:4", "s_endpgm"], binding
 
 
 def mubuf_format_store_controls():
@@ -4076,19 +4086,43 @@ def mubuf_format_d16_store_controls():
     rejects("Unverified raw UAV store", aot.lower, variant(lines, ("s_waitcnt lgkmcnt(0)", "")), 16, **binding)
 
     _, lines, binding = cases[-1]
-    rejects("Formatted D16 buffer store requires a matching whole-texel format", aot.lower,
-            variant(lines, ("buffer_store_format_d16_xyzw", "buffer_store_format_d16_xyz")), 16, **binding)
     rejects("Unverified raw UAV store", aot.lower, variant(lines, ("v[10:11]", "v10")), 16, **binding)
 
+    _, lines, binding = next(mubuf_format_store_cases(xyz=True))
+    store = lines[-2]
+    rejects("Formatted D16 XYZ store requires an explicit W-preservation contract", aot.lower,
+            lines, 16, **(binding | {"mubuf_d16_xyz_mode": None}))
+    rejects("D16 XYZ mode requires a gfx1030 RGBA16 UINT output binding", aot.lower,
+            lines, 16, **(binding | {"output_format": "BUF_FMT_16_16_UINT"}))
+    for replacement, diagnostic in (
+        (store.replace("idxen", "offen"), "Unsupported formatted buffer store target or address mode"),
+        (store.replace("offset:4", "offset:8"), "Unsupported store address"),
+        (store.replace("v[10:11]", "v[255:256]"), "Unverified raw UAV store"),
+        (store + " glc", "Unsupported compute instruction"),
+        (store + "\nbuffer_store_short v10, v8, s[20:23], 0 idxen offset:10", "Overlapping raw UAV stores"),
+    ):
+        rejects(diagnostic, aot.lower, variant(lines, (store, replacement)), 16, **binding)
+    rejects("Unverified raw UAV store", aot.lower, variant(lines, ("s_waitcnt lgkmcnt(0)", "")), 16, **binding)
+    line = lines[-3]
+    pending = variant(lines, ("s_waitcnt lgkmcnt(0)",
+                              "s_load_dwordx4 s[16:19], s[12:13], 0x40\ns_waitcnt lgkmcnt(0)"),
+                      (line, "buffer_load_dword v11, v8, s[16:19], 0 idxen"))
+    read_binding = binding | {"source_descriptor": 0x40, "source_stride": 4}
+    rejects("Vector load result used or overwritten before s_waitcnt vmcnt(0)", aot.lower,
+            pending, 16, **read_binding)
+    aot.lower(variant(pending, (store, "s_waitcnt vmcnt(0)\n" + store)), 16, **read_binding)
 
-def mubuf_format_store_draw(directory, compiler, renderer, backend):
+
+def mubuf_format_store_draw(directory, compiler, renderer, backend, *, xyz=False):
     mubuf_format_d16_store_controls()
     mubuf_format_store_controls()
     src, cso, case = (directory / f"mubuf-format-store.{ext}" for ext in ("hlsl", "cso", "case"))
     compile_shader = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
     run = [renderer, backend, "--compute-store-case", cso, case]
     accepted = []
-    for name, lines, binding in (*mubuf_format_store_cases(), *mubuf_format_store_cases(packed=True)):
+    cases = (mubuf_format_store_cases(xyz=True) if xyz else
+             (*mubuf_format_store_cases(), *mubuf_format_store_cases(packed=True)))
+    for name, lines, binding in cases:
         print(f"{name} ({binding['output_format']})", flush=True)
         components = len(name.rsplit("_", 1)[1])
         packed = "_d16_" in name
@@ -4115,6 +4149,9 @@ def mubuf_format_store_draw(directory, compiler, renderer, backend):
         if packed and components == 1:
             changed = source.replace("& 0xffff0000u", "& 0u")
             mismatch, actual = 1, MUBUF_STORE_WORDS[0] & 0xffff
+        elif xyz:
+            changed = aot.lower(variant(lines, (store, store.replace("_xyz ", "_xyzw "))), 16, **binding)
+            mismatch, actual = 2, MUBUF_STORE_WORDS[1]
         elif packed:
             swapped = "v_lshlrev_b32_e32 v22, 16, v10\nv_lshrrev_b32_e32 v23, 16, v10\nv_or_b32_e32 v10, v22, v23"
             changed = aot.lower(variant(lines, (store, swapped + "\n" + store)), 16, **binding)
@@ -4136,7 +4173,8 @@ def mubuf_format_store_draw(directory, compiler, renderer, backend):
             raise AssertionError(f"{name}: incorrect store escaped detection\n{bad.stderr}")
         print(bad.stderr, end="")
         accepted.append(name)
-    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+    # Register the candidate after its native reference has been verified.
+    if not xyz and (record := os.environ.get("FORM_COVERAGE_RECORD")):
         path = Path(record)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("\n".join(accepted) + "\n", encoding="utf-8")
@@ -5466,6 +5504,7 @@ if __name__ == "__main__":
                  "draw-mubuf-load-format-d16": mubuf_format_d16_draw,
                  "draw-mubuf-format": mubuf_format_draw,
                  "draw-mubuf-format-store": mubuf_format_store_draw,
+                 "draw-mubuf-format-store-xyz": lambda d, *a: mubuf_format_store_draw(d, *a, xyz=True),
                  "draw-mtbuf-load": mtbuf_load_draw,
                  "draw-mimg-load": mimg_load_draw,
                  "draw-mimg-mip": mimg_mip_draw,

@@ -198,7 +198,8 @@ MUBUF_SOURCE_TEXELS = {MUBUF_SOURCE_FORMAT: MUBUF_TEXEL_BYTES, MUBUF_D16_SOURCE_
 def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=None, stride=None,
           constant_descriptor=None, group_reg_y=None, group_reg_z=None, source_descriptor=None,
           source_stride=None, source_format=None, output_format=None, image_descriptor=None, image_format=None,
-          image_uav_mip=None, cpu="gfx1013", lds_bytes=0, lds_f32_mode=None, lds_f64_mode=None):
+          image_uav_mip=None, cpu="gfx1013", lds_bytes=0, lds_f32_mode=None, lds_f64_mode=None,
+          mubuf_d16_xyz_mode=None):
     """v0, v1 and v2 are local X, Y and Z; group_reg, group_reg_y and group_reg_z are the group IDs.
 
     gfx10 compute waves receive each local ID in its own VGPR. Y and Z are bound only when that
@@ -206,6 +207,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     source t0; source_stride is the t0 byte stride that indexed reads use. source_format declares
     the MUBUF source descriptor format, and output_format declares the u0 descriptor format
     for formatted MUBUF stores. Both declarations require identity channel selectors.
+    mubuf_d16_xyz_mode opts into a caller-verified W-preserving RGBA16 store.
     image_descriptor is the table byte offset of the 8-dword image descriptor. image_format is
     the caller's statement of the image format inside it. The image binds to t0 for loads or u0
     for stores, where image_uav_mip selects the writable subresource and replaces descriptor_offset.
@@ -263,6 +265,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     if output_format is not None and (output_format not in MUBUF_OUTPUT_FORMATS or cpu != "gfx1030"
                                       or stride is None):
         raise ValueError("Unsupported formatted output binding")
+    if mubuf_d16_xyz_mode is not None and (mubuf_d16_xyz_mode != "preserve-w"
+                                           or output_format != MUBUF_D16_OUTPUT_FORMATS[4] or cpu != "gfx1030"):
+        raise ValueError("D16 XYZ mode requires a gfx1030 RGBA16 UINT output binding")
     scalar = {table_reg: "table"}
     for axis, reg in group_regs.items():
         scalar[reg] = ("group", axis)
@@ -1341,10 +1346,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                     raise ValueError("Unsupported formatted buffer store target or address mode")
                 if output_format is None:
                     raise ValueError("Formatted buffer stores require an output format")
-                # Only whole texels with identity selectors are proven here.
-                if packed and components not in MUBUF_D16_OUTPUT_FORMATS:
-                    raise ValueError("Formatted D16 buffer store requires a matching whole-texel format")
-                expected = MUBUF_D16_OUTPUT_FORMATS[components] if packed else MUBUF_UINT_FORMATS[components - 1]
+                if packed and components == 3 and mubuf_d16_xyz_mode != "preserve-w":
+                    raise ValueError("Formatted D16 XYZ store requires an explicit W-preservation contract")
+                expected = MUBUF_D16_OUTPUT_FORMATS[format_components] if packed else MUBUF_UINT_FORMATS[components - 1]
                 if output_format != expected:
                     raise ValueError("Formatted buffer store width does not match output format")
             first, *last = map(int, re.findall(r"\d+", m["data"]))
@@ -1502,6 +1506,8 @@ def main():
                         help="Caller-declared MUBUF t0 descriptor format with identity channel selectors")
     parser.add_argument("--output-format", choices=MUBUF_OUTPUT_FORMATS,
                         help="Caller-declared MUBUF u0 descriptor format with identity channel selectors")
+    parser.add_argument("--mubuf-d16-xyz-mode", choices=("preserve-w",),
+                        help="Experimental RGBA16 UINT store with caller-verified preservation of W")
     parser.add_argument("--image-descriptor", type=lambda n: int(n, 0),
                         help="Table byte offset of the 8-dword image descriptor bound to t0 or u0")
     parser.add_argument("--image-uav-mip", type=int,
@@ -1527,7 +1533,8 @@ def main():
                    output_format=args.output_format,
                    image_descriptor=args.image_descriptor, image_format=args.image_format,
                    image_uav_mip=args.image_uav_mip, cpu=args.cpu, lds_bytes=args.lds_bytes,
-                   lds_f32_mode=args.lds_f32_mode, lds_f64_mode=args.lds_f64_mode)
+                   lds_f32_mode=args.lds_f32_mode, lds_f64_mode=args.lds_f64_mode,
+                   mubuf_d16_xyz_mode=args.mubuf_d16_xyz_mode)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(source, encoding="ascii")
     print(json.dumps({"container_sha256": hashlib.sha256(blob).hexdigest(),
