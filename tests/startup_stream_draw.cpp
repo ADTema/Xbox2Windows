@@ -228,6 +228,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     invoke(list, 25, arg(pso));
     if (GetEnvironmentVariableW(L"X2W_TEST_LOGICAL_VIEW", nullptr, 0)) {
         if (int result = draw_logical_tables(desktop.Get(), guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_PLACED_VERTEX", nullptr, 0)) {
+        extern int draw_placed_vertices(ID3D12Device*, void*, void*);
+        if (const int result = draw_placed_vertices(desktop.Get(), guest, list)) return result;
     } else if (bc_chain) {
         extern int draw_bc_chain(void*, void*);
         if (const int result = draw_bc_chain(guest, list)) return result;
