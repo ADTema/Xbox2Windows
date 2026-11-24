@@ -1,6 +1,7 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <wrl/client.h>
 
@@ -12,7 +13,8 @@
 using Microsoft::WRL::ComPtr;
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 
-int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels);
+int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels,
+                      DXGI_FORMAT format, UINT export_word);
 
 struct alignas(8) Stage {
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE tag;
@@ -30,7 +32,11 @@ struct Stream {
 
 int main(int argc, char** argv)
 {
-    if (argc != 4 && argc != 6) return 2;
+    if (argc != 4 && (argc < 6 || argc > 8)) return 2;
+    const auto format = argc >= 7 ? static_cast<DXGI_FORMAT>(std::strtoul(argv[6], nullptr, 10)) : DXGI_FORMAT_UNKNOWN;
+    if (argc >= 7 && format != DXGI_FORMAT_R32_UINT && format != DXGI_FORMAT_R32_SINT &&
+        format != DXGI_FORMAT_R32G32B32A32_FLOAT) return 2;
+    const UINT export_word = argc == 8 ? static_cast<UINT>(std::strtoul(argv[7], nullptr, 0)) : 0;
     std::ifstream vs_file(argv[1], std::ios::binary), ps_file(argv[2], std::ios::binary);
     std::vector<char> vs{std::istreambuf_iterator<char>(vs_file), {}};
     std::vector<char> ps{std::istreambuf_iterator<char>(ps_file), {}};
@@ -39,7 +45,7 @@ int main(int argc, char** argv)
     ComPtr<IDXGIFactory4> factory;
     ComPtr<IDXGIAdapter> adapter;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 4;
-    if (argc == 6 && std::strcmp(argv[4], "hardware") == 0) {
+    if (argc >= 6 && std::strcmp(argv[4], "hardware") == 0) {
         ComPtr<IDXGIFactory6> factory6;
         if (FAILED(factory.As(&factory6))) return 77;
         for (UINT n = 0;; ++n) {
@@ -90,5 +96,5 @@ int main(int argc, char** argv)
     if (!submit(sizeof(stream) - 8)) return 8;
     if (GetEnvironmentVariableW(L"X2W_TEST_TRUNCATED_ONLY", nullptr, 0)) return 0;
     if (!submit(sizeof(stream))) return 9;
-    return argc == 6 ? check_stream_draw(adapter.Get(), device, pso, argv[5]) : 0;
+    return argc >= 6 ? check_stream_draw(adapter.Get(), device, pso, argv[5], format, export_word) : 0;
 }

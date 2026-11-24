@@ -2,6 +2,19 @@
 
 Run commands from the repository root. Start with the [project overview](../README.md) and [contribution guide](../CONTRIBUTING.md). Package-specific observations below used local inputs. Community regression tests use fixtures built from this repository.
 
+## Typed startup colour exports
+
+The [startup draw fixture](startup-runtime.md) uses a source-built gfx1013 pixel shader
+with a typed `R32_UINT` or `R32_SINT` RTV over typeless storage and a second UNORM
+target. It checks both attachments and rejects a stale signedness variant before PSO
+creation. A separate `R32G32B32A32_FLOAT` draw checks the four bit patterns from #1259.
+Optimized FXC preserves them with a run-time zero operand. The same shader without
+that operand loses three patterns under optimized FXC.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_mrt_' -V
+```
+
 ## CPU-written R8 planes across frames
 
 The startup draw uploader checks a single-mip, single-slice R8_UNORM texture of up to 32 MiB
