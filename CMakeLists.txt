@@ -2294,6 +2294,27 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_sse_fp_original_lifted>"
         "$<TARGET_FILE:cpu_sse_fp_altered_lifted>"
         "$<TARGET_FILE:cpu_sse_fp_harness>")
+    set(cpu_sse_fp_pd_exports
+        "op_addpd,op_addpd_mem,op_addpd_mem_disp,op_addpd_self,"
+        "op_subpd,op_subpd_mem,op_subpd_mem_disp,op_subpd_self,"
+        "op_mulpd,op_mulpd_mem,op_mulpd_mem_disp,op_mulpd_self,"
+        "op_divpd,op_divpd_mem,op_divpd_mem_disp,op_divpd_self,"
+        "op_minpd,op_minpd_mem,op_minpd_mem_disp,op_minpd_self,"
+        "op_maxpd,op_maxpd_mem,op_maxpd_mem_disp,op_maxpd_self,"
+        "op_sqrtpd,op_sqrtpd_mem,op_sqrtpd_mem_disp,op_sqrtpd_self,"
+        "op_pd_pipeline")
+    string(CONCAT cpu_sse_fp_pd_exports ${cpu_sse_fp_pd_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_sse_fp_pd_${variant} sse_fp_pd)
+        cpu_translation(cpu_sse_fp_pd_${variant} cpu_sse_fp_aot "${cpu_sse_fp_pd_exports}")
+    endforeach()
+    target_compile_definitions(cpu_sse_fp_pd_altered PRIVATE ALTER_IMM)
+    add_test(NAME cpu_aot_sse_fp_pd COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/sse_fp_pd_check.py"
+        "$<TARGET_FILE:cpu_sse_fp_pd_original>"
+        "$<TARGET_FILE:cpu_sse_fp_pd_original_lifted>"
+        "$<TARGET_FILE:cpu_sse_fp_pd_altered_lifted>"
+        "$<TARGET_FILE:cpu_sse_fp_harness>")
     set(cpu_avx_fp_move_exports
         "op_vmovq_xmm_xmm,op_vmovq_xmm_m64,op_vmovq_m64_xmm,op_vmovq_xmm_r64,op_vmovq_r64_xmm,"
         "op_vmaskmovdqu,op_pipeline,op_discarded_read,op_discarded_read64")
