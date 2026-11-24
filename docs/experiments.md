@@ -8247,9 +8247,10 @@ execution of any retail executable. The public tests contain no private binaries
 ## Legacy SSE FP compares and partial/non-temporal moves
 
 [The SSE FP leaf translator](../tools/cpu_sse_fp_aot.py) lifts bounded straight-line
-Windows x64 leaf functions covering five uncovered forms from `docs/coverage/x64_zen2.tsv`
+Windows x64 leaf functions covering twelve forms from `docs/coverage/x64_zen2.tsv`
 group `SSE`:
 
+- Packed float arithmetic: `addps`, `subps`, `mulps`, `divps`, `minps` and `maxps` (`xmm` and 16-byte aligned `m128` sources, the destination is read and replaced) and `sqrtps` (the destination is only written)
 - Packed float compare: `cmpps` (all eight `imm8` predicates `0..7`, `xmm` and 16-byte aligned `m128` sources)
 - Scalar float compare: `cmpss` (all eight `imm8` predicates `0..7`, `xmm` and unaligned `m32` sources, preserving bits `127:32` of the destination)
 - Half-qword float moves: `movlps` and `movhps` (`m64` load-merge preserving the other 64 bits, and `m64` store)
@@ -8264,6 +8265,15 @@ must target an `r8`-rooted flat `[r8 + disp]` address; full 128-bit aligned oper
 (`cmpps` `m128`, `movntps`, `movaps` `m128`, `movdqa` `m128`) require displacements
 divisible by 16.
 
+The arithmetic forms run the host instruction at run time through the `xmmintrin.h` intrinsics, so the
+rounding mode, DAZ and FTZ are those of the host control word, and nothing is folded at translation time.
+A lane with a NaN source is resolved in software (the first source operand when it is a NaN, else the
+second, made quiet), so a compiler that swaps the operands of an addition cannot change a payload; `minps`
+and `maxps` use the host instruction unchanged, which returns the second source operand for equal values
+(signed zeros included) and for any NaN. A guest `ldmxcsr` is not lifted and exception flags are not observed.
+The packed double forms (`addpd`, `sqrtpd`, `minpd` and the others), the scalar forms, `rcpps` and
+`rsqrtps` stay rejected.
+
 The translator explicitly rejects VEX/EVEX encodings, `cmpps`/`cmpss` predicates
 `imm8 >= 8`, nonvolatile vector registers (`xmm6`..`xmm15`), nonvolatile or non-argument
 memory base registers, non-`r8` store destinations, unaligned 16-byte memory operands,
@@ -8277,8 +8287,8 @@ ctest --preset dev --no-tests=error -R '^cpu_aot_sse_fp$' -V
 
 ### Measured results and open scope
 
-The [MASM fixture](../tests/cpu/sse_fp.asm) exports 34 functions covering all five
-forms: all eight `cmpps` predicates plus aligned `m128`, displaced `m128` and self-compare
+The [MASM fixture](../tests/cpu/sse_fp.asm) exports 34 functions covering the five
+compare and move forms, and 29 more for the arithmetic described below: all eight `cmpps` predicates plus aligned `m128`, displaced `m128` and self-compare
 cases; all eight `cmpss` predicates plus `m32`, unaligned `+1` `m32` and self-compare
 cases; `movlps`/`movhps` loads and stores including unaligned `+1` addresses; `movntps`
 aligned stores at `+0` and `+16`; and a chained `op_pipeline` export. [The differential check](../tests/cpu/sse_fp_check.py)
@@ -8301,7 +8311,53 @@ controls passed 7 alternate-encoding lift checks, 60 unit rejection controls (9 
 4 `imm8 >= 8`, 15 unsupported instructions, 32 ABI/state/addressing/prefix/stream violations),
 and 10 end-to-end PE-patched DLL rejection controls.
 
-Not covered by this experiment: non-default MXCSR modes (FTZ/DAZ or unmasked exceptions),
+#### Packed arithmetic
+
+Each of the seven operations has four exports (register source, aligned `m128` at `[rdx]`, `m128` at
+`[rdx+16]` and the same register as both operands), plus a chained `op_arith_pipeline` that feeds
+`addps`, `mulps`, `subps`, `divps`, `minps`, `maxps` and `sqrtps` into each other. The only stores
+are the `movaps` stores the earlier exports already had, so there is no new store form: every call is
+checked against 32-byte guards before and after the input and output buffers, and bytes of the output
+region the function does not write must keep their fill value.
+
+The reference is [exact rational arithmetic in Python](../tests/cpu/sse_fp_ref.py) with the four rounding
+modes, DAZ and FTZ, written without the processor or the translator. [The check](../tests/cpu/sse_fp_check.py) first
+compares native code, translated code and reference bit for bit on 128 cases per export (every ordered pair of 28 edge
+values, including signed zeros, infinities, quiet and signaling NaNs with payloads, denormals, values that tie
+at a rounding boundary and overflow and underflow, plus 30 random vectors with biased exponents). It then runs
+all 29 exports under 16 control words (round to nearest, down, up and toward zero, each with neither, DAZ,
+FTZ or both) through a native harness export, `op_call_with_mxcsr`, that sets the word for one call and restores
+the caller's word afterwards. The export lives in its own [native-only source](../tests/cpu/sse_fp_harness.asm), built as a separate image and never translated, so the form coverage report credits `cpu_aot_sse_fp` with only the 16 mnemonics of the translated fixture (13 SSE forms) and not the driver's `ldmxcsr`, `stmxcsr` and `call`. A lane the reference cannot decide stays unconstrained and the translated code
+must then still equal the processor: FTZ when the exact result is below the smallest normal number but rounds up
+to it (the manuals leave open whether tininess is judged before or after rounding), and `minps`/`maxps` under DAZ
+when the returned operand is a denormal (it is not established here whether the processor returns the original bits or
+a flushed zero; on the machine used for the Linux run it returned the flushed zero).
+
+Negative controls: an `ALTER_IMM` build assembles each register form with another operation (add and subtract,
+multiply and divide, minimum and maximum, and `sqrtps` as `addps`), each memory form with the other
+displacement, each self form with a second register and the chain with a division in place of the multiplication,
+and the altered translation must match its own reference and differ from the original on every one of the 35
+exports; each non-default control word must change at least one result, so the harness is
+shown to apply it; fifteen deliberately wrong reference rules (NaN operand order, no quieting, mixed-sign zero,
+division by zero, zero and `min` ordering, ignored rounding mode, DAZ or FTZ, and two `sqrtps` rules) must each
+disagree with the processor on some call; a call under a different control word must leave the next default-mode call
+unchanged. The translator also rejects, with the message each time checked, VEX and EVEX forms, unaligned
+displacements, nonvolatile or undefined registers, non-argument and indexed memory bases and the unsupported packed
+double, scalar, `rcpps` and `rsqrtps` forms.
+
+Measured on Linux x86-64 on 24 November 2026 (a QEMU virtual x86-64 processor, not the Windows CI machine): the
+fixture was assembled with `llvm-ml-19` and linked with `lld-link-19`, the native code was run through a Windows-ABI
+caller, and the translation was built with `clang++-19` at `-O0`, `-O2` and `-O3`. All three passed: 4,432 default-mode cases
+over 63 exports, 59,392 arithmetic runs in 16 control words agreeing on 468,906 lanes (6,230 left undecided by the reference), 82 unit
+rejection controls and 10 PE-patched rejection controls. The translator from `origin/main` fails on the same fixture with
+`unsupported instruction at RVA 0x11f9: addps xmm0,xmm1`. Seven mutants of the translator (add as subtract, multiply as divide, minimum as maximum,
+swapped `minps` operands, `sqrtps` that does not quiet a NaN, `sqrtps` that reads its destination, and one that drops the software NaN rule) were
+each built and run: the first six fail on a named word of a named export, for example `lifted op_addps case 0`. The seventh passes on this
+host because the host instruction already returns the architectural NaN, so that rule is defensive and not shown here to matter. The MSVC
+build and `ctest` run of `cpu_aot_sse_fp` are left to CI.
+
+Not covered by this experiment: unmasked exceptions and exception flags, the packed double and scalar arithmetic
+forms, `rcpps` and `rsqrtps`, non-default MXCSR modes for the compares and moves,
 non-temporal cache-bypass hints on `movntps`, control flow, nonvolatile `xmm6`..`xmm15`
 prologues, and title CPU code execution.
 

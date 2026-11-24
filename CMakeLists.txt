@@ -2023,18 +2023,28 @@ if(EXISTS "${INTAKE_PYTHON}")
         "op_cmpss_mem,op_cmpss_mem_plus1,op_cmpss_self,"
         "op_movlps_load,op_movlps_store,op_movhps_load,op_movhps_store,"
         "op_movlps_load_plus1,op_movhps_load_plus1,op_movlps_store_plus1,op_movhps_store_plus1,"
-        "op_movntps,op_movntps_disp16,op_movaps_reg,op_pipeline,op_discarded_read")
+        "op_movntps,op_movntps_disp16,op_movaps_reg,op_pipeline,op_discarded_read,"
+        "op_addps,op_addps_mem,op_addps_mem_disp,op_addps_self,"
+        "op_subps,op_subps_mem,op_subps_mem_disp,op_subps_self,"
+        "op_mulps,op_mulps_mem,op_mulps_mem_disp,op_mulps_self,"
+        "op_divps,op_divps_mem,op_divps_mem_disp,op_divps_self,"
+        "op_minps,op_minps_mem,op_minps_mem_disp,op_minps_self,"
+        "op_maxps,op_maxps_mem,op_maxps_mem_disp,op_maxps_self,"
+        "op_sqrtps,op_sqrtps_mem,op_sqrtps_mem_disp,op_sqrtps_self,"
+        "op_arith_pipeline")
     string(CONCAT cpu_sse_fp_exports ${cpu_sse_fp_exports})
     foreach(variant IN ITEMS original altered)
         cpu_asm_fixture(cpu_sse_fp_${variant} sse_fp)
         cpu_translation(cpu_sse_fp_${variant} cpu_sse_fp_aot "${cpu_sse_fp_exports}")
     endforeach()
     target_compile_definitions(cpu_sse_fp_altered PRIVATE ALTER_IMM)
+    cpu_asm_fixture(cpu_sse_fp_harness sse_fp_harness)
     add_test(NAME cpu_aot_sse_fp COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/sse_fp_check.py"
         "$<TARGET_FILE:cpu_sse_fp_original>"
         "$<TARGET_FILE:cpu_sse_fp_original_lifted>"
-        "$<TARGET_FILE:cpu_sse_fp_altered_lifted>")
+        "$<TARGET_FILE:cpu_sse_fp_altered_lifted>"
+        "$<TARGET_FILE:cpu_sse_fp_harness>")
     set(cpu_avx_fp_move_exports
         "op_vmovq_xmm_xmm,op_vmovq_xmm_m64,op_vmovq_m64_xmm,op_vmovq_xmm_r64,op_vmovq_r64_xmm,"
         "op_vmaskmovdqu,op_pipeline,op_discarded_read,op_discarded_read64")
