@@ -857,6 +857,41 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertEqual(decode_instruction(bytes.fromhex("0038007e"), 0)[:2], (4, "v_vop1_1c"))
         self.assertEqual(decode_instruction(bytes.fromhex("0284007e"), 0)[1], "v_movreld_b32_e32")
 
+    def test_vop1_binary16_transcendental_opcodes(self):
+        # Words from `llvm-mc -arch=amdgcn -mcpu=gfx1013 -show-encoding`; the texts are llvm-mc's disassembly of them.
+        vectors = (
+            ("01a90a7e", 4, "v_rcp_f16_e32 v5, v1"),
+            ("01ab0a7e", 4, "v_sqrt_f16_e32 v5, v1"),
+            ("01ad0a7e", 4, "v_rsq_f16_e32 v5, v1"),
+            ("01af0a7e", 4, "v_log_f16_e32 v5, v1"),
+            ("01b10a7e", 4, "v_exp_f16_e32 v5, v1"),
+            ("01b30a7e", 4, "v_frexp_mant_f16_e32 v5, v1"),
+            ("01b50a7e", 4, "v_frexp_exp_i16_f16_e32 v5, v1"),
+            ("01c10a7e", 4, "v_sin_f16_e32 v5, v1"),
+            ("01c30a7e", 4, "v_cos_f16_e32 v5, v1"),
+            ("0500d4d50101012a", 8, "v_rcp_f16_e64 v5, -v1 mul:2"),
+            ("0500d5d50101012a", 8, "v_sqrt_f16_e64 v5, -v1 mul:2"),
+            ("0500d6d50101012a", 8, "v_rsq_f16_e64 v5, -v1 mul:2"),
+            ("0500d7d50101012a", 8, "v_log_f16_e64 v5, -v1 mul:2"),
+            ("0500d8d50101012a", 8, "v_exp_f16_e64 v5, -v1 mul:2"),
+            ("0500d9d50101012a", 8, "v_frexp_mant_f16_e64 v5, -v1 mul:2"),
+            ("0501dad501010102", 8, "v_frexp_exp_i16_f16_e64 v5, |v1|"),
+            ("0500e0d50101012a", 8, "v_sin_f16_e64 v5, -v1 mul:2"),
+            ("0500e1d50101012a", 8, "v_cos_f16_e64 v5, -v1 mul:2"),
+            ("f9a80a7e01050400", 8,
+             "v_rcp_f16_sdwa v5, v1 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:WORD_0"),
+            ("f9b40a7e01040500", 8,
+             "v_frexp_exp_i16_f16_sdwa v5, v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:WORD_1"),
+            ("fac00a7e010101af", 8, "v_sin_f16_dpp v5, v1 row_shl:1 row_mask:0xa bank_mask:0xf"),
+        )
+        for raw, length, assembly in vectors:
+            with self.subTest(assembly=assembly):
+                self.assertEqual(decode_instruction(bytes.fromhex(raw), 0)[::2], (length, assembly))
+                self.assertTrue(is_opcode_recognized(assembly.split()[0]))
+        # The opcodes around them keep their names: 0x5b is v_floor_f16 and 0x5f is v_fract_f16.
+        self.assertEqual(decode_instruction(bytes.fromhex("01b70a7e"), 0)[1], "v_floor_f16_e32")
+        self.assertEqual(decode_instruction(bytes.fromhex("01bf0a7e"), 0)[1], "v_fract_f16_e32")
+
     def test_vop1_f64_source_conversions_have_one_register_result(self):
         # Words from `llvm-mc -arch=amdgcn -mcpu=gfx1013 -show-encoding`. A 32-bit result from a binary64 source
         # names one VGPR; a binary64 result (or a binary64-to-binary64 op) names a pair, as before.

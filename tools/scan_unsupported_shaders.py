@@ -432,6 +432,8 @@ KNOWN_RDNA2_BASE_OPCODES |= (
         # Decoding only: no translator lowers these binary16 VOP1/VOP2 forms.
         "v_cvt_u16_f16", "v_cvt_i16_f16", "v_fract_f16",
         "v_cvt_norm_i16_f16", "v_cvt_norm_u16_f16",
+        "v_rcp_f16", "v_sqrt_f16", "v_rsq_f16", "v_log_f16", "v_exp_f16", "v_sin_f16", "v_cos_f16",
+        "v_frexp_mant_f16", "v_frexp_exp_i16_f16",
         "v_fmac_f16", "v_max_f16", "v_min_f16", "v_ldexp_f16", "v_pk_fmac_f16",
     }
     | {name for name, _, _ in MUBUF_OPS.values()}
