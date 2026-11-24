@@ -764,7 +764,7 @@ add_executable(startup_packed_target_check tests/startup_packed_target_check.cpp
 target_include_directories(startup_packed_target_check PRIVATE src)
 target_compile_features(startup_packed_target_check PRIVATE cxx_std_17)
 add_test(NAME startup_packed_target COMMAND startup_packed_target_check)
-foreach(mutation IN ITEMS stand-in array b565 view)
+foreach(mutation IN ITEMS stand-in array b565 view tag)
     add_test(NAME startup_packed_target_${mutation}_control COMMAND startup_packed_target_check --mutate ${mutation})
     set_tests_properties(startup_packed_target_${mutation}_control PROPERTIES WILL_FAIL TRUE)
 endforeach()

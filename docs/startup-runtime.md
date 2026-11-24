@@ -89,8 +89,12 @@ Checks:
 - `ctest --preset release --no-tests=error -R '^startup_packed_target$' -V`: the selection rule
   against adapters described by their support bits (B5G6R5_UNORM, arrays of 2, 6, 16 and 2048
   slices, and the refused 0, 2049, multisampled and 3D cases), and the view verdicts, without a
-  device. The four `startup_packed_target_*_control` runs perturb the helper's answer (wrong
-  stand-in format, arrays left alone, B5G6R5_UNORM left alone, view kept packed) and must fail.
+  device. It also tags fake resources: an R8G8B8A8_UNORM stand-in must read back the packed format it was
+  asked for, and a texture created in the packed format must carry no tag. The five
+  `startup_packed_target_*_control` runs perturb the helper's answer (wrong stand-in format, arrays
+  left alone, B5G6R5_UNORM left alone, view kept packed, tag read back as none) and must fail
+  (`ctest --preset release --no-tests=error -R '^startup_packed_target_.*_control$'`). On the WARP
+  build tested, all three packed formats were created as described, so the draw check below did not read a tag.
 - `ctest --preset release --no-tests=error -R '^startup_packed_target_draw_' -V`: through the
   wrapper, a texture of each packed format is created (slot 133), cleared through a render-target
   view, sampled in a draw and read back. The expected pixel follows the format this adapter
