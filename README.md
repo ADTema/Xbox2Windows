@@ -4,7 +4,7 @@
 
 Xbox2Windows researches static recompilation from Xbox Series X|S (Scarlett) to x64 Windows. It translates selected x64 machine code into C++ and selected gfx1013 shaders into desktop DXIL. You can run the public tests without a game installation.
 
-> **Current status.** Source-built programs run from PE entry to exit, and selected shader fixtures produce checked D3D12 output. Execution of the title's CPU code, full-game startup and frame rate remain unverified.
+> **Current status.** The full-package DXIL compilation scan found a compiled route for 26,500 of 26,503 shader records. Local main-executable diagnostics reach D3D12 pipeline creation, with a verified rendered frame still pending. [Live startup progress #870](https://github.com/R0Y00/Xbox2Windows/issues/870) · [GPU tasks #874](https://github.com/R0Y00/Xbox2Windows/issues/874)
 
 ## Community and contributions
 
