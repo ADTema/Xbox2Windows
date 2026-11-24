@@ -1038,6 +1038,17 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^pixel_aot_region_scalar_load_(warp|hardware)$' -V
 ```
 
+In a masked if/else, outstanding work joins at the end of each arm that can
+be skipped. A load issued in an unskippable then arm can still be pending
+after the restore if the else arm skips its wait. A wait in an unskippable
+else arm resolves pending work even when the wave skipped the then arm. The
+translation controls cover both openers, both restores and all four skip
+shapes, plus removing the else wait or moving it after the in-arm read.
+The LLVM 15 round trip covers both openers with either arm skippable. The
+scalar-load draw also compares the two single-skip variants under mixed,
+full and empty masks, with a reference that gives every lane the else value
+as a mismatch control.
+
 ### SPIR-V physical addresses in a D3D12 buffer window
 
 An optional offline experiment accepts validated Vulkan 1.2 SPIR-V assembly with the named user-data and physical DWORD pointer types emitted by [Leonida at `f85582e`](https://github.com/ItsNotRexed/Leonida/blob/f85582e23d4ab9e19acbf694358f137d6b8531b1/tools/rdna2spirv.py). [SPIRV-Cross at `57e4efc`](https://github.com/KhronosGroup/SPIRV-Cross/tree/57e4efcc84112abcd426dc5ec248b5339bee04f2) rejects the physical addressing model on its HLSL path. The [window adapter](../tools/spirv_address_window.py) converts direct DWORD loads, stores and array element addresses to logical storage-buffer accesses. It validates the input and the result before publishing the output module.
