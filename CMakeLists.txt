@@ -882,6 +882,20 @@ add_custom_command(OUTPUT "${startup_cb_blend_ps}" COMMAND "${DXC_EXECUTABLE}" -
     -Vn startup_cb_blend_ps -Fh "${startup_cb_blend_ps}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_cb_blend.hlsl"
     DEPENDS tests/startup_cb_blend.hlsl VERBATIM)
 target_sources(offscreen_check PRIVATE tests/startup_cb_blend.cpp "${startup_cb_blend_vs}" "${startup_cb_blend_ps}")
+# Composite provenance (#1628): one VS and two pixel shaders from one HLSL file.
+set(startup_composite_provenance_headers "")
+foreach(stage IN ITEMS "vs_6_0;vs_main;vs" "ps_6_0;ps_fill;fill" "ps_6_0;ps_composite;composite")
+    list(GET stage 0 profile)
+    list(GET stage 1 entry)
+    list(GET stage 2 suffix)
+    set(header "${CMAKE_CURRENT_BINARY_DIR}/startup_composite_provenance_${suffix}.h")
+    add_custom_command(OUTPUT "${header}" COMMAND "${DXC_EXECUTABLE}" -T ${profile} -E ${entry}
+        -Vn startup_composite_provenance_${suffix} -Fh "${header}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_composite_provenance.hlsl"
+        DEPENDS tests/startup_composite_provenance.hlsl VERBATIM)
+    list(APPEND startup_composite_provenance_headers "${header}")
+endforeach()
+target_sources(offscreen_check PRIVATE tests/startup_composite_provenance.cpp ${startup_composite_provenance_headers})
 target_sources(offscreen_check PRIVATE tests/binding_mips.cpp tests/ffx_recurrent_views.cpp)
 target_sources(offscreen_check PRIVATE tests/ffx_rcas_views.cpp)
 foreach(storage IN ITEMS Native Packed)
@@ -1446,6 +1460,8 @@ foreach(adapter IN ITEMS hardware warp)
     add_test(NAME startup_cb_blend_${adapter} COMMAND offscreen_check ${adapter} --startup-cb-blend)
     add_test(NAME startup_cb_blend_swapped_${adapter} COMMAND offscreen_check ${adapter} --startup-cb-blend-swapped)
     set_tests_properties(startup_cb_blend_${adapter} startup_cb_blend_swapped_${adapter} PROPERTIES TIMEOUT 60)
+    add_test(NAME startup_composite_provenance_${adapter} COMMAND offscreen_check ${adapter} --startup-composite-provenance)
+    set_tests_properties(startup_composite_provenance_${adapter} PROPERTIES TIMEOUT 60)
 endforeach()
 
 set(SIMPLE_TRIANGLE_DIR "${CMAKE_SOURCE_DIR}/out/reference/b1e77b6ac10f95b07296025fda171ca2ddc42dbe/Samples/IntroGraphics/SimpleTriangle"

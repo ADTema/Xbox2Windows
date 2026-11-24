@@ -141,6 +141,37 @@ by reading a render log. The device prints the counts by cause value, so
 checks without a device that each cause lands in the slot printed under its label, and that the
 header's names follow the same order. The control swaps the buffer and token slots and must fail.
 
+## Composite provenance fixture
+
+Issue #1628 asks whether a uniform colour left in a composite's destination came from the composite or was
+already there. `tests/startup_composite_provenance.cpp` is a source-built model of that question, not a trace
+of the title. One command list draws a 64×64 RGBA32F source:
+- a blue base;
+- a green centre block, `[16, 48)²`;
+- a red corner block, `[0, 8)²`.
+
+It then clears the destination to magenta and runs the composite, which `Load`s the exact source texel at
+`floor(position) × scale + offset`. The source, the destination immediately before the composite draw and the
+destination immediately after it are copied to readback buffers on the same list, behind one fence. A CPU
+model built from the first two readbacks predicts every pixel of the third.
+
+The three cases leave three different destination centres:
+
+| case | scissor | UV | centre after |
+|---|---|---|---|
+| drawn centre | full | identity | green |
+| clipped centre | top 16 rows | identity | magenta (retained) |
+| UV selects the corner | full | constant texel (2, 2) | red |
+
+Each case reports viewport, scissor, blend (off) and write mask. Two mutants run against the unchanged model
+and must mismatch: the corner case with its UV moved to the source centre, and the drawn case with a write
+mask of red and alpha only.
+
+On an AMD Radeon RX 9070 XT (driver 32.0.31044.16) and WARP 10.0.26100.9818, Windows 11 build 26300.9974,
+debug layer enabled, all 4,096 pixels of each case matched the model. The UV mutant mismatched 4,096 pixels
+and the mask mutant 1,088, with zero debug errors or warnings
+(`ctest --preset dev --no-tests=error -R '^startup_composite_provenance_(hardware|warp)$' -V`).
+
 ## What is measured
 
 With the switches below, an x64 console executable on an AMD RDNA4 GPU (Windows 11, release
