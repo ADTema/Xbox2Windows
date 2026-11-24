@@ -648,6 +648,14 @@ target_sources(offscreen_check PRIVATE tests/startup_sampler_x.cpp "${startup_sa
 target_sources(offscreen_check PRIVATE tests/startup_sampler_heap.cpp)
 target_sources(offscreen_check PRIVATE tests/startup_image_3d.cpp)
 target_sources(offscreen_check PRIVATE tests/startup_flat_param.cpp)
+# The storage root handed to the executable ends in a separator and is never cut off
+# (src/startup_stubs/storage_root.h); the mutated run is the negative control.
+add_executable(startup_storage_root_check tests/startup_storage_root_check.cpp)
+target_include_directories(startup_storage_root_check PRIVATE src)
+target_compile_features(startup_storage_root_check PRIVATE cxx_std_17)
+add_test(NAME startup_storage_root COMMAND startup_storage_root_check)
+add_test(NAME startup_storage_root_separator_control COMMAND startup_storage_root_check --mutate separator)
+set_tests_properties(startup_storage_root_separator_control PROPERTIES WILL_FAIL TRUE)
 # Stand-in format for 16-bit packed targets the adapter cannot use (src/startup_stubs/packed_target_format.h).
 add_executable(startup_packed_target_check tests/startup_packed_target_check.cpp)
 target_include_directories(startup_packed_target_check PRIVATE src)

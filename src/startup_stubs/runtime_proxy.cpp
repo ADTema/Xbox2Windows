@@ -11,6 +11,7 @@
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/save_blob_pack.h"
 #include "startup_stubs/save_store.h"
+#include "startup_stubs/storage_root.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -887,10 +888,24 @@ bool area_call(unsigned long provider, int slot, u64* args, u64* result)
 // Persistent local storage: the root of a drive (X2W_STORAGE_PATH, e.g. "S:\\", mapped by the run
 // script onto a folder outside the game) with the quota from the manifest (X2W_STORAGE_MB).
 struct StorageObject { void* const* vtable; };
+// The value is read once. It gets a trailing separator when it has none (storage_root.h). A value
+// that does not fit is refused with a log line and the default is used: handing the executable a
+// cut-off or empty root would send its files somewhere else without a word.
 const char* storage_path()
 {
-    static char path[64];
-    if (!path[0] && !GetEnvironmentVariableA("X2W_STORAGE_PATH", path, sizeof(path))) std::strcpy(path, "S:\\");
+    static char path[x2w_startup::storage_root_capacity];
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    InitOnceExecuteOnce(&once, [](PINIT_ONCE, PVOID, PVOID*) -> BOOL {
+        char value[x2w_startup::storage_root_capacity + 1];
+        const DWORD length = GetEnvironmentVariableA("X2W_STORAGE_PATH", value, sizeof(value));
+        if (length >= sizeof(value))
+            x2w_local::logf("x2w-runtime X2W_STORAGE_PATH has %lu characters, more than the %zu supported: using S:\\",
+                            static_cast<unsigned long>(length - 1), x2w_startup::storage_root_capacity - 2);
+        else if (length && !x2w_startup::storage_root(value, path))
+            x2w_local::logf("x2w-runtime X2W_STORAGE_PATH does not fit with its trailing separator: using S:\\");
+        if (!path[0]) std::strcpy(path, "S:\\");
+        return TRUE;
+    }, nullptr, nullptr);
     return path;
 }
 HRESULT __stdcall storage_query(StorageObject* self, const GUID*, void** out) { if (out) *out = self; return S_OK; }
