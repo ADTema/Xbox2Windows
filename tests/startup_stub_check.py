@@ -8,10 +8,12 @@ usage: startup_stub_check.py <consumer.exe> <src/startup_stubs> <stub dll>... <x
 3. Controls: the 'none' scenario exits 0 and writes no trap line; the physical-page round trip
    in xmem.dll still works next to the traps.
 """
+import atexit
 import ctypes
 import ctypes.wintypes as wt
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -61,7 +63,10 @@ for want in list(defs) + list(extra):
 
 env = dict(os.environ)
 env["PATH"] = os.pathsep.join(sorted({os.path.dirname(os.path.abspath(p)) for p in dlls})) + os.pathsep + env["PATH"]
-log = os.path.join(tempfile.mkdtemp(prefix="x2w_trap_"), "trap.log")
+# The trap log lives in a fresh folder that is removed when the check exits, pass or fail.
+log_dir = tempfile.mkdtemp(prefix="x2w_trap_")
+atexit.register(shutil.rmtree, log_dir, ignore_errors=True)
+log = os.path.join(log_dir, "trap.log")
 env["X2W_TRAP_LOG"] = log
 
 cases = [
