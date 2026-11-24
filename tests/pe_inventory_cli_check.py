@@ -355,16 +355,25 @@ class PeInventoryNegativeTests(unittest.TestCase):
             ]))
             base = pe_inventory.scan(pkg)
             out_json = root / "out.json"
-            for idx, bad in enumerate((dict(base, images=[]), dict(base, imports={}))):
+            image_name = next(iter(base["images"]))
+            malformed = (
+                dict(base, images=[]),
+                dict(base, imports={}),
+                dict(base, images={image_name: {}}),
+                dict(base, imports=[{}]),
+                dict(base, imports=[dict(base["imports"][0], symbol=[])]),
+            )
+            for idx, bad in enumerate(malformed):
                 bad_baseline = root / f"bad_structure_{idx}.json"
                 bad_baseline.write_text(json.dumps(bad), encoding="utf-8")
                 proc = self._run_cli_subprocess(
                     str(pkg), "--output", str(out_json), "--baseline", str(bad_baseline),
                 )
-                self.assertEqual(proc.returncode, 1, proc.stderr)
-                self.assertNotIn("Traceback", proc.stderr)
-                self.assertIn("Invalid inventory structure", proc.stderr)
-                self.assertFalse(out_json.exists())
+                with self.subTest(index=idx):
+                    self.assertEqual(proc.returncode, 1, proc.stderr)
+                    self.assertNotIn("Traceback", proc.stderr)
+                    self.assertIn("Invalid inventory structure", proc.stderr)
+                    self.assertFalse(out_json.exists())
 
     def test_output_inside_input_or_aliasing_baseline_exits_2_without_traceback(self):
         with tempfile.TemporaryDirectory() as tmp:

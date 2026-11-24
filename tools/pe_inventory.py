@@ -444,15 +444,28 @@ def changes(old, new):
         raise ValueError("Invalid inventory structure")
 
     def edges(report):
-        return {(r["image"], r["kind"], r["dll"], r["symbol"]) for r in report["imports"]}
+        result = set()
+        fields = ("image", "kind", "dll", "symbol")
+        for row in report["imports"]:
+            if not isinstance(row, dict) or not all(isinstance(row.get(field), str) for field in fields):
+                raise ValueError("Invalid inventory structure: expected an import edge with string fields")
+            result.add(tuple(row[field] for field in fields))
+        return result
+
+    def digests(report):
+        result = {}
+        for name, image in report["images"].items():
+            if not isinstance(name, str) or not isinstance(image, dict) or not isinstance(image.get("sha256"), str):
+                raise ValueError("Invalid inventory structure: expected an image with a SHA-256 string")
+            result[name] = image["sha256"]
+        return result
 
     before, after = edges(old), edges(new)
-    previous, current = old["images"], new["images"]
+    previous, current = digests(old), digests(new)
     return {
         "added_images": sorted(current.keys() - previous.keys()),
         "removed_images": sorted(previous.keys() - current.keys()),
-        "changed_images": sorted(p for p in previous.keys() & current.keys()
-                                 if previous[p]["sha256"] != current[p]["sha256"]),
+        "changed_images": sorted(p for p in previous.keys() & current.keys() if previous[p] != current[p]),
         "added_edges": sorted(after - before), "removed_edges": sorted(before - after),
         "newly_required_modules": sorted({e[2] for e in after} - {e[2] for e in before}),
         "newly_required_symbols": sorted({e[2:] for e in after} - {e[2:] for e in before}),
