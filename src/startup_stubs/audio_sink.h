@@ -106,6 +106,7 @@ struct Report {
     uint64_t consumed_frames = 0;     // submitted frames minus frames still queued
     uint64_t clock_frames = 0;        // IAudioClock position converted to frames
     uint32_t unsupported = 0, rejected_full = 0;
+    uint32_t padding_errors = 0;      // GetCurrentPadding failed (e.g. the endpoint went away): not a measurement
     double drained_ms = 0, recovery_ms = -1;  // recovery_ms < 0: not measured
     // Glitches: the render API exposes no discontinuity flag, so this stays "not available".
     bool glitches_available = false;
@@ -125,6 +126,8 @@ public:
     Submit submit(const BlockFormat& in, uint32_t frames, const void* bytes);
     // Samples padding and the clock. withholding = the producer is deliberately not submitting.
     void observe(bool withholding);
+    // Frames still queued, or padding_failed (and padding_errors counts it) when the query fails.
+    static constexpr uint32_t padding_failed = 0xFFFFFFFFu;
     uint32_t padding();
     Report report() const;
     const std::string& endpoint() const { return endpoint_; }

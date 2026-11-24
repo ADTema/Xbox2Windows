@@ -25,10 +25,10 @@ int fail(const char* what, int code)
 void print_report(const char* name, const Report& r)
 {
     std::printf("%s: first_block=%lld submitted_blocks=%zu submitted_frames=%llu consumed_frames=%llu clock_frames=%llu "
-                "unsupported=%u rejected_full=%u drained_ms=%.1f recovery_ms=%.1f glitches=%s\n",
+                "unsupported=%u rejected_full=%u padding_errors=%u drained_ms=%.1f recovery_ms=%.1f glitches=%s\n",
                 name, static_cast<long long>(r.first_block), r.frames.size(), static_cast<unsigned long long>(r.submitted_frames),
                 static_cast<unsigned long long>(r.consumed_frames), static_cast<unsigned long long>(r.clock_frames),
-                r.unsupported, r.rejected_full, r.drained_ms, r.recovery_ms, r.glitches_available ? "reported" : "not available");
+                r.unsupported, r.rejected_full, r.padding_errors, r.drained_ms, r.recovery_ms, r.glitches_available ? "reported" : "not available");
 }
 
 // Polls until done() holds or ms elapse; every wait in this fixture goes through here.
@@ -72,13 +72,10 @@ int skip(const std::string& why)
     return 77;
 }
 
-}  // namespace
-
-int main()
+// The three sinks live in this function, so they stop and release their COM interfaces before
+// main() calls CoUninitialize().
+int run()
 {
-    if (const int rc = check_pure()) return fail("pure helper checks", rc);
-    if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return skip("COM initialisation failed");
-
     AudioSink a;
     if (const std::string why = a.open(); !why.empty()) return skip(why);
     print_windows_build();
@@ -126,7 +123,7 @@ int main()
         c.observe(true);
         Sleep(2);
     }
-    if (c.padding() != 0) return fail("case c queue refilled while withheld", 7);
+    if (c.padding() != 0) return fail("case c queue refilled while withheld", 7);  // also fails on a failed query
     if (send(c, make_tone(mix.rate, block, 550.0, 0.4), src) != Submit::Accepted) return fail("case c resume block", 8);
     wait_for(c, 3000, [&] { return c.report().recovery_ms >= 0 && c.report().consumed_frames == 3ull * block; });
     const Report rc = c.report();
@@ -134,7 +131,19 @@ int main()
     if (rc.drained_ms < 250) return fail("case c drained interval too short", 9);
     if (rc.recovery_ms < 0) return fail("case c consumption did not recover", 10);
     if (rc.consumed_frames != 3ull * block) return fail("case c consumption incomplete", 10);
+    // A failed padding query is not a measurement: reject the run instead of counting frames as consumed.
+    if (ra.padding_errors || rb.padding_errors || rc.padding_errors) return fail("GetCurrentPadding failed during a case (endpoint lost?)", 11);
     std::puts("startup_audio_output: PASS (no capture-path verification; glitch count not available from the render API)");
-    CoUninitialize();
     return 0;
+}
+
+}  // namespace
+
+int main()
+{
+    if (const int rc = check_pure()) return fail("pure helper checks", rc);
+    if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return skip("COM initialisation failed");
+    const int rc = run();
+    CoUninitialize();
+    return rc;
 }

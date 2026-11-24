@@ -97,7 +97,11 @@ std::string AudioSink::open()
 uint32_t AudioSink::padding()
 {
     UINT32 pad = 0;
-    if (p_) p_->client->GetCurrentPadding(&pad);
+    if (!p_) return 0;
+    if (FAILED(p_->client->GetCurrentPadding(&pad))) {
+        ++r_.padding_errors;
+        return padding_failed;
+    }
     return pad;
 }
 
@@ -106,6 +110,7 @@ void AudioSink::observe(bool withholding)
     if (!p_) return;
     const double now = now_ms();
     const uint32_t pad = padding();
+    if (pad == padding_failed) return;  // no observation: neither consumption nor the queue timers move
     const uint64_t consumed = r_.submitted_frames > pad ? r_.submitted_frames - pad : 0;
     r_.consumed_frames = std::max(r_.consumed_frames, consumed);
     UINT64 pos = 0;
@@ -125,6 +130,7 @@ Submit AudioSink::submit(const BlockFormat& in, uint32_t frames, const void* byt
         return Submit::Unsupported;
     }
     const uint32_t pad = padding();
+    if (pad == padding_failed) return Submit::NotOpen;
     if (frames > buffer_frames_ - pad) {
         ++r_.rejected_full;
         return Submit::Full;
