@@ -613,12 +613,17 @@ class Stage:
         lod = None
         if how == 'l':
             # Address dwords are the coordinates and then the explicit level; offsets, bias, clamp and derivatives
-            # would add dwords or modifiers this lowering does not read, so they are refused.
+            # would add dwords or modifiers this lowering does not read, so they are refused. Only the cache-policy
+            # bits (glc, slc, dlc), which never change the sampled value, are accepted next to dim and dmask;
+            # unorm, r128, tfe, lwe, a16, d16 and reserved bits would each change the address, resource or result
+            # layout and are refused by name.
             for m in mods:
-                if not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'glc')):
+                if not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'glc', 'slc')):
                     raise Unsupported('image_sample_l modifier %s' % m)
             if dmask == 0:
                 raise Unsupported('image_sample_l with an empty dmask')
+            if len(cs) != (4 if three else 3):
+                raise Unsupported('image_sample_l with %d address registers' % len(cs))
             lod, cs = cs[-1], cs[:-1]
         tex = self.pipe.resource(self.descriptor(ops[2]), 'tex3d' if three else 'tex2d')
         if how == 'load':

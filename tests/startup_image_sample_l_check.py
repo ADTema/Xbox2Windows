@@ -10,6 +10,7 @@ v2, the NSA form from v3 (so it is not just "the third register"), and the 3D fo
 not model are refused with their own message instead of being sampled at a wrong level.
 """
 import re
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -49,8 +50,63 @@ IMAGE = {
     'a16': 'image_sample_l v[4:7], v[0:1], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_2D a16',
     'tfe': 'image_sample_l v[4:5], v[0:2], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D tfe',
     'unorm': 'image_sample_l v[4:7], v[0:2], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_2D unorm',
+    'lwe': 'image_sample_l v[4:7], v[0:2], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_2D lwe',
+    'd16': 'image_sample_l v[4:5], v[0:2], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_2D d16',
+    'r128': 'image_sample_l v[4:7], v[0:2], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_2D r128',
+    'glc': 'image_sample_l v[4:7], v[0:2], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_2D glc',
+    'slc': 'image_sample_l v[4:7], v[0:2], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_2D slc',
+    'dlc': 'image_sample_l v[4:7], v[0:2], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_2D dlc',
+    'dim1d': 'image_sample_l v[4:7], v[0:1], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_1D',
+    'array': 'image_sample_l v[4:7], v[0:3], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY',
+    'msaa': 'image_sample_l v[4:7], v[0:3], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_2D_MSAA',
+    'dmask3': 'image_sample_l v[4:6], v[0:2], s[16:23], s[24:27] dmask:0x7 dim:SQ_RSRC_IMG_2D',
+    'dmask0': 'image_sample_l v4, v[0:2], s[16:23], s[24:27] dmask:0x0 dim:SQ_RSRC_IMG_2D',
 }
 WORDS = {
+    'lwe': bytes.fromhex(
+        '04040cf4000000fa800398be800399be80039abe80039bbef002007eff02027e'
+        '0000803ef202047ef402067e7fc08cbf080f92f00004c400703f8cbf0f1800f8'
+        '04050607000081bf'),
+    'd16': bytes.fromhex(
+        '04040cf4000000fa800398be800399be80039abe80039bbef002007eff02027e'
+        '0000803ef202047ef402067e7fc08cbf080f90f00004c480703f8cbf0f1800f8'
+        '04050607000081bf'),
+    'r128': bytes.fromhex(
+        '04040cf4000000fa800398be800399be80039abe80039bbef002007eff02027e'
+        '0000803ef202047ef402067e7fc08cbf088f90f00004c400703f8cbf0f1800f8'
+        '04050607000081bf'),
+    'glc': bytes.fromhex(
+        '04040cf4000000fa800398be800399be80039abe80039bbef002007eff02027e'
+        '0000803ef202047ef402067e7fc08cbf082f90f00004c400703f8cbf0f1800f8'
+        '04050607000081bf'),
+    'slc': bytes.fromhex(
+        '04040cf4000000fa800398be800399be80039abe80039bbef002007eff02027e'
+        '0000803ef202047ef402067e7fc08cbf080f90f20004c400703f8cbf0f1800f8'
+        '04050607000081bf'),
+    'dlc': bytes.fromhex(
+        '04040cf4000000fa800398be800399be80039abe80039bbef002007eff02027e'
+        '0000803ef202047ef402067e7fc08cbf880f90f00004c400703f8cbf0f1800f8'
+        '04050607000081bf'),
+    'dim1d': bytes.fromhex(
+        '04040cf4000000fa800398be800399be80039abe80039bbef002007eff02027e'
+        '0000803ef202047ef402067e7fc08cbf000f90f00004c400703f8cbf0f1800f8'
+        '04050607000081bf'),
+    'array': bytes.fromhex(
+        '04040cf4000000fa800398be800399be80039abe80039bbef002007eff02027e'
+        '0000803ef202047ef402067e7fc08cbf280f90f00004c400703f8cbf0f1800f8'
+        '04050607000081bf'),
+    'msaa': bytes.fromhex(
+        '04040cf4000000fa800398be800399be80039abe80039bbef002007eff02027e'
+        '0000803ef202047ef402067e7fc08cbf300f90f00004c400703f8cbf0f1800f8'
+        '04050607000081bf'),
+    'dmask3': bytes.fromhex(
+        '04040cf4000000fa800398be800399be80039abe80039bbef002007eff02027e'
+        '0000803ef202047ef402067e7fc08cbf080790f00004c400703f8cbf0f1800f8'
+        '04050607000081bf'),
+    'dmask0': bytes.fromhex(
+        '04040cf4000000fa800398be800399be80039abe80039bbef002007eff02027e'
+        '0000803ef202047ef402067e7fc08cbf080090f00004c400703f8cbf0f1800f8'
+        '04050607000081bf'),
     'tfe': bytes.fromhex(
         '04040cf4000000fa800398be800399be80039abe80039bbef002007eff02027e'
         '0000803ef202047ef402067e7fc08cbf080191f00004c400703f8cbf0f1800f8'
@@ -102,8 +158,22 @@ def source(name):
     return PRE + IMAGE[name] + '\n' + POST
 
 
+# Reserved gfx10 MIMG bits: llvm-mc cannot assemble them, so each fixture sets one in the plain instruction.
+PLAIN_INSTRUCTION = bytes.fromhex('080f90f00004c400')
+RESERVED = {'reserved_w0_6': (1 << 6, 0), 'reserved_w0_14': (1 << 14, 0)}
+RESERVED.update({'reserved_w1_%d' % bit: (0, 1 << bit) for bit in range(26, 30)})
+
+
+def reserved_words(name):
+    w0, w1 = struct.unpack('<II', PLAIN_INSTRUCTION)
+    patched = struct.pack('<II', w0 | RESERVED[name][0], w1 | RESERVED[name][1])
+    assert WORDS['plain'].count(PLAIN_INSTRUCTION) == 1
+    return WORDS['plain'].replace(PLAIN_INSTRUCTION, patched)
+
+
 def stage(name):
-    return G.Pipeline(VS_WORDS, WORDS[name], root_blob(flags=0)).hlsl_ps()
+    words = reserved_words(name) if name in RESERVED else WORDS[name]
+    return G.Pipeline(VS_WORDS, words, root_blob(flags=0)).hlsl_ps()
 
 
 def refused(name, text):
@@ -147,7 +217,22 @@ def controls():
     refused('unorm', 'image_sample_l modifier unorm')
     refused('tfe', 'image_sample_l modifier tfe')  # the extra status register is not modelled
     refused('a16', 'image_sample_l modifier a16')  # packed 16-bit address: v[0:1] holds u, v and the level as halves
-    print('refused: offset, compare, gather, cube, unorm, a16, tfe')
+    refused('lwe', 'image_sample_l modifier lwe')  # LOD-warning dword: bit 17, not the reserved bit 14
+    refused('d16', 'image_sample_l modifier d16')  # half-precision result layout
+    refused('r128', 'image_sample_l modifier r128')  # four-dword resource descriptor
+    refused('dmask0', 'empty dmask')
+    for name in ('dim1d', 'array', 'msaa'):
+        refused(name, 'image dimension SQ_RSRC_IMG_')
+    for name in RESERVED:
+        refused(name, 'image_sample_l modifier reserved')  # bits LLVM ignores must not be silently accepted
+    print('refused: offset, compare, gather, cube, 1D, array, MSAA, unorm, a16, tfe, lwe, d16, r128, dmask 0, reserved bits')
+
+    # Cache-policy bits do not change the sampled value: same lowering as the plain form.
+    for name in ('glc', 'slc', 'dlc'):
+        assert stage(name) == stage('plain'), name
+    partial = level_register(stage('dmask3'), '2d')
+    assert partial == ('v0', 'v1', None, 'v2'), partial
+    print('glc, slc, dlc and a partial dmask are accepted')
 
 
 def check_binary(llvm_mc):
