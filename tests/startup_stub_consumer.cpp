@@ -825,6 +825,261 @@ bool dstorage_checks() {
         if (!valid_ok || !neg_ok) return false;
     }
 
+    // Control: valid chunked submission followed by a separate Submit with same-size non-zlib read at matching offset fails cleanly (Refs #1214)
+    {
+        const size_t stream_plain_size = 128 * 1024;
+        const auto comp = make_fixed_deflate_zlib(0x44, stream_plain_size);
+        const unsigned comp_size = static_cast<unsigned>(comp.size());
+        const size_t offset_cont = 64 * 1024; // Matching continuation offset (0 + 64 KiB)
+
+        wchar_t temp_dir[MAX_PATH];
+        if (!GetTempPathW(MAX_PATH, temp_dir)) return false;
+        wchar_t temp_file[MAX_PATH];
+        if (!GetTempFileNameW(temp_dir, L"x2w", 0, temp_file)) return false;
+
+        // File layout:
+        // Offset 0: valid compressed stream (size comp_size)
+        // Offset 64 KiB: non-zlib bytes (0xEE), size comp_size
+        std::vector<unsigned char> file_bytes(offset_cont + comp_size, 0xEE);
+        std::memcpy(file_bytes.data(), comp.data(), comp_size);
+
+        HANDLE h = CreateFileW(temp_file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        DWORD written = 0;
+        WriteFile(h, file_bytes.data(), static_cast<DWORD>(file_bytes.size()), &written, nullptr);
+        CloseHandle(h);
+
+        void* file_ptr = nullptr;
+        if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, temp_file, nullptr, &file_ptr) != 0 || !file_ptr) {
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* file_obj = static_cast<Object*>(file_ptr);
+
+        void* status_ptr1 = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 2, "ChunkedStatus1", nullptr, &status_ptr1) != 0 || !status_ptr1) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* status1 = static_cast<Object*>(status_ptr1);
+
+        void* queue_ptr = nullptr;
+        unsigned char desc[0x20] = {};
+        *reinterpret_cast<uint16_t*>(desc + 8) = 16;
+        if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &queue_ptr) != 0 || !queue_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* queue = static_cast<Object*>(queue_ptr);
+
+        std::vector<unsigned char> dest0(64 * 1024, 0);
+        std::vector<unsigned char> dest1(64 * 1024, 0);
+
+        // Piece 0: offset 0, compressed size S, destination 64 KiB
+        unsigned char req0[0x48] = {};
+        *reinterpret_cast<u64*>(req0 + 0x00) = 1;
+        *reinterpret_cast<void**>(req0 + 0x08) = dest0.data();
+        *reinterpret_cast<unsigned*>(req0 + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req0 + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req0 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req0 + 0x30) = comp_size;
+        *reinterpret_cast<unsigned*>(req0 + 0x38) = static_cast<unsigned>(stream_plain_size);
+
+        // Piece 1: offset 64 KiB, compressed size S, destination 64 KiB
+        unsigned char req1[0x48] = {};
+        *reinterpret_cast<u64*>(req1 + 0x00) = 1;
+        *reinterpret_cast<void**>(req1 + 0x08) = dest1.data();
+        *reinterpret_cast<unsigned*>(req1 + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req1 + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req1 + 0x28) = offset_cont;
+        *reinterpret_cast<unsigned*>(req1 + 0x30) = comp_size;
+        *reinterpret_cast<unsigned*>(req1 + 0x38) = static_cast<unsigned>(stream_plain_size);
+
+        // First Submit: valid 2-slice chunked submission
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req0);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status1, 0);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req1);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status1, 1);
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+
+        for (int i = 0; i < 200; ++i) {
+            if (reinterpret_cast<IsCompleteFn>(status1->vtable[3])(status1, 1)) break;
+            Sleep(10);
+        }
+        bool comp1_ok = reinterpret_cast<IsCompleteFn>(status1->vtable[3])(status1, 0) &&
+                        reinterpret_cast<IsCompleteFn>(status1->vtable[3])(status1, 1);
+        long hr0 = comp1_ok ? reinterpret_cast<GetHResultFn>(status1->vtable[4])(status1, 0) : -1;
+        long hr1 = comp1_ok ? reinterpret_cast<GetHResultFn>(status1->vtable[4])(status1, 1) : -1;
+
+        if (hr0 != 0 || hr1 != 0) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        for (unsigned char b : dest0) if (b != 0x44) return false;
+        for (unsigned char b : dest1) if (b != 0x44) return false;
+
+        // Separate Submit: same queue and same live file, same-size non-zlib read at matching offset 64 KiB
+        void* status_ptr2 = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 1, "SeparateStatus", nullptr, &status_ptr2) != 0 || !status_ptr2) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* status2 = static_cast<Object*>(status_ptr2);
+
+        std::vector<unsigned char> dest_unrelated(64 * 1024, 0x99); // Sentinel
+
+        unsigned char req_unrelated[0x48] = {};
+        *reinterpret_cast<u64*>(req_unrelated + 0x00) = 1; // zlib decompression requested
+        *reinterpret_cast<void**>(req_unrelated + 0x08) = dest_unrelated.data();
+        *reinterpret_cast<unsigned*>(req_unrelated + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req_unrelated + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req_unrelated + 0x28) = offset_cont; // Matching continuation offset
+        *reinterpret_cast<unsigned*>(req_unrelated + 0x30) = comp_size; // Same size
+        *reinterpret_cast<unsigned*>(req_unrelated + 0x38) = static_cast<unsigned>(stream_plain_size);
+
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req_unrelated);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status2, 0);
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+
+        for (int i = 0; i < 200; ++i) {
+            if (reinterpret_cast<IsCompleteFn>(status2->vtable[3])(status2, 0)) break;
+            Sleep(10);
+        }
+        bool comp2_ok = reinterpret_cast<IsCompleteFn>(status2->vtable[3])(status2, 0);
+        long hr_unrelated = comp2_ok ? reinterpret_cast<GetHResultFn>(status2->vtable[4])(status2, 0) : 0;
+
+        reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+        DeleteFileW(temp_file);
+
+        // The separate read must fail with non-zero HRESULT and leave its sentinel untouched
+        if (!comp2_ok || hr_unrelated == 0) return false;
+        for (unsigned char b : dest_unrelated) {
+            if (b != 0x99) return false;
+        }
+    }
+
+    // Control: deterministic boundary test across two Submit() calls (Refs #1214, #1235)
+    // First Submit(): compressed stream into undersized destination buffer (no continuation in this batch).
+    // Second Submit(): immediate matching non-zlib request at continuation offset.
+    // Both requests must fail cleanly, and both destination sentinel buffers must remain untouched.
+    {
+        const size_t stream_plain_size = 128 * 1024;
+        const auto comp = make_fixed_deflate_zlib(0x5A, stream_plain_size);
+        const unsigned comp_size = static_cast<unsigned>(comp.size());
+        const size_t offset_cont = 64 * 1024; // Matching continuation offset (0 + 64 KiB)
+
+        wchar_t temp_dir[MAX_PATH];
+        if (!GetTempPathW(MAX_PATH, temp_dir)) return false;
+        wchar_t temp_file[MAX_PATH];
+        if (!GetTempFileNameW(temp_dir, L"x2w", 0, temp_file)) return false;
+
+        // File layout:
+        // Offset 0: valid compressed stream (size comp_size)
+        // Offset 64 KiB: non-zlib bytes (0xEE), size comp_size
+        std::vector<unsigned char> file_bytes(offset_cont + comp_size, 0xEE);
+        std::memcpy(file_bytes.data(), comp.data(), comp_size);
+
+        HANDLE h = CreateFileW(temp_file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        DWORD written = 0;
+        WriteFile(h, file_bytes.data(), static_cast<DWORD>(file_bytes.size()), &written, nullptr);
+        CloseHandle(h);
+
+        void* file_ptr = nullptr;
+        if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, temp_file, nullptr, &file_ptr) != 0 || !file_ptr) {
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* file_obj = static_cast<Object*>(file_ptr);
+
+        void* status_ptr1 = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 1, "UndersizedStatus", nullptr, &status_ptr1) != 0 || !status_ptr1) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* status1 = static_cast<Object*>(status_ptr1);
+
+        void* status_ptr2 = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 1, "MatchingStatus", nullptr, &status_ptr2) != 0 || !status_ptr2) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* status2 = static_cast<Object*>(status_ptr2);
+
+        void* queue_ptr = nullptr;
+        unsigned char desc[0x20] = {};
+        *reinterpret_cast<uint16_t*>(desc + 8) = 16;
+        if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &queue_ptr) != 0 || !queue_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* queue = static_cast<Object*>(queue_ptr);
+
+        std::vector<unsigned char> dest_undersized(64 * 1024, 0xA5); // Sentinel 0xA5
+        std::vector<unsigned char> dest_matching(64 * 1024, 0xB6);   // Sentinel 0xB6
+
+        // First Submit: compressed stream into undersized destination buffer (64 KiB < 128 KiB uncompressed)
+        // with NO continuation requests queued in this batch.
+        unsigned char req_undersized[0x48] = {};
+        *reinterpret_cast<u64*>(req_undersized + 0x00) = 1;
+        *reinterpret_cast<void**>(req_undersized + 0x08) = dest_undersized.data();
+        *reinterpret_cast<unsigned*>(req_undersized + 0x18) = 64 * 1024; // Undersized capacity
+        *reinterpret_cast<void**>(req_undersized + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req_undersized + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req_undersized + 0x30) = comp_size;
+        *reinterpret_cast<unsigned*>(req_undersized + 0x38) = static_cast<unsigned>(stream_plain_size);
+
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req_undersized);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status1, 0);
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+
+        // Immediately in second Submit: matching non-zlib request at continuation offset
+        unsigned char req_matching[0x48] = {};
+        *reinterpret_cast<u64*>(req_matching + 0x00) = 1; // zlib decompression requested
+        *reinterpret_cast<void**>(req_matching + 0x08) = dest_matching.data();
+        *reinterpret_cast<unsigned*>(req_matching + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req_matching + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req_matching + 0x28) = offset_cont; // Matching continuation offset
+        *reinterpret_cast<unsigned*>(req_matching + 0x30) = comp_size;
+        *reinterpret_cast<unsigned*>(req_matching + 0x38) = static_cast<unsigned>(stream_plain_size);
+
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req_matching);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status2, 0);
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+
+        for (int i = 0; i < 200; ++i) {
+            if (reinterpret_cast<IsCompleteFn>(status1->vtable[3])(status1, 0) &&
+                reinterpret_cast<IsCompleteFn>(status2->vtable[3])(status2, 0)) break;
+            Sleep(10);
+        }
+        bool complete1 = reinterpret_cast<IsCompleteFn>(status1->vtable[3])(status1, 0);
+        bool complete2 = reinterpret_cast<IsCompleteFn>(status2->vtable[3])(status2, 0);
+        long hr1 = complete1 ? reinterpret_cast<GetHResultFn>(status1->vtable[4])(status1, 0) : 0;
+        long hr2 = complete2 ? reinterpret_cast<GetHResultFn>(status2->vtable[4])(status2, 0) : 0;
+
+        reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+        DeleteFileW(temp_file);
+
+        // Both requests must fail cleanly
+        if (!complete1 || hr1 == 0) return false;
+        if (!complete2 || hr2 == 0) return false;
+
+        // Both sentinels must remain completely untouched
+        for (unsigned char b : dest_undersized) {
+            if (b != 0xA5) return false;
+        }
+        for (unsigned char b : dest_matching) {
+            if (b != 0xB6) return false;
+        }
+    }
+
     return true;
 }
 

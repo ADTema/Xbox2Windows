@@ -62,12 +62,15 @@ struct Entry {
     unsigned index;
     void* fence;
     u64 value;
+    u64 id = 0;
+    u64 submission_id = 0;
 };
 struct CachedStream {
     u64 source = 0;
     u64 base_offset = 0;
     unsigned compressed_size = 0;
     unsigned chunk_size = 0;
+    std::vector<u64> continuation_ids;
     std::vector<unsigned char> data;
 };
 
@@ -75,10 +78,13 @@ struct QueueWork {
     std::mutex mutex;
     std::condition_variable wake;
     std::deque<Entry> waiting, submitted;
+    u64 next_entry_id = 0;
+    u64 next_submission_id = 0;
     static constexpr std::size_t max_cached_streams = 16;
     std::deque<CachedStream> cached_streams;
 
-    void put_stream(u64 source, u64 base_offset, unsigned compressed_size, unsigned chunk_size, std::vector<unsigned char> data)
+    void put_stream(u64 source, u64 base_offset, unsigned compressed_size, unsigned chunk_size,
+                    std::vector<u64> continuation_ids, std::vector<unsigned char> data)
     {
         for (auto it = cached_streams.begin(); it != cached_streams.end(); ++it) {
             if (it->source == source && it->base_offset == base_offset && it->compressed_size == compressed_size) {
@@ -89,7 +95,8 @@ struct QueueWork {
         if (cached_streams.size() >= max_cached_streams) {
             cached_streams.pop_front();
         }
-        cached_streams.push_back({source, base_offset, compressed_size, chunk_size, std::move(data)});
+        cached_streams.push_back({source, base_offset, compressed_size, chunk_size,
+                                  std::move(continuation_ids), std::move(data)});
     }
 };
 
@@ -104,28 +111,46 @@ static bool has_zlib_header(const unsigned char* bytes, std::size_t size)
     return true;
 }
 
-bool has_following_chunk(Object* self, u64 source, u64 offset, unsigned source_size, unsigned destination_size) {
-    if (!self || !self->work) return false;
+// Return the exact queued requests that continue this stream in this submission, in queue order.
+// Status entries are skipped, and any unrelated request, submission boundary, or non-matching
+// source/offset ends the continuation chain.
+static std::vector<u64> following_chunk_ids(Object* self, u64 current_submission_id, u64 source, u64 offset,
+                                            unsigned source_size, unsigned destination_size, std::size_t total_size)
+{
+    std::vector<u64> ids;
+    if (!self || !self->work) return ids;
     QueueWork& work = *self->work;
     const std::lock_guard guard(work.mutex);
-    auto check = [&](const Entry& e) {
-        if (e.type != Entry::request) return false;
+    const unsigned step = destination_size ? destination_size : 0x10000;
+    u64 expected = offset + step;
+    if (expected < offset) return ids;
+
+    for (const auto& e : work.submitted) {
+        if (e.submission_id != current_submission_id) {
+            break;
+        }
+        if (e.type != Entry::request) continue;
         const u64 e_options = *reinterpret_cast<const u64*>(e.bytes);
-        if (!(e_options & 1)) return false;
-        if (e_options & 0x400000) return false;
+        if (!(e_options & 1) || (e_options & 0x400000)) {
+            break;
+        }
         const u64 e_source = *reinterpret_cast<const u64*>(e.bytes + 0x20);
         const u64 e_offset = *reinterpret_cast<const u64*>(e.bytes + 0x28);
         const unsigned e_source_size = *reinterpret_cast<const unsigned*>(e.bytes + 0x30);
-        return e_source == source && e_source_size == source_size && e_offset > offset &&
-               e_offset - offset == destination_size;
-    };
-    for (const auto& e : work.submitted) {
-        if (check(e)) return true;
+        if (e_source != source || e_source_size != source_size || e_offset != expected) {
+            break;
+        }
+        const u64 delta = expected - offset;
+        if (delta >= total_size) {
+            break;
+        }
+        ids.push_back(e.id);
+        if (expected > UINT64_MAX - step) {
+            break;
+        }
+        expected += step;
     }
-    for (const auto& e : work.waiting) {
-        if (check(e)) return true;
-    }
-    return false;
+    return ids;
 }
 
 void log(const char* format, ...)
@@ -288,7 +313,7 @@ long __stdcall file_information(Object* self, BY_HANDLE_FILE_INFORMATION* info)
 // synchronously; compressed ones are logged and left undone. The first requests are logged in full.
 LONG requests_done, requests_compressed, requests_failed, requests_bcpack_blank;
 LONG zero_tokens_at_enqueue, zero_tokens_at_run;
-void execute_request(Object* self, const unsigned char* request, const ULONG_PTR* tokens)
+void execute_request(Object* self, const unsigned char* request, const ULONG_PTR* tokens, u64 entry_id, u64 submission_id)
 {
     if (!request) return;
     const u64 options = *reinterpret_cast<const u64*>(request);
@@ -371,19 +396,22 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 }
                 if (ok) {
                     output.resize(produced);
-                    // If the stream expanded beyond this request's destination and following chunks exist,
-                    // cache the uncompressed stream in the queue's work and serve slice 0 (Refs #1136).
-                    if (!memory_source && produced > destination_size &&
-                        has_following_chunk(self, source, offset, source_size, destination_size)) {
-                        if (self && self->work) {
+                    bool cached_chunked = false;
+                    // If the stream expanded beyond this request's destination and continuation chunks are queued
+                    // in this submission, scope the cache to those identified continuation requests and serve slice 0 (Refs #1136, #1214).
+                    if (!memory_source && produced > destination_size && self && self->work) {
+                        auto continuation_ids = following_chunk_ids(self, submission_id, source, offset, source_size, destination_size, produced);
+                        if (!continuation_ids.empty()) {
                             QueueWork& work = *self->work;
                             const std::lock_guard guard(work.mutex);
-                            work.put_stream(source, offset, source_size, destination_size, output);
+                            work.put_stream(source, offset, source_size, destination_size, std::move(continuation_ids), output);
+                            decode_length = destination_size;
+                            data = output.data();
+                            outcome = "inflated (chunked stream piece 0)";
+                            cached_chunked = true;
                         }
-                        decode_length = destination_size;
-                        data = output.data();
-                        outcome = "inflated (chunked stream piece 0)";
-                    } else {
+                    }
+                    if (!cached_chunked) {
                         decode_length = produced;
                         data = output.data();
                         outcome = produced == destination_size || bcpack ? "inflated" : "inflated (larger/short)";
@@ -403,21 +431,28 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 if (file_object && file_object->kind == file && file_object->handle != INVALID_HANDLE_VALUE) {
                     QueueWork& work = *self->work;
                     const std::lock_guard guard(work.mutex);
-                    for (auto it = work.cached_streams.rbegin(); it != work.cached_streams.rend(); ++it) {
+                    for (auto it = work.cached_streams.begin(); it != work.cached_streams.end(); ++it) {
                         if (it->source == source && it->compressed_size == source_size && offset > it->base_offset) {
-                            const u64 delta = offset - it->base_offset;
-                            const unsigned step = it->chunk_size ? it->chunk_size : 0x10000;
-                            if ((delta % step) == 0 && delta < it->data.size()) {
-                                const std::size_t available = it->data.size() - delta;
-                                // Handle short final destinations in multi-piece streams (Refs #1144)
-                                const std::size_t slice_size = destination_size < available ? destination_size : available;
-                                if (slice_size > 0 && destination_size <= available) {
-                                    output.assign(it->data.begin() + delta, it->data.begin() + delta + slice_size);
-                                    decode_length = slice_size;
-                                    data = output.data();
-                                    outcome = "inflated (slice from stream cache)";
-                                    direct_decoded = true;
-                                    break;
+                            auto pos = std::find(it->continuation_ids.begin(), it->continuation_ids.end(), entry_id);
+                            if (pos != it->continuation_ids.end()) {
+                                const u64 delta = offset - it->base_offset;
+                                const unsigned step = it->chunk_size ? it->chunk_size : 0x10000;
+                                if ((delta % step) == 0 && delta < it->data.size()) {
+                                    const std::size_t available = it->data.size() - delta;
+                                    // Handle short final destinations in multi-piece streams (Refs #1144)
+                                    const std::size_t slice_size = destination_size < available ? destination_size : available;
+                                    if (slice_size > 0 && destination_size <= available) {
+                                        output.assign(it->data.begin() + delta, it->data.begin() + delta + slice_size);
+                                        decode_length = slice_size;
+                                        data = output.data();
+                                        outcome = "inflated (slice from stream cache)";
+                                        direct_decoded = true;
+                                        it->continuation_ids.erase(pos);
+                                        if (it->continuation_ids.empty()) {
+                                            work.cached_streams.erase(it);
+                                        }
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -523,7 +558,7 @@ void run_entry(Object* self, Entry& entry)
                     if (!entry.tokens[i]) InterlockedIncrement(&zero_tokens_at_run);
                 }
         }
-        execute_request(self, entry.bytes, entry.tokens.empty() ? nullptr : entry.tokens.data());
+        execute_request(self, entry.bytes, entry.tokens.empty() ? nullptr : entry.tokens.data(), entry.id, entry.submission_id);
     } else if (entry.type == Entry::status_entry) {
         const LONG result = InterlockedExchange(&self->pending, S_OK);
         InterlockedExchange(&entry.array->results[entry.index], result);
@@ -560,6 +595,12 @@ QueueWork& work_of(Object* self)
                         log("x2w-dstorage entry type %d failed: %s (options=0x%llx)", static_cast<int>(entry.type), error.what(),
                             entry.type == Entry::request ? *reinterpret_cast<const unsigned long long*>(entry.bytes) : 0ull);
                 }
+                {
+                    const std::lock_guard guard(work.mutex);
+                    if (work.submitted.empty()) {
+                        work.cached_streams.clear();
+                    }
+                }
             }
         }).detach();
     }
@@ -571,7 +612,11 @@ void submit(Object* self)
     QueueWork& work = work_of(self);
     {
         const std::lock_guard guard(work.mutex);
-        for (auto& entry : work.waiting) work.submitted.push_back(std::move(entry));
+        const u64 submission_id = ++work.next_submission_id;
+        for (auto& entry : work.waiting) {
+            entry.submission_id = submission_id;
+            work.submitted.push_back(std::move(entry));
+        }
         work.waiting.clear();
     }
     work.wake.notify_one();
@@ -583,6 +628,7 @@ void push(Object* self, Entry&& entry)
     bool full;
     {
         const std::lock_guard guard(work.mutex);
+        entry.id = ++work.next_entry_id;
         work.waiting.push_back(std::move(entry));
         full = self->capacity && work.waiting.size() >= self->capacity;
     }
