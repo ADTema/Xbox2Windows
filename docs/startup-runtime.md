@@ -61,7 +61,7 @@ selected.
 When the adapter lacks typed UAV support for B5G5R5A1_UNORM or render-target support for
 B4G4R4A4_UNORM, the wrapper uses an R8G8B8A8_UNORM null descriptor if that format supports the
 requested view. This applies only to Texture2D views with no resource or counter. Run
-`ctest --test-dir out/bin --no-tests=error -R "^startup_null_views_" -V` against your build
+`ctest --preset dev --no-tests=error -R '^startup_null_views_' -V` against your build
 directory to exercise both slots on hardware and WARP. On Windows 11 build 26300.9974 two adapters on one machine split. An RTX 5080 Laptop (32.0.15.8142) lacks the typed UAV and render-target support the rule keys on and reports `slot 19 format 86 -> 28; slot 20 format 115 -> 28`; an Intel Arc 140T (32.0.101.8132) has it, like in-box WARP 10.0.26100.9818, and both report `slot 19 format 86 -> 86; slot 20 format 115 -> 115`. Physical versus WARP is therefore not the discriminator; select the adapter with `XBOX2WINDOWS_ADAPTER=intel` or `XBOX2WINDOWS_ADAPTER=nvidia` and read the two lines.
 
 ## 16-bit packed targets
