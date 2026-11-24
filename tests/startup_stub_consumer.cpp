@@ -7,7 +7,7 @@
 //   physical -> XMemAllocatePhysicalPages/XMemFreePhysicalPages round trip (no trap expected)
 //   dstorage -> DirectStorage multi-page RFC 1950 zlib request, BCPack decode and failure controls (Refs #1139, #1144)
 //   dstorage-pages -> page-array entries replaced, or made unreadable, between EnqueueRequest and Submit
-//   store    -> XStoreCreateContext for the local user, and the same call on a mutated provider (Refs #1147)
+//   store    -> XStoreCreateContext for the local user, a mutated provider, and a non-local user (Refs #1147)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif

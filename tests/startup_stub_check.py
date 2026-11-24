@@ -110,7 +110,8 @@ store_env = dict(env, X2W_RUNTIME_PROXY="1", X2W_FAKE_USER="1")
 run = subprocess.run([consumer, "store"], capture_output=True, text=True, env=store_env, timeout=20)
 traps_after = open(log, encoding="ascii").read().count("x2w-trap ") if os.path.exists(log) else 0
 ok = (run.returncode == 0 and "store context 5832575300000001" in run.stdout
-      and "store refused 80004005" in run.stdout and "x2w-trap" not in run.stderr
+      and "store refused 80004005" in run.stdout
+      and "store user refused 80004005" in run.stdout and "x2w-trap" not in run.stderr
       and traps_after == len(cases))
 print(f"store context: exit={run.returncode} {'ok' if ok else 'MISMATCH'}")
 if not ok:

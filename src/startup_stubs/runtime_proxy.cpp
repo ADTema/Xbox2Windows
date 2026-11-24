@@ -892,8 +892,12 @@ bool area_call(unsigned long provider, int slot, u64* args, u64* result)
         // The public GDK takes the console user and writes an XStoreContextHandle. The VIctory
         // runtime notes (github.com/Marvisak/VIctory, facts only) answer it offline by writing one
         // context and returning success; catalog, licence and purchase methods stay unanswered.
-        // Only the local user is answered. A buffer that cannot be written is E_INVALIDARG.
-        if (args[0] != local_user_handle) return false;
+        // Only the local user is answered. A different user is refused and the output is left
+        // unchanged. A buffer that cannot be written is E_INVALIDARG.
+        if (args[0] != local_user_handle) {
+            *result = 0x80004005;
+            return true;
+        }
         if (!out(args[1], 8)) {
             *result = 0x80070057;
             return true;
@@ -907,8 +911,8 @@ bool area_call(unsigned long provider, int slot, u64* args, u64* result)
 
 // Source-built check (tests/startup_stub_consumer.cpp). Both switches are required, as they are
 // for a title: the proxy is installed only for X2W_RUNTIME_PROXY, and this answer only for the
-// fake user. Returns 0 when the local user receives the context and a mutated provider still
-// fails with E_FAIL without writing.
+// fake user. Returns 0 when the local user receives the context, a mutated provider still
+// fails with E_FAIL without writing, and a non-local user is refused the same way.
 int store_method3_check()
 {
     if (!x2w_local::env_on("X2W_RUNTIME_PROXY") || !fake_user()) return 2;
@@ -928,11 +932,17 @@ int store_method3_check()
     if (refused != 0x80004005 || untouched != 0x1111111111111111ull) return 5;
     provider_ids[index].Data1 = store_provider_data1;
 
+    u64 foreign_out = 0x1111111111111111ull;
+    const u64 foreign_user = local_user_handle ^ 1ull;
+    const u64 foreign = forward<3>(&proxy, foreign_user, reinterpret_cast<u64>(&foreign_out), 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    if (foreign != 0x80004005 || foreign_out != 0x1111111111111111ull) return 7;
+
     const u64 missing = forward<3>(&proxy, local_user_handle, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
     if (missing != 0x80070057) return 6;
 
     std::printf("store context %016llx\n", static_cast<unsigned long long>(context));
     std::printf("store refused %08llx\n", static_cast<unsigned long long>(refused & 0xffffffffu));
+    std::printf("store user refused %08llx\n", static_cast<unsigned long long>(foreign & 0xffffffffu));
     return 0;
 }
 
