@@ -178,22 +178,24 @@ def labelled(decoded):
     return [item for pc, line in lines for item in ([f".L{pc}:"] if pc in targets else []) + [line]]
 
 
-MUBUF_SOURCE_FORMAT = "BUF_FMT_32_32_32_32_UINT"
+MUBUF_UINT_FORMATS = tuple(f"BUF_FMT_{'32_' * count}UINT" for count in range(1, 5))
+MUBUF_SOURCE_FORMAT = MUBUF_UINT_FORMATS[-1]
 MUBUF_TEXEL_BYTES = 16
 
 
 def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, stride=None,
           constant_descriptor=None, group_reg_y=None, group_reg_z=None, source_descriptor=None,
-          source_stride=None, source_format=None, image_descriptor=None, image_format=None,
+          source_stride=None, source_format=None, output_format=None, image_descriptor=None, image_format=None,
           cpu="gfx1013", lds_bytes=0, lds_f32_mode=None, lds_f64_mode=None):
     """v0, v1 and v2 are local X, Y and Z; group_reg, group_reg_y and group_reg_z are the group IDs.
 
     gfx10 compute waves receive each local ID in its own VGPR. Y and Z are bound only when that
     group dimension is larger than one. Descriptors name u0 and optionally b0 and a read-only raw
     source t0; source_stride is the t0 byte stride that indexed reads use. source_format declares
-    the MUBUF source descriptor format with identity channel selectors. image_descriptor is the
-    table byte offset of the 8-dword image descriptor; image_format is the caller's statement of
-    the image format inside it, and the texel is bound to t0.
+    the MUBUF source descriptor format, and output_format declares the u0 descriptor format
+    for formatted MUBUF stores. Both declarations require identity channel selectors.
+    image_descriptor is the table byte offset of the 8-dword image descriptor. image_format is
+    the caller's statement of the image format inside it, and the texel is bound to t0.
     """
     dims = checked_group(group)
     if cpu not in ("gfx1013", "gfx1030"):
@@ -234,6 +236,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
         raise ValueError("Invalid group register")
     if stride is not None and (not group_regs or not 4 <= stride <= 0x3fff or stride % 4):
         raise ValueError("Indexed stores require a group register and aligned stride")
+    if output_format is not None and (output_format not in MUBUF_UINT_FORMATS or cpu != "gfx1030"
+                                      or stride is None):
+        raise ValueError("Unsupported formatted output binding")
     scalar = {table_reg: "table"}
     for axis, reg in group_regs.items():
         scalar[reg] = ("group", axis)
@@ -1201,10 +1206,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 vector.pop(reg, None)
                 loading[reg] = ("alu", f"{name}.{component}")
         elif m := re.fullmatch(r"(?:buffer_store_(?:dword(?:x(?P<raw_count>[234]))?|(?P<subword>byte|short)(?P<store_hi>_d16_hi)?)|"
-                               r"tbuffer_store_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
+                               r"(?P<typed>t)?buffer_store_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
                                r"(?P<data>v\d+|v\[\d+:\d+\]), (?P<addr>off|v\d+|v\[\d+:\d+\]), "
                                r"s\[(?P<base>\d+):(?P<high>\d+)\], 0"
-                               r"(?(channels) format:\[(?P<format>BUF_FMT_(?:(?:32_){1,4}|(?:16_){1,4})UINT)\])"
+                               r"(?(typed) format:\[(?P<format>BUF_FMT_(?:(?:32_){1,4}|(?:16_){1,4})UINT)\])"
                                r"(?P<idxen> idxen)?(?P<offen> offen)?(?: offset:(?P<offset>\d+))?", line):
             channels = m["channels"]
             packed = channels is not None and channels.startswith("d16_")
@@ -1218,12 +1223,22 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             width = {"byte": 1, "short": 2}.get(subword, 4)
             format_components = 4 if packed and components == 3 else components
             fmt = f"BUF_FMT_{('16_' if packed else '32_') * format_components}UINT"
-            if channels and (cpu != "gfx1030" or not idxen or offen or m["format"] != fmt):
+            if m["typed"] and (cpu != "gfx1030" or not idxen or offen or m["format"] != fmt):
                 raise ValueError("Unsupported typed buffer store format, target or address mode")
+            formatted = channels is not None and not m["typed"]
+            if formatted:
+                if cpu != "gfx1030" or packed or not idxen or offen:
+                    raise ValueError("Unsupported formatted buffer store target or address mode")
+                if output_format is None:
+                    raise ValueError("Formatted buffer stores require an output format")
+                # Only whole texels with identity selectors are proven here.
+                if output_format != MUBUF_UINT_FORMATS[components - 1]:
+                    raise ValueError("Formatted buffer store width does not match output format")
             first, *last = map(int, re.findall(r"\d+", m["data"]))
             base, high = int(m["base"]), int(m["high"])
             offset = int(m["offset"] or 0)
             if (last != ([] if count == 1 else [first + count - 1])
+                    or (formatted and first + count > 256)
                     or high != base + 3 or base % 4 or offset % width or offset > 4095
                     or pending.intersection(range(base, high + 1))
                     or any(scalar.get(base + i) != ("uav", i) for i in range(4))):
@@ -1371,6 +1386,8 @@ def main():
     parser.add_argument("--source-stride", type=int, help="Indexed t0 byte stride")
     parser.add_argument("--source-format", choices=(MUBUF_SOURCE_FORMAT,),
                         help="Caller-declared MUBUF t0 descriptor format with identity channel selectors")
+    parser.add_argument("--output-format", choices=MUBUF_UINT_FORMATS,
+                        help="Caller-declared MUBUF u0 descriptor format with identity channel selectors")
     parser.add_argument("--image-descriptor", type=lambda n: int(n, 0),
                         help="Table byte offset of the 8-dword image descriptor bound to t0")
     parser.add_argument("--image-format", choices=sorted(IMAGE_FORMATS),
@@ -1389,6 +1406,7 @@ def main():
                    constant_descriptor=args.constant_descriptor, group_reg_y=args.group_reg_y,
                    group_reg_z=args.group_reg_z, source_descriptor=args.source_descriptor,
                    source_stride=args.source_stride, source_format=args.source_format,
+                   output_format=args.output_format,
                    image_descriptor=args.image_descriptor, image_format=args.image_format, cpu=args.cpu, lds_bytes=args.lds_bytes,
                    lds_f32_mode=args.lds_f32_mode, lds_f64_mode=args.lds_f64_mode)
     args.output.parent.mkdir(parents=True, exist_ok=True)

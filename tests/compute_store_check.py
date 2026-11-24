@@ -3080,6 +3080,8 @@ def binary(directory, assembler, objcopy, library):
     mimg_load_binary(directory, assembler, objcopy, library)
     gfx1030_binary(directory, assembler, objcopy, library, MTBUF_LOAD_CASES, "tbuffer_")
     two_exits(directory, assembler, objcopy, library)
+    mubuf_format_store_controls()
+    gfx1030_binary(directory, assembler, objcopy, library, mubuf_format_store_cases(), "buffer_store_format_", group=16)
     mubuf_format_controls()
     gfx1030_binary(directory, assembler, objcopy, library, mubuf_format_cases(), "buffer_load_format_")
     for name, lines, width, binding in CASES + GUARD_CASES + READ_CASES + ALU_CASES + F32_CASES:
@@ -3625,6 +3627,106 @@ def mubuf_format_draw(directory, compiler, renderer, backend):
         path = Path(record)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("".join(f"{name}\n" for name, _, _ in mubuf_format_cases()), encoding="utf-8")
+    return 0
+
+
+MUBUF_STORE_WORDS = (0x89abcdef, 0x01234567, 0xdcbafed0, 0x76543210)
+
+
+def mubuf_format_store_cases():
+    for count in range(1, 5):
+        name = f"buffer_store_format_{'xyzw'[:count]}"
+        data = "v10" if count == 1 else f"v[10:{9 + count}]"
+        lines = ["s_mov_b32 s12, s7", "s_mov_b32 s13, 0",
+                 "s_load_dwordx4 s[20:23], s[12:13], 0x30",
+                 "v_lshl_add_u32 v8, s11, 4, v0", "s_waitcnt lgkmcnt(0)"]
+        lines += [f"v_xor_b32_e32 v{10 + i}, {word:#x}, v8" for i, word in enumerate(MUBUF_STORE_WORDS[:count])]
+        yield name, [*lines, f"{name} {data}, v8, s[20:23], 0 idxen offset:4", "s_endpgm"], DS_BINDING | {
+            "stride": 4 * (count + 1), "output_format": f"BUF_FMT_{'32_' * count}UINT"}
+
+
+def mubuf_format_store_controls():
+    cases = list(mubuf_format_store_cases())
+    _, lines, binding = cases[0]
+    store = lines[-2]
+    for replacement, diagnostic in (
+        (store.replace("idxen", "offen"), "Unsupported formatted buffer store target or address mode"),
+        (store.replace("idxen", "idxen offen"), "Unsupported formatted buffer store target or address mode"),
+        (store.replace("format_x", "format_d16_x"), "Unsupported formatted buffer store target or address mode"),
+        (store.replace(", 0 idxen", ", s0 idxen"), "Unsupported compute instruction"),
+        (store + " glc", "Unsupported compute instruction"),
+        (store.replace("offset:4", "offset:2"), "Unverified raw UAV store"),
+        (store.replace("offset:4", "offset:8"), "Unsupported store address"),
+        (store.replace(", v8,", ", v10,"), "Unsupported store address"),
+        (store.replace("s[20:23]", "s[16:19]"), "Unverified raw UAV store"),
+        (store + "\nbuffer_store_dword v10, v8, s[20:23], 0 idxen offset:4", "Overlapping raw UAV stores"),
+    ):
+        rejects(diagnostic, aot.lower, variant(lines, (store, replacement)), 16, **binding)
+    for options, diagnostic in (
+        ({"output_format": None}, "Formatted buffer stores require an output format"),
+        ({"output_format": "BUF_FMT_32_32_UINT"}, "Formatted buffer store width does not match output format"),
+        ({"output_format": "BUF_FMT_32_FLOAT"}, "Unsupported formatted output binding"),
+        ({"stride": None}, "Unsupported formatted output binding"),
+        ({"cpu": "gfx1013"}, "Unsupported formatted output binding"),
+    ):
+        rejects(diagnostic, aot.lower, lines, 16, **(binding | options))
+    rejects("Unverified raw UAV store", aot.lower, variant(lines, ("s_waitcnt lgkmcnt(0)", "")), 16, **binding)
+    rejects("Store address does not separate every invocation", aot.lower, lines, (16, 2, 1), **binding)
+
+    _, lines, binding = cases[-1]
+    store = lines[-2]
+    for data in ("v[10:12]", "v[253:256]"):
+        rejects("Unverified raw UAV store", aot.lower,
+                variant(lines, ("v[10:13]", data)), 16, **binding)
+    # The last data VGPR is still pending even if the other three are ready.
+    lines = variant(lines, ("s_waitcnt lgkmcnt(0)",
+                            "s_load_dwordx4 s[16:19], s[12:13], 0x40\ns_waitcnt lgkmcnt(0)"),
+                    (store, "buffer_load_dword v13, v8, s[16:19], 0 idxen\n" + store))
+    binding |= {"source_descriptor": 0x40, "source_stride": 4}
+    rejects("Vector load result used or overwritten before s_waitcnt vmcnt(0)", aot.lower, lines, 16, **binding)
+    aot.lower(variant(lines, (store, "s_waitcnt vmcnt(0)\n" + store)), 16, **binding)
+
+
+def mubuf_format_store_draw(directory, compiler, renderer, backend):
+    mubuf_format_store_controls()
+    src, cso, case = (directory / f"mubuf-format-store.{ext}" for ext in ("hlsl", "cso", "case"))
+    compile_shader = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
+    run = [renderer, backend, "--compute-store-case", cso, case]
+    accepted = []
+    for name, lines, binding in mubuf_format_store_cases():
+        print(f"{name} ({binding['output_format']})", flush=True)
+        count = len(name.rsplit("_", 1)[1])
+        store = lines[-2]
+        src.write_text(aot.lower(lines, 16, **binding), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        for groups in (1, 2):
+            words = [SENTINEL] * 320
+            for gid in range(16 * groups):
+                start = gid * (count + 1) + 1
+                words[start:start + count] = [word ^ gid for word in MUBUF_STORE_WORDS[:count]]
+            case.write_bytes(struct.pack("<321I", groups, *words))
+            result = subprocess.run(run)
+            if result.returncode:
+                return result.returncode
+        if count == 1:
+            mutant = variant(lines, (store, store.removesuffix(" offset:4")))
+            mismatch, actual = 0, MUBUF_STORE_WORDS[0]
+        else:
+            first, last = lines[5], lines[4 + count]
+            mutant = variant(lines, (first, first.replace("v10,", f"v{9 + count},")),
+                             (last, last.replace(f"v{9 + count},", "v10,")))
+            mismatch, actual = 1, MUBUF_STORE_WORDS[count - 1]
+        src.write_text(aot.lower(mutant, 16, **binding), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        bad = subprocess.run(run, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={mismatch} expected={words[mismatch]:08x} actual={actual:08x}" not in bad.stderr:
+            raise AssertionError(f"{name}: incorrect store escaped detection\n{bad.stderr}")
+        print(bad.stderr, end="")
+        accepted.append(name)
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(accepted) + "\n", encoding="utf-8")
     return 0
 
 
@@ -4610,6 +4712,7 @@ if __name__ == "__main__":
                  "draw-mubuf-vector": mubuf_vector_draw,
                  "draw-mubuf-d16": mubuf_d16_draw,
                  "draw-mubuf-format": mubuf_format_draw,
+                 "draw-mubuf-format-store": mubuf_format_store_draw,
                  "draw-mtbuf-load": mtbuf_load_draw,
                  "draw-mimg-load": mimg_load_draw,
                  "draw-mimg-mip": mimg_mip_draw,
