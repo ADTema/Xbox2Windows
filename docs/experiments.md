@@ -6077,6 +6077,27 @@ and matches its own image. Run `ctest --preset dev --no-tests=error -R '^startup
 `tests/startup_gfx2hlsl_f32_lg_check.py binary <llvm-mc>` and `decode <libLLVM>` round-trip the forms and the
 fixtures through LLVM 15.
 
+**f32 nlt, nle, ngt, nge, o and u under compilers without `-Gis` (#1936).** The startup cache compiles every
+`gfx2hlsl` pair with FXC and no flags, and neither compiler keeps float compares IEEE-strict unless asked. FXC
+compiled `!(a < b)` to `ge a, b` (and likewise for `<=`, `>`, `>=`), so nlt, nle, ngt and nge gave 0 on every NaN
+pair where the ISA gives 1; DXC folded `a != a` and `a == a`, so u was constant 0 and o constant 1. WARP and an
+RX 9070 XT (driver 32.0.31044.16) agreed in every case, and `/Gis` or `-Gis` restored the ISA result, so the
+bytecode decides it. The n-forms now read `!(ORDERED && a OP b)` and o and u read ORDERED and `!ORDERED`, with
+ORDERED the bit test of both source words that lg uses; neq is unchanged, as both compilers keep `!(a == b)` true
+on NaN. `startup_gfx2hlsl_f32_nan` evaluates the HLSL of all 510 f32 forms over the 256 source pairs under IEEE
+compares and under models of the two rewrites (a negation pushed into the opposite relation; reflexive float
+relations folded, and less-or-greater read as unordered not-equal, #1920); each equals the ISA reference, and the
+text before #1936 fails all 204 forms of the six conditions under the model of the compiler that broke it. The
+draws `startup_gfx2hlsl_f32_nan_{warp,hardware}` write four results of each of the 13 conditions other than lg
+and nlg (e32, and e64 with `(-a, |b|)`, `(-|a|, -b)`, `(|a|, b)`) and keep pixels through `v_cmpx_*_e64` for the
+six, compiled with FXC `ps_5_1` and DXC `ps_6_0`. Every pixel matched on WARP and the RX 9070 XT with both
+compilers (denormal sources flushed where they matter). The text before #1936 fails each draw on the compiler that
+rewrote it (156 NaN pixels against the flushed image) and matches that rewrite's image; on the other compiler it
+is recorded, and it matched. Also recorded, not checked: with `/Gis` and `-Gis` the old and the new text of the six
+both matched every pixel. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_f32_nan' -V`;
+`tests/startup_gfx2hlsl_f32_nan_check.py binary <llvm-mc>` and `decode <libLLVM>` round-trip the fixtures through
+LLVM 15.
+
 **Four half channels in a typed buffer load.** `BUF_FMT_16_16_16_16_FLOAT` stores x and y in the first
 dword and z and w in the second, and the typed-load format table had only the two-channel half-float
 form, so a load of this format was refused with `buffer format BUF_FMT_16_16_16_16_FLOAT` - 5 of the 29
