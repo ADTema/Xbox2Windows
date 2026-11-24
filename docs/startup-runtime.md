@@ -1007,10 +1007,11 @@ is not affected: section-backed pages already took the committed, not-aliased pa
   the same pages with writes seen both ways; an unmap refused at each of three steps
   (`X2W_XMEM_TEST_FAULT`); and a reader on a page while its neighbour is unmapped and mapped
   again. Two cases must end in an access violation, the reader without the handler
-  (`X2W_XMEM_NO_FAULT_RETRY=1`) and a read of a forgotten page; each runs in a child process
+  (`X2W_XMEM_NO_FAULT_RETRY=1`, with `X2W_XMEM_TEST_HOLD_WINDOW` holding the unmap until the
+  reader has read the unmapped page) and a read of a forgotten page; each runs in a child process
   whose exit code the parent checks. Those controls and `X2W_XMEM_TEST_FAULT` exist only in a
   second build of the shim (`xmem_shim_test_controls`, `X2W_XMEM_TEST_CONTROLS`); the check shows
-  that the deployed `xmem.dll` ignores both switches. Four more children cover the lifetime on
+  that the deployed `xmem.dll` ignores these switches. Four more children cover the lifetime on
   the deployed shim: without the opt-in, pages mapped with a view each and the shim unloading
   after that mapping, twice; with it, an unused shim unloads, a used one stays loaded through `FreeLibrary` with an
   unrelated handled access violation still delivered and the handler still working; `FreeLibrary`
