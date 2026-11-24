@@ -2674,7 +2674,8 @@ The translator also lowers the one-source binary32 math and rounding forms
 `v_rndne_f32` and `v_fract_f32` (`_e32` and `_e64`) to `1.0f / x`,
 `rsqrt`, `sqrt`, `floor`, `trunc`, `round` (half to even) and `frac` capped at
 `0x3f7fffff`, so that `v_fract_f32` of -2^-30 is the largest binary32 below 1.0 and not 1.0 (the
-same rule as the pixel and dispatch translators). Source
+same rule as the pixel translator). The cap is a comparison (a result of 1.0 or more is replaced), not `min`,
+because D3D `min` returns its other operand for a NaN, and a NaN input must stay a NaN. Source
 modifiers, `clamp`, output modifiers and a second source are refused. The
 precision of reciprocal, reciprocal square root and square root is not
 claimed, because D3D allows each of them an error. The test program does not
@@ -2698,7 +2699,9 @@ a different depth. The draw `mesh_entry_unary_draw_*` (`draw-unary`) compares
 the exported position words with that reference; a depth one unit in the last
 place off in the last vertex, or any of the fourteen opcodes swapped for its
 sibling, must report `Mesh export trace mismatch`. The draw is written for
-Windows and has not been run there since this program changed. NaN, infinity,
+Windows and has not been run there since this program changed. The binary mode also
+checks that a NaN input of either fract encoding gives a NaN depth, and that the cap written as `min` loses it.
+Infinity,
 denormals, a zero or negative operand of reciprocal square root or square root,
 and signed zero results are not exercised.
 

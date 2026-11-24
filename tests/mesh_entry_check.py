@@ -261,8 +261,16 @@ HLSL_MATH = {
     "floor": lambda x: F32(math.floor(x)),
     "trunc": lambda x: F32(math.trunc(x)),
     "round": lambda x: F32(round(float(x))),
-    "frac": lambda x: F32(x - math.floor(x)),
+    "frac": lambda x: F32(x - math.floor(x)) if math.isfinite(x) else F32(math.nan),
+    # D3D min returns the other operand when one is a NaN.
+    "min": lambda a, b: b if math.isnan(a) else a if math.isnan(b) else F32(min(a, b)),
+    # The emitted comparison cap: a NaN fails the comparison and passes through.
+    "fract32": lambda x: F32(0.99999994) if HLSL_MATH["frac"](x) >= 1.0 else HLSL_MATH["frac"](x),
 }
+
+
+# The emitted cap on a fraction: group 1 is the frac call, group 2 its argument.
+FRACT_CAP = r"\((frac\(([^;]*?)\)) >= 1\.0f \? asfloat\(0x3f7fffffu\) : \1\)"
 
 
 def evaluate_depth(text, inputs, error=0.0):
@@ -291,10 +299,11 @@ def evaluate_depth(text, inputs, error=0.0):
         )
         expr = re.sub(r"(?<!\w)float\(0x([0-9a-f]+)u\)", lambda m: repr(F32(int(m[1], 16))), expr)
         expr = re.sub(r"^\(1\.0f / (.*)\)$", r"rcp(\1)", expr)
+        expr = re.sub(FRACT_CAP, r"fract32(\2)", expr)
         expr = re.sub(r"asfloat\(0x([0-9a-f]+)u\)", word, expr)
         expr = re.sub(r"(point|matrix)Data\[(\d+)\]\.([xyzw])", buffer, expr)
         expr = re.sub(r"(?<![\w.])(-?\d+\.\d+(?:e[+-]?\d+)?)f?", r"F32(\1)", expr)
-        return eval(expr, {"F32": F32, **math_ops}, names)
+        return eval(expr, {"F32": F32, "nan": math.nan, **math_ops}, names)
 
     names = {}
     for name, expr in re.findall(r"precise float (f\d+) = (.*);", text):
@@ -695,13 +704,15 @@ def unary_binary(tmp, tools):
 # Fract of a tiny negative input. x - floor(x) rounds to 1.0 in binary32, but v_fract_f32 returns at most 0x3f7fffff.
 # Both encodings get their own input (-2^-30 and -2^-28), so the two emitted expressions stay distinct. Each result
 # is moved by -1.0 first, which makes it exact (-2^-24, or zero when the clamp is missing).
-FRACT_TINY = [(("v_fract_f32_e32", 0xB0800000), "v_fract_f32_e32"), (("v_fract_f32_e64", 0xB1800000), "v_fract_f32_e64")]
+FRACT_TINY = [("v_fract_f32_e32", 0xB0800000), ("v_fract_f32_e64", 0xB1800000)]
+# A NaN input must come out as a NaN, in each encoding. The payloads differ so that the expressions stay distinct.
+FRACT_NAN = [("v_fract_f32_e32", 0x7FC00000), ("v_fract_f32_e64", 0x7FC00001)]
 
 
-def fract_tiny_program():
+def fract_program(cases):
     program = PROGRAM.copy()
     body = ["v_sub_f32_e32 v5, v3, v3"]
-    for i, ((op, word), _) in enumerate(FRACT_TINY):
+    for i, (op, word) in enumerate(cases):
         body += [
             f"v_add_f32_e32 v{40 + i}, 0x{word:08x}, v5",
             f"{op} v{20 + i}, v{40 + i}",
@@ -712,33 +723,55 @@ def fract_tiny_program():
     return program
 
 
-def fract_tiny_reference():
-    # The RDNA rule in binary32: fract(x) = min(x - floor(x), 0x3f7fffff). The bare difference is 1.0 for both inputs.
+def fract_reference(cases):
+    # The RDNA rule in binary32: fract(x) is x - floor(x) capped at 0x3f7fffff, and a NaN stays a NaN. The bare
+    # difference is 1.0 for both tiny inputs.
     top = F32(struct.unpack("<f", struct.pack("<I", 0x3F7FFFFF))[0])
     z = F32(0.125) + F32(0.375)  # pointData y plus the matrix value
-    for (_, word), _ in FRACT_TINY:
+    for _, word in cases:
         x = F32(struct.unpack("<f", struct.pack("<I", word))[0])
+        if math.isnan(x):
+            return F32(math.nan)
         assert F32(x - math.floor(x)) == 1.0
         z = z + (F32(min(F32(x - math.floor(x)), top)) - F32(1.0))
     return z
 
 
+def drop_cap(text, indexes, keep):
+    # Replace the chosen emitted caps by keep(frac call), in place.
+    matches = list(re.finditer(FRACT_CAP, text))
+    for i in sorted(indexes, reverse=True):
+        m = matches[i]
+        text = text[: m.start()] + keep(m[1]) + text[m.end() :]
+    return text
+
+
 def fract_tiny_binary(tmp, tools):
-    inputs, reference = triangle_inputs(), fract_tiny_reference()
+    inputs, reference = triangle_inputs(), fract_reference(FRACT_TINY)
     assert reference == 0.5 - 2**-23, reference
-    text = binary(tmp, *tools, program=fract_tiny_program(), words=[4099])
+    text = binary(tmp, *tools, program=fract_program(FRACT_TINY), words=[4099])
     assert evaluate_depth(text, inputs) == reference, text
-    cap = r"min\((frac\([^;]*?\)), asfloat\(0x3f7fffffu\)\)"
-    assert len(re.findall(cap, text)) == 2, text
+    assert len(re.findall(FRACT_CAP, text)) == 2, text
     # Without the cap, either encoding alone moves the depth, and dropping both moves it further.
-    for count in (1, 2):
-        for first in (True, False):
-            matches = list(re.finditer(cap, text))
-            chosen = matches[:count] if first else matches[-count:]
-            mutated = text
-            for m in reversed(chosen):
-                mutated = mutated[: m.start()] + m[1] + mutated[m.end() :]
-            assert evaluate_depth(mutated, inputs) != reference, (count, first, mutated)
+    for chosen in ([0], [1], [0, 1]):
+        mutated = drop_cap(text, chosen, lambda frac: frac)
+        assert evaluate_depth(mutated, inputs) != reference, (chosen, mutated)
+    # The cap as a min gives the same depth on these finite inputs, so only the NaN check below tells it apart.
+    old = drop_cap(text, [0, 1], lambda frac: f"min({frac}, asfloat(0x3f7fffffu))")
+    assert evaluate_depth(old, inputs) == reference, old
+
+
+def fract_nan_binary(tmp, tools):
+    inputs = triangle_inputs()
+    # Each encoding alone, so that a lost NaN in one cannot hide behind the other.
+    for case in FRACT_NAN:
+        text = binary(tmp, *tools, program=fract_program([case]), words=[4099])
+        assert len(re.findall(FRACT_CAP, text)) == 1, text
+        assert math.isnan(evaluate_depth(text, inputs)), (case, text)
+        # The cap as a min turns the NaN into the finite 0x3f7fffff, and a bare frac keeps it a NaN.
+        old = drop_cap(text, [0], lambda frac: f"min({frac}, asfloat(0x3f7fffffu))")
+        assert not math.isnan(evaluate_depth(old, inputs)), (case, old)
+        assert math.isnan(evaluate_depth(drop_cap(text, [0], lambda frac: frac), inputs)), (case, text)
 
 
 def offset_draw():
@@ -789,6 +822,7 @@ if __name__ == "__main__":
             cvt_minmax_binary(Path(directory), sys.argv[2:])
             unary_binary(Path(directory), sys.argv[2:])
             fract_tiny_binary(Path(directory), sys.argv[2:])
+            fract_nan_binary(Path(directory), sys.argv[2:])
             sys.exit(0)
         if sys.argv[1] == "draw-cvt-minmax":
             args = sys.argv[2:]
