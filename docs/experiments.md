@@ -11605,6 +11605,16 @@ Tests: `startup_gfx2hlsl_cvt_alu_controls`, `startup_gfx2hlsl_cvt_alu_warp` and 
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_int_med3_controls$' -V
 ```
 
+## Startup translator: scalar select into the wave32 lane masks
+
+In wave32, `vcc_lo` and `exec_lo` hold the whole lane mask, and the generic scalar path in `tools/startup/gfx2hlsl.py` already writes them as `vcc` and `exec`. `s_cselect_b32` went through a separate select path that assumed an SGPR destination, so `s_cselect_b32 vcc_lo, -1, 0` stopped the translation with a `TypeError` instead of a lowering or an `Unsupported` refusal. The select path now writes the lane's bit of the selected word to `vcc` or `exec` for `vcc_lo` and `exec_lo` (an `exec_lo` write clears `exec_known`, as an `exec` write does), keeps the SGPR and `m0` destinations as before, and refuses any other destination with an `Unsupported` message.
+
+`tests/startup_gfx2hlsl_cselect_mask_check.py` decodes synthetic SOP2 words, evaluates the emitted select for both SCC values with the restricted evaluator of `startup_gfx2hlsl_bit_alu_check.py`, and checks that an unreduced select (the `& 1` removed) gives a different `vcc`. It also checks the SGPR and `m0` lines and the refusal of the null SGPR as a destination. On the translator before this change the first case raises the `TypeError`. Test: `startup_gfx2hlsl_cselect_mask_controls`. Not covered: a draw through a translated pipeline, and the guard that refuses exec writes behind a fetch call, which still accepts only the `exec` spelling.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_cselect_mask_controls$' -V
+```
+
 ## Startup translator: explicit-LOD image sampling
 
 `tools/startup/gfx2hlsl.py` now lowers the gfx1013 `image_sample_l` form of a 2D or 3D texture sample to `tex.SampleLevel(smp, uv, level)`. The level is the last address register: the third for a contiguous 2D address, the fourth for 3D, and the last element of an NSA list. `tests/startup_image_sample_l_check.py` translates source-built fixtures (the words are checked against `llvm-mc`) and requires the level to come from that register; an address list `[v0, v1, v3]` must use `v3`, not the third consecutive register. Replacing the level with 0, replacing the call with implicit `Sample`, or reading the third register in every form each make the check fail. Offset (`_o`), compare (`_c_l`), gather, 1D, array, cube and multisample dimensions, an empty `dmask`, and the `unorm`, `r128`, `tfe`, `lwe`, `a16` and `d16` modifiers or any set reserved MIMG bit are refused with an `Unsupported` message; only the cache-policy bits `glc`, `slc` and `dlc` are accepted because they do not change the sampled value. The disassembler previously read `lwe` from reserved bit 14 of word 0; `llvm-mc` (19, gfx1013) encodes it in bit 17, and the check now has one `llvm-mc`-built fixture per refused modifier plus patched reserved-bit fixtures. Not measured: no draw samples a mip level on WARP or hardware through this lowering, so the level selection is checked on the generated HLSL text only. [HLSL SampleLevel](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-to-samplelevel)
