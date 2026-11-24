@@ -12,7 +12,7 @@ import sys
 
 from pe_package_preflight import inspect
 
-# --trap-missing exit codes are TRAP_EXIT_BASE | trap number (1-based, in sorted dll!symbol order).
+# --trap-callable exit codes are TRAP_EXIT_BASE | trap number (1-based, in sorted dll!symbol order).
 TRAP_EXIT_BASE = 0xE7A00000
 TRAP_LIMIT = 0xFFFF
 _TRAP_CALLBACKS = []  # Process lifetime: trap thunks must outlive every guest thread.
@@ -65,28 +65,46 @@ def prototype(lib, name, args, result):
     return function
 
 
-def bind_traps(kernel, missing_keys):
-    """Bind each unresolved external to a numbered trap for a diagnostic run.
+def trap_key(name):
+    """Parse a --trap-callable DLL!SYMBOL (or DLL!#ORDINAL) into an import key."""
+    dll, sep, symbol = name.partition("!")
+    if not sep or not dll or not symbol or Path(dll).name != dll:
+        raise ValueError(f"--trap-callable expects DLL!SYMBOL or DLL!#ORDINAL, got {name!r}")
+    return dll.casefold(), symbol
 
-    A trap never returns to its caller: it writes its number and name to stderr and
-    terminates the process with TRAP_EXIT_BASE | number. No DLL is loaded or written,
-    so a trap cannot be mistaken for a provider. Returns (addresses, callbacks, labels);
-    keep the callbacks alive for the whole run.
+
+def bind_traps(kernel, trap_importers):
+    """Bind each listed callable import to a numbered trap for a diagnostic run.
+
+    trap_importers maps (dll, symbol) to the images that import it. A trap never returns
+    to its caller: it writes its number and name to stderr, best effort, and terminates
+    the process with TRAP_EXIT_BASE | number even when that report fails. No DLL is
+    loaded or written, so a trap cannot be mistaken for a provider. Returns
+    (addresses, callbacks, labels); keep the callbacks alive for the whole run.
     """
-    if len(missing_keys) > TRAP_LIMIT:
-        raise ValueError(f"--trap-missing supports at most {TRAP_LIMIT} traps, got {len(missing_keys)}")
+    if len(trap_importers) > TRAP_LIMIT:
+        raise ValueError(f"--trap-callable supports at most {TRAP_LIMIT} traps, got {len(trap_importers)}")
     terminate = prototype(kernel, "TerminateProcess", [W.HANDLE, W.UINT], W.BOOL)
     current = prototype(kernel, "GetCurrentProcess", [], W.HANDLE)
     trap_type = C.WINFUNCTYPE(None)
     addresses, callbacks, labels = {}, [], []
-    for number, key in enumerate(sorted(missing_keys), 1):
+    for number, key in enumerate(sorted(trap_importers), 1):
         label = f"{key[0]}!{key[1]}"
-        message = f"trap {number}: {', '.join(sorted(missing_keys[key]))}: {label}\n".encode("ascii", "replace")
+        message = f"trap {number}: {', '.join(sorted(trap_importers[key]))}: {label}\n".encode("ascii", "replace")
 
         def hit(message=message, code=TRAP_EXIT_BASE | number):
-            # os.write is unbuffered, so the line is out before the process ends.
-            os.write(2, message)
-            terminate(current(), code)
+            # ctypes swallows an exception raised here and returns to the guest, so the report
+            # is best effort and termination happens in finally, whatever the report did.
+            try:
+                try:
+                    os.write(2, message)  # unbuffered, so the line is out before the process ends
+                except BaseException:
+                    pass
+            finally:
+                try:
+                    terminate(current(), code)
+                finally:
+                    os._exit(code)
 
         trap = trap_type(hit)
         callbacks.append(trap)
@@ -95,7 +113,7 @@ def bind_traps(kernel, missing_keys):
     return addresses, callbacks, labels
 
 
-def run(root, report, mapper, shims, system, *, preflight_only=False, pin_shims=(), trap_missing=False):
+def run(root, report, mapper, shims, system, *, preflight_only=False, pin_shims=(), trap_callable=()):
     order, routes = plan(report)
     callback = C.WINFUNCTYPE(C.c_void_p, C.c_char_p, C.c_char_p, C.c_uint32)
     kernel = C.WinDLL("kernel32", use_last_error=True)
@@ -106,11 +124,13 @@ def run(root, report, mapper, shims, system, *, preflight_only=False, pin_shims=
     modules, addresses = {}, {}
     if set(pin_shims) - shims.keys():
         raise ValueError("Pinned providers must be named with --shim")
-    if trap_missing and preflight_only:
-        raise ValueError("--trap-missing applies to execution mode, not --preflight-only")
+    trap_keys = {trap_key(name) for name in trap_callable}
+    if trap_keys and preflight_only:
+        raise ValueError("--trap-callable applies to execution mode, not --preflight-only")
     trap_labels = []
     with ExitStack() as stack:
         missing, missing_keys = [], defaultdict(set)
+        missing_entry_keys = []
         for image in order:
             for terminal in routes[image].values():
                 if terminal.get("package"):
@@ -134,13 +154,25 @@ def run(root, report, mapper, shims, system, *, preflight_only=False, pin_shims=
                 if not addresses[key]:
                     missing.append(f"{image}: {dll}!{symbol}")
                     missing_keys[key].add(image)
-        if missing and trap_missing:
-            trap_addresses, trap_callbacks, trap_labels = bind_traps(kernel, missing_keys)
+                    missing_entry_keys.append(key)
+        if trap_keys:
+            # An import table entry does not say whether the caller calls the symbol or reads it as
+            # data, so only names the caller lists as callable get a trap; any other unresolved
+            # external is refused as before.
+            stale = sorted(trap_keys - missing_keys.keys())
+            if stale:
+                raise ValueError(f"--trap-callable {stale[0][0]}!{stale[0][1]} is not an unresolved external")
+            unlisted = [entry for entry, key in zip(missing, missing_entry_keys) if key not in trap_keys]
+            if unlisted:
+                raise ValueError(f"{len(unlisted)} unresolved external symbol(s) not listed with "
+                                 f"--trap-callable, first {unlisted[0]}")
+            trap_addresses, trap_callbacks, trap_labels = bind_traps(
+                kernel, {key: missing_keys[key] for key in trap_keys})
             # A guest worker may still reach a trap after the entry returns.
             _TRAP_CALLBACKS.extend(trap_callbacks)
             addresses.update(trap_addresses)
-            sys.stderr.write(f"trap-missing: {len(trap_labels)} unresolved external(s) bound to terminating "
-                             "traps; diagnostic only, not providers\n")
+            sys.stderr.write(f"trap-callable: {len(trap_labels)} listed unresolved external(s) bound to "
+                             "terminating traps; diagnostic only, not providers\n")
             for number, label in enumerate(trap_labels, 1):
                 sys.stderr.write(f"  trap {number} (exit {TRAP_EXIT_BASE | number:#x}): {label}\n")
             sys.stderr.flush()
@@ -215,7 +247,7 @@ def run(root, report, mapper, shims, system, *, preflight_only=False, pin_shims=
         if not start(mapped[report["entry"]], C.byref(code)):
             raise ValueError("mapper refused the EXE start")
         result = {"image_order": order, "entry_executed": True, "exit_code": code.value}
-        if trap_missing:
+        if trap_keys:
             # Reaching this point means no trap was called.
             result["unhit_traps"] = trap_labels
         return result
@@ -232,9 +264,10 @@ def main():
     parser.add_argument("--system", action="append", default=[], metavar="DLL")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--preflight-only", action="store_true")
-    mode.add_argument("--trap-missing", action="store_true",
-                      help="diagnostic: bind each unresolved external to a trap that names it on stderr and "
-                           f"terminates the process with {TRAP_EXIT_BASE:#x} | trap number")
+    mode.add_argument("--trap-callable", action="append", default=[], metavar="DLL!SYMBOL",
+                      help="diagnostic: bind this unresolved external, which the caller must call rather than "
+                           "read as data, to a trap that names it on stderr and terminates the process with "
+                           f"{TRAP_EXIT_BASE:#x} | trap number; any unlisted unresolved external is still refused")
     options = parser.parse_args()
     try:
         root = options.package.resolve(strict=True)
@@ -246,7 +279,7 @@ def main():
         result = run(root, report, options.mapper.resolve(), shims, system,
                      preflight_only=options.preflight_only,
                      pin_shims={name.casefold() for name in options.pin_shim},
-                     trap_missing=options.trap_missing)
+                     trap_callable=options.trap_callable)
     except (ValueError, OSError) as exc:
         parser.exit(1, f"{exc}\n")
     print(json.dumps(result, indent=2))
