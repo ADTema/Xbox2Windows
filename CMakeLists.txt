@@ -3,6 +3,10 @@ project(Xbox2Windows LANGUAGES CXX)
 
 enable_testing()
 
+# Defined before the first Python-driven test so a fresh configure registers all of them.
+set(INTAKE_PYTHON "${CMAKE_SOURCE_DIR}/out/pe-env/Scripts/python.exe" CACHE FILEPATH
+    "Native x64 Python with pefile for static intake tests")
+
 set(DSTORAGE_SDK_ROOT "" CACHE PATH "Extracted Microsoft.Direct3D.DirectStorage NuGet package")
 if(DSTORAGE_SDK_ROOT)
     find_package(ZLIB 1.2.9 REQUIRED)
@@ -1152,8 +1156,6 @@ if(EXISTS "${SIMPLE_TRIANGLE_DIR}/VertexShader.hlsl")
     endforeach()
 endif()
 
-set(INTAKE_PYTHON "${CMAKE_SOURCE_DIR}/out/pe-env/Scripts/python.exe" CACHE FILEPATH
-    "Native x64 Python with pefile for static intake tests")
 target_sources(offscreen_check PRIVATE tests/ffx_device_init.cpp tests/ffx_backend_slots.cpp tests/ffx_recurrent.cpp tests/ffx_provider_loop.cpp)
 set(FFX_UPSCALER_IMAGE "" CACHE FILEPATH "Local Xbox upscaler DLL for offline backend translation")
 set(FFX_DISPATCH_SHADER_DIR "" CACHE PATH "Directory containing locally translated FSR4 shaders and scratch_reference.h")
