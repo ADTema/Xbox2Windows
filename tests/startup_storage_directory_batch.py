@@ -26,6 +26,11 @@ def write_fixture(path, records, labels):
     # A raw ETPF interval, DISTANT + 1 individually compressed pages, and an end marker.
     streams = [zlib.compress(bytes([tag]) * PAGE, 9) for tag in labels]
     assert {len(stream) for stream in streams} == {28}
+    write_compressed_fixture(path, records, streams)
+
+
+def write_compressed_fixture(path, records, streams):
+    assert len(streams) == 3 and all(0 < len(stream) <= ALIGNMENT for stream in streams)
     count = DISTANT + 3
     metadata_start = round_up(16 + count * 8, ALIGNMENT)
     metadata_size = round_up(16 + records * (16 + 8 + 32), PAGE)

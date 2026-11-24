@@ -320,6 +320,8 @@ def check_shader_records():
     carry_in_forms = {(group, f"v_{op}_co_ci_u32{suffix}") for op in ("add", "sub", "subrev")
                       for group, suffix in (("VOP2", ""), ("VOP3", "_e64"))}
     sad_forms = {("VOP3", "v_sad_hi_u8"), ("VOP3", "v_sad_u32"), ("VOP3", "v_msad_u8")}
+    # gfx10 encodes the 64-bit multiply-adds as VOP3B, listed under VOP3 with their plain names.
+    mad64_forms = {("VOP3", "v_mad_u64_u32"), ("VOP3", "v_mad_i64_i32")}
     mul24_forms = {
         ("VOP2", "v_mul_i32_i24"), ("VOP3", "v_mul_i32_i24_e64"),
         ("VOP2", "v_mul_u32_u24"), ("VOP3", "v_mul_u32_u24_e64"),
@@ -363,6 +365,7 @@ def check_shader_records():
         assert carry_out_forms <= covered, (name, carry_out_forms - covered)
         assert carry_in_forms <= covered, (name, carry_in_forms - covered)
         assert sad_forms <= covered, (name, sad_forms - covered)
+        assert mad64_forms <= covered, (name, mad64_forms - covered)
         assert mul24_forms <= covered, (name, mul24_forms - covered)
         assert sop2_lshl_add_forms <= covered, (name, sop2_lshl_add_forms - covered)
         assert sop2_absdiff_forms <= covered, (name, sop2_absdiff_forms - covered)
