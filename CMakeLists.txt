@@ -2785,6 +2785,31 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_vmxcsr_native COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/vmxcsr.py"
         check native "$<TARGET_FILE:cpu_mxcsr_harness>" "$<TARGET_FILE:cpu_vmxcsr>" "$<TARGET_FILE:cpu_vmxcsr_lifted>")
     set_tests_properties(cpu_aot_vmxcsr_native PROPERTIES SKIP_RETURN_CODE 77)
+    # PF readers after the VEX scalar compares: the lifted DLL, the stale and reversed controls that must break a
+    # rule, and an /O2 build. The MXCSR harness sets the masked MXCSR and reports whether VEX runs natively.
+    cpu_asm_fixture(cpu_parity parity)
+    set(parity_controls)
+    foreach(variant IN ITEMS lifted stale reversed)
+        set(parity_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_parity_${variant}.cpp")
+        add_custom_command(OUTPUT "${parity_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/parity.py"
+                emit "$<TARGET_FILE:cpu_parity>" "${parity_fixture}" ${variant}
+            DEPENDS cpu_parity tests/cpu/parity.py tools/ffx_version_query.py tools/x87_lower.py
+                tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_parity_${variant} SHARED "${parity_fixture}")
+        if(NOT variant STREQUAL "lifted")
+            list(APPEND parity_controls "$<TARGET_FILE:cpu_parity_${variant}>")
+        endif()
+    endforeach()
+    set(parity_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_parity_lifted_o2.dll")
+    add_custom_command(OUTPUT "${parity_o2}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /EHsc /LD "${CMAKE_CURRENT_BINARY_DIR}/cpu_parity_lifted.cpp"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_parity_lifted_o2.obj" "/Fe${parity_o2}"
+        DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/cpu_parity_lifted.cpp" VERBATIM)
+    add_custom_target(cpu_parity_lifted_o2 ALL DEPENDS "${parity_o2}")
+    add_test(NAME cpu_aot_parity COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/parity.py"
+        check "$<TARGET_FILE:cpu_mxcsr_harness>" "$<TARGET_FILE:cpu_parity>" "$<TARGET_FILE:cpu_parity_lifted>"
+        ${parity_controls} "${parity_o2}")
     # FTZ and DAZ in the profile's denormals opt-in: the lifted DLL, the sim variant that must keep every rule,
     # the noftz, nodaz and nomask controls that must break one, and an /O2 build of the translation.
     cpu_asm_fixture(cpu_mxcsr_denormals mxcsr_denormals)
