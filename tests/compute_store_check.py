@@ -778,6 +778,10 @@ ALU_CASES = [
     ("read_compute", READ_COMPUTE, 32, READ_BINDING),
     ("read_mad24", READ_MAD24, 32, READ_BINDING),
     ("read_mul_lo", READ_MUL_LO, 32, READ_BINDING),
+]
+# Assembled and translated in the binary mode only: the draw modes route every read_ case through the indexed-copy
+# reference, which does not describe this arithmetic, so a runtime case would need its own reference first.
+TEXT_ONLY_CASES = [
     ("read_vop2", READ_VOP2, 32, READ_BINDING),
 ]
 
@@ -2551,7 +2555,7 @@ def binary(directory, assembler, objcopy, library):
     lds_controls()
     ds_binary(directory, assembler, objcopy, library)
     two_exits(directory, assembler, objcopy, library)
-    for name, lines, width, binding in CASES + GUARD_CASES + READ_CASES + ALU_CASES:
+    for name, lines, width, binding in CASES + GUARD_CASES + READ_CASES + ALU_CASES + TEXT_ONLY_CASES:
         src, obj, raw = [directory / x for x in ("test.s", "test.o", "test.bin")]
         src.write_text("\n".join(lines) + "\n", encoding="ascii")
         subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-filetype=obj", src, "-o", obj], check=True)
