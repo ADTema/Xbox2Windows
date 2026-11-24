@@ -1881,7 +1881,12 @@ def check_differential(
 
         # A host without XSAVEC must not be handed native xsavec fixtures.
         gated = native_exports_for_host(native, False, False)
-        unsupported = set(XSAVEC_EXPORTS) | set(XSAVEOPT_EXPORTS) | set(COMPACTED_EXPORTS)
+        unsupported = (
+            set(XSAVEC_EXPORTS)
+            | set(XSAVEOPT_EXPORTS)
+            | set(COMPACTED_EXPORTS)
+            | {"op_xrstor64_avx_xsaveopt64_avx", SSE_COMPACTED_CONTROL_EXPORT}
+        )
         assert not unsupported & set(gated) and set(native) - unsupported == set(gated)
         check_fault_controls(harness, gated, lifted, canonical, mxcsr_mask)
 
