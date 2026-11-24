@@ -2449,7 +2449,22 @@ primitive index order and guard bytes.
 ```text
 python3 -B tests/mesh_entry_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ctest --preset dev --no-tests=error -R "^mesh_entry_draw_" -V
+ctest --preset dev --no-tests=error -R "^mesh_entry_float_draw_" -V
 ```
+
+The per-lane binary32 forms of the translator now also include `v_add_f32_e64`,
+`v_sub_f32`, `v_subrev_f32` and `v_mul_f32` (`_e32` and `_e64`; `v_subrev` is
+source 1 minus source 0). They lower to plain `precise float` expressions, so
+an IEEE multiply, unlike `v_mul_legacy_f32`, does not turn zero times infinity
+into zero. Source modifiers, `clamp` and output modifiers are refused. One
+program chains all seven encodings on binary32 values that are exact; the binary
+mode evaluates the emitted expressions in binary32 and compares the depth with
+an independent hand calculation (0.28125), and each sibling opcode (sub for
+subrev, add for mul and so on) must give a different depth. The draw
+`mesh_entry_float_draw_*` (`draw-float`) compares the exported depth word
+with that reference, and a depth one unit in the last place off, or any sibling
+opcode, must report `Mesh export trace mismatch`. The draw is written for
+Windows and has not been run on Linux; denormal handling is not exercised.
 
 A local scan based on main `933cbad` selected the shortest validated native
 stream among 9,282 MS records (832 bytes, 153 instructions). For the tested
