@@ -30,6 +30,7 @@
 #include <d3d12.h>
 #include "null_binding_cause.h"
 #include "null_texture_view.h"
+#include "state_block_blend.h"
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
 #include <dxgi1_4.h>
