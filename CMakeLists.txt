@@ -2140,7 +2140,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_switch_bswap>" "$<TARGET_FILE:cpu_switch_bswap_lifted>")
     cpu_asm_fixture(cpu_switch_fsgsbase_rdpid switch_fsgsbase_rdpid)
     cpu_translation(cpu_switch_fsgsbase_rdpid cpu_switch_aot
-        "rdfsbase_32,rdfsbase_64,rdgsbase_32,rdgsbase_64,wrfsbase_32_roundtrip,wrfsbase_64_roundtrip,wrgsbase_32_roundtrip,wrgsbase_64_roundtrip,wrfsgsbase_nonvolatile,rdpid_64,rdpid_twice,flag_preserve_fsgsbase_rdpid,unused_host_reads"
+        "rdfsbase_32,rdfsbase_64,rdgsbase_32,rdgsbase_64,read_host_nonvolatile,rdpid_64,rdpid_twice,flag_preserve_fsgsbase_rdpid,unused_host_reads"
         HOST_CPU)
     add_test(NAME cpu_aot_switch_fsgsbase_rdpid COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/switch_fsgsbase_rdpid_check.py"

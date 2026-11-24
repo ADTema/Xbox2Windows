@@ -249,16 +249,12 @@ STRING_TRANSFERS = {
 # which only read them.
 FLAG_NEUTRAL = {M.CLZERO, M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, M.BSWAP, *SETCC, *CMOVCC, *SIGN_EXTENSIONS,
                 M.MOVSB, M.MOVSW, M.MOVSD, M.MOVSQ, M.STOSB, M.STOSW, M.STOSD, M.STOSQ, M.CLD, M.STD, M.LEAVE,
-                M.RDFSBASE, M.RDGSBASE, M.WRFSBASE, M.WRGSBASE, M.RDPID}
-HOST_CPU_FSGSBASE_CODES = {
-    Code.RDFSBASE_R32: ("_readfsbase_u32", False, 4),
-    Code.RDFSBASE_R64: ("_readfsbase_u64", False, 8),
-    Code.RDGSBASE_R32: ("_readgsbase_u32", False, 4),
-    Code.RDGSBASE_R64: ("_readgsbase_u64", False, 8),
-    Code.WRFSBASE_R32: ("_writefsbase_u32", True, 4),
-    Code.WRFSBASE_R64: ("_writefsbase_u64", True, 8),
-    Code.WRGSBASE_R32: ("_writegsbase_u32", True, 4),
-    Code.WRGSBASE_R64: ("_writegsbase_u64", True, 8),
+                M.RDFSBASE, M.RDGSBASE, M.RDPID}
+HOST_CPU_READ_BASE_CODES = {
+    Code.RDFSBASE_R32: ("_readfsbase_u32", 4),
+    Code.RDFSBASE_R64: ("_readfsbase_u64", 8),
+    Code.RDGSBASE_R32: ("_readgsbase_u32", 4),
+    Code.RDGSBASE_R64: ("_readgsbase_u64", 8),
 }
 FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC, M.NEG, *SHIFTS, *BIT_TESTS, *BIT_COUNTS, *BIT_SCANS}
 MAX_FLAG_DISTANCE = 16
@@ -1118,7 +1114,7 @@ class Lifter:
             # even when a following iteration or caller overwrites the same line.
             return (f"{{ auto* line = reinterpret_cast<volatile unsigned char*>({address} & ~63ull); "
                     "for (unsigned i = 0; i < 64; ++i) line[i] = 0; }", {R.RAX: 8}, {})
-        if mnemonic in (M.RDFSBASE, M.RDGSBASE, M.WRFSBASE, M.WRGSBASE, M.RDPID):
+        if mnemonic in (M.RDFSBASE, M.RDGSBASE, M.RDPID):
             if not self.host_cpu:
                 raise ValueError(f"{str(ins).split()[0].upper()} requires host_cpu=True (--host-cpu) at RVA {ins.ip:#x}")
             if (ins.has_lock_prefix or ins.has_rep_prefix or ins.has_repne_prefix
@@ -1134,15 +1130,9 @@ class Lifter:
                     raise ValueError(f"unsupported RDPID encoding at RVA {ins.ip:#x}: {ins}")
                 line = f"{{ const volatile std::uint32_t pid = _rdpid_u32(); {self.write(ins, 8, 'pid')} }}"
                 return line, {}, {full(dest_reg): 8}
-            if ins.code not in HOST_CPU_FSGSBASE_CODES:
+            if ins.code not in HOST_CPU_READ_BASE_CODES:
                 raise ValueError(f"unsupported FSGSBASE encoding at RVA {ins.ip:#x}: {ins}")
-            intrinsic, is_write, op_width = HOST_CPU_FSGSBASE_CODES[ins.code]
-            if is_write:
-                val = self.reg(dest_reg)
-                line = (f"{{ std::atomic_signal_fence(std::memory_order_seq_cst); "
-                        f"{intrinsic}({val}); "
-                        f"std::atomic_signal_fence(std::memory_order_seq_cst); }}")
-                return line, {full(dest_reg): op_width}, {}
+            intrinsic, op_width = HOST_CPU_READ_BASE_CODES[ins.code]
             u = unsigned(op_width)
             line = f"{{ const volatile {u} base = {intrinsic}(); {self.write(ins, op_width, 'base')} }}"
             return line, {}, {full(dest_reg): op_width}
@@ -2099,8 +2089,7 @@ def lift_function(program, entry, symbol, arguments, internal):
     return "\n".join(source), function
 
 
-PRELUDE = """#include <atomic>
-#include <cstdint>
+PRELUDE = """#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <immintrin.h>
@@ -2422,7 +2411,7 @@ if __name__ == "__main__":
                                         "fourth integer argument in R9, and the host must pass four")
     parser.add_argument("output", type=Path)
     parser.add_argument("--host-cpu", action="store_true",
-                        help="opt into host-CPU instructions (rdfsbase, rdgsbase, wrfsbase, wrgsbase, rdpid)")
+                        help="opt into read-only host-CPU instructions (rdfsbase, rdgsbase, rdpid)")
     parser.add_argument("--image-data", action="store_true",
                         help="translate RIP-relative data against a live mapping of the image that the host "
                              "binds at run time with lifted_bind_image; the generated source states the contract")

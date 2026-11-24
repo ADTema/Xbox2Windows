@@ -1,7 +1,7 @@
 ; coverage: record cpu_aot_switch_fsgsbase_rdpid
-; Source-built MASM fixture for RDFSBASE, RDGSBASE, WRFSBASE, WRGSBASE, and RDPID
-; in tools/cpu_switch_aot.py (--host-cpu opt-in), plus native CPUID/RDTSCP helpers
-; and negative controls.
+; Source-built MASM fixture for read-only RDFSBASE, RDGSBASE, and RDPID in
+; tools/cpu_switch_aot.py (--host-cpu opt-in), plus native CPUID/RDTSCP/FS_BASE
+; helpers and negative controls (including host segment-base write rejections).
 ; Every translated export uses the Windows x64 ABI: RCX, RDX, R8 -> RAX.
 .code
 
@@ -33,66 +33,28 @@ rdgsbase_64 PROC FRAME
     ret
 rdgsbase_64 ENDP
 
-wrfsbase_32_roundtrip PROC FRAME
-    .endprolog
-    rdfsbase r9
-    wrfsbase ecx
-    mov rax, -1
-    rdfsbase rax
-    wrfsbase r9
-    ret
-wrfsbase_32_roundtrip ENDP
-
-wrfsbase_64_roundtrip PROC FRAME
-    .endprolog
-    rdfsbase r9
-    wrfsbase rcx
-    rdfsbase rax
-    wrfsbase r9
-    ret
-wrfsbase_64_roundtrip ENDP
-
-wrgsbase_32_roundtrip PROC FRAME
-    .endprolog
-    rdgsbase r9
-    wrgsbase ecx
-    mov rax, -1
-    rdgsbase rax
-    wrgsbase r9
-    ret
-wrgsbase_32_roundtrip ENDP
-
-wrgsbase_64_roundtrip PROC FRAME
-    .endprolog
-    rdgsbase r9
-    wrgsbase rcx
-    rdgsbase rax
-    wrgsbase r9
-    ret
-wrgsbase_64_roundtrip ENDP
-
-wrfsgsbase_nonvolatile PROC FRAME
+read_host_nonvolatile PROC FRAME
     push rbx
     .pushreg rbx
     push r12
     .pushreg r12
+    push r13
+    .pushreg r13
     .endprolog
     rdfsbase rbx
     rdgsbase r12
-    wrfsbase rcx
-    rdfsbase r10
-    wrfsbase rbx
-    wrgsbase rdx
-    rdgsbase r11
-    wrgsbase r12
-    mov QWORD PTR [r8], r10
-    mov QWORD PTR [r8+8], r11
-    mov rax, r10
-    xor rax, r11
+    rdpid r13
+    mov QWORD PTR [r8], rbx
+    mov QWORD PTR [r8+8], r12
+    mov QWORD PTR [r8+16], r13
+    mov rax, rbx
+    xor rax, r12
+    xor rax, r13
+    pop r13
     pop r12
     pop rbx
     ret
-wrfsgsbase_nonvolatile ENDP
+read_host_nonvolatile ENDP
 
 rdpid_64 PROC FRAME
     .endprolog
@@ -113,19 +75,18 @@ rdpid_twice ENDP
 
 flag_preserve_fsgsbase_rdpid PROC FRAME
     .endprolog
+    add rcx, rdx
     rdfsbase r9
     rdgsbase r10
-    add rcx, rdx
-    rdfsbase rax
-    rdgsbase r11
-    wrfsbase r9
-    wrgsbase r10
     rdpid r11
     setb BYTE PTR [r8]
     sete BYTE PTR [r8+1]
     sets BYTE PTR [r8+2]
     seto BYTE PTR [r8+3]
     setp BYTE PTR [r8+4]
+    mov QWORD PTR [r8+8], r9
+    mov QWORD PTR [r8+16], r10
+    mov QWORD PTR [r8+24], r11
     mov rax, rcx
     ret
 flag_preserve_fsgsbase_rdpid ENDP
@@ -139,7 +100,7 @@ unused_host_reads PROC FRAME
     ret
 unused_host_reads ENDP
 
-; --- Native-only host CPUID / RDTSCP helpers (never translated) ---
+; --- Native-only host helpers (never translated) ---
 
 native_host_features PROC FRAME
     push rbx
@@ -173,21 +134,56 @@ native_rdtscp_aux PROC FRAME
     ret
 native_rdtscp_aux ENDP
 
+; Temporarily sets FS_BASE to RCX around calling RDX(0, 0, 0) and restores FS_BASE.
+; Windows x64 uses GS_BASE for the TEB; FS_BASE is unused by the CRT/OS.
+native_with_fsbase PROC FRAME
+    push rbx
+    .pushreg rbx
+    sub rsp, 32
+    .allocstack 32
+    .endprolog
+    rdfsbase rbx
+    wrfsbase rcx
+    mov r10, rdx
+    xor ecx, ecx
+    xor edx, edx
+    xor r8d, r8d
+    call r10
+    wrfsbase rbx
+    add rsp, 32
+    pop rbx
+    ret
+native_with_fsbase ENDP
+
 ; --- Negative controls (refused by translator; never translated in build) ---
 
-neg_undef_wrfsbase PROC FRAME
+neg_wrfsbase_32 PROC FRAME
     .endprolog
-    wrfsbase r10
+    wrfsbase ecx
     xor eax, eax
     ret
-neg_undef_wrfsbase ENDP
+neg_wrfsbase_32 ENDP
 
-neg_undef_wrgsbase PROC FRAME
+neg_wrfsbase_64 PROC FRAME
     .endprolog
-    wrgsbase r11d
+    wrfsbase rcx
     xor eax, eax
     ret
-neg_undef_wrgsbase ENDP
+neg_wrfsbase_64 ENDP
+
+neg_wrgsbase_32 PROC FRAME
+    .endprolog
+    wrgsbase ecx
+    xor eax, eax
+    ret
+neg_wrgsbase_32 ENDP
+
+neg_wrgsbase_64 PROC FRAME
+    .endprolog
+    wrgsbase rcx
+    xor eax, eax
+    ret
+neg_wrgsbase_64 ENDP
 
 neg_rsp_rdfsbase PROC FRAME
     .endprolog
@@ -195,6 +191,13 @@ neg_rsp_rdfsbase PROC FRAME
     xor eax, eax
     ret
 neg_rsp_rdfsbase ENDP
+
+neg_rsp_rdgsbase PROC FRAME
+    .endprolog
+    rdgsbase rsp
+    xor eax, eax
+    ret
+neg_rsp_rdgsbase ENDP
 
 neg_rsp_rdpid PROC FRAME
     .endprolog

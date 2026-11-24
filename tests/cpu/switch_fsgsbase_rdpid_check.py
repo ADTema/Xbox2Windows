@@ -1,5 +1,6 @@
 """Differential checks, mutated-C++ controls, and unit/PE rejection controls
-for RDFSBASE, RDGSBASE, WRFSBASE, WRGSBASE, and RDPID in tools/cpu_switch_aot.py.
+for read-only RDFSBASE, RDGSBASE, and RDPID (and rejection of WRFSBASE/WRGSBASE)
+in tools/cpu_switch_aot.py.
 """
 
 import ctypes
@@ -26,11 +27,7 @@ TRANSLATED_EXPORTS = (
     "rdfsbase_64",
     "rdgsbase_32",
     "rdgsbase_64",
-    "wrfsbase_32_roundtrip",
-    "wrfsbase_64_roundtrip",
-    "wrgsbase_32_roundtrip",
-    "wrgsbase_64_roundtrip",
-    "wrfsgsbase_nonvolatile",
+    "read_host_nonvolatile",
     "rdpid_64",
     "rdpid_twice",
     "flag_preserve_fsgsbase_rdpid",
@@ -45,15 +42,6 @@ CANONICAL_64_VALUES = (
     0x00007FFFFFFFFFF0,
     0xFFFF800012345678,
     0xFFFFFFFF80000001,
-)
-
-WR32_VALUES = (
-    0x0000000000000000,
-    0x0000000012345678,
-    0x0000000080000001,
-    0x00007FFF80000001,
-    0xDEAD0000BEEF1234,
-    0xFFFFFFFFFFFFFFFF,
 )
 
 FLAG_PAIRS = (
@@ -90,12 +78,16 @@ def bind_lib(dll_path, prefix=""):
         fn.restype = U64
         funcs[name] = fn
     if not prefix:
-        for helper in ("native_host_features", "native_rdtscp_aux"):
+        for helper in ("native_host_features", "native_rdtscp_aux", "native_with_fsbase"):
             fn = getattr(lib, helper)
             fn.argtypes = [U64, U64, U64]
             fn.restype = U64
             funcs[helper] = fn
     return lib, funcs
+
+
+def fn_address(fn):
+    return ctypes.cast(fn, ctypes.c_void_p).value
 
 
 def logical_cpus():
@@ -136,6 +128,7 @@ def verify_exports(native_fns, target_fns, label, cpus):
     kernel32, full_mask, _ = logical_cpus()
     saved_affinity = None
     total_checks = 0
+    with_fsbase = native_fns["native_with_fsbase"]
     try:
         for cpu in cpus:
             prev = pin_to_cpu(kernel32, cpu)
@@ -164,42 +157,20 @@ def verify_exports(native_fns, target_fns, label, cpus):
                     )
                 total_checks += 4
 
-            # 2) Canonical FS/GS round-trips (preserving TEB GS_BASE & FS_BASE across every call)
+            # 2) Non-zero canonical FS_BASE values via native-only harness (restoring FS_BASE)
             for tag, fns in (("native", native_fns), (label, target_fns)):
-                for val in WR32_VALUES:
-                    got_fs = fns["wrfsbase_32_roundtrip"](val, 0, 0)
-                    got_gs = fns["wrgsbase_32_roundtrip"](val, 0, 0)
-                    want = val & MASK32
-                    if got_fs != want or got_gs != want:
-                        raise AssertionError(
-                            f"{tag} wr*base_32({val:#x}): got fs={got_fs:#x}, gs={got_gs:#x}, want={want:#x}"
-                        )
-                    if native_fns["rdfsbase_64"](0, 0, 0) != base_fs or native_fns["rdgsbase_64"](0, 0, 0) != base_gs:
-                        raise AssertionError(f"{tag} wr*base_32 failed to restore FS_BASE/TEB GS_BASE")
-                    total_checks += 2
-
+                fn64 = fn_address(fns["rdfsbase_64"])
+                fn32 = fn_address(fns["rdfsbase_32"])
                 for val in CANONICAL_64_VALUES:
-                    got_fs = fns["wrfsbase_64_roundtrip"](val, 0, 0)
-                    got_gs = fns["wrgsbase_64_roundtrip"](val, 0, 0)
-                    if got_fs != val or got_gs != val:
+                    got64 = with_fsbase(val, fn64, 0)
+                    got32 = with_fsbase(val, fn32, 0)
+                    if got64 != val or got32 != (val & MASK32):
                         raise AssertionError(
-                            f"{tag} wr*base_64({val:#x}): got fs={got_fs:#x}, gs={got_gs:#x}"
+                            f"{tag} rdfsbase with fs_base={val:#x}: got64={got64:#x}, got32={got32:#x}"
                         )
-                    if native_fns["rdfsbase_64"](0, 0, 0) != base_fs or native_fns["rdgsbase_64"](0, 0, 0) != base_gs:
-                        raise AssertionError(f"{tag} wr*base_64 failed to restore FS_BASE/TEB GS_BASE")
+                    if native_fns["rdfsbase_64"](0, 0, 0) != base_fs:
+                        raise AssertionError(f"{tag} native_with_fsbase failed to restore FS_BASE")
                     total_checks += 2
-
-                out_nv = (U64 * 2)()
-                for fs_v, gs_v in zip(CANONICAL_64_VALUES, reversed(CANONICAL_64_VALUES)):
-                    got_xor = fns["wrfsgsbase_nonvolatile"](fs_v, gs_v, ctypes.addressof(out_nv))
-                    if got_xor != (fs_v ^ gs_v) or out_nv[0] != fs_v or out_nv[1] != gs_v:
-                        raise AssertionError(
-                            f"{tag} wrfsgsbase_nonvolatile({fs_v:#x}, {gs_v:#x}): "
-                            f"got ({got_xor:#x}, {out_nv[0]:#x}, {out_nv[1]:#x})"
-                        )
-                    if native_fns["rdfsbase_64"](0, 0, 0) != base_fs or native_fns["rdgsbase_64"](0, 0, 0) != base_gs:
-                        raise AssertionError(f"{tag} wrfsgsbase_nonvolatile failed to restore FS_BASE/TEB GS_BASE")
-                    total_checks += 1
 
             # 3) RDPID cross-checked against pinned RDTSCP IA32_TSC_AUX
             aux = native_fns["native_rdtscp_aux"](0, 0, 0)
@@ -214,21 +185,36 @@ def verify_exports(native_fns, target_fns, label, cpus):
                     )
                 total_checks += 2
 
-            # 4) FLAG_NEUTRAL flag preservation across all five instructions
-            flag_buf = ctypes.create_string_buffer(8)
+            # 4) Nonvolatile register reads (rbx, r12, r13)
+            out_nv = (U64 * 3)()
+            for tag, fns in (("native", native_fns), (label, target_fns)):
+                got_xor = fns["read_host_nonvolatile"](0, 0, ctypes.addressof(out_nv))
+                if (out_nv[0] != base_fs or out_nv[1] != base_gs or out_nv[2] != aux
+                        or got_xor != (base_fs ^ base_gs ^ aux)):
+                    raise AssertionError(
+                        f"{tag} read_host_nonvolatile mismatch on cpu {cpu}: "
+                        f"got ({got_xor:#x}, {out_nv[0]:#x}, {out_nv[1]:#x}, {out_nv[2]:#x})"
+                    )
+                total_checks += 1
+
+            # 5) FLAG_NEUTRAL flag preservation across RDFSBASE, RDGSBASE, RDPID
+            flag_buf = ctypes.create_string_buffer(32)
             for tag, fns in (("native", native_fns), (label, target_fns)):
                 for a, b in FLAG_PAIRS:
                     exp_sum, exp_flags = expected_add_flags(a, b)
                     got_sum = fns["flag_preserve_fsgsbase_rdpid"](a, b, ctypes.addressof(flag_buf))
                     got_flags = flag_buf.raw[:5]
-                    if got_sum != exp_sum or got_flags != exp_flags:
+                    got_fs, got_gs, got_pid = (U64 * 3).from_buffer_copy(flag_buf.raw[8:32])
+                    if (got_sum != exp_sum or got_flags != exp_flags
+                            or got_fs != base_fs or got_gs != base_gs or got_pid != aux):
                         raise AssertionError(
                             f"{tag} flag_preserve({a:#x}, {b:#x}): "
-                            f"sum={got_sum:#x}!={exp_sum:#x}, flags={got_flags.hex()}!={exp_flags.hex()}"
+                            f"sum={got_sum:#x}!={exp_sum:#x}, flags={got_flags.hex()}!={exp_flags.hex()}, "
+                            f"reads=({got_fs:#x}, {got_gs:#x}, {got_pid:#x})"
                         )
                     total_checks += 1
 
-            # 5) Unused host-CPU reads must still compile and return 42
+            # 6) Unused host-CPU reads must still compile and return 42
             for tag, fns in (("native", native_fns), (label, target_fns)):
                 got_unused = fns["unused_host_reads"](0, 0, 0)
                 if got_unused != 42:
@@ -258,7 +244,7 @@ def compile_cpp_dll(cxx_path, cpp_path, dll_path, opt_flag="/O2"):
 
 
 def build_mutated_sources(base_source):
-    """Create four C++ mutants that each break one required semantic invariant."""
+    """Create five C++ mutants that each break one required semantic invariant."""
     mutants = {}
 
     # 1) Keep high 32 bits instead of zero-extending on RDFSBASE/RDGSBASE 32-bit and RDPID.
@@ -276,33 +262,43 @@ def build_mutated_sources(base_source):
         raise AssertionError(f"keep_high32 mutant expected 2 base + >=3 pid replacements, got {n1a}, {n1b}")
     mutants["keep_high32"] = src_keep
 
-    # 2) Drop WRFSBASE/WRGSBASE writes (no-op).
-    src_drop, n2 = re.subn(
-        r"_write(fs|gs)base_u(32|64)\(([^;]+)\);",
-        r"static_cast<void>(\3);",
+    # 2) Truncate 64-bit RDFSBASE/RDGSBASE to 32 bits.
+    src_trunc, n2 = re.subn(
+        r"(const volatile std::uint64_t base = _read(?:fs|gs)base_u64\(\); \w+ = )static_cast<std::uint64_t>\(base\);",
+        r"\1static_cast<std::uint32_t>(base);",
         base_source,
     )
     if n2 < 4:
-        raise AssertionError(f"drop_wrfsgsbase mutant expected >= 4 replacements, got {n2}")
-    mutants["drop_wrfsgsbase"] = src_drop
+        raise AssertionError(f"truncate_64 mutant expected >= 4 replacements, got {n2}")
+    mutants["truncate_64"] = src_trunc
 
-    # 3) Constant RDPID instead of reading IA32_TSC_AUX.
-    src_pid, n3 = re.subn(r"_rdpid_u32\(\)", "0x13572468u", base_source)
-    if n3 < 2:
-        raise AssertionError(f"constant_rdpid mutant expected >= 2 replacements, got {n3}")
+    # 3) Swap FS and GS base reads.
+    src_swap, n3 = re.subn(
+        r"_read(fs|gs)base_u(32|64)\(\)",
+        lambda m: f"_read{'gs' if m.group(1) == 'fs' else 'fs'}base_u{m.group(2)}()",
+        base_source,
+    )
+    if n3 < 6:
+        raise AssertionError(f"swap_fs_gs mutant expected >= 6 replacements, got {n3}")
+    mutants["swap_fs_gs"] = src_swap
+
+    # 4) Constant RDPID instead of reading IA32_TSC_AUX.
+    src_pid, n4 = re.subn(r"_rdpid_u32\(\)", "0x13572468u", base_source)
+    if n4 < 2:
+        raise AssertionError(f"constant_rdpid mutant expected >= 2 replacements, got {n4}")
     mutants["constant_rdpid"] = src_pid
 
-    # 4) Clobber arithmetic flags inside lifted_flag_preserve_fsgsbase_rdpid.
+    # 5) Clobber arithmetic flags inside lifted_flag_preserve_fsgsbase_rdpid.
     marker = "lifted_flag_preserve_fsgsbase_rdpid("
     head, rest = base_source.split(marker, 1)
     body, tail = rest.split("\n}", 1)
-    body_mut, n4 = re.subn(
+    body_mut, n5 = re.subn(
         r"(const volatile std::uint32_t pid = _rdpid_u32\(\);[^\n]+\n)",
         r"\1    fa = 0; fb = 1;\n",
         body,
         count=1,
     )
-    if n4 != 1:
+    if n5 != 1:
         raise AssertionError("clobber_flags mutant failed to anchor on _rdpid_u32 in flag_preserve")
     mutants["clobber_flags"] = head + marker + body_mut + "\n}" + tail
 
@@ -318,8 +314,8 @@ def encode_seq(*instructions):
 
 
 def check_rejections(native_path):
-    # 1) Default profile (host_cpu omitted) must refuse all five instructions.
-    for name in ("rdfsbase_64", "rdgsbase_64", "wrfsbase_64_roundtrip", "wrgsbase_64_roundtrip", "rdpid_64"):
+    # 1) Default profile (host_cpu omitted) must refuse read-only/PID instructions and writes.
+    for name in ("rdfsbase_64", "rdgsbase_64", "rdpid_64"):
         try:
             translate(native_path, [name])
         except ValueError as exc:
@@ -328,33 +324,41 @@ def check_rejections(native_path):
         else:
             raise AssertionError(f"default profile unexpectedly accepted {name}")
 
-    # 2) MASM negative exports (undefined source on WRFSBASE/WRGSBASE, RSP operand).
+    # 2) MASM negative exports (WRFSBASE/WRGSBASE writes and RSP operands must be refused even with host_cpu=True).
     masm_refusals = (
-        ("neg_undef_wrfsbase", "undefined register r10"),
-        ("neg_undef_wrgsbase", "undefined register r11"),
+        ("neg_wrfsbase_32", "unsupported instruction"),
+        ("neg_wrfsbase_64", "unsupported instruction"),
+        ("neg_wrgsbase_32", "unsupported instruction"),
+        ("neg_wrgsbase_64", "unsupported instruction"),
         ("neg_rsp_rdfsbase", "rsp"),
+        ("neg_rsp_rdgsbase", "rsp"),
         ("neg_rsp_rdpid", "rsp"),
     )
     for name, expected_reason in masm_refusals:
-        try:
-            translate(native_path, [name], host_cpu=True)
-        except ValueError as exc:
-            if expected_reason not in str(exc).lower():
-                raise AssertionError(f"{name}: expected {expected_reason!r}, got {exc!r}") from exc
-        else:
-            raise AssertionError(f"{name}: translator unexpectedly accepted negative export")
+        for opt_in in (False, True):
+            if "rsp" in name and not opt_in:
+                continue
+            try:
+                translate(native_path, [name], host_cpu=opt_in)
+            except ValueError as exc:
+                if expected_reason not in str(exc).lower():
+                    raise AssertionError(f"{name} (host_cpu={opt_in}): expected {expected_reason!r}, got {exc!r}") from exc
+            else:
+                raise AssertionError(f"{name} (host_cpu={opt_in}): translator unexpectedly accepted negative export")
 
-    # 3) Unit Lifter.lower rejections: host_cpu omitted, RSP/ESP, prefixes, RDPID_R32.
+    # 3) Unit Lifter.lower rejections: host_cpu omitted, WRFSBASE/WRGSBASE, RSP/ESP, prefixes, RDPID_R32.
     unit_insns = [
         ("lower_default_rdfsbase", Instruction.create_reg(Code.RDFSBASE_R64, R.RAX), False, "requires host_cpu=True"),
         ("lower_default_rdgsbase", Instruction.create_reg(Code.RDGSBASE_R32, R.EAX), False, "requires host_cpu=True"),
-        ("lower_default_wrfsbase", Instruction.create_reg(Code.WRFSBASE_R64, R.RCX), False, "requires host_cpu=True"),
-        ("lower_default_wrgsbase", Instruction.create_reg(Code.WRGSBASE_R32, R.ECX), False, "requires host_cpu=True"),
         ("lower_default_rdpid", Instruction.create_reg(Code.RDPID_R64, R.RAX), False, "requires host_cpu=True"),
+        ("lower_default_wrfsbase_64", Instruction.create_reg(Code.WRFSBASE_R64, R.RCX), False, "unsupported instruction"),
+        ("lower_default_wrgsbase_32", Instruction.create_reg(Code.WRGSBASE_R32, R.ECX), False, "unsupported instruction"),
+        ("lower_host_wrfsbase_32", Instruction.create_reg(Code.WRFSBASE_R32, R.ECX), True, "unsupported instruction"),
+        ("lower_host_wrfsbase_64", Instruction.create_reg(Code.WRFSBASE_R64, R.RCX), True, "unsupported instruction"),
+        ("lower_host_wrgsbase_32", Instruction.create_reg(Code.WRGSBASE_R32, R.ECX), True, "unsupported instruction"),
+        ("lower_host_wrgsbase_64", Instruction.create_reg(Code.WRGSBASE_R64, R.RCX), True, "unsupported instruction"),
         ("lower_rsp_rdfsbase", Instruction.create_reg(Code.RDFSBASE_R64, R.RSP), True, "unsupported use of rsp"),
         ("lower_esp_rdgsbase", Instruction.create_reg(Code.RDGSBASE_R32, R.ESP), True, "unsupported use of rsp"),
-        ("lower_rsp_wrfsbase", Instruction.create_reg(Code.WRFSBASE_R64, R.RSP), True, "unsupported use of rsp"),
-        ("lower_esp_wrgsbase", Instruction.create_reg(Code.WRGSBASE_R32, R.ESP), True, "unsupported use of rsp"),
         ("lower_rsp_rdpid", Instruction.create_reg(Code.RDPID_R64, R.RSP), True, "unsupported use of rsp"),
         ("lower_rdpid_r32", Instruction.create_reg(Code.RDPID_R32, R.EAX), True, "unsupported RDPID encoding"),
     ]
@@ -367,19 +371,19 @@ def check_rejections(native_path):
         else:
             raise AssertionError(f"{label}: Lifter.lower unexpectedly accepted {ins}")
 
-    # Segment / REP / LOCK prefixes on FSGSBASE and RDPID.
+    # Segment / REP / LOCK prefixes on RDFSBASE, RDGSBASE, and RDPID.
     gs_rdfsbase = Instruction.create_reg(Code.RDFSBASE_R32, R.EAX)
     gs_rdfsbase.segment_prefix = R.GS
     gs_rdpid = Instruction.create_reg(Code.RDPID_R64, R.RAX)
     gs_rdpid.segment_prefix = R.GS
-    rep_wrfsbase = Instruction.create_reg(Code.WRFSBASE_R64, R.RCX)
-    rep_wrfsbase.has_rep_prefix = True
+    rep_rdfsbase = Instruction.create_reg(Code.RDFSBASE_R64, R.RAX)
+    rep_rdfsbase.has_rep_prefix = True
     repne_rdgsbase = Instruction.create_reg(Code.RDGSBASE_R64, R.RAX)
     repne_rdgsbase.has_repne_prefix = True
     for label, ins in (
         ("seg_rdfsbase", gs_rdfsbase),
         ("seg_rdpid", gs_rdpid),
-        ("rep_wrfsbase", rep_wrfsbase),
+        ("rep_rdfsbase", rep_rdfsbase),
         ("repne_rdgsbase", repne_rdgsbase),
     ):
         try:
@@ -390,10 +394,10 @@ def check_rejections(native_path):
         else:
             raise AssertionError(f"{label}: Lifter.lower unexpectedly accepted prefixed {ins}")
 
-    # 4) End-to-end PE-patched DLL rejections (patching wrfsgsbase_nonvolatile).
+    # 4) End-to-end PE-patched DLL rejections (patching read_host_nonvolatile).
     pe_bytes = Path(native_path).read_bytes()
     with pefile.PE(data=pe_bytes, fast_load=True) as pe:
-        entry = export_rva(pe, "wrfsgsbase_nonvolatile")
+        entry = export_rva(pe, "read_host_nonvolatile")
         file_off = pe.get_offset_from_rva(entry)
         pdata = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]
         records = pe.get_data(pdata.VirtualAddress, pdata.Size)
@@ -410,7 +414,10 @@ def check_rejections(native_path):
         ("pe_lock_rdfsbase", bytes.fromhex("f0f30faec0") + ret_bytes, "invalid"),
         ("pe_rsp_rdfsbase", bytes.fromhex("f3480faec4") + ret_bytes, "frame"),
         ("pe_rsp_rdpid", bytes.fromhex("f30fc7fc") + ret_bytes, "frame"),
-        ("pe_undef_wrfsbase", bytes.fromhex("f3490faed2") + ret_bytes, "undefined register"),
+        ("pe_wrfsbase_32", bytes.fromhex("f30faed1") + ret_bytes, "unsupported instruction"),
+        ("pe_wrfsbase_64", bytes.fromhex("f3480faed1") + ret_bytes, "unsupported instruction"),
+        ("pe_wrgsbase_32", bytes.fromhex("f30faed9") + ret_bytes, "unsupported instruction"),
+        ("pe_wrgsbase_64", bytes.fromhex("f3480faed9") + ret_bytes, "unsupported instruction"),
     ]
     with TemporaryDirectory() as folder:
         patched_path = Path(folder) / "patched.dll"
@@ -422,14 +429,14 @@ def check_rejections(native_path):
             damaged[pdata_end_off:pdata_end_off + 4] = (entry + len(patch)).to_bytes(4, "little")
             patched_path.write_bytes(damaged)
             try:
-                translate(patched_path, ["wrfsgsbase_nonvolatile"], host_cpu=True)
+                translate(patched_path, ["read_host_nonvolatile"], host_cpu=True)
             except ValueError as exc:
                 if reason not in str(exc).lower():
                     raise AssertionError(f"{label}: expected {reason!r}, got {exc!r}") from exc
             else:
                 raise AssertionError(f"{label}: PE translate unexpectedly accepted patched bytes")
 
-    print(f"20 unit rejections (5 default-profile, 4 MASM negative, 11 Lifter.lower/prefix) "
+    print(f"unit rejections (3 default-profile, 7 MASM negative, 17 Lifter.lower/prefix) "
           f"and {len(pe_patches)} PE-patched rejections passed")
 
 
@@ -476,7 +483,7 @@ def main():
 
     checked_cmake = verify_exports(native_fns, lifted_fns, "lifted_cmake", cpus)
 
-    # Also build /O2 and the 4 mutated C++ negative control DLLs directly from cpu_switch_aot.
+    # Also build /O2 and the 5 mutated C++ negative control DLLs directly from cpu_switch_aot.
     source_text, _ = translate(native_path, list(TRANSLATED_EXPORTS), host_cpu=True)
     mutants = build_mutated_sources(source_text)
     with TemporaryDirectory() as folder:
@@ -512,7 +519,7 @@ def main():
     check_rejections(native_path)
     record_covered_forms(native_path)
     print(f"verified {checked_cmake} CMake-lifted + {checked_o2} /O2-lifted checks across "
-          f"{len(cpus)} pinned CPU(s), 4 mutated-C++ controls, and all rejections")
+          f"{len(cpus)} pinned CPU(s), 5 mutated-C++ controls, and all rejections")
 
 
 if __name__ == "__main__":
