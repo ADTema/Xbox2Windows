@@ -1,4 +1,7 @@
-"""Offline synthetic PE32+/DXBC/RTS0 unit and refusal suite for tools/probe_root_devices.py."""
+"""Offline synthetic PE32+/DXBC/RTS0 unit and refusal suite for tools/probe_root_devices.py.
+
+Windows-only: probe_root_devices.main() queries sys.getwindowsversion().
+"""
 
 from contextlib import redirect_stderr, redirect_stdout
 import hashlib
@@ -24,13 +27,14 @@ RAW_OFFSET = 0x200
 RAW_SIZE = 0x1000
 
 
-def make_dxbc_container(rts0_payload: bytes, *, dxil_tag_seed: bytes = b"\x00\x00\x00\x00") -> bytes:
-    """Build a minimal synthetic DXBC container carrying DXIL and RTS0 parts."""
+def make_dxbc_container(rts0_payload: bytes | None, *, dxil_tag_seed: bytes = b"\x00\x00\x00\x00") -> bytes:
+    """Build a minimal synthetic DXBC container carrying DXIL and optional RTS0 parts."""
     program = struct.pack("<II4sIII", 0, 8, b"DXIL", 0, 16, 4) + b"BC\xc0\xde" + dxil_tag_seed
     parts_list = [
         b"DXIL" + struct.pack("<I", len(program)) + program,
-        b"RTS0" + struct.pack("<I", len(rts0_payload)) + rts0_payload,
     ]
+    if rts0_payload is not None:
+        parts_list.append(b"RTS0" + struct.pack("<I", len(rts0_payload)) + rts0_payload)
     table_end = 32 + 4 * len(parts_list)
     offsets = []
     cursor = table_end
@@ -452,6 +456,70 @@ class ProbeRootDevicesNegativeTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 1, proc.stderr)
             self.assertNotIn("Traceback", proc.stderr)
             self.assertTrue(proc.stderr.strip())
+
+    def test_container_missing_rts0_exits_1_cleanly(self):
+        names = probe_root_devices.NAMES
+        pe_bytes, layout = build_pe32_plus([make_dxbc_container(None)])
+        inventory = {
+            names[0]: {
+                "sha256": hashlib.sha256(pe_bytes).hexdigest(),
+                "containers": [{"rva": hex(layout[0][0]), "bytes": layout[0][1]}],
+            },
+            names[1]: {"sha256": "0" * 64, "containers": []},
+            names[2]: {"sha256": "0" * 64, "containers": []},
+        }
+
+        def fake_ok(cmd, *, input, stdout, check, timeout):
+            return subprocess.CompletedProcess(
+                cmd, 0, (json.dumps(_ok_row(warp_only=True)) + "\n").encode("utf-8")
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            calls_dir = repo / "out" / "calls"
+            calls_dir.mkdir(parents=True)
+            (calls_dir / "six-apis.json").write_text(json.dumps(inventory), encoding="utf-8")
+            build_dir = base / "build"
+            build_dir.mkdir()
+            (build_dir / names[0]).write_bytes(pe_bytes)
+            bin_dir = base / "bin"
+            _setup_controls(bin_dir)
+
+            code, err = self._run_main(
+                [str(build_dir), "--warp-only", "--bin", str(bin_dir)], repo, fake_run=fake_ok
+            )
+            self.assertEqual(code, 1)
+            self.assertNotIn("Traceback", err)
+            self.assertIn("missing RTS0", err)
+            self.assertFalse((calls_dir / "root-devices-warp.json").exists())
+
+    def test_malformed_inventory_entry_exits_1_cleanly(self):
+        names = probe_root_devices.NAMES
+        inventory = {names[0]: {"containers": "bad"}}
+
+        def fake_ok(cmd, *, input, stdout, check, timeout):
+            return subprocess.CompletedProcess(
+                cmd, 0, (json.dumps(_ok_row(warp_only=True)) + "\n").encode("utf-8")
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            calls_dir = repo / "out" / "calls"
+            calls_dir.mkdir(parents=True)
+            (calls_dir / "six-apis.json").write_text(json.dumps(inventory), encoding="utf-8")
+            build_dir = base / "build"
+            build_dir.mkdir()
+            bin_dir = base / "bin"
+            _setup_controls(bin_dir)
+
+            code, err = self._run_main(
+                [str(build_dir), "--warp-only", "--bin", str(bin_dir)], repo, fake_run=fake_ok
+            )
+            self.assertEqual(code, 1)
+            self.assertNotIn("Traceback", err)
+            self.assertIn("Invalid six-apis.json entry", err)
 
     def test_refuses_report_destination_inside_build_dir(self):
         def fake_ok(cmd, *, input, stdout, check, timeout):

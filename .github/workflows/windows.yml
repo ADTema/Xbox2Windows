@@ -75,6 +75,7 @@ jobs:
               (["tests/startup_gfx2hlsl_scalar_m0_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_cvt_alu_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_sample_l_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_image_gather_lz_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_image_sample_c_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_3d_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_load_mip_check.py", "--llvm-mc", "llvm-mc-15"], {}),
@@ -85,6 +86,8 @@ jobs:
               (["tests/startup_gfx2hlsl_shift64_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_vopc_sdwa_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_vopc_sdwa_check.py", "decode", "libLLVM-15.so.1"], {}),
+              (["tests/startup_gfx2hlsl_sop2_complement_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_gfx2hlsl_sop2_complement_check.py", "decode", "libLLVM-15.so.1"], {}),
               (["tests/startup_inline_sampler_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_smem_address_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/compute_entry_layout_check.py", "binary", "llvm-mc-15"], {}),
@@ -180,6 +183,7 @@ jobs:
             tests/rectlist_topology_check.py \
             tests/startup_sampler_heap_check.py \
             tests/startup_image_sample_l_check.py \
+            tests/startup_image_gather_lz_check.py \
             tests/startup_image_sample_c_check.py \
             tests/startup_image_3d_check.py \
             tests/startup_image_load_mip_check.py \
@@ -198,6 +202,7 @@ jobs:
             tests/startup_gfx2hlsl_mad_check.py \
             tests/startup_gfx2hlsl_shift64_check.py \
             tests/startup_gfx2hlsl_vopc_sdwa_check.py \
+            tests/startup_gfx2hlsl_sop2_complement_check.py \
             tests/startup_inline_sampler_check.py \
             tests/startup_buffer_address_check.py \
             tests/startup_smem_address_check.py \

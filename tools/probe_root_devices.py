@@ -49,24 +49,30 @@ def main(argv=None):
         if not isinstance(inventory, dict):
             raise ValueError("Invalid six-apis.json inventory")
         for name in NAMES:
-            entry = inventory[name]
-            if not entry["containers"]:
-                continue
+            try:
+                entry = inventory[name]
+                containers = entry["containers"]
+                if not containers:
+                    continue
+                expected_sha256 = entry["sha256"]
+                container_specs = [(int(item["rva"], 16), item["bytes"], item["rva"]) for item in containers]
+            except (KeyError, TypeError) as exc:
+                raise ValueError(f"Invalid six-apis.json entry for {name}: {exc}") from exc
             image = (args.build / name).read_bytes()
-            if hashlib.sha256(image).hexdigest() != entry["sha256"]:
+            if hashlib.sha256(image).hexdigest() != expected_sha256:
                 raise ValueError(f"Regenerate six-apis.json for {name}")
             layouts = {}
             with pefile.PE(data=image, fast_load=True) as pe:
-                for item in entry["containers"]:
-                    blob = pe.get_data(int(item["rva"], 16), item["bytes"])
+                for rva, size, rva_text in container_specs:
+                    blob = pe.get_data(rva, size)
                     container_parts = parts(blob)
                     if b"RTS0" not in container_parts:
-                        raise ValueError(f"Container at {item['rva']} in {name} is missing RTS0")
+                        raise ValueError(f"Container at {rva_text} in {name} is missing RTS0")
                     key = hashlib.sha256(container_parts[b"RTS0"]).hexdigest()
                     if key not in layouts:
                         layouts[key] = {"rvas": [], "outcomes": measure(command, blob)}
-                    layouts[key]["rvas"].append(item["rva"])
-            result["images"][name] = {"sha256": entry["sha256"], "layouts": layouts}
+                    layouts[key]["rvas"].append(rva_text)
+            result["images"][name] = {"sha256": expected_sha256, "layouts": layouts}
             print(f"{name}: {len(layouts)} distinct layouts")
         dest.parent.mkdir(parents=True, exist_ok=True)
         temporary = None
@@ -81,7 +87,7 @@ def main(argv=None):
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
         print(dest)
-    except (OSError, ValueError, KeyError, TypeError, struct.error, pefile.PEFormatError,
+    except (OSError, ValueError, struct.error, pefile.PEFormatError,
             subprocess.SubprocessError) as exc:
         parser.exit(1, f"probe_root_devices: {exc}\n")
     return 0

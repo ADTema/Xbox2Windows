@@ -178,6 +178,12 @@ def stream_fetch(vs_container, layout_text):
     return fetch
 
 
+# Binary32 words for inline source encodings 240 through 248, in encoding order.
+CNDMASK_INLINE_FLOAT_BITS = (0x3f000000, 0xbf000000, 0x3f800000, 0xbf800000,
+                            0x40000000, 0xc0000000, 0x40800000, 0xc0800000,
+                            0x3e22f983)  # 1/(2*pi)
+
+
 def decode(code):
     out, off = [], 0
     while off + 4 <= len(code):
@@ -194,14 +200,32 @@ def decode(code):
                 raise Unsupported('image_load_mip a16')
         if name == 'v_cndmask_b32_e64':
             # The printed -1 is ambiguous: it can be plain inline -1 or inline 1 with NEG.
-            # Preserve plain immediates and refuse NEG on immediate data operands by encoding.
-            word1, = struct.unpack_from('<I', code, off + 4)
+            word0, word1 = struct.unpack_from('<2I', code, off)
             for i in range(2):
+                source = (word1 >> (9 * i)) & 0x1ff
+                if not (128 <= source <= 208 or 240 <= source <= 248 or source == 255):
+                    continue
+                if word0 & (1 << (8 + i)):
+                    raise Unsupported('v_cndmask_b32_e64 ABS on an immediate')
                 if not word1 & (1 << (29 + i)):
                     continue
-                source = (word1 >> (9 * i)) & 0x1ff
-                if 128 <= source <= 208 or 240 <= source <= 248 or source == 255:
-                    raise Unsupported('v_cndmask_b32_e64 NEG on an immediate')
+                if source <= 192:
+                    bits = source - 128
+                elif source <= 208:
+                    bits = (192 - source) & 0xffffffff
+                elif source <= 248:
+                    bits = CNDMASK_INLINE_FLOAT_BITS[source - 240]
+                else:
+                    if n != 12 or off + n > len(code):
+                        raise Unsupported('v_cndmask_b32_e64 missing literal dword')
+                    bits, = struct.unpack_from('<I', code, off + 8)
+                # Preserve the other operand spellings and any modifiers on the final operand.
+                fields = asm.split(',', 3)
+                if len(fields) != 4:
+                    raise Unsupported('malformed v_cndmask_b32_e64 operands')
+                operand = fields[i + 1]
+                fields[i + 1] = operand[:len(operand) - len(operand.lstrip())] + '0x%08x' % (bits ^ 0x80000000)
+                asm = ','.join(fields)
         out.append((off, n, name, asm))
         off += n
     last = max((i for i, x in enumerate(out) if x[2] == 's_endpgm'), default=len(out) - 1)
@@ -418,7 +442,9 @@ class Stage:
             elif m == 'div:2':
                 scale *= 0.5
             elif m.startswith('op_sel'):
-                pass
+                # op_sel selects which half of a packed source the operation reads. This path does not
+                # model that, so dropping it would change the operand: refuse instead of ignoring it.
+                raise Unsupported('modifier %s' % m)
             else:
                 raise Unsupported('modifier %s' % m)
         if scale != 1.0:
@@ -615,6 +641,15 @@ class Stage:
             return ('s%d' % r[1]) if r and r[0] == 's' and r[1] != r[2] else tok
         srcs = [low(t) for t in srcs]
         dname = low(ops[0])
+        word_complement = base in ('s_nand_b32', 's_nor_b32', 's_xnor_b32')
+        if word_complement:
+            # A lane mask here is the whole wave's mask, and SCC is set when any bit of the
+            # complemented 32-bit result is; the per-lane projection below cannot show that.
+            def lane_mask(t):
+                r = reg_range(t)
+                return t in ('exec', 'exec_lo', 'vcc', 'vcc_lo') or bool(r and r[0] == 's' and r[1] in self.masks)
+            if lane_mask(dname) or any(lane_mask(t) for t in srcs):
+                raise Unsupported('%s on a lane mask' % base)
         if pair and ('m0' in srcs or dname == 'm0'):
             raise Unsupported('64-bit scalar operand m0')
         def src_sym(t):
@@ -624,6 +659,8 @@ class Stage:
             return self.sym.get(r[1]) if r and r[0] == 's' else None
         syms = [src_sym(t) for t in srcs]
         if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
+            if word_complement:
+                raise Unsupported('scc from descriptor data')
             if dname == 'm0':
                 if scc:
                     raise Unsupported('scc from descriptor data')
@@ -1178,6 +1215,41 @@ class Stage:
     def op_image_load_mip(self, ops, mods):
         self.image(ops, mods, 'load_mip')
 
+    def op_image_gather4_lz(self, ops, mods):
+        name = 'image_gather4_lz'
+        if self.kind != 'ps' or len(ops) != 4:
+            raise Unsupported('%s requires a pixel stage and four operands' % name)
+        for modifier in mods:
+            if not (modifier.startswith(('dim:', 'dmask:')) or modifier in ('dlc', 'glc', 'slc')):
+                raise Unsupported('%s modifier %s' % (name, modifier))
+        if [m for m in mods if m.startswith('dim:')] != ['dim:SQ_RSRC_IMG_2D']:
+            raise Unsupported('%s requires a 2D texture' % name)
+        channels = {'dmask:0x1': 'Red', 'dmask:0x2': 'Green', 'dmask:0x4': 'Blue', 'dmask:0x8': 'Alpha'}
+        masks = [m for m in mods if m.startswith('dmask:')]
+        if len(masks) != 1 or masks[0] not in channels:
+            raise Unsupported('%s requires a one-hot dmask' % name)
+        dst, addr, sampler = (reg_range(ops[i]) for i in (0, 1, 3))
+        if not dst or dst[0] != 'v' or dst[2] - dst[1] != 3 or dst[2] > 255:
+            raise Unsupported('%s requires four destination registers' % name)
+        if not addr or addr[0] != 'v' or addr[2] - addr[1] != 1 or addr[2] > 255:
+            raise Unsupported('%s requires two contiguous address registers' % name)
+        words = self.const_words(ops[3]) if sampler and sampler[0] == 's' and sampler[2] - sampler[1] == 3 else None
+        if words is None:
+            raise Unsupported('%s requires a constant sampler' % name)
+        from pixel_aot import check_gather_sampler
+        try:
+            # Both the guest _lz and D3D Gather select mip zero of the bound view.
+            # Validate the sampler for that level even when the view has more mips.
+            check_gather_sampler(words, 1, comparison=False)
+        except ValueError as error:
+            raise Unsupported('%s sampler: %s' % (name, error)) from error
+        tex = self.pipe.resource(self.descriptor(ops[2]), 'tex2d')
+        smp = self.pipe.sampler(tuple(words))
+        u, v = (self.f('v%d' % i) for i in range(addr[1], addr[2] + 1))
+        self.emit('t = %s.Gather%s(%s, float2(%s, %s));' % (tex, channels[masks[0]], smp, u, v))
+        for i, component in enumerate('xyzw', dst[1]):
+            self.set_v(i, 'U(t.%s)' % component)
+
     def op_v_cvt_i32_f32(self, ops, mods):
         if mods:
             raise Unsupported('v_cvt_i32_f32 with modifiers')
@@ -1214,6 +1286,10 @@ class Stage:
         self.set_v(reg_range(ops[0])[1], 'U(i.param%d.%s)' % (attr, comp))
 
     def op_v_interp_mov_f32(self, ops, mods):
+        # Only p0 is the flat copy. p10 (P1 - P0) and p20 (P2 - P0) need the per-vertex attribute
+        # values, which the FXC path does not have, so they are refused rather than read as p0.
+        if ops[1] != 'p0':
+            raise Unsupported('v_interp_mov_f32 parameter selector %s: only p0 is lowered' % ops[1])
         attr, comp = self.note_attr(ops[2], 'flat')
         self.set_v(reg_range(ops[0])[1], 'i.fparam%d.%s' % (attr, comp))
 
@@ -1320,6 +1396,37 @@ class Stage:
         return sources
 
     def compare(self, base, ops, mods=()):
+        # A comparison reads its two operands directly, so a modifier that arrives here is one this
+        # lowering does not model (op_sel selects a packed half, clamp/omod have no place in a compare):
+        # refuse it rather than emit a predicate computed from the unselected operands.
+        if mods and not base.endswith('_sdwa'):
+            raise Unsupported('%s with %s' % (base, mods))
+        # v_cmp_class_f32 / v_cmpx_class_f32 test the binary32 class of the value in SRC0 against the
+        # class-bit mask in SRC1 (the ISA order: the float operand first, the integer mask second).
+        if base in ('v_cmp_class_f32', 'v_cmpx_class_f32'):
+            if len(ops) == 3:
+                dst, value, mask = ops
+            elif base == 'v_cmpx_class_f32' and len(ops) == 2:
+                # The _e32 spelling writes EXEC implicitly and prints no destination.
+                dst, (value, mask) = 'exec', ops
+            else:
+                raise Unsupported('%s with %d operands' % (base, len(ops)))
+            cond = '(class32(%s) & %s) != 0u' % (self.f(value), self.u(mask))
+            predicate = '((%s) ? 1u : 0u)' % cond
+            # A narrowed EXEC must stay narrowed: intersect with it, as the generic compare path does.
+            if not self.exec_known:
+                predicate = '(exec & %s)' % predicate
+            if base == 'v_cmpx_class_f32' or dst in ('exec', 'exec_lo'):
+                self.exec_known = False
+                self.emit('exec = %s;' % predicate)
+            elif dst in ('vcc', 'vcc_lo'):
+                self.emit('vcc = %s;' % predicate)
+            else:
+                d = reg_range(dst)[1]
+                self.set_s(d, predicate)
+                self.masks.add(d)
+            return None
+
         m = re.fullmatch(r'v_cmp(x?)_(\w+?)_(f32|u32|i32)(_sdwa)?', base)
         if not m:
             raise Unsupported(base)
@@ -1514,6 +1621,7 @@ SCA = {
     's_mov_b32': ('{0}', None), 's_mov_b64': ('{0}', None), 's_movk_i32': ('{0}', None),
     's_and_b32': ('{0} & {1}', '$ != 0'), 's_or_b32': ('{0} | {1}', '$ != 0'), 's_xor_b32': ('{0} ^ {1}', '$ != 0'),
     's_andn2_b32': ('{0} & ~{1}', '$ != 0'), 's_orn2_b32': ('{0} | ~{1}', '$ != 0'), 's_not_b32': ('~{0}', '$ != 0'),
+    's_nand_b32': ('~({0} & {1})', '$ != 0'), 's_nor_b32': ('~({0} | {1})', '$ != 0'), 's_xnor_b32': ('~({0} ^ {1})', '$ != 0'),
     's_and_b64': ('{0} & {1}', '$ != 0'), 's_or_b64': ('{0} | {1}', '$ != 0'), 's_xor_b64': ('{0} ^ {1}', '$ != 0'),
     's_andn2_b64': ('{0} & ~{1}', '$ != 0'), 's_orn2_b64': ('{0} | ~{1}', '$ != 0'), 's_not_b64': ('~{0}', '$ != 0'),
     's_nand_b64': ('~({0} & {1})', '$ != 0'), 's_nor_b64': ('~({0} | {1})', '$ != 0'), 's_xnor_b64': ('~({0} ^ {1})', '$ != 0'),
@@ -1662,6 +1770,14 @@ class Pipeline:
                '    return ftz32(sum);',
                '}',
                'float med3(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }',
+               # The ten binary32 classes v_cmp_class_f32 tests, from the raw encoding (#1795).
+               'uint class32(float value) { uint bits = asuint(value), magnitude = bits & 0x7fffffffu;'
+               ' bool negative = bits >= 0x80000000u;'
+               ' if (magnitude > 0x7f800000u) return (bits & 0x00400000u) != 0u ? 0x2u : 0x1u;'
+               ' if (magnitude == 0x7f800000u) return negative ? 0x4u : 0x200u;'
+               ' if (magnitude >= 0x00800000u) return negative ? 0x8u : 0x100u;'
+               ' if (magnitude != 0u) return negative ? 0x10u : 0x80u;'
+               ' return negative ? 0x20u : 0x40u; }',
                # The 64-bit shifts (issue #1815): a pair of words, so the count never reaches 32 in a 32-bit
                # shift and an in-place destination keeps the original value (the caller passes both words in).
                'uint2 shl64(uint lo, uint hi, uint sh) { sh &= 63u; uint sb = sh & 31u, sc = (32u - sb) & 31u;'
