@@ -1,5 +1,6 @@
 // Checks src/startup_stubs/local_log.h without a GPU device: GetLastError-preserving env_on
 // gating, atomic first_calls countdown, logf formatting/truncation/X2W_TRAP_LOG append,
+// one X2W_TRAP_LOG open per module under 8 concurrent writers (in a child process),
 // probe_readable page truncation and PAGE_GUARD re-arming, and readable/writable boundary checks.
 #include "startup_stubs/local_log.h"
 
@@ -100,6 +101,143 @@ void test_first_calls()
           "first_calls concurrent InterlockedIncrement exactness");
 }
 
+// Child process body: 8 threads x 2,000 lines through logf to the inherited %X2W_TRAP_LOG%. Every
+// line must land intact and the module must open the log exactly once. With reopen (the negative
+// control) the variable is respelled as the same file after the first line, so append_log takes its
+// per-line open path; the lines stay intact and only the open count may fail (exit code 3).
+int concurrency_child(bool reopen)
+{
+    constexpr int kThreads = 8;
+    constexpr int kLines = 2000;
+    const char* const filler = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+    HANDLE null_err = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    check(null_err != INVALID_HANDLE_VALUE && SetStdHandle(STD_ERROR_HANDLE, null_err) != FALSE,
+          "child sends stderr copies to NUL");
+
+    wchar_t path[MAX_PATH]{};
+    const DWORD path_len = GetEnvironmentVariableW(L"X2W_TRAP_LOG", path, MAX_PATH);
+    check(path_len > 0 && path_len < MAX_PATH, "child inherits X2W_TRAP_LOG");
+    if (!path_len || path_len >= MAX_PATH) return 1;
+    check(x2w_trap::log_opens() == 0, "child starts with no trap log open");
+
+    x2w_local::logf("main-start");
+    if (reopen) {
+        std::wstring respelled(path);
+        const auto slash = respelled.rfind(L'\\');
+        respelled.insert(slash == std::wstring::npos ? 0 : slash + 1, L".\\");
+        SetEnvironmentVariableW(L"X2W_TRAP_LOG", respelled.c_str());
+    }
+
+    std::atomic<int> ready{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t]() {
+            ready.fetch_add(1);
+            while (ready.load() < kThreads) SwitchToThread();
+            for (int i = 0; i < kLines; ++i) x2w_local::logf("t%d-%05d-%s", t, i, filler);
+        });
+    }
+    for (auto& th : threads) th.join();
+    const LONG opens = x2w_trap::log_opens();
+
+    const std::string text = read_file_bytes(path);
+    std::vector<std::vector<bool>> seen(kThreads, std::vector<bool>(kLines, false));
+    std::size_t lines = 0;
+    std::size_t bad = 0;
+    std::size_t duplicate = 0;
+    bool first_ok = false;
+    for (std::size_t pos = 0; pos < text.size();) {
+        const std::size_t end = text.find("\r\n", pos);
+        if (end == std::string::npos) {
+            ++bad;
+            break;
+        }
+        const std::string line = text.substr(pos, end - pos);
+        pos = end + 2;
+        if (lines++ == 0) {
+            first_ok = line == "main-start";
+            continue;
+        }
+        int t = -1;
+        int i = -1;
+        char expected[128];
+        if (std::sscanf(line.c_str(), "t%d-%d-", &t, &i) != 2 || t < 0 || t >= kThreads || i < 0 || i >= kLines ||
+            std::snprintf(expected, sizeof(expected), "t%d-%05d-%s", t, i, filler) <= 0 || line != expected) {
+            ++bad;
+            continue;
+        }
+        if (seen[t][i]) ++duplicate;
+        seen[t][i] = true;
+    }
+    std::size_t missing = 0;
+    for (const auto& row : seen)
+        for (bool b : row) missing += b ? 0 : 1;
+    const std::size_t want = 1 + static_cast<std::size_t>(kThreads) * kLines;
+    check(first_ok, "concurrent log starts with the priming line");
+    check(lines == want && bad == 0 && duplicate == 0 && missing == 0,
+          "concurrent logf lines are all present and intact");
+
+    const int before = failures;
+    check(opens == 1, "trap log is opened once per module");
+    const bool open_failed = failures != before;
+    std::printf("concurrency child: opens=%ld lines=%zu bad=%zu missing=%zu duplicate=%zu\n",
+                static_cast<long>(opens), lines, bad, missing, duplicate);
+    std::fflush(stdout);
+    if (failures - (open_failed ? 1 : 0)) return 1;
+    return open_failed ? 3 : 0;
+}
+
+// Runs this executable with the given arguments (sharing stdout) and returns its exit code.
+DWORD run_self(const std::wstring& args)
+{
+    wchar_t exe[MAX_PATH]{};
+    const DWORD exe_len = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    if (!exe_len || exe_len >= MAX_PATH) return MAXDWORD;
+    std::wstring command = L"\"" + std::wstring(exe) + L"\" " + args;
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    startup.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    PROCESS_INFORMATION process{};
+    std::fflush(stdout);
+    if (!CreateProcessW(exe, command.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &startup, &process))
+        return MAXDWORD;
+    WaitForSingleObject(process.hProcess, INFINITE);
+    DWORD code = MAXDWORD;
+    GetExitCodeProcess(process.hProcess, &code);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return code;
+}
+
+// Runs concurrency_child in a fresh process (its module log state starts empty) on a temporary
+// log, then removes the log. Returns the child's exit code.
+DWORD test_concurrency(bool reopen)
+{
+    wchar_t temp_dir[MAX_PATH]{};
+    const DWORD dir_len = GetTempPathW(MAX_PATH, temp_dir);
+    check(dir_len > 0 && dir_len < MAX_PATH, "GetTempPathW succeeds for the concurrent log");
+    if (!dir_len || dir_len >= MAX_PATH) return MAXDWORD;
+    const auto folder = std::wstring(temp_dir) + L"x2w_trap_log_" + std::to_wstring(GetCurrentProcessId());
+    const auto log_path = folder + L"\\trap.log";
+    if (log_path.size() + 2 >= MAX_PATH || !CreateDirectoryW(folder.c_str(), nullptr)) {
+        check(false, "create the concurrent log folder");
+        return MAXDWORD;
+    }
+    wchar_t prev[MAX_PATH]{};
+    const DWORD prev_len = GetEnvironmentVariableW(L"X2W_TRAP_LOG", prev, MAX_PATH);
+    SetEnvironmentVariableW(L"X2W_TRAP_LOG", log_path.c_str());
+    const DWORD code = run_self(reopen ? L"--phase concurrency-reopen" : L"--phase concurrency");
+    SetEnvironmentVariableW(L"X2W_TRAP_LOG", prev_len > 0 && prev_len < MAX_PATH ? prev : nullptr);
+    DeleteFileW(log_path.c_str());
+    check(RemoveDirectoryW(folder.c_str()) != FALSE, "clean up the concurrent log folder");
+    return code;
+}
+
 void test_logf()
 {
     wchar_t prev_trap_log[MAX_PATH]{};
@@ -123,6 +261,13 @@ void test_logf()
     const auto max_name = MAX_PATH - 2 - folder.size();
     const auto fit_path = folder + L"\\" + std::wstring(max_name, L'f');
     const auto long_path = folder + L"\\" + std::wstring(max_name + 1, L'g');
+    // Keep this module's log handle on NUL: the paths below then take append_log's per-line path for
+    // a changed variable (the behaviour before the handle was kept), and their files stay removable.
+    SetEnvironmentVariableW(L"X2W_TRAP_LOG", L"NUL");
+    const LONG opens_before = x2w_trap::log_opens();
+    x2w_trap::append_log("kept\r\n", 6, false);
+    x2w_trap::append_log("kept\r\n", 6, true);
+    check(x2w_trap::log_opens() - opens_before == 1, "append_log reuses the kept handle");
     const HANDLE saved_stderr = GetStdHandle(STD_ERROR_HANDLE);
     HANDLE stderr_file = CreateFileW(err_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
                                      CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -319,16 +464,34 @@ void test_probe_and_access(bool guard_drop_mutate)
 
 int main(int argc, char** argv)
 {
+    const bool two_args = argc == 3;
+    if (two_args && std::strcmp(argv[1], "--phase") == 0) {
+        if (std::strcmp(argv[2], "concurrency") == 0) return concurrency_child(false);
+        if (std::strcmp(argv[2], "concurrency-reopen") == 0) return concurrency_child(true);
+    }
     // --mutate guard-drop: negative control expecting PAGE_GUARD to be dropped rather than re-armed.
     const bool guard_drop_mutate =
-        argc > 2 && std::strcmp(argv[1], "--mutate") == 0 && std::strcmp(argv[2], "guard-drop") == 0;
-    if (argc > 1 && !guard_drop_mutate) {
+        two_args && std::strcmp(argv[1], "--mutate") == 0 && std::strcmp(argv[2], "guard-drop") == 0;
+    // --mutate reopen: negative control whose child reopens the log per line. It exits 1 only when
+    // the open-count check is the child's sole failure (child exit code 3), so any other fault in
+    // that run (lost or torn lines, a crash, a child that never started) makes the control fail.
+    const bool reopen_mutate =
+        two_args && std::strcmp(argv[1], "--mutate") == 0 && std::strcmp(argv[2], "reopen") == 0;
+    if (argc > 1 && !guard_drop_mutate && !reopen_mutate) {
         std::printf("unknown mutation\n");
         return 2;
+    }
+    if (reopen_mutate) {
+        const DWORD code = test_concurrency(true);
+        std::printf("startup_local_log reopen control: child exit %lu, parent failures %d\n",
+                    static_cast<unsigned long>(code), failures);
+        return code == 3 && failures == 0 ? 1 : 0;
     }
 
     test_env_on();
     test_first_calls();
+    const DWORD child = test_concurrency(false);
+    check(child == 0, "concurrent logging child passes");
     test_logf();
     test_probe_and_access(guard_drop_mutate);
 

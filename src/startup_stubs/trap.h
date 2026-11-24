@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 
 namespace x2w_trap {
 
@@ -51,6 +52,59 @@ inline bool listed(const char* variable, const char* name) noexcept
         item = *end ? end + 1 : end;
     }
     return false;
+}
+
+// Number of times append_log has opened %X2W_TRAP_LOG% in this module (test seam).
+inline volatile LONG& log_opens() noexcept
+{
+    static volatile LONG count = 0;
+    return count;
+}
+
+// Appends one line to %X2W_TRAP_LOG% with one WriteFile. Under the startup launcher every file
+// open is a traced call that stops the process, so the first path a module logs to is opened once
+// (append access, shared read/write) and the handle is kept; a failed open is kept too, so it is
+// not retried per line. A line for another path (the variable changed in-process) is appended the
+// old way: open, write, close. Nothing is written when the variable is unset or too long. flush
+// asks for FlushFileBuffers before returning (the trap path, which may end the process next).
+inline void append_log(const char* line, DWORD size, bool flush) noexcept
+{
+    struct Log {
+        HANDLE handle;
+        wchar_t path[MAX_PATH];
+    };
+    static Log* volatile kept = nullptr;
+
+    wchar_t path[MAX_PATH];
+    const DWORD length = GetEnvironmentVariableW(L"X2W_TRAP_LOG", path, MAX_PATH);
+    if (!length || length >= MAX_PATH) return;
+
+    Log* current = static_cast<Log*>(InterlockedCompareExchangePointer(
+        reinterpret_cast<void* volatile*>(&kept), nullptr, nullptr));
+    if (current && !std::wcscmp(current->path, path)) {
+        if (current->handle == INVALID_HANDLE_VALUE) return;
+        write_all(current->handle, line, size);
+        if (flush) FlushFileBuffers(current->handle);
+        return;
+    }
+
+    InterlockedIncrement(&log_opens());
+    HANDLE out = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                             FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (out != INVALID_HANDLE_VALUE) {
+        write_all(out, line, size);
+        if (flush) FlushFileBuffers(out);
+    }
+    if (!current) {
+        if (Log* const fresh = static_cast<Log*>(HeapAlloc(GetProcessHeap(), 0, sizeof(Log)))) {
+            fresh->handle = out;
+            std::memcpy(fresh->path, path, sizeof(path));
+            if (!InterlockedCompareExchangePointer(reinterpret_cast<void* volatile*>(&kept), fresh, nullptr))
+                return;  // published: the module keeps this handle
+            HeapFree(GetProcessHeap(), 0, fresh);  // another thread published first
+        }
+    }
+    if (out != INVALID_HANDLE_VALUE) CloseHandle(out);
 }
 
 inline bool continues(const char* name) noexcept { return listed("X2W_TRAP_CONTINUE", name); }
@@ -87,17 +141,7 @@ __declspec(noinline) inline void record(const char* tag, const char* module, uns
 
     write_all(GetStdHandle(STD_ERROR_HANDLE), line, size);
 
-    wchar_t log_path[MAX_PATH];
-    const DWORD path_length = GetEnvironmentVariableW(L"X2W_TRAP_LOG", log_path, MAX_PATH);
-    if (path_length && path_length < MAX_PATH) {
-        HANDLE log = CreateFileW(log_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (log != INVALID_HANDLE_VALUE) {
-            write_all(log, line, size);
-            FlushFileBuffers(log);
-            CloseHandle(log);
-        }
-    }
+    append_log(line, size, true);
 }
 
 [[noreturn]] __declspec(noinline) inline void fire(const char* module, unsigned module_id,

@@ -297,10 +297,15 @@ ctest --preset release --no-tests=error -R '^startup_inflate$' -V
 ## Local switches, logging, and memory probing
 
 `tests/startup_local_log_check.cpp` (device-free ctest `startup_local_log`, with negative
-control `startup_local_log_guard_drop_control`) verifies `src/startup_stubs/local_log.h`:
+controls `startup_local_log_guard_drop_control` and `startup_local_log_reopen_control`) verifies
+`src/startup_stubs/local_log.h`:
 `env_on` (a leading `1` in values up to three characters, preserving `GetLastError`), atomic
 `first_calls` countdowns, `logf` (stderr and `X2W_TRAP_LOG` output, CRLF and 1533-byte payload
 truncation, `MAX_PATH` boundary behavior, and `GetLastError` preservation on file-open failure),
+the shared `x2w_trap::append_log` (one `X2W_TRAP_LOG` open per module: in a child process, 8
+threads write 2,000 lines each, every line must arrive intact and the open count must be 1; the
+reopen control respells the path after the first line so each line reopens the file, and passes
+only when the open count is its sole failure),
 `probe_readable` (invalid-pointer and zero-length refusals, multi-page reads, `PAGE_NOACCESS` /
 `MEM_RESERVE` prefix truncation, and `PAGE_GUARD` re-arming verified by `VirtualQuery` and a
 second probe), and `readable`/`writable` boundaries across `PAGE_READONLY`, `PAGE_READWRITE`,
@@ -308,7 +313,7 @@ second probe), and `readable`/`writable` boundaries across `PAGE_READONLY`, `PAG
 
 ```powershell
 cmake --build --preset dev --target startup_local_log_check
-ctest --preset dev --no-tests=error -R '^startup_local_log(_guard_drop_control)?$' -V
+ctest --preset dev --no-tests=error -R '^startup_local_log(_guard_drop_control|_reopen_control)?$' -V
 ```
 
 ## Switches

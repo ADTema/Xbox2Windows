@@ -874,6 +874,8 @@ target_compile_features(startup_local_log_check PRIVATE cxx_std_17)
 add_test(NAME startup_local_log COMMAND startup_local_log_check)
 add_test(NAME startup_local_log_guard_drop_control COMMAND startup_local_log_check --mutate guard-drop)
 set_tests_properties(startup_local_log_guard_drop_control PROPERTIES WILL_FAIL TRUE)
+add_test(NAME startup_local_log_reopen_control COMMAND startup_local_log_check --mutate reopen)
+set_tests_properties(startup_local_log_reopen_control PROPERTIES WILL_FAIL TRUE)
 
 # Colour-blend register decoding (src/startup_stubs/cb_blend.h, #1216): decoder table plus draws
 # compared with a CPU model of the register fields.
