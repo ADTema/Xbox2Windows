@@ -198,6 +198,14 @@ set_target_properties(d3d12_xs_shim PROPERTIES OUTPUT_NAME d3d12_xs)
 target_include_directories(d3d12_xs_shim PRIVATE src)
 target_compile_features(d3d12_xs_shim PRIVATE cxx_std_17)
 target_link_libraries(d3d12_xs_shim PRIVATE d3d12)
+# The creation-IID gate and refusal text of D3D12XboxCreateDevice (src/d3d12x_device_slots.h),
+# without a device. The mutated run is the negative control.
+add_executable(d3d12x_device_slots_check tests/d3d12x_device_slots_check.cpp src/d3d12x_device_slots.cpp)
+target_include_directories(d3d12x_device_slots_check PRIVATE src)
+target_compile_features(d3d12x_device_slots_check PRIVATE cxx_std_17)
+add_test(NAME d3d12x_device_slots COMMAND d3d12x_device_slots_check)
+add_test(NAME d3d12x_device_slots_device1_control COMMAND d3d12x_device_slots_check --mutate device1)
+set_tests_properties(d3d12x_device_slots_device1_control PROPERTIES WILL_FAIL TRUE)
 
 # Fixture-only desktop xgameruntime.dll. The single X-macro table in
 # xgameruntime_shim.cpp distinguishes implemented synchronous contracts from
