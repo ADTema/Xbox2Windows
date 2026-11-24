@@ -7808,6 +7808,28 @@ Python-only controls check explicit reference words and translator acceptance.
 Those controls do not establish GPU execution; the command above must pass on
 the named backend before recording readback evidence.
 
+### Placed vertex buffer draw from a source-built EXE
+
+`cpu_placed_draw_warp` and `cpu_placed_draw_hardware` compare the Windows loader,
+`pe_map`, and an AOT executable generated from the same linked PE entry. The
+test reads the source SHA-256 exported by the compiled AOT image. The guest
+chooses two addresses separated by bit 40, allocates two 260-byte views through
+DLL imports, records a draw and writes the last DWORD of both buffers before
+submitting. The provider forwards the view, draw, submission and fence calls
+to the same `d3d12_xs` runtime in each process. The fixture supplies the PSO,
+a pixel shader that reads one DWORD, and an independent readback queue.
+
+Each runner checks all 32 RGBA pixels. A four-byte view at offset 256 reads
+41 or 135 according to the chosen buffer. An eight-byte view at the same offset
+reads zero. Each path releases two placed resources and exits with 42. A
+zero-width second resource leaves one resource to release. A zero-list
+submission leaves two. Both rejection cases produce no image and exit with 20.
+
+```powershell
+cmake --build --preset release --target cpu_placed_draw_lifted pe_map startup_stream_consumer
+ctest --preset release --no-tests=error -R '^cpu_placed_draw_(warp|hardware)$' -V
+```
+
 ### Two shadow frames from the EXE entry
 
 The native, mapped and AOT runners use the existing translated shadow scene. The
