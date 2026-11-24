@@ -6548,3 +6548,68 @@ definedness leak control), and 9 end-to-end PE-patched DLL rejection controls.
 Not covered by this experiment: non-temporal cache hints or implementation-dependent
 partial-page fault progress on `vmaskmovdqu`, control flow, nonvolatile `xmm6`..`xmm15`
 prologues, and title CPU code execution.
+
+## XSAVE and XRSTOR extended processor state slice
+
+[The XSAVE state leaf translator](../tools/cpu_xsave_aot.py) lifts bounded straight-line
+Windows x64 leaf functions covering four uncovered forms from `docs/coverage/x64_zen2.tsv`
+group `XSAVE`:
+
+- `xsave` and `xsave64`: require 64-byte-aligned `[base + disp]` and bounded mask
+  (`EDX == 0` and `(EAX & ~7) == 0`); write requested legacy x87/SSE regions (`[0..415]`,
+  with `FCS`/`FDS` matching `CPUID.7.0:EBX[13]` and `MXCSR_MASK` at `[28..31]`) and AVX
+  `YMM[255:128]` (`[576..831]`), leave `[416..511]`, `XCOMP_BV` (`[520..527]`), and
+  header `[528..575]` untouched, and update `XSTATE_BV[2:0] = (old & ~RFBM) | (XINUSE & RFBM)`
+- `xrstor` and `xrstor64`: require 64-byte-aligned `[base + disp]` and bounded mask
+  (`EDX == 0` and `(EAX & ~7) == 0`); raise `#GP` before mutating state on non-zero
+  `XCOMP_BV`, non-zero reserved header bytes `[528..535]`, `(XSTATE_BV & ~7) != 0`, or
+  `(RFBM & 6) != 0` with invalid `MXCSR & ~MXCSR_MASK`; restore or initialize each
+  requested component and update `XINUSE[2:0]`
+
+Per Intel SDM Vol. 1 Ch. 13.5.1, hardware `XSAVE` may report `XSTATE_BV[1:0] = 1` for
+initialized legacy x87/SSE components when selected by `RFBM` (observed directly on hybrid
+P-core vs E-core scheduling: `XSTATE_BV` after clean `XRSTOR` was `0..7` on P-core CPU 0
+vs `XSTATE_BV[1:0] = 3` on E-core CPU 15 while `XSTATE_BV[2]` AVX init-tracking matched
+uniformly). The lifted translator matches the deterministic `XINUSE` model bit-for-bit,
+and the native comparator verifies exact byte equality across all payload/header bytes
+while allowing `XSTATE_BV[1:0]` to be `0` or `1` on native runs only when `RFBM` selects
+an initialized legacy component.
+
+Each lifted export takes `(word rcx, word rdx, word r8)` pointing to caller-owned flat
+buffers and models the 832-byte standard-format `x87|SSE|AVX` `XState` locally without
+mutating host nonvolatile `XMM6`..`XMM15`, `x87`, or `MXCSR`. Transport and ABI glue
+covers `vmovdqa`/`vmovdqu` (`XMM0`..`5`, `YMM0`..`5`), `vzeroupper`, `movdqa`/`movdqu`,
+`paddd`, `movq` (`MM0`..`7`), `emms`, 32/64-bit volatile GPR `mov`/`xor` (with pointer
+provenance tracking across register saves), and terminal `ret`. The lifted DLL exports
+`host_has_xsave()` (`CPUID.1:ECX[26..28]` and `XGETBV(0) & 7 == 7`, returning exit code
+77 when absent), `host_deprecates_fpu_cs_ds()`, and `host_mxcsr_mask()`. `xsaveopt*`,
+`xsavec*`, `xsaves*`/`xrstors*`, `fxsave*`/`fxrstor*`, EVEX encodings, nonvolatile
+registers, unclosed MMX state before `ret`, non-`r8` stores, prefixes, RIP-relative or
+indexed addressing, and branches reject.
+
+```powershell
+cmake --build --preset dev --target cpu_xsave_state_original cpu_xsave_state_original_lifted cpu_xsave_state_altered cpu_xsave_state_altered_lifted
+ctest --preset dev --no-tests=error -R '^cpu_aot_xsave_state$' -V
+```
+
+### Measured results and open scope
+
+The [MASM fixture](../tests/cpu/xsave_state.asm) exports 11 functions covering `xsave`,
+`xsave64`, `xrstor`, `xrstor64`, displaced `[rcx+64]`/`[r8+64]`, `RFBM = 2` SSE-only
+masking, `vzeroupper` clearing `XINUSE[2]`, a chained `xrstor64` + `movq` + `vmovdqu` +
+`paddd` + `xsave64` + `emms` pipeline, and a dead-read fault-ordering control
+(`op_discarded_read`). [The differential check](../tests/cpu/xsave_state_check.py)
+verifies 70 cases across the 10 differential exports bit-for-bit across `XSTATE_BV`
+subsets `{0, 1, 2, 3, 4, 6, 7}` (with non-zero component payloads when `XSTATE_BV[i] == 1`)
+against both the native MASM DLL (via a `VirtualAlloc` + `RtlAddFunctionTable` SEH
+caller-state harness) and an independent Python reference model with 64-byte pre/post
+buffer guards across `dev` and `release` (`/O2`) builds, alongside 16 misalignment `#GP`
+checks (`+16` and `+8`), 16 header/MXCSR `#GP` checks (`XCOMP_BV != 0`, nonzero
+`header[16:23]`, unsupported `XSTATE_BV`, invalid `MXCSR`), dead-read fault ordering
+across unmapped/`#GP` modes, host nonvolatile state preservation, 5 `ALTER_OP` divergence
+controls (`3`, `3`, `3`, `7`, `7`), an output-mutation control, 4 alternate-encoding lift
+checks, 32 unit rejection controls, and 10 end-to-end PE-patched DLL rejection controls.
+
+Not covered by this experiment: compacted/supervisor formats (`xsavec*`, `xsaves*`,
+`xrstors*`), `xsaveopt*`, AVX-512/PKRU state components beyond `XCR0[2:0]`, control flow,
+and title CPU code execution.

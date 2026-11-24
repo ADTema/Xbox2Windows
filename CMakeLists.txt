@@ -1146,6 +1146,22 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_avx_pcmpstr_original_lifted>"
         "$<TARGET_FILE:cpu_avx_pcmpstr_altered_lifted>")
     set_tests_properties(cpu_aot_avx_pcmpstr PROPERTIES SKIP_RETURN_CODE 77)
+    set(cpu_xsave_state_exports
+        "op_xsave_only,op_xsave64_only,op_xrstor_xsave,op_xrstor64_xsave64,"
+        "op_xrstor_xsave64,op_xrstor64_xsave,op_xrstor64_disp,op_xrstor64_mask_sse,"
+        "op_vzeroupper_xsave64,op_pipeline,op_discarded_read")
+    string(CONCAT cpu_xsave_state_exports ${cpu_xsave_state_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_xsave_state_${variant} xsave_state)
+        cpu_translation(cpu_xsave_state_${variant} cpu_xsave_aot "${cpu_xsave_state_exports}")
+    endforeach()
+    target_compile_definitions(cpu_xsave_state_altered PRIVATE ALTER_OP)
+    add_test(NAME cpu_aot_xsave_state COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/xsave_state_check.py"
+        "$<TARGET_FILE:cpu_xsave_state_original>"
+        "$<TARGET_FILE:cpu_xsave_state_original_lifted>"
+        "$<TARGET_FILE:cpu_xsave_state_altered_lifted>")
+    set_tests_properties(cpu_aot_xsave_state PROPERTIES SKIP_RETURN_CODE 77)
     set(cpu_pcmpstr64_exports
         "pcmpestri64_ub_eqany_pos_lsb,pcmpestri64_sw_ranges_neg_msb,"
         "pcmpestri64_mem_sb_eqeach_mpos_msb,pcmpestri64_alias_xmm0,"
