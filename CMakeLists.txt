@@ -339,7 +339,7 @@ target_link_libraries(startup_dump_fence_check PRIVATE d3d12 dxgi)
 add_test(NAME startup_dump_fence_warp COMMAND startup_dump_fence_check)
 set_tests_properties(startup_dump_fence_warp PROPERTIES ENVIRONMENT "X2W_SHIM_DRAW_ADAPTER=warp" TIMEOUT 45)
 
-add_executable(startup_stream_consumer tests/startup_stream_consumer.cpp tests/startup_stream_draw.cpp
+add_executable(startup_stream_consumer tests/startup_stream_consumer.cpp tests/startup_stream_setup.cpp tests/startup_stream_draw.cpp
     tests/startup_address_srv.cpp)
 target_compile_features(startup_stream_consumer PRIVATE cxx_std_17)
 target_link_libraries(startup_stream_consumer PRIVATE d3d12_xs_shim startup_stub_xg_xs d3d12 dxgi)
@@ -4172,6 +4172,28 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:cpu_shim_startup>" "${shim_startup_cpp}"
         DEPENDS cpu_shim_startup tests/cpu/translate_shim_startup.py tools/cpu_switch_aot.py
             tools/cpu_call_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
+    add_library(cpu_placed_provider SHARED tests/cpu/placed_draw_provider.cpp tests/startup_stream_setup.cpp)
+    target_compile_features(cpu_placed_provider PRIVATE cxx_std_17)
+    target_link_libraries(cpu_placed_provider PRIVATE d3d12_xs_shim d3d12 dxgi)
+    add_executable(cpu_placed_draw tests/cpu/placed_draw.asm tests/cpu/exe_startup.asm)
+    set_target_properties(cpu_placed_draw PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_placed_draw PRIVATE /ENTRY:native_startup /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+    target_link_libraries(cpu_placed_draw PRIVATE cpu_placed_provider cpu_exe_io)
+    set(placed_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_placed_draw_lifted.cpp")
+    add_custom_command(OUTPUT "${placed_cpp}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/translate_placed_draw.py"
+            "$<TARGET_FILE:cpu_placed_draw>" "${placed_cpp}"
+        DEPENDS cpu_placed_draw tests/cpu/translate_placed_draw.py tests/cpu/translate_shim_startup.py tools/cpu_switch_aot.py)
+    add_executable(cpu_placed_draw_lifted "${placed_cpp}")
+    target_compile_features(cpu_placed_draw_lifted PRIVATE cxx_std_17)
+    target_link_libraries(cpu_placed_draw_lifted PRIVATE cpu_placed_provider cpu_exe_io)
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME cpu_placed_draw_${adapter} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/placed_draw_check.py" "${adapter}"
+            "$<TARGET_FILE:startup_stream_consumer>" "$<TARGET_FILE:pe_map>" "$<TARGET_FILE:cpu_placed_draw>"
+            "$<TARGET_FILE:cpu_placed_draw_lifted>" "$<TARGET_FILE:cpu_placed_provider>" "$<TARGET_FILE:cpu_exe_io>")
+        set_tests_properties(cpu_placed_draw_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
     add_executable(cpu_shim_startup_lifted "${shim_startup_cpp}")
     target_compile_features(cpu_shim_startup_lifted PRIVATE cxx_std_17)
     target_link_libraries(cpu_shim_startup_lifted PRIVATE cpu_shim_startup_guest cpu_exe_io cpu_shim_compute cpu_shim_draw d3d12_xs_shim)
