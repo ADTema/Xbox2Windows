@@ -138,7 +138,7 @@ ULONG WINAPI fixture_release(void* self)
 
 HRESULT WINAPI fixture_query(const GUID* provider, const GUID* iid, void** out)
 {
-    // Leave a non-null output on failure so the controls check that the proxy clears it.
+    // Leave a non-null output on failure to check whether each phase preserves or clears it.
     if (out) *out = &async_service;
     if (provider && *provider == async_provider) {
         ++async_queries;
@@ -181,18 +181,18 @@ bool set_switch(const char* name, bool enabled)
            x2w_local::env_on(name) == enabled;
 }
 
-bool query_fails(QueryApi query, const GUID& provider, const GUID& iid)
+bool query_fails(QueryApi query, const GUID& provider, const GUID& iid, void* expected_output)
 {
-    void* object = &async_service;
+    void* object = nullptr;
     const unsigned previous = provider_queries;
     const int published = provider_count;
-    return query(&provider, &iid, &object) == query_failure && !object &&
+    return query(&provider, &iid, &object) == query_failure && object == expected_output &&
            provider_queries == previous + 1 && provider_count == published;
 }
 
-bool query_fails(QueryApi query, const ApiPair& pair)
+bool query_fails(QueryApi query, const ApiPair& pair, void* expected_output)
 {
-    return query_fails(query, pair.provider, pair.iid);
+    return query_fails(query, pair.provider, pair.iid, expected_output);
 }
 
 const char* run()
@@ -211,7 +211,7 @@ const char* run()
         if (entry != original_init[i] || entry(11, 22, 33, 44) != init_failure || init_calls[i] != 1)
             return "switch off changed an initialization export or its real failure";
     }
-    if (local_active || activation_logs || !query_fails(query, user_pair))
+    if (local_active || activation_logs || !query_fails(query, user_pair, &async_service))
         return "switch off activated the fallback";
 
     if (!set_switch("X2W_RUNTIME_LOCAL", !control)) return "could not enable local runtime";
@@ -231,7 +231,7 @@ const char* run()
         const unsigned previous = init_calls[i];
         init_result = S_FALSE;
         if (entry(11, 22, 33, 44) != S_FALSE || init_calls[i] != previous + 1 || local_active ||
-            activation_logs != static_cast<unsigned>(i) || !query_fails(query, user_pair))
+            activation_logs != static_cast<unsigned>(i) || !query_fails(query, user_pair, &async_service))
             return "successful initialization did not pass through or activated the fallback";
         init_result = init_failure;
         if (entry(11, 22, 33, 44) != S_OK || init_calls[i] != previous + 2 || !local_active ||
@@ -254,19 +254,25 @@ const char* run()
         if (reinterpret_cast<InitApi>(hooked_get_proc_address(nullptr, exports[i])) != original_init[i])
             return "fake user off still wrapped an initialization export";
     for (const auto& pair : providers)
-        if (!query_fails(query, pair)) return "fake user off still returned a local object";
+        if (!query_fails(query, pair, &async_service)) return "fake user off still returned a local object";
     if (!set_switch("X2W_FAKE_USER", true)) return "could not re-enable fake user";
-    if (!query_fails(query, unknown_provider, unknown_provider)) return "unlisted provider did not keep the real failure";
-    if (!query_fails(query, user_pair.provider, unsupported_iid))
+    if (!query_fails(query, unknown_provider, unknown_provider, nullptr)) return "unlisted provider did not keep the real failure";
+    if (!query_fails(query, user_pair.provider, unsupported_iid, nullptr))
         return "known provider with an unknown IID returned a local object";
+    if (!query_fails(query, user_pair.provider, providers[4].iid, nullptr))
+        return "user provider accepted the title IID";
+    GUID colliding_storage_provider = storage_fixture_pair.provider;
+    colliding_storage_provider.Data4[7] ^= 1;
+    if (!query_fails(query, colliding_storage_provider, storage_fixture_pair.iid, nullptr))
+        return "storage provider with matching Data1 returned a local object";
     GUID colliding_provider = user_pair.provider;
     colliding_provider.Data4[7] ^= 1;
-    if (!query_fails(query, colliding_provider, user_pair.iid))
+    if (!query_fails(query, colliding_provider, user_pair.iid, nullptr))
         return "provider with matching Data1 returned a local object";
     GUID colliding_iid = gamertag_pair.iid;
     colliding_iid.Data4[7] ^= 1;
-    if (!query_fails(query, user_pair.provider, colliding_iid) ||
-        !query_fails(query, storage_fixture_pair.provider, unsupported_iid))
+    if (!query_fails(query, user_pair.provider, colliding_iid, nullptr) ||
+        !query_fails(query, storage_fixture_pair.provider, unsupported_iid, nullptr))
         return "gamertag or storage accepted an unlisted pair";
 
     Proxy* user = nullptr;
@@ -279,35 +285,53 @@ const char* run()
         if (&pair == &storage_fixture_pair) {
             auto* storage = static_cast<StorageObject*>(object);
             const auto qi = reinterpret_cast<decltype(&storage_query)>(storage->vtable[0]);
-            void* queried = nullptr;
-            if (qi(storage, &pair.iid, &queried) != S_OK || queried != storage ||
-                qi(storage, &fixture_iunknown, &queried) != S_OK || queried != storage ||
-                qi(storage, &unsupported_iid, &queried) != E_NOINTERFACE || queried ||
-                qi(storage, &pair.iid, nullptr) != E_POINTER)
-                return "storage QueryInterface result was wrong";
+            void* queried = &async_service;
+            if (qi(storage, &pair.iid, &queried) != S_OK || queried != storage)
+                return "storage QueryInterface did not return its interface";
+            queried = &async_service;
+            if (qi(storage, &fixture_iunknown, &queried) != S_OK || queried != storage)
+                return "storage QueryInterface did not return its IUnknown identity";
+            queried = &async_service;
+            if (qi(storage, &unsupported_iid, &queried) != E_NOINTERFACE || queried)
+                return "storage QueryInterface did not refuse an unsupported IID";
+            if (qi(storage, &pair.iid, nullptr) != E_POINTER)
+                return "storage QueryInterface accepted a null out pointer";
             continue;
         }
         auto* proxy = static_cast<Proxy*>(object);
         if (proxy->real || proxy->vtable != slot_table) return "local provider did not return a null-real proxy";
         if (&pair == &user_pair) user = proxy;
-        if (&pair == &gamertag_pair && proxy == user) return "gamertag reused the user object";
+        if (&pair == &gamertag_pair) {
+            if (proxy == user) return "gamertag reused the user object";
+            void* queried = &async_service;
+            if (invoke(proxy, 0, address(&user_pair.iid), address(&queried)) !=
+                    static_cast<unsigned>(E_NOINTERFACE) || queried)
+                return "gamertag QueryInterface did not refuse the user IID";
+        }
         if (&pair == &providers[6]) first_store = proxy;
         if (&pair == &providers[7]) {
-            void* queried = first_store;
+            void* queried = &async_service;
             if (proxy == first_store ||
                 invoke(first_store, 0, address(&providers[6].iid), address(&queried)) != S_OK ||
                 queried != first_store)
                 return "the second store IID changed the first store object's interface";
+            queried = &async_service;
+            if (invoke(first_store, 0, address(&pair.iid), address(&queried)) !=
+                    static_cast<unsigned>(E_NOINTERFACE) || queried)
+                return "first store QueryInterface did not refuse the second store IID";
         }
-        void* queried = nullptr;
-        if (invoke(proxy, 0, address(&pair.iid), address(&queried)) != S_OK || queried != proxy ||
-            invoke(proxy, 0, address(&fixture_iunknown), address(&queried)) != S_OK || queried != proxy ||
-            invoke(proxy, 1) != 1 || invoke(proxy, 2) != 1)
-            return "local QueryInterface, AddRef, or Release result was wrong";
+        void* queried = &async_service;
+        if (invoke(proxy, 0, address(&pair.iid), address(&queried)) != S_OK || queried != proxy)
+            return "local QueryInterface did not return its interface";
+        queried = &async_service;
+        if (invoke(proxy, 0, address(&fixture_iunknown), address(&queried)) != S_OK || queried != proxy)
+            return "local QueryInterface did not return its IUnknown identity";
+        if (invoke(proxy, 1) != 1 || invoke(proxy, 2) != 1)
+            return "local AddRef or Release result was wrong";
     }
     const unsigned previous_rejections = rejected_iid_logs;
     for (const GUID* iid : {&unsupported_iid, &gamertag_pair.iid}) {
-        void* queried = user;
+        void* queried = &async_service;
         if (invoke(user, 0, address(iid), address(&queried)) != static_cast<unsigned>(E_NOINTERFACE) || queried ||
             rejected_iid_logs != previous_rejections + 1)
             return "user QueryInterface did not refuse an unsupported IID and log once";

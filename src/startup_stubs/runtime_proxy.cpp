@@ -284,7 +284,6 @@ void fill_slots(std::index_sequence<I...>)
 HRESULT __stdcall proxy_query(const GUID* provider, const GUID* iid, void** out)
 {
     const HRESULT hr = real_query(provider, iid, out);
-    if (FAILED(hr) && out) *out = nullptr;
     if (FAILED(hr) && out && fake_user() && matches_pair(storage_pair, provider, iid)) {
         // Persistent local storage: the system runtime has none for an unpackaged process.
         static LONG logged;
@@ -293,7 +292,9 @@ HRESULT __stdcall proxy_query(const GUID* provider, const GUID* iid, void** out)
         return S_OK;
     }
     const ApiPair* local = nullptr;
-    if (FAILED(hr) && out && fake_user() && InterlockedCompareExchange(&local_active, 0, 0)) {
+    if (FAILED(hr) && out && fake_user() && InterlockedCompareExchange(&local_active, 0, 0) &&
+        x2w_local::writable(out, sizeof(*out))) {
+        *out = nullptr;
         for (const auto& pair : local_pairs) {
             if (matches_pair(pair, provider, iid)) {
                 local = &pair;
