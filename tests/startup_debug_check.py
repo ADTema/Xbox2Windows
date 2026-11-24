@@ -72,6 +72,7 @@ def main(probe, calls_dll):
         sites = [int(m, 16) for m in re.findall(r"breakpoint at %s\+0x([0-9a-f]+) first-chance" % re.escape(image),
                                                 text(logdir / "events.txt"))]
         assert len(sites) == 2 and sites[0] != sites[1], text(logdir / "events.txt")
+        assert "debugger stop " not in text(logdir / "events.txt")
         assert not (logdir / "threads_stop.txt").exists() and "VALLOC" not in text(logdir / "files.txt")
         # The launcher keeps the debug heap off by default ...
         assert "debug-probe heap flags 0x0\n" in text(logdir / "stdout.txt"), missing_heap_flags(logdir)
@@ -84,6 +85,7 @@ def main(probe, calls_dll):
         out, logdir = run(probe, work, "stop", {"X2W_STOP_AT": f"{sites[1]:x}"})
         assert f"stopped at breakpoint (0x80000003) at {image}+{sites[1]:#x}" in out and "first chance" in out, out
         events = text(logdir / "events.txt")
+        assert events.splitlines().count("debugger stop 0x80000003 first-chance") == 1, events
         assert f"breakpoint at {image}+{sites[0]:#x}" in events, events
         stacks = text(logdir / "threads_stop.txt")
         assert image in stacks and "rip=" in stacks, stacks
