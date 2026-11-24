@@ -550,6 +550,33 @@ endforeach()
 add_test(NAME d3d12x_pso_reject_warp COMMAND d3d12x_device_check
     "$<TARGET_FILE:d3d12_xs_shim>" reject warp)
 set_tests_properties(d3d12x_pso_static_sampler_hardware PROPERTIES SKIP_RETURN_CODE 77)
+
+# D3D12.X descriptor heaps, CPU/GPU handles and descriptor table records (#XCL-09).
+set(d3d12x_descriptor_cs "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_descriptor_cs.h")
+add_custom_command(OUTPUT "${d3d12x_descriptor_cs}"
+    COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E CSMain -Vn d3d12x_descriptor_cs
+            -Fh "${d3d12x_descriptor_cs}" -Fo "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_descriptor_cs.cso"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/d3d12x_descriptor.hlsl"
+    DEPENDS tests/d3d12x_descriptor.hlsl
+    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_descriptor_cs.cso" VERBATIM)
+add_custom_target(d3d12x_descriptor_shader DEPENDS "${d3d12x_descriptor_cs}")
+add_executable(d3d12x_descriptor_check tests/d3d12x_descriptor_check.cpp "${d3d12x_descriptor_cs}")
+add_dependencies(d3d12x_descriptor_check d3d12_xs_shim d3d12x_descriptor_shader)
+target_include_directories(d3d12x_descriptor_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_features(d3d12x_descriptor_check PRIVATE cxx_std_17)
+target_link_libraries(d3d12x_descriptor_check PRIVATE d3d12 dxgi)
+foreach(adapter IN ITEMS warp hardware)
+    add_test(NAME d3d12x_descriptor_heap_${adapter} COMMAND d3d12x_descriptor_check
+        "$<TARGET_FILE:d3d12_xs_shim>" heap ${adapter})
+    add_test(NAME d3d12x_descriptor_table_${adapter} COMMAND d3d12x_descriptor_check
+        "$<TARGET_FILE:d3d12_xs_shim>" table ${adapter})
+    add_test(NAME d3d12x_descriptor_negative_${adapter} COMMAND d3d12x_descriptor_check
+        "$<TARGET_FILE:d3d12_xs_shim>" negative ${adapter})
+    set_tests_properties(d3d12x_descriptor_heap_${adapter} d3d12x_descriptor_table_${adapter}
+        d3d12x_descriptor_negative_${adapter} PROPERTIES TIMEOUT 30)
+endforeach()
+set_tests_properties(d3d12x_descriptor_heap_hardware d3d12x_descriptor_table_hardware
+    d3d12x_descriptor_negative_hardware PROPERTIES SKIP_RETURN_CODE 77)
 # The main executable's CPU/GPU range translation against a desktop D3D12 heap (#874).
 set(vm_translation_header "${CMAKE_CURRENT_BINARY_DIR}/vm_translation_cs.h")
 add_custom_command(OUTPUT "${vm_translation_header}"
