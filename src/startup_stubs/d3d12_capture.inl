@@ -25,6 +25,7 @@ struct HeapInfo {
     u64 wrapper;
     std::uint32_t type, count, increment, pad;
     u64 title_cpu, desktop_cpu, desktop_gpu;
+    u64 title_sampler_cpu;
     std::uint32_t* shadow;           // per descriptor: view id + 1 (0: nothing known)
 };
 struct ResourceInfo {
@@ -122,10 +123,11 @@ const ResourceInfo* resource_info(const Wrapper* w)
     ReleaseSRWLockShared(&note_lock);
     return info;
 }
-void note_heap(Wrapper* w, UINT type, UINT count, UINT increment, u64 title_cpu, u64 desktop_cpu, u64 desktop_gpu)
+void note_heap(Wrapper* w, UINT type, UINT count, UINT increment, u64 title_cpu, u64 desktop_cpu, u64 desktop_gpu,
+               u64 title_sampler_cpu)
 {
     AcquireSRWLockExclusive(&note_lock);
-    heap_infos().push_back(HeapInfo{reinterpret_cast<u64>(w), type, count, increment, 0, title_cpu, desktop_cpu, desktop_gpu,
+    heap_infos().push_back(HeapInfo{reinterpret_cast<u64>(w), type, count, increment, 0, title_cpu, desktop_cpu, desktop_gpu, title_sampler_cpu,
         static_cast<std::uint32_t*>(VirtualAlloc(nullptr, (u64{count} + 1) * 4, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))});
     ReleaseSRWLockExclusive(&note_lock);
 }
@@ -162,10 +164,12 @@ void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_
     }
     if (std::uint32_t* slot = shadow_slot(dest_desktop)) *slot = record.id + 1;
     ReleaseSRWLockExclusive(&note_lock);
-    if (dest_title != dest_desktop && title_backed(dest_title, 32) && x2w_local::writable(reinterpret_cast<void*>(dest_title), 32)) {
+    const std::size_t token_bytes = slot == 22 ? x2w_startup::title_sampler_stride : 32u;
+    if (dest_title != dest_desktop && title_backed(dest_title, token_bytes) &&
+        x2w_local::writable(reinterpret_cast<void*>(dest_title), token_bytes)) {
         std::uint32_t token[8] = {view_token_magic, record.id, static_cast<std::uint32_t>(slot), 0,
                                   static_cast<std::uint32_t>(resource), static_cast<std::uint32_t>(resource >> 32), 0, 0};
-        std::memcpy(reinterpret_cast<void*>(dest_title), token, sizeof(token));
+        std::memcpy(reinterpret_cast<void*>(dest_title), token, token_bytes);
     }
 }
 void note_copy(u64 dest_title, u64 src_title, u64 dest_desktop, u64 src_desktop, UINT count, UINT increment)
@@ -180,8 +184,10 @@ void note_copy(u64 dest_title, u64 src_title, u64 dest_desktop, u64 src_desktop,
         else std::memset(to, 0, u64{count} * 4);
     }
     ReleaseSRWLockExclusive(&note_lock);
-    const u64 bytes = u64{count} * increment;
-    if (dest_title != dest_desktop && src_title != src_desktop && title_backed(dest_title, bytes) && title_backed(src_title, bytes))
+    const UINT stride = title_descriptor_stride(dest_title, increment);
+    const u64 bytes = u64{count} * stride;
+    if (dest_title != dest_desktop && src_title != src_desktop &&
+        stride == title_descriptor_stride(src_title, increment) && title_backed(dest_title, bytes) && title_backed(src_title, bytes))
         std::memmove(reinterpret_cast<void*>(dest_title), reinterpret_cast<const void*>(src_title), bytes);
 }
 
@@ -381,13 +387,15 @@ void table(int slot, UINT parameter, u64 gpu_handle, std::uint32_t entries)
     std::vector<std::uint32_t> ids(entries * 2);  // [shadow ids + 1][token ids + 1]
     for (std::uint32_t i = 0; i < entries; ++i) ids[i] = heap.shadow ? heap.shadow[index + i] : 0;
     if (heap.title_cpu) {
+        const UINT stride = title_descriptor_stride(heap.title_cpu, heap.increment);
+        const u64 title_start = heap.title_cpu + index * stride;
         for (std::uint32_t i = 0; i < entries; ++i) {
             std::uint32_t token[2]{};
             SIZE_T got = 0;
-            ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(heap.title_cpu + offset + u64{i} * heap.increment), token, sizeof(token), &got);
+            ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(title_start + u64{i} * stride), token, sizeof(token), &got);
             ids[entries + i] = token[0] == view_token_magic ? token[1] + 1 : 0;
         }
-        memory(heap.title_cpu + offset, u64{entries} * heap.increment, 0, 0x4c4254);
+        memory(title_start, u64{entries} * stride, 0, 0x4c4254);
     }
     struct { std::uint32_t sequence, slot, parameter, entries; u64 gpu_handle, heap, index; } header{
         static_cast<std::uint32_t>(sequence), static_cast<std::uint32_t>(slot), parameter, entries, gpu_handle, heap.wrapper, index};

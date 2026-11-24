@@ -9,8 +9,8 @@
 The fixture is a source-built gfx1013 vertex+pixel pair. Its pixel stage loads a texture descriptor
 from table 0 and four sampler words from the sampler heap at the byte offset in root constant 1 (s9),
 then samples at (1.25, 0.5) and exports the result. tests/startup_sampler_heap.cpp binds a 2048-entry
-point-sampler table: entry 0 wraps (0.25), entry 1 clamps (0.75), entries 2 to 2046 use a black border
-(0.0), and entry 2047, the fallback for unaligned or out-of-range offsets, uses a border of 0.5.
+point-sampler table: entry 0 wraps (0.25), entry 1 clamps (0.75), and missing entries use a black
+border (0.0). Entry 2047 is reserved for a distinguishable fallback border (0.5).
 """
 import os
 import re
@@ -170,24 +170,34 @@ def compile_hlsl(compiler, kind, source, out, profile, directory):
 
 def check_draw(dxc, renderer, adapter, fxc=None):
     # (pixel words, table byte offset, expected red bits)
-    # Entries 0, 1 and 2, the last title entry (2046), the first out-of-range offset (2047 * 16), the
-    # largest offset and an unaligned one; the last three must read the fallback entry's 0.5 border.
     cases = [(0, 0x3e800000), (16, 0x3f400000), (32, 0x00000000), (2046 * 16, 0x00000000),
              (2047 * 16, 0x3f000000), (0xfffffff0, 0x3f000000), (8, 0x3f000000)]
     compilers = [('dxc', dxc, 'vs_6_0', 'ps_6_0')] + ([('fxc', fxc, 'vs_5_1', 'ps_5_1')] if fxc else [])
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
+        dynamic = translate(PS_WORDS, True)
+        static = translate(PS_WORDS, False)
+        manifest = directory / 'dynamic.txt'
+        # Include a space-zero sampler alongside the translated space-one table.
+        manifest.write_text(dynamic.manifest().rstrip() + '\nsmp 0 0 0 0 0\n', encoding='ascii')
+        static_manifest = directory / 'static.txt'
+        static_manifest.write_text(static.manifest(), encoding='ascii')
+        legacy_manifest = directory / 'legacy.txt'
+        legacy_manifest.write_text(dynamic.manifest().replace(' fallback 2047', ''), encoding='ascii')
+        bad_manifest = directory / 'bad.txt'
+        bad_manifest.write_text(dynamic.manifest().replace('smpheap 2048 1', 'smpheap 2049 1'), encoding='ascii')
         for kind, compiler, vs_profile, ps_profile in compilers:
             vs = compile_hlsl(compiler, kind, FULLSCREEN_VS, 'fullscreen_%s' % kind, vs_profile, directory)
-            shader = compile_hlsl(compiler, kind, translate(PS_WORDS, True).hlsl_ps(), 'ps_%s' % kind, ps_profile, directory)
+            shader = compile_hlsl(compiler, kind, dynamic.hlsl_ps(), 'ps_%s' % kind, ps_profile, directory)
+            static_shader = compile_hlsl(compiler, kind, static.hlsl_ps(), 'ps_static_%s' % kind, ps_profile, directory)
             # Negative control: the run-time shader with its index dropped must lose entry 1.
-            guarded = translate(PS_WORDS, True).hlsl_ps()
+            guarded = dynamic.hlsl_ps()
             dropped = re.sub(r'qh\[x2w_sampler_entry\(s\d+\)\]', 'qh[0]', guarded)
             assert dropped != guarded
             mutant = compile_hlsl(compiler, kind, dropped, 'ps_dropped_%s' % kind, ps_profile, directory)
             for offset, expected, dropped_index in [c + (False,) for c in cases] + [(16, 0x3f400000, True)]:
                 run = subprocess.run([renderer, adapter, '--startup-sampler-heap', str(vs),
-                                      str(mutant if dropped_index else shader), str(offset), '%08x' % expected],
+                                      str(mutant if dropped_index else shader), str(offset), '%08x' % expected, str(manifest)],
                                      capture_output=True, text=True)
                 sys.stdout.write(run.stdout)
                 label = 'dropped index' if dropped_index else 'run-time offset'
@@ -202,7 +212,92 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                     sys.exit(77)
                 if run.returncode:
                     raise AssertionError('%s %s offset %d\n%s\n%s' % (kind, label, offset, run.stdout, run.stderr))
+                assert 'null_sampler_unreadable=1 null_sampler_out_of_range=2044' in run.stdout, run.stdout
                 print('%s %s offset %d: %08x' % (kind, label, offset, expected), flush=True)
+
+            for label, pixel, bindings, extra, failure in (
+                ('static only', static_shader, static_manifest, [], None),
+                ('legacy manifest', shader, legacy_manifest, ['rebind'], None),
+                ('changed binding', shader, manifest, ['rebind'], None),
+                ('stale binding', shader, manifest, ['stale'], 'mismatch offset=16 expected=3e800000 actual=3f400000'),
+                ('invalid manifest', shader, bad_manifest, [], 'Invalid sampler heap manifest'),
+            ):
+                run = subprocess.run([renderer, adapter, '--startup-sampler-heap', str(vs), str(pixel),
+                                      '16', '3e800000', str(bindings), *extra], capture_output=True, text=True)
+                sys.stdout.write(run.stdout)
+                if failure:
+                    assert run.returncode == 1 and failure in run.stderr, f'{kind} {label}\n{run.stdout}\n{run.stderr}'
+                else:
+                    assert run.returncode == 0, f'{kind} {label}\n{run.stdout}\n{run.stderr}'
+                print(f'{kind} {label}: {"failed at the expected check" if failure else "passed"}', flush=True)
+
+
+def check_wrapped_heap(dll_path, backend):
+    import ctypes as c
+    import struct
+    import uuid
+
+    ptr, uint, word, hr = c.c_void_p, c.c_uint32, c.c_uint64, c.c_int32
+
+    def guid(value):
+        return (c.c_ubyte * 16).from_buffer_copy(uuid.UUID(value).bytes_le)
+
+    def method(obj, slot, result, *args):
+        table = c.cast(obj, c.POINTER(c.POINTER(ptr)))[0]
+        return c.WINFUNCTYPE(result, ptr, *args)(table[slot])
+
+    adapter = ptr()
+    if backend == 'warp':
+        factory = ptr()
+        dxgi = c.WinDLL('dxgi.dll')
+        dxgi.CreateDXGIFactory2.argtypes = (uint, ptr, c.POINTER(ptr))
+        dxgi.CreateDXGIFactory2.restype = hr
+        assert dxgi.CreateDXGIFactory2(
+            0, guid('1bc6ea02-ef36-464f-bf0c-21ca39e5168a'), c.byref(factory)) == 0
+        assert method(factory, 27, hr, ptr, c.POINTER(ptr))(
+            factory, guid('29038f61-3839-4626-91fd-086879011a05'), c.byref(adapter)) == 0
+
+    dll = c.WinDLL(dll_path)
+    create = dll.D3D12XboxCreateDevice
+    create.argtypes = (ptr, ptr, ptr, c.POINTER(ptr))
+    create.restype = hr
+    device = ptr()
+    parameters = c.create_string_buffer(64)
+    assert create(adapter, parameters, guid('189819f1-1db6-4b57-be54-1821339b85f7'), c.byref(device)) == 0
+    native_stride = method(device, 15, uint, uint)(device, 1)
+
+    def heap(flags):
+        sentinel = 0xABCDEF00
+        memory = (uint * 12)(*([sentinel] * 12))
+        start = c.addressof(memory)
+        # SAMPLER heap, three 16-byte records, with the stand-in's explicit
+        # title-memory extension. Both arrays retain their storage through the copies.
+        desc = c.create_string_buffer(struct.pack('<4I2Q', 1, 3, flags, 0, start, 48))
+        result = ptr()
+        assert method(device, 14, hr, ptr, ptr, c.POINTER(ptr))(
+            device, desc, guid('8efb471d-616c-4f49-90f7-127bb763fa51'), c.byref(result)) == 0
+        actual = method(result, 9, word, ptr)(result, None)
+        assert actual == start, f'title sampler CPU handle was not returned (desktop increment {native_stride})'
+        return memory
+
+    source, target = heap(0), heap(1)
+    src, dst = c.addressof(source), c.addressof(target)
+    create_sampler = method(device, 22, None, ptr, word, word, word)
+    for slot, address_u in ((1, 1), (2, 3)):
+        desc = c.create_string_buffer(struct.pack('<4If2I6f', 0, address_u, 3, 3, 0.0, 1, 1, *([0.0] * 6)))
+        create_sampler(device, desc, src + 16 * slot, 0, 0)
+    assert source[0] == 0xABCDEF00 and source[4] == source[8] == 0x56573258, list(source)
+    assert source[5] != source[9], 'distinct samplers produced the same token'
+    method(device, 24, None, uint, word, word, uint)(device, 1, dst + 32, src + 16, 1)
+    assert target[8:12] == source[4:8] and target[:8] == [0xABCDEF00] * 8, list(target)
+
+    dest_ranges, source_ranges = (word * 1)(dst), (word * 2)(src + 16, src + 32)
+    dest_sizes = (uint * 1)(2)
+    method(device, 23, None, uint, ptr, ptr, uint, ptr, ptr, uint)(
+        device, 1, dest_ranges, dest_sizes, 2, source_ranges, None, 1)
+    assert target[:8] == source[4:12] and target[8:12] == source[4:8], list(target)
+    assert method(device, 37, hr)(device) == 0
+    print(f'wrapped sampler heap {backend}: title_stride=16 desktop_stride={native_stride}, token copies match')
 
 
 def main():
@@ -215,6 +310,8 @@ def main():
     elif mode == 'draw':
         controls()
         check_draw(*args)
+    elif mode == 'wrapped':
+        check_wrapped_heap(*args)
     else:
         raise SystemExit(__doc__)
 
