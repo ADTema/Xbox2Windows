@@ -3448,6 +3448,14 @@ def mimg_load_words(count, shift, groups):
     return words
 
 
+def mimg_ds_program():
+    lines = ds_program("ds_bpermute_b32", 5)
+    lines.insert(lines.index("s_waitcnt lgkmcnt(0)"), "s_load_dwordx8 s[24:31], s[12:13], 0x40")
+    return variant(lines, ("ds_bpermute_b32 v5, v5, v8", "v_mov_b32_e32 v9, 0\n"
+                           "image_load v14, v[8:9], s[24:31] dmask:0x1 dim:SQ_RSRC_IMG_2D\n"
+                           "s_waitcnt vmcnt(0)\nds_bpermute_b32 v5, v5, v14"))
+
+
 def mimg_load_controls():
     count, groups, shift, lines = next(mimg_load_cases())
     binding = MIMG_BINDING
@@ -3490,6 +3498,10 @@ def mimg_load_controls():
             **{key: value for key, value in binding.items() if key not in ("image_descriptor", "image_format")})
     rejects("Unresolved compute descriptor load", aot.lower, lines, (8, 8, 1),
             **{key: value for key, value in binding.items() if key not in ("image_descriptor", "image_format")})
+    # A lane route can consume a texel after vmcnt; the image temporary must be declared first.
+    mixed = aot.lower(mimg_ds_program(), 32, **(DS_BINDING | {"image_descriptor": 0x40,
+                                                            "image_format": "R32G32B32A32_UINT"}))
+    assert mixed.index("uint4 image_load_0 =") < mixed.index("= image_load_0.x;")
 
 
 def mimg_load_draw(directory, compiler, renderer, backend):

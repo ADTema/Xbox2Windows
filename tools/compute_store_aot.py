@@ -235,10 +235,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
     # they enter vector only at s_waitcnt vmcnt(0).
     loading = {}
     stores = []
-    ds_steps = []
-    # Image loads are typed reads of the bound texture, so each one becomes a local variable at the
-    # point where its coordinates are known; the loaded components enter vector only at vmcnt(0).
-    image_steps = []
+    # DS operations and image loads can consume each other's temporaries. Keep them in instruction order.
+    staged_steps = []
+    ds_step_count = 0
+    image_step_count = 0
     lds_enabled = ds_group and 128 <= lds_bytes <= 65536
     lds_word = None
     lds_strided_words = {}
@@ -493,13 +493,14 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             value = vector.get(src)
             if (not ds_group or guard_span is not None or max(dst, addr, src) > 255
                     or not isinstance(address, tuple) or address[0] != "ds_address" or not is_word(value)
-                    or len(ds_steps) >= 64):
+                    or ds_step_count >= 64):
                 raise ValueError("Unverified DS lane routing")
             # The bijective address is (local X + bias) mod 32. Scatter reads from its inverse.
             bias = address[1] if op == "bpermute" else (-address[1]) % 32
-            slot = f"ds_stage_{len(ds_steps)}"
-            result = f"ds_result_{len(ds_steps)}"
-            ds_steps.append((slot, f"    {slot}[local.x] = {hlsl_word(value)};\n"
+            slot = f"ds_stage_{ds_step_count}"
+            result = f"ds_result_{ds_step_count}"
+            ds_step_count += 1
+            staged_steps.append((slot, f"    {slot}[local.x] = {hlsl_word(value)};\n"
                                    f"    GroupMemoryBarrierWithGroupSync();\n"
                                    f"    uint {result} = {slot}[(local.x + {bias}u) & 31u];"))
             vector[dst] = ("alu", result)
@@ -552,10 +553,11 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Unverified private LDS floating-point access")
             old, src = map(hlsl_word, (lds_word, value))
             if op.startswith("add"):
-                if len(ds_steps) >= 64:
+                if ds_step_count >= 64:
                     raise ValueError("Too many private LDS floating-point steps")
-                name = f"ds_f32_{len(ds_steps)}"
-                ds_steps.append((None, f"    precise float {name} = asfloat({old}) + asfloat({src});"))
+                name = f"ds_f32_{ds_step_count}"
+                ds_step_count += 1
+                staged_steps.append((None, f"    precise float {name} = asfloat({old}) + asfloat({src});"))
                 expression = f"asuint({name})"
             else:
                 condition = {"min": "<", "max": ">", "cmpst": "=="}[op]
@@ -589,9 +591,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             if not all(map(is_word, cmp_word + new_word)):
                 raise ValueError("Unverified private LDS binary64 source")
             inputs = tuple(map(hlsl_word, prev + cmp_word + new_word))
-            if len(ds_steps) >= 64 or any(len(word) > ALU_EXPRESSION_LIMIT for word in inputs):
+            if ds_step_count >= 64 or any(len(word) > ALU_EXPRESSION_LIMIT for word in inputs):
                 raise ValueError("LDS expression exceeds the profile limit")
-            prefix = f"ds_f64_{len(ds_steps)}"
+            prefix = f"ds_f64_{ds_step_count}"
+            ds_step_count += 1
             old_lo, old_hi, cmp_lo, cmp_hi, new_lo, new_hi = (
                 f"{prefix}_{suffix}" for suffix in ("old_lo", "old_hi", "cmp_lo", "cmp_hi", "new_lo", "new_hi")
             )
@@ -612,7 +615,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             take = f"{prefix}_take"
             statements = [f"    uint {name} = {word};" for name, word in zip(names, inputs)]
             statements.append(f"    bool {take} = {condition};")
-            ds_steps.append((None, "\n".join(statements)))
+            staged_steps.append((None, "\n".join(statements)))
             update = (f"({take} ? {new_lo} : {old_lo})", f"({take} ? {new_hi} : {old_hi})")
             if dest:
                 vector.update(zip(ranges[-1], prev))
@@ -766,15 +769,16 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
         elif m := re.fullmatch(r"ds_(append|consume) v(\d+)(?: offset:0)?", line):
             op, dst = m[1], int(m[2])
             if (not lds_m0_zero or guard_span is not None or dst > 255
-                    or lds_address_shift != 2 or not is_word(lds_word) or len(ds_steps) >= 64):
+                    or lds_address_shift != 2 or not is_word(lds_word) or ds_step_count >= 64):
                 raise ValueError("Unverified LDS wave counter")
             old = hlsl_word(lds_word)
-            slot = f"ds_stage_{len(ds_steps)}"
-            previous = f"ds_result_{len(ds_steps)}"
+            slot = f"ds_stage_{ds_step_count}"
+            previous = f"ds_result_{ds_step_count}"
+            ds_step_count += 1
             # LDS byte zero is lane zero's word. Snapshot it once per group,
             # then only change that lane's word in the private layout.
             operator = "+" if op == "append" else "-"
-            ds_steps.append((slot, f"    if (local.x == 0u) {slot}[0] = {old};\n"
+            staged_steps.append((slot, f"    if (local.x == 0u) {slot}[0] = {old};\n"
                              "    GroupMemoryBarrierWithGroupSync();\n"
                              f"    uint {previous} = {slot}[0];"))
             vector[dst] = ("alu", previous)
@@ -1115,7 +1119,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 loading[reg] = word
         elif m := re.fullmatch(r"image_load (v\d+|v\[\d+:\d+\]), v\[(\d+):(\d+)\], "
                                r"s\[(\d+):(\d+)\] dmask:0x([0-9a-f]+) dim:SQ_RSRC_IMG_2D( unorm)?", line):
-            # One typed 2D read: (x, y) come from two packed address dwords, and dmask selects the
+            # One typed 2D read: x and y come from separate address dwords, and dmask selects the
             # leading components of the caller-declared texel format in ascending order. LLVM 15
             # encodes non-sampler loads with the unorm (un-normalized address) flag, which has no
             # effect on this integer-address lowering.
@@ -1137,9 +1141,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             coordinates = (vector.get(x), vector.get(y))
             if not all(is_word(value) for value in coordinates):
                 raise ValueError("Unverified image coordinates")
-            name = f"image_load_{len(image_steps)}"
+            name = f"image_load_{image_step_count}"
+            image_step_count += 1
             address = f"int3(asint({hlsl_word(coordinates[0])}), asint({hlsl_word(coordinates[1])}), 0)"
-            image_steps.append(f"    {IMAGE_FORMATS[image_format][0]} {name} = imageData.Load({address});")
+            staged_steps.append((None, f"    {IMAGE_FORMATS[image_format][0]} {name} = imageData.Load({address});"))
             for index in range(count):
                 reg = first + index
                 vector.pop(reg, None)
@@ -1265,11 +1270,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
     if image_descriptor is not None:
         cbuffer += f"Texture2D<{IMAGE_FORMATS[image_format][0]}> imageData : register(t0);\n"
     local = ""
-    steps = [step for _, step in ds_steps] + image_steps
-    if steps:
-        body = "\n".join([*steps, body])
-    if ds_steps:
-        shared = [slot for slot, _ in ds_steps if slot is not None]
+    if staged_steps:
+        body = "\n".join([*(step for _, step in staged_steps), body])
+        shared = [slot for slot, _ in staged_steps if slot is not None]
         cbuffer += "".join(f"groupshared uint {slot}[32];\n" for slot in shared)
         if shared:
             local = ", uint3 local : SV_GroupThreadID"
