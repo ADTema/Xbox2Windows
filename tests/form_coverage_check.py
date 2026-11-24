@@ -278,6 +278,9 @@ def check_shader_records():
         assert shift64_forms <= fc.gfx_forms(pixel.ACCEPTED, fc.load_reference(name)), name
     masked_forms = {("SOP1", "s_and_saveexec_b64"), ("SOPP", "s_cbranch_execz")}
     assert masked_forms <= fc.gfx_forms(pixel.ACCEPTED, gfx)
+    # Forward skips on a tracked scalar compare (issue #1413).
+    scc_skip_forms = {("SOPP", "s_cbranch_scc0"), ("SOPP", "s_cbranch_scc1")}
+    assert scc_skip_forms <= fc.gfx_forms(pixel.ACCEPTED, gfx)
     scalar64_forms = {
         ("SOP1", "s_cmov_b64"), ("SOP1", "s_not_b64"), ("SOP1", "s_brev_b64"),
         ("SOP2", "s_and_b64"), ("SOP2", "s_or_b64"), ("SOP2", "s_xor_b64"),
@@ -349,7 +352,6 @@ def check_shader_records():
         "v_cvt_pknorm_i16_f16", "v_cvt_pknorm_u16_f16",
         "s_lshl0_add_u32", "s_lshl5_add_u32",
         "s_cbranch_execnz", "s_cbranch_vccz", "s_cbranch_vccnz",
-        "s_cbranch_scc0", "s_cbranch_scc1",
         "s_absdiff_i64", "s_absdiff_u32",
         "v_sad_u8", "v_sad_u16", "v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8", "v_mqsad_u32_u8",
     }
