@@ -8060,6 +8060,15 @@ produced 768 bytes. Truncation, bad checksum, trailing bytes and mismatched
 destination sizes in both directions returned `0x8007000d` and preserved the
 destination. All six cases passed on Windows build 26200.
 
+The `refusals` case calls the codec directly with hand-built requests. Another
+custom format, `GDEFLATE` and the upload-heap flag return `E_NOTIMPL`. A null
+or empty source or destination and sizes above `ULONG_MAX` return
+`E_INVALIDARG`. Each refusal reports zero bytes and leaves the destination
+unchanged. A null queue returns `E_POINTER`, and an empty or missing queue
+resets the reported result to `E_PENDING`. The
+`dstorage_rfc1950_refusals_truncation_control` build drops the `SrcSize` bound
+and must report `FAIL: refusals src_over_ulong_max: status 0x8007000d`.
+
 Extract the [DirectStorage NuGet package](https://www.nuget.org/packages/Microsoft.Direct3D.DirectStorage/1.3.0)
 under `out/dstorage-sdk` and install a static x64 build of
 [zlib 1.3.1](https://github.com/madler/zlib/releases/tag/v1.3.1) under
