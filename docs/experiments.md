@@ -2159,7 +2159,7 @@ The [translator](../tools/cpu_vex_aot.py) lifts Windows x64 leaf functions that 
 - `vpaddw`, `vpsubw`, `vpmaxsw`, `vpminsw`, `vpmulhw` and `vpavgw`;
 - `vpaddsw`, `vpaddusw`, `vpsubsw` and `vpsubusw` (saturating), `vpmullw` and `vpmulhuw`, `vpmaxuw` and `vpminuw`;
 - `vpcmpeqw` and `vpcmpgtw` (signed), which set a lane to all ones or all zeros;
-- `vpsraw`, `vpsllw` and `vpsrlw` with an immediate count;
+- `vpsraw`, `vpsllw` and `vpsrlw` with an immediate count, or with a count in an XMM register or a 16-byte memory operand;
 - `vpunpcklbw`, `vpunpckhbw`, `vpunpcklwd` and `vpunpckhwd`;
 - `vpackuswb`;
 - the 16-byte moves `vmovdqu` and `vmovdqa`, the logic ops `vpxor`, `vpand` and `vpor`, and `vzeroupper`.
@@ -2171,7 +2171,7 @@ cmake --build --preset dev --target cpu_vex_words_original_lifted cpu_vex_words_
 ctest --preset dev --no-tests=error -R '^cpu_aot_vex_words$' -V
 ```
 
-The [fixture](../tests/cpu/vex_words.asm) has nine functions. The test runs each through the native and lifted DLLs on the same 4096 input pairs:
+The [fixture](../tests/cpu/vex_words.asm) has fifteen functions. The test runs each through the native and lifted DLLs on the same 4096 input pairs:
 - every pairing of eight edge words, including 0x7fff, 0x8000, 0xffff and 0x00ff, broadcast to all lanes;
 - the edge words rotated across lanes;
 - seeded random lanes.
@@ -2180,11 +2180,13 @@ Each call runs in one 16-byte-aligned arena in which the two inputs and the outp
 
 **Alignment.** `vmovdqu` accepts any address, and the four functions that use only `vmovdqu` also match on buffers 8 bytes off alignment. `vmovdqa` requires 16-byte alignment. `aligned_ops` is called only with aligned buffers, because the generated C++ does not check the precondition that the native instruction would fault on.
 
-**Aliases.** The output may alias either input exactly. Reads and the store then happen in program order, each as one 16-byte copy. With the output aliasing A and then B, and with RCX equal to RDX, all five functions match on 512 pairs. `store_reload` stores, reads the inputs again and stores a second result; with the output aliasing an input, its result differs from the non-aliased one in 955 of these cases, so the order is observed. Partial overlaps are not tested.
+**Aliases.** The output may alias either input exactly. Reads and the store then happen in program order, each as one 16-byte copy. With the output aliasing A and then B, and with RCX equal to RDX, all functions match on 512 pairs. `store_reload` stores, reads the inputs again and stores a second result; with the output aliasing an input, its result differs from the non-aliased one in 955 of these cases, so the order is observed. Partial overlaps are not tested.
 
 **Reference.** `sat_words` (the four saturating forms), `mul_minmax_words` (`vpmullw`, `vpmulhuw`, `vpmaxuw`, `vpminuw`) and `cmp_words` (`vpcmpeqw`, `vpcmpgtw` in both operand orders) are also compared with a per-lane integer model in the test that shares no code with the translator. It covers the signed clamps at 0x7fff and 0x8000, the unsigned clamps at 0 and 0xffff, and lanes with bit 15 set, where the signed and unsigned forms differ.
 
-**Controls.** A second fixture build replaces one `vpsraw` with `vpsrlw` in `shift_edges`. Its lifted DLL matches its own native build and differs from the original in 4044 of 4096 outputs, while the other functions are unchanged. The same build also replaces `vpmulhuw` with `vpmulhw` in `mul_minmax_words`; its lifted DLL matches the signed model and differs from the original model in 4071 of 4096 outputs. Translation rejects three patched copies: a VEX.256 load, a VEX.256 store, which uses a three-byte VEX prefix because of R8, and a `vpaddw` turned into `vpaddd`. It also rejects eight hand-encoded bodies, each first checked against its iced disassembly: an EVEX `vpaddw xmm0{k1}`, a legacy `paddw`, `xmm6` as destination and as source, `[rcx+10h]`, `[rax]`, a store to `[rcx]` and `vpsraw` with an XMM count.
+**Count forms.** The count of `vpsraw`, `vpsllw` and `vpsrlw` with an XMM or memory count is the low 64 bits of the operand as one unsigned integer; the upper quadword is ignored. A count above 15 clears every word of a logical shift and fills every word of `vpsraw` with its sign bit, so values such as 2^32 and 2^32 + 1, whose low 32 bits are 0 and 1, still saturate. The generated C++ reads the 8 low bytes into a 64-bit value and clamps it to 16 before calling the same shift helpers as the immediate form. The memory form is one 16-byte load from `[RCX]`, `[RDX]` or `[R8]`, like every other source. The six functions `sraw_count_reg`, `sraw_count_mem`, `sllw_count_reg`, `sllw_count_mem`, `srlw_count_reg` and `srlw_count_mem` shift A by the operand at `[RDX]`. Besides the shared 4096 pairs (whose second input is the count), the test runs 10752 cases per function: 56 low counts (0 to 39, 255, 256, 0xffff, 0x10000, 0x10001, 0x7fffffff, 0x80000000, 0xffffffff, 2^32, 2^32 + 1, 2^32 + 15, 2^33 + 3, 2^48, 2^63, 2^63 + 1 and 2^64 - 1) with four upper quadwords (0, all ones, 0x0123456789abcdef and 1) over 48 inputs. Native and lifted DLLs must match a per-lane integer model that shares no code with the translator, with the guard zones intact. The test also checks that the model of a translator that keeps only 32 bits of the count differs from the correct model (768, 960 and 1056 of 10752 outputs for the arithmetic, left and right shifts), so the cases tell that mistake apart.
+
+**Controls.** A second fixture build replaces one `vpsraw` with `vpsrlw` in `shift_edges`. Its lifted DLL matches its own native build and differs from the original in 4044 of 4096 outputs, while the other functions are unchanged. The same build also replaces `vpmulhuw` with `vpmulhw` in `mul_minmax_words`; its lifted DLL matches the signed model and differs from the original model in 4071 of 4096 outputs. Translation rejects three patched copies: a VEX.256 load, a VEX.256 store, which uses a three-byte VEX prefix because of R8, and a `vpaddw` turned into `vpaddd`. It also rejects thirteen hand-encoded bodies, each first checked against its iced disassembly: an EVEX `vpaddw xmm0{k1}`, a legacy `paddw`, `vpaddw` with an undefined source, `xmm6` as destination and as source, `[rcx+10h]`, `[rax]`, a store to `[rcx]`, and for the count forms a VEX.256 `vpsllw ymm0,ymm1,xmm2`, a count at `[rbx]`, a count at `[rcx+8]`, `vpsrad` (not lifted) and a `vpsllw` count in an undefined register.
 
 Sixteen mutations of the translator each fail the test:
 - `vpavgw` without rounding;
@@ -2202,9 +2204,11 @@ Sixteen mutations of the translator each fail the test:
 
 Only the alias checks catch the last two.
 
+Four mutations of the count forms each fail the model comparison, checked by editing the generated helper and rebuilding: the count truncated to 32 bits (caught by the first 2^32 case, `sraw_count_reg` with count 0x0000000100000000), truncated to 16 bits, the upper quadword read instead of the lower, and the two quadwords ORed. Changing the clamp threshold from 15 to 16 is not a mutation: counts of 16 behave like 15 for `vpsraw` and clear the lane for the logical shifts either way.
+
 Six more mutations, one per new form family, fail the comparison with the model: `vpmulhuw` as the signed product (4071 of 4096 `mul_minmax_words` outputs), `vpaddusw` without the clamp (4042 of `sat_words`), `vpsubsw` without the clamp (3665), `vpmaxuw` as signed (4041), `vpcmpgtw` as unsigned (4041 of `cmp_words`) and `vpcmpeqw` setting 1 instead of all ones (17, the equal lanes).
 
-The lifted functions were also run on Linux, outside the CTest, against the same machine code assembled with GNU as and executed on an AVX2 host. All four builds above matched the model on the 4096 pairs. The CTest `cpu_aot_vex_words`, which assembles with ML64 and builds with MSVC, was not run for this change.
+The lifted functions were also run on Linux, outside the CTest, against the same machine code assembled with GNU as and executed on an AVX2 host. For the count forms, a PE built with MinGW from the GNU as copy was also lifted by the translator, compiled with MinGW g++ at -O0 and -O2, and loaded with the native PE under Wine, where native, lifted and a C model agreed on 2112 cases per build; the full `vex_words_check.py` main path also passed on Linux with the GNU as builds, native and lifted, at -O0 and -O2. All four builds above matched the model on the 4096 pairs. The CTest `cpu_aot_vex_words`, which assembles with ML64 and builds with MSVC, was not run for this change.
 
 ## String memory transfers in the control-flow CPU lifter
 
