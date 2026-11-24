@@ -12,6 +12,15 @@ arguments. Identifying both masks for the affected pipeline remains open. [Refs 
 
 Run commands from the repository root. Start with the [project overview](../README.md) and [contribution guide](../CONTRIBUTING.md). Package-specific observations below used local inputs. Community regression tests use fixtures built from this repository.
 
+## Resuming startup shader compilation
+
+Run `python3 -B tests/startup_translator_check.py`. The check runs `--pending` in
+manifest-only mode, then enables a synthetic FXC invocation and verifies that it
+compiles both stages. A pixel compile failure leaves the request pending. A later
+run publishes both bytecode files and clears the failure report. The next run
+skips the completed request. Restart the runtime if it already read the manifest
+before the bytecode was available.
+
 ## One-dimensional texture sampling in startup draws
 
 The startup translator accepts ordinary 1D image sampling with a single coordinate and a
