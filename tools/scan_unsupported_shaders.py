@@ -54,6 +54,9 @@ PIXEL_INT_COMPARE = tuple(pixel_aot.INT_COMPARE) if pixel_aot is not None else (
 PIXEL_VOP3P_F16 = pixel_aot.VOP3P_F16 if pixel_aot is not None else {}
 PIXEL_VOP3P_INT16 = pixel_aot.VOP3P_INT16 if pixel_aot is not None else {}
 PIXEL_VOP3_INT16 = pixel_aot.VOP3_INT16 if pixel_aot is not None else {}
+PIXEL_VOP2_F16 = tuple(pixel_aot.VOP2_F16) if pixel_aot is not None else ()
+PIXEL_VOP1_F16_ROUND = tuple(pixel_aot.VOP1_F16_ROUND) if pixel_aot is not None else ()
+PIXEL_INLINE_F16 = tuple(pixel_aot.INLINE_F16) if pixel_aot is not None else ()
 PIXEL_VCC = r"(?:vcc(?:_lo)?)"
 PIXEL_VOP3_INT16_TERNARY = pixel_aot.VOP3_INT16_TERNARY if pixel_aot is not None else {}
 PIXEL_LANE_MASK = pixel_aot.LANE_MASK if pixel_aot is not None else r"(?:vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
@@ -67,6 +70,12 @@ INT16_VGPR = r"v(?:[0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])"
 INT16_SOURCE = (
     rf"(?:{INT16_VGPR}|s(?:[0-9]|[1-9][0-9]|10[0-5])|0x0{{0,4}}[0-9a-f]{{1,4}}"
     r"|-?(?:[0-9]|1[0-6])|(?:1[7-9]|[2-5][0-9]|6[0-4]))"
+)
+# Source of the plain binary16 e32 arithmetic and rounding forms as pixel_aot.half16_arith_source reads it: a binary16 inline
+# constant, 0, a 16-bit literal or a register. Integer inline constants other than 0 and every modifier are refused.
+F16_ARITH_SOURCE = (
+    r"(?:" + "|".join(map(re.escape, PIXEL_INLINE_F16 + ("0",)))
+    + r"|0x0*[0-9a-f]{1,4}|v(?:[0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])|s(?:[0-9]|[1-9][0-9]|10[0-5]))"
 )
 SCALAR32_SOURCE = r"(?:s\d+|0x[0-9a-f]{1,8}|-?\d+(?:\.\d+)?)"
 SCALAR64_SOURCE = r"(?:s\[\d+:\d+\]|0x[0-9a-f]{1,8}|-?\d+)"
@@ -197,6 +206,19 @@ if PIXEL_INT_COMPARE:
     )
 else:
     INT64_COMPARE_PATTERN = None
+# Plain binary16 e32 forms whose result keeps only the low half (pixel_aot proves finite sources and results).
+if PIXEL_VOP2_F16:
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_(?:{'|'.join(map(re.escape, PIXEL_VOP2_F16))})_f16_e32\s+{INT16_VGPR},\s+{F16_ARITH_SOURCE},\s+{INT16_VGPR}"
+    )
+if PIXEL_VOP1_F16_ROUND:
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_(?:{'|'.join(map(re.escape, PIXEL_VOP1_F16_ROUND))})_f16_e32\s+{INT16_VGPR},\s+{F16_ARITH_SOURCE}"
+    )
+if pixel_aot is not None:
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_cvt_f16_(?:i16|u16)_e32\s+{INT16_VGPR},\s+{INT16_SOURCE}"
+    )
 if PIXEL_VOP3P_F16:
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_pk_(?:{'|'.join(map(re.escape, PIXEL_VOP3P_F16))})_f16\s+v\d+,\s+.+"
@@ -324,6 +346,13 @@ KNOWN_RDNA2_BASE_OPCODES |= {
     "s_dcache_wb", "s_memtime", "s_memrealtime", "s_atc_probe", "s_atc_probe_buffer",
 }
 
+# Scalar program-control and compare-immediate forms the disassembler decodes: recognition only, no lowering.
+KNOWN_RDNA2_BASE_OPCODES |= {
+    "s_wakeup", "s_setkill", "s_sethalt", "s_sendmsg", "s_sendmsghalt", "s_icache_inv", "s_incperflevel",
+    "s_decperflevel", "s_ttracedata", "s_ttracedata_imm", "s_endpgm_saved", "s_endpgm_ordered_ps_done",
+    "s_wait_idle", "s_waitcnt_depctr", "s_denorm_mode", "s_call_b64",
+}
+
 KNOWN_RDNA2_BASE_OPCODES |= (
     SUPPORTED_ALU
     | {f"v_{name}" for name in PIXEL_INTEGER}
@@ -333,6 +362,8 @@ KNOWN_RDNA2_BASE_OPCODES |= (
     | {f"v_pk_{name}" for name in PIXEL_VOP3P_INT16}
     | {f"v_{name}" for name in PIXEL_VOP3_INT16}
     | {f"v_{name}" for name in PIXEL_VOP3_INT16_TERNARY}
+    | {f"v_{name}_f16" for name in PIXEL_VOP2_F16 + PIXEL_VOP1_F16_ROUND}
+    | {"v_cvt_f16_i16", "v_cvt_f16_u16"}
     | {name for name, _, _ in MUBUF_OPS.values()}
     | {name for name, _, _ in MTBUF_OPS.values()}
     | {entry[0] for entry in FLAT_OPS.values()}

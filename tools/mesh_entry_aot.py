@@ -198,8 +198,12 @@ class Wave:
             v = a << (b & 31)
         elif op == "s_lshr_b32":
             v = (a & U32) >> (b & 31)
-        elif op == "s_add_i32":
+        elif op in ("s_add_i32", "s_add_u32"):
             v = a + b
+        elif op == "s_sub_u32":
+            v = a - b
+        elif op == "s_mul_i32":
+            v = a * b
         elif op == "s_and_b32" or op == "s_and_b64":
             v = a & b
         elif op in ("s_or_b32", "s_or_b64"):
@@ -212,7 +216,11 @@ class Wave:
             raise ValueError(f"Unsupported scalar instruction {op}")
         wide = op.endswith("_b64")
         self.put(d, v, wide)
-        if not op.startswith(("s_mov", "s_cselect")):
+        if op == "s_add_u32":
+            self.scc = (a & U32) + (b & U32) > U32
+        elif op == "s_sub_u32":
+            self.scc = (a & U32) < (b & U32)
+        elif not op.startswith(("s_mov", "s_cselect", "s_mul")):
             self.scc = (
                 bool((~(a ^ b) & (a ^ v)) & (1 << 31))
                 if op == "s_add_i32"
@@ -250,6 +258,13 @@ class Wave:
             "v_fmac_f32_e32",
             "v_fmac_f32_e64",
             "v_add_f32_e32",
+            "v_add_f32_e64",
+            "v_sub_f32_e32",
+            "v_sub_f32_e64",
+            "v_subrev_f32_e32",
+            "v_subrev_f32_e64",
+            "v_mul_f32_e32",
+            "v_mul_f32_e64",
             "v_fma_f32",
         }
         for lane in live:
@@ -276,6 +291,16 @@ class Wave:
                 )
             elif op == "v_add_nc_u32_e32":
                 v = a + b
+            elif op == "v_sub_nc_u32_e32":
+                v = a - b
+            elif op == "v_or_b32_e32":
+                v = a | b
+            elif op == "v_xor_b32_e32":
+                v = a ^ b
+            elif op == "v_min_u32_e32":
+                v = min(a & U32, b & U32)
+            elif op == "v_max_u32_e32":
+                v = max(a & U32, b & U32)
             elif op == "v_mad_u32_u24":
                 v = (a & 0xFFFFFF) * (b & 0xFFFFFF) + vals[2]
             elif op == "v_lshrrev_b32_e32":
@@ -302,6 +327,12 @@ class Wave:
                     expr = f"mad({x}, {y}, {fp(vals[2])})"
                 elif op.startswith("v_fmac_f32_"):
                     expr = f"mad({x}, {y}, {fp(self.lane_value(d, lane))})"
+                elif op.startswith("v_mul_f32_"):
+                    expr = f"({x} * {y})"
+                elif op.startswith("v_sub_f32_"):
+                    expr = f"({x} - {y})"
+                elif op.startswith("v_subrev_f32_"):
+                    expr = f"({y} - {x})"
                 else:
                     expr = f"({x} + {y})"
                 if expr not in expressions:
