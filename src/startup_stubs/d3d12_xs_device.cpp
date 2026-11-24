@@ -1804,7 +1804,8 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
             }
             dsv_format = view_format_of(resolved, dsv_target);
             const bool read_depth = (view.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_DEPTH) != 0;
-            const bool read_stencil = (view.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL) != 0 || !format_has_stencil(dsv_format);
+            // A format without a stencil plane has no second plane to disagree with.
+            const bool read_stencil = !format_has_stencil(dsv_format) ? read_depth : (view.dsv_flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL) != 0;
             if (read_depth != read_stencil) {
                 if (first_calls(refused, 6)) log("x2w-d3d12 OMSetRenderTargets refused: depth stencil view with one read-only plane (flags 0x%x)", view.dsv_flags);
                 return;
