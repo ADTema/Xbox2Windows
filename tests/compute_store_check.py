@@ -1310,6 +1310,105 @@ MBCNT_BINDING = dict(table_reg=8, descriptor_offset=0, group_reg=10, stride=12, 
 MBCNT_MASK = 0x5a5a5a5a
 MBCNT_LANE = "(1u << (gindex & 31u)) - 1u"
 
+# A scalar readlane result selects lane 3 from each complete logical wave32. The group ID and descriptor setup
+# match the source-built read fixture; unique input words make both the selected wave and lane observable.
+READLANE = [
+    "s_mov_b32 s2, s1",
+    "s_mov_b32 s1, 0",
+    "v_lshl_add_u32 v0, s2, 6, v0",
+    "s_load_dwordx4 s[4:7], s[0:1], 0x20",
+    "s_waitcnt lgkmcnt(0)",
+    "s_load_dwordx8 s[8:15], s[0:1], 0x0",
+    "s_waitcnt lgkmcnt(0)",
+    "v_lshlrev_b32_e32 v3, 2, v0",
+    "buffer_load_dword v1, v3, s[12:15], 0 offen",
+    "s_waitcnt vmcnt(0)",
+    "s_mov_b32 s20, 3",
+    "v_readlane_b32 s21, v1, s20",
+    "v_or_b32_e32 v2, s21, v0",
+    "buffer_store_dword v2, v0, s[8:11], 0 idxen",
+    "s_endpgm",
+]
+READLANE_BINDING = READ_BINDING | {"wave_size": 32}
+
+
+def readlane_words(threads=64, lane=3):
+    words = [SENTINEL] * 320
+    for flat in range(threads):
+        words[flat] = source_word((flat & ~31) + lane) | flat
+    return words
+
+
+def readlane_controls():
+    """Readlane supports only statically selected, defined lanes in unguarded logical wave groups."""
+    source = aot.lower(READLANE, 64, **READLANE_BINDING)
+    assert "groupshared uint readlane_stage_0[64];" in source, source
+    assert "readlane_stage_0[gindex] = inputData.Load((tid.x << 2u) + 0u);" in source, source
+    assert "uint readlane_value_0 = readlane_stage_0[(gindex & ~31u) + 3u];" in source, source
+    assert "uint v_readlane_b32" not in source
+    literal = variant(READLANE, ("v_readlane_b32 s21, v1, s20", "v_readlane_b32 s21, v1, 3"))
+    assert "(gindex & ~31u) + 3u" in aot.lower(literal, 64, **READLANE_BINDING)
+
+    no_wave_statement = dict(READLANE_BINDING)
+    del no_wave_statement["wave_size"]
+    one_wave = variant(READLANE, ("v_lshl_add_u32 v0, s2, 6, v0", "v_lshl_add_u32 v0, s2, 5, v0"))
+    assert "readlane_value_0" in aot.lower(one_wave, 32, **no_wave_statement)
+    rejects("Unverified readlane operand or wave layout", aot.lower, READLANE, 64, **no_wave_statement)
+    rejects("Unverified readlane operand or wave layout", aot.lower,
+            variant(READLANE, ("s_mov_b32 s20, 3", "s_mov_b32 s20, 32")), 64, **READLANE_BINDING)
+    rejects("Unverified readlane operand or wave layout", aot.lower,
+            variant(READLANE, ("v_readlane_b32 s21, v1, s20", "v_readlane_b32 s21, v1, s12")),
+            64, **READLANE_BINDING)
+    short_group = variant(READLANE, ("v_lshl_add_u32 v0, s2, 6, v0", "v_lshl_add_u32 v0, s2, 1, v0"))
+    rejects("Unverified readlane operand or wave layout", aot.lower, short_group, 2, **READLANE_BINDING)
+    rejects("Unsupported wave size statement", aot.lower, READLANE, 64,
+            **(READLANE_BINDING | {"wave_size": 64}))
+    guarded = variant(READLANE,
+                      ("v_readlane_b32 s21, v1, s20",
+                       "v_cmp_gt_u32_e32 vcc_lo, 10, v0\ns_and_saveexec_b32 s19, vcc_lo\n"
+                       "v_readlane_b32 s21, v1, s20\ns_or_b32 exec_lo, exec_lo, s19"))
+    rejects("Unverified readlane operand or wave layout", aot.lower, guarded, 64, **READLANE_BINDING)
+
+
+def readlane_binary(directory, assembler, objcopy, library):
+    """Assemble and disassemble the accepted readlane form before lowering it."""
+    decoded = aot.labelled(disassemble(assemble(directory, assembler, objcopy, READLANE), library, offsets=True))
+    assert "v_readlane_b32 s21, v1, s20" in decoded, decoded
+    assert aot.lower(decoded, 64, **READLANE_BINDING) == aot.lower(READLANE, 64, **READLANE_BINDING)
+
+
+def readlane_draw(directory, compiler, renderer, backend):
+    for threads in (32, 64):
+        lines = READLANE if threads == 64 else variant(
+            READLANE, ("v_lshl_add_u32 v0, s2, 6, v0", "v_lshl_add_u32 v0, s2, 5, v0"))
+        binding = READLANE_BINDING if threads == 64 else READ_BINDING
+        source = aot.lower(lines, threads, **binding)
+        src, cso, case = [directory / f"readlane-{threads}.{suffix}" for suffix in ("hlsl", "cso", "case")]
+        src.write_text(source, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+        cmd = [renderer, backend, "--compute-store-case", cso, case]
+        expected = readlane_words(threads)
+        case.write_bytes(struct.pack("<321I", 1, *expected))
+        result = subprocess.run(cmd)
+        if result.returncode:
+            return result.returncode
+
+        if threads == 64:
+            # Reading the current lane or a different lane instead of lane 3 must fail on unique inputs.
+            mutants = (("identity lane", "(gindex & ~31u) + 3u", "gindex"),
+                       ("wrong selected lane", "(gindex & ~31u) + 3u", "(gindex & ~31u) + 4u"))
+            for label, old, new in mutants:
+                mutated = source.replace(old, new)
+                if mutated == source:
+                    raise AssertionError(f"readlane: mutation '{label}' did not change generated HLSL")
+                msrc, mcso = directory / "readlane-mutant.hlsl", directory / "readlane-mutant.cso"
+                msrc.write_text(mutated, encoding="ascii")
+                subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", mcso, msrc], check=True)
+                bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
+                if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+                    raise AssertionError(f"readlane: mutation '{label}' escaped detection\n{bad.stderr}")
+    return 0
+
 
 def mbcnt_words(*, lane=lambda flat: flat % 32, mask=MBCNT_MASK, base=7):
     """Independent reference for one MBCNT group: per thread, the bits of -1 and of the mask below its lane."""
@@ -3608,6 +3707,8 @@ def mubuf_cache_invalidate_binary(directory, assembler, objcopy, library):
 def binary(directory, assembler, objcopy, library):
     dpp_controls()
     dpp_binary(directory, assembler, objcopy, library)
+    readlane_controls()
+    readlane_binary(directory, assembler, objcopy, library)
     mubuf_cache_invalidate_binary(directory, assembler, objcopy, library)
     mubuf_reduction_controls()
     mubuf_reduction_x2_controls()
@@ -6370,6 +6471,7 @@ if __name__ == "__main__":
                  "draw-mimg-atomic-float": mimg_atomic_float,
                  "draw-mimg-packed-store": lambda d, *a: mimg_store_draw(d, *a, packed=True),
                  "draw-ds-route": ds_draw,
+                 "draw-readlane": readlane_draw,
                  "draw-lds-qword": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_QWORD_CASES),
                  "draw-lds-strided": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_STRIDED_CASES),
                  "draw-lds-wide-replacement": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_WIDE_REPLACEMENT_CASES),

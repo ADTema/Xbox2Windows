@@ -3289,6 +3289,16 @@ The GPU fixture uses 32 unique lane words, distinct across quads. The result rec
 ctest --preset dev --no-tests=error -R '^compute_store_aot_dpp_(warp|hardware)$' -V
 ```
 
+### gfx1013 compute readlane
+
+The compute profile lowers `v_readlane_b32 sD, vS, lane` when the VGPR source is known, the lane selector resolves to an integer from 0 through 31, and execution is not lane-guarded. It stages each logical thread's source word in group-shared memory and computes the scalar result from that lane within the current logical wave. This does not depend on the desktop adapter's wave-lane mapping. Only one-dimensional groups are accepted. A group of at most 32 threads must contain the selected lane; a larger group must be a multiple of 32 and explicitly state `wave_size=32`. Dynamic lane selectors, incomplete larger waves and `v_writelane_b32` remain unsupported.
+
+The source-built gfx1013 fixture uses distinct input words and checks both one-wave (32-thread) and two-wave (64-thread) groups against a CPU reference. The two-wave case verifies the selected lane resets at each logical wave. Identity-lane and wrong-selected-lane HLSL mutants must mismatch. The binary check assembles and disassembles the instruction through LLVM 15 in CI.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^compute_store_aot_readlane_(warp|hardware)$' -V
+```
+
 ### gfx1030 MUBUF cache-invalidation rejection
 
 The compute store profile rejects `buffer_gl0_inv` and `buffer_gl1_inv`
