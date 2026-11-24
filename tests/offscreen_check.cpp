@@ -796,6 +796,12 @@ OperationResult run_mesh_entry(const OperationContext& ctx)
     return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], false, binding));
 }
 
+OperationResult run_mesh_amplified(const OperationContext& ctx)
+{
+    return skip_if_false(check_mesh_amplified_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5],
+                                                   ctx.argv[6]));
+}
+
 OperationResult run_mesh_indexed(const OperationContext& ctx)
 {
     return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], true));
@@ -1269,6 +1275,7 @@ const OperationSpec kOperations[] = {
     {"--depth-mask", 6, 6, nullptr, kNoGate, run_depth_mask},
     {"--depth-mask-swapped", 6, 6, nullptr, kNoGate, run_depth_mask_swapped},
     {"--mesh-entry", 6, 7, validate_mesh_entry_args, kNoGate, run_mesh_entry},
+    {"--mesh-amplified", 7, 7, nullptr, kNoGate, run_mesh_amplified},
     {"--mesh-indexed", 6, 6, nullptr, kNoGate, run_mesh_indexed},
     {"--mesh-indexed-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_indexed_fallback},
     {"--mesh-textured-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_textured_fallback},
@@ -1510,6 +1517,10 @@ int run_self_test()
                    "Unknown GPU operation or invalid arguments: --check-pixel")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--mesh-entry", "a", "b", "c", "invalid"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --mesh-entry")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--mesh-amplified", "as", "ms", "ps"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --mesh-amplified")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--mesh-amplified", "as", "ms", "ps", "fixture"},
+                   CliAction::operation)) return 1;
     if (!check_cli({"offscreen_check", "warp", "--mesh-indexed-fallback", "cs", "vs", "ps"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --mesh-indexed-fallback")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--mesh-depth-pair-fallback", "cs", "vs", "ps"}, CliAction::usage_error,

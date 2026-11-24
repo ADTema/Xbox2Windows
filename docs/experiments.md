@@ -2932,6 +2932,48 @@ reference index caused the comparison to fail. Tested on Windows build
 26200.9974, RTX 4060 Laptop driver 32.0.16.1656 and WARP 10.0.26100.9818,
 with the debug layer enabled.
 
+## Amplification and mesh pipeline forms
+
+`tests/mesh_amplified_check.py` builds an amplification shader (`as_6_5`) and a
+mesh shader (`ms_6_5`) that reads its payload. `offscreen_check --mesh-amplified
+<as.dxil> <ms.dxil> <ps.dxil> <fixture>` creates one pipeline state with the AS,
+MS and PS subobjects and issues `DispatchMesh(1,1,1)` for a single AS group. The
+AS dispatches one mesh group and passes a depth word; the MS exports the same
+80-byte trace as the translated mesh fixtures, and the 32x32 target compares all
+1,024 RGBA pixels. A `--mesh-entry` draw with the same mesh body and no AS is the
+positive control for the mesh-only form.
+
+The stale-payload control compiles the AS with 0.75 in place of 0.5. It must fail
+`Mesh export trace mismatch` at the first differing depth byte (trace byte 26)
+while every pixel still matches, which shows that the AS payload reaches the MS
+and changes its exported vertex. The wrong-image control keeps the trace intact
+and reports 1,024 pixel mismatches. WARP accepts
+a mesh-only pipeline whose MS declares `in payload`, but the payload contents
+are then undefined, so the fixture does not use that shape as a control.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^mesh_amplified_draw_' -V
+ctest --preset dev --no-tests=error -R '^mesh_amplification_refusal$' -V
+```
+
+Both draws matched on Windows 10 Pro 26H2 build 26300.10075 with DXC
+1.8.2502.11 (`10.0.26100.0`). On in-box WARP 10.0.26100.10068 (Microsoft Basic
+Render Driver, vendor 1414, device 008c), the mesh-only pipeline reported
+`mesh_pipeline_ms=0.659` and the AS+MS pipeline reported `1.092`. On the AMD
+Radeon RX 9060 XT (vendor 1002, device 7590, driver 32.0.32029.2010), every
+`_hardware` variant also passed; the full `^mesh_` filter ran 37/37 with no
+failure. The debug layer was unavailable. A hardware target without a mesh
+shader tier exits 77.
+
+The translator refuses the guest amplification stage by name. `require_mesh_stage`
+checks both the PSV0 stage byte and the DXIL program kind before the mesh profile
+checks, and stage 14 reports `Unsupported amplification stage: only the bounded
+mesh stage is translated`. The accepted form remains one triangle-topology mesh
+program with 128 threads, three vertices and one primitive in a single group.
+Guest amplification code, a multi-group mesh dispatch, a translated mesh payload
+and the meshlet command stream are not translated. The fixture above is source
+built; it makes no console mesh-shader ABI claim.
+
 ## Compute UAV stores from a native container
 
 `tools/compute_store_aot.py` accepts a local extracted DXBC compute container. It checks the stage in both the DXIL and PSV0 parts, the group dimensions, the FSSM v0x101 extent and termination, then decodes the gfx1013 instructions with LLVM. The store profile translates one or more non-overlapping raw UAV stores of one to four known 32-bit constant words per invocation, including constants loaded via `s_mov_b32`, `s_movk_i32`, and `v_mov_b32` register copies, along with `s_clause` hints and combined `lgkmcnt(0)`/`vmcnt(0)` waits. A test binding maps one four-word descriptor to u0. Its table pointer has a known low register and a zero high word. Scalar loads must complete before use. For an indexed store the caller also supplies the group-X register and byte stride, v0 carries local X, and the decoded shift and add must produce the dispatch-thread index. The tests bind in-range raw buffers with no swizzle, format conversion or out-of-range accesses. The original descriptor contents and dispatch configuration require separate evidence.

@@ -46,7 +46,10 @@ struct MeshTextureProducers {
 bool check_mesh_entry_draw(ID3D12Device*, const char*, const char*, const char*, bool,
                            MeshConstantBinding = MeshConstantBinding::root,
                            MeshDrawMode = MeshDrawMode::color,
-                           const MeshTextureProducers* = nullptr);
+                           const MeshTextureProducers* = nullptr,
+                           const char* amplification = nullptr);
+bool check_mesh_amplified_draw(ID3D12Device*, const char* amplification, const char* mesh,
+                               const char* pixel, const char* fixture);
 void check_mesh_fallback_draw(ID3D12Device* device, const char* compute, const char* vertex,
                               const char* pixel, const char* fixture, MeshDrawMode mode = MeshDrawMode::color,
                               const MeshTextureProducers* = nullptr);
