@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <vector>
 
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
@@ -39,6 +40,16 @@ void write_left() {
 void write_right() {
     data.Store4(4, uint4(3, 1, 4, 0));
     data.Store(20, 0);
+}
+
+[numthreads(1, 1, 1)]
+void write_one_triangle() {
+    data.Store4(4, uint4(3, 1, 0, 0));
+}
+
+[numthreads(1, 1, 1)]
+void write_two_triangles() {
+    data.Store4(4, uint4(6, 1, 0, 0));
 }
 
 struct Varying {
@@ -212,26 +223,29 @@ void submit(ID3D12Device* device, ID3D12GraphicsCommandList* list)
     check(device->GetDeviceRemovedReason(), "GPU completion");
 }
 
-enum class Refusal { none, invalid_index, short_argument };
+enum class Refusal { none, invalid_index, short_argument, missing_viewport };
 
 bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_root, ID3D12PipelineState* writer,
          ID3D12RootSignature* graphics_root, IUnknown* graphics, ID3D12CommandSignature* signature,
-         bool draw_right, Refusal refusal, const char* label)
+         bool indexed, bool draw_right, Refusal refusal, const char* label)
 {
-    const UINT index_bytes = draw_right ? sizeof(wide_indices) : sizeof(indices);
+    const UINT index_bytes = indexed ? (draw_right ? sizeof(wide_indices) : sizeof(indices)) : 0;
     const UINT index_offset = 2 * (draw_right ? sizeof(std::uint32_t) : sizeof(std::uint16_t));
     const void* index_data = draw_right ? static_cast<const void*>(wide_indices.data()) : indices.data();
-    const PlacedBuffer arguments(device, guest, sizeof(initial), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    const PlacedBuffer index_buffer(device, guest, index_bytes, D3D12_RESOURCE_FLAG_NONE);
-    const auto upload = make_buffer(device, sizeof(initial) + index_bytes, D3D12_HEAP_TYPE_UPLOAD,
+    Words initial_words = initial;
+    if (!indexed) initial_words[5] = 0x3c3c3c3c; // Guard immediately after the four-word Draw record.
+    const PlacedBuffer arguments(device, guest, sizeof(initial_words), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    std::optional<PlacedBuffer> index_buffer;
+    if (indexed) index_buffer.emplace(device, guest, index_bytes, D3D12_RESOURCE_FLAG_NONE);
+    const auto upload = make_buffer(device, sizeof(initial_words) + index_bytes, D3D12_HEAP_TYPE_UPLOAD,
                                     D3D12_RESOURCE_STATE_GENERIC_READ);
     const auto arg_readback = make_buffer(device, sizeof(initial), D3D12_HEAP_TYPE_READBACK,
                                           D3D12_RESOURCE_STATE_COPY_DEST);
     void* memory = nullptr;
     const D3D12_RANGE untouched{0, 0};
     check(upload->Map(0, &untouched, &memory), "map upload");
-    std::memcpy(memory, initial.data(), sizeof(initial));
-    std::memcpy(static_cast<char*>(memory) + sizeof(initial), index_data, index_bytes);
+    std::memcpy(memory, initial_words.data(), sizeof(initial_words));
+    if (indexed) std::memcpy(static_cast<char*>(memory) + sizeof(initial_words), index_data, index_bytes);
     upload->Unmap(0, nullptr);
 
     const D3D12_RESOURCE_DESC target_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1, format, {1, 0},
@@ -252,9 +266,11 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     auto* wrapped = wrapped_list.Get();
     const auto native_list = native_object<ID3D12GraphicsCommandList>(device, guest, wrapped);
     auto* list = native_list.Get();
-    transition(list, index_buffer.native.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-    list->CopyBufferRegion(index_buffer.native.Get(), 0, upload.Get(), sizeof(initial), index_bytes);
-    transition(list, index_buffer.native.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+    if (index_buffer) {
+        transition(list, index_buffer->native.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyBufferRegion(index_buffer->native.Get(), 0, upload.Get(), sizeof(initial_words), index_bytes);
+        transition(list, index_buffer->native.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+    }
     transition(list, arguments.native.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     list->CopyBufferRegion(arguments.native.Get(), 0, upload.Get(), 0, sizeof(initial));
     auto argument_state = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -282,18 +298,23 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     using Execute = void (WINAPI*)(IUnknown*, IUnknown*, UINT, IUnknown*, UINT64, IUnknown*, UINT64);
     const D3D12_VIEWPORT viewport{0, 0, width, height, 0, 1};
     const D3D12_RECT scissor{0, 0, width, height};
-    const auto address = reinterpret_cast<UINT64>(index_buffer.address);
-    const D3D12_INDEX_BUFFER_VIEW view{address + (refusal == Refusal::invalid_index ? index_bytes : index_offset),
-                                     index_bytes - index_offset, draw_right ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT};
     slot<Clear>(wrapped, 52)(wrapped, rtv.ptr, clear, 0, nullptr);
     slot<Targets>(wrapped, 50)(wrapped, 1, &rtv, FALSE, nullptr);
     slot<Bind>(wrapped, 25)(wrapped, graphics);
     slot<Bind>(wrapped, 34)(wrapped, graphics_root);
     slot<Topology>(wrapped, 20)(wrapped, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    slot<Viewport>(wrapped, 21)(wrapped, 1, &viewport);
+    if (refusal != Refusal::missing_viewport) slot<Viewport>(wrapped, 21)(wrapped, 1, &viewport);
     slot<Scissor>(wrapped, 22)(wrapped, 1, &scissor);
-    slot<Index>(wrapped, 47)(wrapped, &view);
-    const UINT64 offset = refusal == Refusal::short_argument ? argument_offset + 2 * sizeof(std::uint32_t) : argument_offset;
+    if (index_buffer) {
+        const auto address = reinterpret_cast<UINT64>(index_buffer->address);
+        const auto start = refusal == Refusal::invalid_index ? index_bytes : index_offset;
+        const D3D12_INDEX_BUFFER_VIEW view{address + start, index_bytes - index_offset,
+                                         draw_right ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT};
+        slot<Index>(wrapped, 47)(wrapped, &view);
+    }
+    const auto record_bytes = indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS) : sizeof(D3D12_DRAW_ARGUMENTS);
+    const UINT64 offset = refusal == Refusal::short_argument
+        ? sizeof(initial_words) - record_bytes + sizeof(std::uint32_t) : argument_offset;
     slot<Execute>(wrapped, 61)(wrapped, signature, 1, arguments.wrapped.Get(), offset, nullptr, 0);
     check(slot<HRESULT (WINAPI*)(IUnknown*)>(wrapped, 9)(wrapped), "close guest command list");
     submit(device, list);
@@ -303,11 +324,11 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     Words observed{};
     std::memcpy(observed.data(), memory, sizeof(observed));
     arg_readback->Unmap(0, &untouched);
-    Words expected = initial;
+    Words expected = initial_words;
     if (writer) {
-        expected[1] = 3;
+        expected[1] = !indexed && draw_right ? 6 : 3;
         expected[2] = 1;
-        expected[3] = draw_right ? 4 : 1;
+        if (indexed) expected[3] = draw_right ? 4 : 1;
     }
     for (std::size_t i = 0; i < expected.size(); ++i) {
         if (observed[i] == expected[i]) continue;
@@ -336,8 +357,10 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
             std::uint32_t actual = 0;
             std::memcpy(&actual, static_cast<char*>(memory) + y * footprint.Footprint.RowPitch + x * sizeof(actual),
                         sizeof(actual));
-            const bool drawn = writer && refusal == Refusal::none && ((x >= width / 2) == draw_right);
-            const auto wanted = drawn ? (draw_right ? green : red) : black;
+            const bool right_half = x >= width / 2;
+            const bool covered = indexed ? right_half == draw_right : !right_half || draw_right;
+            const bool drawn = writer && refusal == Refusal::none && covered;
+            const auto wanted = drawn ? (right_half ? green : red) : black;
             if (actual != black) ++painted;
             if (actual == wanted) continue;
             std::fprintf(stderr, "%s: pixel (%u,%u): got 0x%08x, expected 0x%08x\n", label, x, y, actual, wanted);
@@ -351,8 +374,10 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
 
 int main(int argc, char** argv) try
 {
-    const bool warp = argc == 2 && std::strcmp(argv[1], "warp") == 0;
-    if (!warp && (argc != 2 || std::strcmp(argv[1], "hardware") != 0)) return 2;
+    if (argc != 2 && (argc != 3 || std::strcmp(argv[2], "draw") != 0)) return 2;
+    const bool indexed = argc == 2;
+    const bool warp = std::strcmp(argv[1], "warp") == 0;
+    if (!warp && std::strcmp(argv[1], "hardware") != 0) return 2;
     ComPtr<ID3D12Debug> debug;
     const HRESULT debug_hr = D3D12GetDebugInterface(IID_PPV_ARGS(&debug));
     if (debug_hr != DXGI_ERROR_SDK_COMPONENT_MISSING) check(debug_hr, "get debug layer");
@@ -395,24 +420,26 @@ int main(int argc, char** argv) try
     const D3D12_ROOT_SIGNATURE_DESC graphics_desc{0, nullptr, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
     const auto writer = create_root(device.Get(), writer_desc);
     const auto graphics = create_root(guest.Get(), graphics_desc);
-    const auto left = writer_pipeline(device.Get(), writer.Get(), "write_left");
-    const auto right = writer_pipeline(device.Get(), writer.Get(), "write_right");
+    const auto left = writer_pipeline(device.Get(), writer.Get(), indexed ? "write_left" : "write_one_triangle");
+    const auto right = writer_pipeline(device.Get(), writer.Get(), indexed ? "write_right" : "write_two_triangles");
     const auto pso = guest_pipeline(guest.Get(), graphics.Get());
     D3D12_INDIRECT_ARGUMENT_DESC argument{};
-    argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
-    const D3D12_COMMAND_SIGNATURE_DESC signature_desc{sizeof(D3D12_DRAW_INDEXED_ARGUMENTS), 1, &argument, 0};
+    argument.Type = indexed ? D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED : D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+    const UINT stride = indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS) : sizeof(D3D12_DRAW_ARGUMENTS);
+    const D3D12_COMMAND_SIGNATURE_DESC signature_desc{stride, 1, &argument, 0};
     ComPtr<ID3D12CommandSignature> signature;
-    check(guest->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature)), "create guest indexed signature");
+    check(guest->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature)), "create guest draw signature");
 
     const auto verify = [&](ID3D12PipelineState* producer, bool draw_right, Refusal refusal, const char* label) {
         return run(device.Get(), guest.Get(), writer.Get(), producer, graphics.Get(), pso.Get(), signature.Get(),
-                   draw_right, refusal, label);
+                   indexed, draw_right, refusal, label);
     };
-    if (!verify(left.Get(), false, Refusal::none, "left writer") ||
-        !verify(right.Get(), true, Refusal::none, "right writer") ||
+    if (!verify(left.Get(), false, Refusal::none, indexed ? "left writer" : "one triangle") ||
+        !verify(right.Get(), true, Refusal::none, indexed ? "right writer" : "two triangles") ||
         !verify(nullptr, false, Refusal::none, "omitted writer") ||
-        !verify(left.Get(), false, Refusal::invalid_index, "invalid index range") ||
         !verify(left.Get(), false, Refusal::short_argument, "short argument range")) return 1;
+    if (indexed ? !verify(left.Get(), false, Refusal::invalid_index, "invalid index range")
+                : !verify(left.Get(), false, Refusal::missing_viewport, "missing viewport")) return 1;
     if (info) {
         for (UINT64 i = 0; i < info->GetNumStoredMessages(); ++i) {
             SIZE_T bytes = 0;
