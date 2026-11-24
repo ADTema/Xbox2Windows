@@ -733,7 +733,7 @@ ctest --preset release --no-tests=error -R '^startup_nv12_draw_' -V
 
 `ctest --preset dev --no-tests=error -R '^startup_slice_footprints' -V` checks
 `src/startup_stubs/slice_footprints.h` without a GPU. It covers NV12 descriptions refused for odd or zero
-sizes, mips, layers, samples or dimension; the one-frame R8 plane and 15-frame re-read intervals and the
+sizes, mips, layers, samples or dimension; the one-frame R8 and A8 plane and 15-frame re-read intervals and the
 inclusive 32 MiB cap; the footprint request for 15 and 16 mips and without a device; and the bytes up to
 the end of the last row. The padded-last-row control must fail.
 
