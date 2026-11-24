@@ -216,6 +216,10 @@ def controls():
                     encode_sop1(SOP1_MOV_B32, M0, 16),
                     encode_sop2(SOP2_ADD_U32, M0, M0, 128 + 4),
                     encode_vop1(0x01, 4, M0))
+    for width, shift in ((M0, 128 + 2), (128 + 5, M0)):
+        must_refuse_seq('numeric use of m0 holding ptr',
+                        encode_sop1(SOP1_MOV_B32, M0, 10),
+                        encode_sop2(SOP2_BFM_B32, M0, width, shift))
     must_refuse_seq('scc from descriptor data',
                     encode_sop2(SOP2_AND_B32, M0, 16, 128 + 1))
 

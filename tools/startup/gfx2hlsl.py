@@ -652,12 +652,13 @@ class Stage:
                 except ValueError:
                     vals.append(None)
         if ops[0] == 'm0':
-            self.sym.pop('m0', None)
             if None not in vals:
                 value = (((1 << (vals[0] & 31)) - 1) << (vals[1] & 31)) & 0xffffffff
-                self.emit('m0 = 0x%08xu;' % value)
+                expr = '0x%08xu' % value
             else:
-                self.emit('m0 = (((1u << (%s & 31)) - 1) << (%s & 31));' % (self.u(ops[1]), self.u(ops[2])))
+                expr = '(((1u << (%s & 31)) - 1) << (%s & 31))' % (self.u(ops[1]), self.u(ops[2]))
+            self.sym.pop('m0', None)
+            self.emit('m0 = %s;' % expr)
             return None
         d = reg_range(ops[0])[1]
         if None not in vals:
