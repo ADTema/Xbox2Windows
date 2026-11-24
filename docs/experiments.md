@@ -8516,8 +8516,8 @@ A lane with a NaN source is resolved in software (the first source operand when 
 second, made quiet), so a compiler that swaps the operands of an addition cannot change a payload; `minps`
 and `maxps` use the host instruction unchanged, which returns the second source operand for equal values
 (signed zeros included) and for any NaN. A guest `ldmxcsr` is not lifted and exception flags are not observed.
-The packed double forms (`addpd`, `sqrtpd`, `minpd` and the others), the scalar forms, `rcpps` and
-`rsqrtps` stay rejected.
+The packed double arithmetic forms are described in the next subsection; the other packed double forms
+(compares, logic, conversions), the scalar forms, `rcpps` and `rsqrtps` stay rejected.
 
 The translator explicitly rejects VEX/EVEX encodings, `cmpps`/`cmpss` predicates
 `imm8 >= 8`, nonvolatile vector registers (`xmm6`..`xmm15`), nonvolatile or non-argument
@@ -8588,7 +8588,7 @@ division by zero, zero and `min` ordering, ignored rounding mode, DAZ or FTZ, an
 disagree with the processor on some call; a call under a different control word must leave the next default-mode call
 unchanged. The translator also rejects, with the message each time checked, VEX and EVEX forms, unaligned
 displacements, nonvolatile or undefined registers, non-argument and indexed memory bases and the unsupported packed
-double, scalar, `rcpps` and `rsqrtps` forms.
+double (other than the arithmetic forms below), scalar, `rcpps` and `rsqrtps` forms.
 
 Measured on Linux x86-64 on 24 November 2026 (a QEMU virtual x86-64 processor, not the Windows CI machine): the
 fixture was assembled with `llvm-ml-19` and linked with `lld-link-19`, the native code was run through a Windows-ABI
@@ -8601,10 +8601,56 @@ each built and run: the first six fail on a named word of a named export, for ex
 host because the host instruction already returns the architectural NaN, so that rule is defensive and not shown here to matter. The MSVC
 build and `ctest` run of `cpu_aot_sse_fp` are left to CI.
 
-Not covered by this experiment: unmasked exceptions and exception flags, the packed double and scalar arithmetic
+Not covered by this experiment: unmasked exceptions and exception flags, the scalar arithmetic
 forms, `rcpps` and `rsqrtps`, non-default MXCSR modes for the compares and moves,
 non-temporal cache-bypass hints on `movntps`, control flow, nonvolatile `xmm6`..`xmm15`
 prologues, and title CPU code execution.
+
+#### Packed double arithmetic
+
+The same translator also lifts the seven legacy SSE2 packed double forms `addpd`, `subpd`, `mulpd`, `divpd`,
+`minpd`, `maxpd` and `sqrtpd`, with an `xmm` source or a 16-byte aligned `m128` source (a displacement that is
+not a multiple of 16 is rejected at translation time, so no code that could fault on a misaligned address is
+generated; the leaf contract already requires 16-byte aligned argument pointers). Each form runs the matching
+`emmintrin.h` instruction on a run-time operand, so rounding mode, DAZ and FTZ are the host's, nothing is folded
+at translation time, and the C library square root is never used (it can differ from the hardware on a denormal
+operand under DAZ). A lane with a NaN source is resolved in software as for the single forms (the first source
+operand when it is a NaN, else the second, made quiet); `minpd` and `maxpd` use the host instruction unchanged
+(second source operand for equal values and for any NaN); `sqrtpd` returns a NaN source quiet with its payload
+and only writes its destination. A guest `ldmxcsr` is still not lifted and exception flags are not observed.
+VEX and EVEX forms, scalar forms (`F2`/`F3` prefixes with the same opcodes are `addsd`, `addss`, `sqrtsd`,
+`sqrtss`), `cmppd`, `andpd`, `cvtps2pd` and the other packed double forms stay rejected. These forms add no
+store: the results leave through the `movaps` stores the fixture already used.
+
+[The fixture](../tests/cpu/sse_fp_pd.asm) has four exports per operation (register source, `m128` at `[rdx]`, `m128`
+at `[rdx+16]`, same register as both operands) and a chained `op_pd_pipeline`. [The check](../tests/cpu/sse_fp_pd_check.py)
+compares native code, translated code and an [independent exact-rational reference](../tests/cpu/sse_fp_pd_ref.py)
+(no host floating point, no translator) bit for bit on 412 inputs per export: every ordered pair of 28 edge values
+(signed zeros, infinities, quiet and signaling NaNs with payloads, denormals, ties, overflow and underflow
+boundaries) plus 20 random vectors with biased exponents. It then repeats all 29 exports under the 16 control words
+(four rounding modes, each with neither, DAZ, FTZ or both) through the native-only `op_call_with_mxcsr` driver
+of the packed single check. Lanes the reference cannot decide (FTZ at the smallest normal number, `minpd`/`maxpd`
+under DAZ with a denormal result) are compared native against translated only.
+
+Negative controls: the `ALTER_IMM` build (add and subtract, multiply and divide, minimum and maximum, `sqrtpd` as
+`addpd`, the other displacement, a second register, a division in the chain) must match its own reference and differ
+from the original on every export; each non-default control word must change a result; fifteen wrong reference
+rules (NaN order, no quieting, mixed-sign zero, division by zero, zero and `min` order, ignored rounding, DAZ or FTZ,
+two `sqrtpd` rules) must each disagree with the processor; 48 translator rejection controls (VEX and EVEX, out-of-scope
+packed double and scalar forms, wrong-prefix scalar bytes, misaligned displacements, nonvolatile or undefined
+registers, non-argument, indexed, `rip`, `rsp` and 32-bit bases, segment prefix, missing `ret`) and 9 of them patched
+into a copy of the linked DLL.
+
+Measured on Linux x86-64 on 24 November 2026 (a QEMU virtual x86-64 processor, not the Windows CI machine): the
+fixture was assembled with `llvm-ml-19` and linked with `lld-link-19`, the native code was run through a Windows-ABI
+caller, and the translation was built with `clang++-19` at `-O0`, `-O2` and `-O3` (and compiled warning-free with
+MinGW `g++`). All three passed: 11,948 default-mode cases over 29 exports, 191,168 runs in 16 control words agreeing
+on 755,105 lanes (9,567 left undecided by the reference), 48 rejection controls and 9 PE-patched controls. The translator from
+`origin/main` fails on the same fixture with `unsupported instruction at RVA 0x1006: addpd xmm0,xmm1`. Eleven translator
+mutants (add as subtract, subtract with swapped operands, multiply as divide, divide as multiply, minimum as maximum,
+swapped `minpd` and `maxpd` operands, `sqrtpd` or the NaN rule not quieting, the NaN rule picking the second operand,
+`sqrtpd` as a doubling) each fail on a named word of a named export, for example `lifted op_addpd case 1`. The MSVC
+build and `ctest` run of `cpu_aot_sse_fp_pd` are left to CI. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_sse_fp_pd$' -V`.
 
 ## Legacy SSE/MMX conversion, shuffle, and masked/non-temporal stores
 
