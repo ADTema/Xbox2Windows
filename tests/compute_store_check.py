@@ -365,6 +365,7 @@ def controls():
     scalar_alu_controls()
     mbcnt_controls()
     bcnt_exec_controls()
+    ff1_exec_controls()
     writelane_controls()
 
 
@@ -1759,6 +1760,108 @@ def writelane_draw(directory, compiler, renderer, backend):
         bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
         if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
             raise AssertionError(f"writelane: mutation '{label}' escaped detection")
+    return 0
+
+
+FF1_EXEC = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "s_ff1_i32_b64 s4, exec",
+    "s_ff1_i32_b32 s5, exec_lo",
+    "s_add_u32 s6, s4, s5",
+    "v_lshl_add_u32 v3, s10, 6, v0",
+    "v_mad_u32_u24 v1, v3, 64, s6",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dword v1, v3, s[12:15], 0 idxen",
+    "s_endpgm",
+]
+FF1_EXEC_BINDING = dict(table_reg=8, descriptor_offset=0, group_reg=10, stride=4)
+
+
+def ff1_exec_words(*, result_fn=lambda flat: 0):
+    """Independent reference for one FF1_EXEC group: per thread, flat * 64 + ff1."""
+    words = [SENTINEL] * 320
+    for flat in range(64):
+        words[flat] = flat * 64 + result_fn(flat)
+    return words
+
+
+def ff1_exec_controls():
+    """s_ff1_i32_b64/b32 of exec: exact output and one rejection per assumption."""
+    expected_line = ("    outputData.Store(tid.x * 4u + 0u, (((tid.x & 0xffffffu) * (0x00000040u & 0xffffffu)) "
+                     "+ (0x00000000u + 0x00000000u)));")
+    lines = aot.lower(FF1_EXEC, 64, **FF1_EXEC_BINDING).splitlines()
+    assert lines[3] == expected_line, lines
+    # Inside a guarded region:
+    guarded = [
+        "s_mov_b32 s9, 0",
+        "s_load_dwordx4 s[12:15], s[8:9], null",
+        "v_lshl_add_u32 v3, s10, 6, v0",
+        "v_cmp_lt_u32_e32 vcc_lo, 4, v3",
+        "s_and_saveexec_b32 s2, vcc_lo",
+        "s_ff1_i32_b64 s4, exec",
+        "s_or_b32 exec_lo, exec_lo, s2",
+        "v_mad_u32_u24 v1, v3, 64, s4",
+        "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dword v1, v3, s[12:15], 0 idxen",
+        "s_endpgm",
+    ]
+    rejects("First active lane inside guarded region", aot.lower, guarded, 64, **FF1_EXEC_BINDING)
+    # Any other source:
+    for bad_src in ("vcc", "exec_hi", "s4", "0", "exec_lo"):
+        rejects("Unsupported first active lane source: " + bad_src, aot.lower,
+                variant(FF1_EXEC, ("s4, exec", f"s4, {bad_src}")), 64, **FF1_EXEC_BINDING)
+    rejects("Unsupported first active lane source: exec", aot.lower,
+            variant(FF1_EXEC, ("s5, exec_lo", "s5, exec")), 64, **FF1_EXEC_BINDING)
+    # Invalid or pending destination (and single SGPR required for b64):
+    rejects("Invalid scalar destination or pending load", aot.lower,
+            variant(FF1_EXEC, ("s4, exec", "s106, exec")), 64, **FF1_EXEC_BINDING)
+    rejects("Invalid scalar destination or pending load", aot.lower,
+            variant(FF1_EXEC, ("s4, exec", "s12, exec")), 64, **FF1_EXEC_BINDING)
+    rejects("Unsupported compute instruction", aot.lower,
+            variant(FF1_EXEC, ("s4, exec", "s[4:5], exec")), 64, **FF1_EXEC_BINDING)
+
+
+def ff1_exec_binary(directory, assembler, objcopy, library):
+    """The assembled FF1_EXEC program decodes to its text and lowers to the same translation."""
+    decoded = aot.labelled(disassemble(assemble(directory, assembler, objcopy, FF1_EXEC), library, offsets=True))
+    assert [line for line in decoded if line.startswith("s_ff1_i32_")] == [
+        line for line in FF1_EXEC if line.startswith("s_ff1_i32_")], decoded
+    assert aot.lower(decoded, 64, **FF1_EXEC_BINDING) == aot.lower(FF1_EXEC, 64, **FF1_EXEC_BINDING)
+
+
+def ff1_exec_draw(directory, compiler, renderer, backend):
+    src, cso, case = [directory / x for x in ("ff1_exec.hlsl", "ff1_exec.cso", "ff1_exec.case")]
+    source = aot.lower(FF1_EXEC, 64, **FF1_EXEC_BINDING)
+    src.write_text(source, encoding="ascii")
+    subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+    cmd = [renderer, backend, "--compute-store-case", cso, case]
+    expected = ff1_exec_words()
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+    off = list(expected)
+    off[64] ^= 1
+    for label, reference, word in (
+            ("result taken as 1", ff1_exec_words(result_fn=lambda flat: 1), 0),
+            ("result taken as lane index", ff1_exec_words(result_fn=lambda flat: flat & 31), 1),
+            ("sentinel past group", off, 64)):
+        assert next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b) == word, label
+        case.write_bytes(struct.pack("<321I", 1, *reference))
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"ff1_exec: reference '{label}' escaped detection\n{bad.stderr}")
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    mutated = source.replace("0x00000000u + 0x00000000u", "0x00000001u + 0x00000000u")
+    if mutated == source:
+        raise AssertionError("ff1_exec: mutation did not change the source")
+    msrc, mcso = directory / "mutated.hlsl", directory / "mutated.cso"
+    msrc.write_text(mutated, encoding="ascii")
+    subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", mcso, msrc], check=True)
+    bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
+    if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+        raise AssertionError("ff1_exec: mutation escaped detection")
     return 0
 
 
@@ -3993,6 +4096,7 @@ def binary(directory, assembler, objcopy, library):
     scalar_alu_binary(directory, assembler, objcopy, library)
     mbcnt_binary(directory, assembler, objcopy, library)
     bcnt_exec_binary(directory, assembler, objcopy, library)
+    ff1_exec_binary(directory, assembler, objcopy, library)
     writelane_binary(directory, assembler, objcopy, library)
     mubuf_subword_store_controls()
     gfx1030_binary(directory, assembler, objcopy, library, mubuf_subword_store_cases(), "buffer_store_")
@@ -6747,6 +6851,7 @@ if __name__ == "__main__":
                  "draw-f32": lambda d, *a: draw(d, *a, cases=F32_CASES),
                  "draw-mbcnt": mbcnt_draw,
                  "draw-bcnt-exec": bcnt_exec_draw,
+                 "draw-ff1-exec": ff1_exec_draw,
                  "draw-writelane": writelane_draw,
                  "draw-mtbuf-store": mtbuf_store_draw,
                  "draw-mubuf-subword-store": mubuf_subword_store_draw,
