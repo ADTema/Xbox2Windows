@@ -168,6 +168,12 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/startup_heartbeat_check.py"
         "$<TARGET_FILE:xmem_shim>" "$<TARGET_FILE:startup_stub_xcrdapi>")
     set_tests_properties(startup_heartbeat_commit PROPERTIES TIMEOUT 60)
+    # Startup tooling lint (#1149): every Python file under tools/startup must parse. The check compiles each
+    # source without running it and self-tests that a broken snippet is rejected, so a passing run means the
+    # files were actually looked at. It needs no GPU and no game files.
+    add_test(NAME startup_tools_lint COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_tools_lint_check.py" "${CMAKE_SOURCE_DIR}/tools/startup")
+    set_tests_properties(startup_tools_lint PROPERTIES TIMEOUT 60)
 endif()
 # Mutation controls: each run flips one expected value and passes only when the
 # named check reports it. An unknown mutation name or an overall PASS fails.
