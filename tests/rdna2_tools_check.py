@@ -14,7 +14,7 @@ import unittest
 import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-from disasm_rdna2 import VOP1_OPS, VOP2_OPS, disasm_rdna2, decode_instruction, disassemble_binary
+from disasm_rdna2 import SOPK_OPS, SOPP_OPS, VOP1_OPS, VOP2_OPS, disasm_rdna2, decode_instruction, disassemble_binary
 from extract_shaders import extract_shaders, extract_native_rdna2_code, sanitize_filename
 from pixel_aot import VOP3_INT16, VOP3_INT16_TERNARY, fma_mix_operand, lower, native_program, parse_fma_mix
 from scan_unsupported_shaders import (
@@ -710,6 +710,61 @@ class TestRdna2Disasm(unittest.TestCase):
                 insns = disasm_rdna2(bytes.fromhex(raw) + endpgm)
                 self.assertEqual([(i["offset"], i["length"], i["opcode"]) for i in insns],
                                  [(0, 8, f"{name}_unsupported"), (8, 4, "s_endpgm")])
+
+    def test_sopk_compare_and_call_opcodes(self):
+        vectors = (
+            ("feff04b3", "s_cmpk_ge_i32 s4, 0xfffe"),
+            ("feff84b3", "s_cmpk_lt_i32 s4, 0xfffe"),
+            ("feff04b4", "s_cmpk_le_i32 s4, 0xfffe"),
+            ("ffff84b4", "s_cmpk_eq_u32 s4, 0xffff"),
+            ("ffff04b5", "s_cmpk_lg_u32 s4, 0xffff"),
+            ("ffff84b5", "s_cmpk_gt_u32 s4, 0xffff"),
+            ("ffff04b6", "s_cmpk_ge_u32 s4, 0xffff"),
+            ("ffff84b6", "s_cmpk_lt_u32 s4, 0xffff"),
+            ("ffff04b7", "s_cmpk_le_u32 s4, 0xffff"),
+            ("feff04bb", "s_call_b64 s[4:5], 65534"),
+        )
+        for raw, assembly in vectors:
+            with self.subTest(assembly=assembly):
+                records = disasm_rdna2(bytes.fromhex(raw + "000081bf"))
+                self.assertEqual(
+                    [(r["offset"], r["length"], r["opcode"], r["assembly"]) for r in records],
+                    [(0, 4, assembly.split()[0], assembly), (4, 4, "s_endpgm", "s_endpgm")],
+                )
+
+    def test_sopp_system_opcodes(self):
+        # Fixed gfx1013 encodings. Keep raw message and dependency-control
+        # immediates independent of LLVM's version-specific symbolic spelling.
+        vectors = (
+            ("000083bf", "s_wakeup"),
+            ("01008bbf", "s_setkill 1"),
+            ("01008dbf", "s_sethalt 1"),
+            ("07008ebf", "s_sleep 7"),
+            ("02008fbf", "s_setprio 2"),
+            ("030090bf", "s_sendmsg 0x3"),
+            ("030091bf", "s_sendmsghalt 0x3"),
+            ("070092bf", "s_trap 7"),
+            ("000093bf", "s_icache_inv"),
+            ("010094bf", "s_incperflevel 1"),
+            ("010095bf", "s_decperflevel 1"),
+            ("000096bf", "s_ttracedata"),
+            ("00009bbf", "s_endpgm_saved"),
+            ("00009ebf", "s_endpgm_ordered_ps_done"),
+            ("0000a2bf", "s_wait_idle"),
+            ("e3ffa3bf", "s_waitcnt_depctr 0xffe3"),
+            ("0900a4bf", "s_round_mode 0x9"),
+            ("0900a5bf", "s_denorm_mode 9"),
+            ("3412a8bf", "s_ttracedata_imm 0x1234"),
+        )
+        for raw, assembly in vectors:
+            with self.subTest(assembly=assembly):
+                records = disasm_rdna2(bytes.fromhex(raw + "000081bf"))
+                self.assertEqual(
+                    [(r["offset"], r["length"], r["opcode"], r["assembly"]) for r in records],
+                    [(0, 4, assembly.split()[0], assembly), (4, 4, "s_endpgm", "s_endpgm")],
+                )
+        self.assertEqual(decode_instruction(bytes.fromhex("0000a6bf"), 0)[:3],
+                         (4, "s_sopp_26", "s_sopp_26 0x0"))
 
     def test_hwreg_operands_use_llvm_spelling(self):
         """Issue #938: hwreg operands and s_setreg_imm32_b32 literals print as LLVM 15 prints them for gfx1013.
@@ -3057,6 +3112,15 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertEqual(sorted(name for name in names if not is_opcode_recognized(name)), [])
         # The nonexistent VOP3 form of the packed fused multiply-accumulate stays unrecognized.
         self.assertFalse(is_opcode_recognized("v_pk_fmac_f16_unsupported"))
+
+    def test_decoded_scalar_control_forms_are_recognized(self):
+        """Every mnemonic the decoder prints for SOPP and SOPK is recognized by the scanner, decoding only."""
+        missing = sorted(
+            name for table in (SOPP_OPS, SOPK_OPS)
+            for name, _ in table.values()
+            if not is_opcode_recognized(name)
+        )
+        self.assertEqual(missing, [])
 
     def test_accepted_full_shader(self):
         """Canonical straight-line pixel shader accepted by pixel_aot translator."""

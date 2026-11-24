@@ -75,6 +75,15 @@ Two distinct eight-byte streams produced 26 identical bytes, two completed recor
 
 Install requirements-dev.txt before building. On x64 Windows this includes the pinned Zig compiler (about 80 MB download).
 
+On one Windows 11 x64 host (Core Ultra 9 285H, MSVC 14.44, SDK 10.0.26100), both Zig targets failed during `cmake --build --preset dev` with `error: AccessDenied` from `python -m ziglang build-exe`, which stopped the build twice; invoking the same command by hand printed `error: unable to create compilation: AccessDenied`. Pointing both caches at writable directories before configuring built the same two targets and the rest of the dev preset:
+
+```powershell
+$env:ZIG_GLOBAL_CACHE_DIR = 'out/zig-global'
+$env:ZIG_LOCAL_CACHE_DIR = 'out/zig-local'
+```
+
+The default cache location remained empty in the failing runs, and the same emitting path (`out/build/dev/archive_reader.exe`) wrote successfully once the two variables were set, so the failing step is the cache, not the output path. Which cache path the packed compiler resolves by default on that host is not established here; record the two settings rather than a cause.
+
 ```powershell
 cmake --build --preset dev --target archive_reader_lifted pe_map
 ctest --preset dev --no-tests=error -R '^cpu_native_archive_reader$' -V
@@ -420,7 +429,14 @@ cmake --build --preset dev --target pso_root_check
 ctest --preset dev --no-tests=error -R '^pso_(readiness_check|root_signature_warp)$' -V
 ```
 
-Add `--llvm <AMDGPU LLVM library>` to disassemble referenced native pixel code and run the existing pixel scanner and lowering probe. Each unique stage/hash pair is assessed once. A known missing root signature takes precedence over shader diagnostics. Missing references, unassessed stages and unknown signature status require more evidence. Passing the pixel probe leaves the pipeline awaiting PSO validation, since the scanner uses synthetic bindings.
+Add `--llvm <AMDGPU LLVM library>` to disassemble referenced native pixel and mesh code. The pixel stage uses the existing scanner and lowering probe. The mesh stage retains byte offsets for wave64 branches and runs the mesh entry lowerer with the synthetic triangle profile: 128 threads, geometry word `0x1003` and output limits of three vertices and one primitive. A mesh rejection describes the limits of that profile. The native code manifest supplies neither the real dispatch declaration nor the geometry bindings.
+
+Each unique stage/hash pair is assessed once. A known missing root signature takes precedence over shader diagnostics. Missing references, unassessed stages and unknown signature status require more evidence. A pipeline with all stage probes passed and a present root signature still awaits PSO validation.
+
+```sh
+python3 -B tools/pso_readiness.py out/shaders/manifest.json out/pipelines.json --llvm libLLVM-15.so.1
+python3 -B tests/pso_readiness_check.py
+```
 
 The WARP control compiles the source-built compute shader with its root signature stripped. D3D12 rejects creation without a root signature. The same shader creates a PSO when given the matching signature from the embedded build. The control measures PSO creation on the source-built fixture.
 
@@ -702,6 +718,10 @@ ctest --preset dev --no-tests=error -R '^spirv_address_window_' -V
 ```
 
 With SPIRV-Tools on Linux, run `python3 -B tests/spirv_window/check.py` to assemble and validate the fixture and exercise the rejection paths. This also validates a combined fixture where a lowered ballot bit controls the value stored through the address window. The adapter reserves `%x2w_` identifiers in the input and gives address and ballot temporaries separate prefixes. To use WSL tools for the GPU check, generate a logical module with `python3 tools/spirv_address_window.py tests/spirv_window/subtract.spvasm out/window.spv`, then generate HLSL with `spirv-cross out/window.spv --hlsl --shader-model 60 --output out/window.hlsl`. Compile it on Windows with `dxc -T cs_6_0 -E main -Fo out/window.dxil out/window.hlsl` and run `out/build/dev/offscreen_check.exe hardware --spirv-address-window out/window.dxil`, then repeat with `warp`.
+
+The same Linux check validates eight unsigned DWORD atomics in Vulkan 1.2 SPIR-V: `OpAtomicIAdd`, `OpAtomicExchange`, `OpAtomicUMin`, `OpAtomicUMax`, `OpAtomicAnd`, `OpAtomicOr`, `OpAtomicXor` and `OpAtomicCompareExchange`. The synthetic variant exercises a direct word cast and an indexed physical address. Each atomic is lowered into a branch taken only for an aligned, in-window address, so an invalid address issues no atomic at all (the substitute index of the plain loads and stores is never used for an atomic); the atomic keeps its operands, scope and semantics, and its result is a phi of the old value and zero. This Linux check measures SPIR-V validation and the shape of the lowering. The GPU behavior of the valid and invalid cases requires the separate readback evidence.
+
+Run `ctest --preset dev --no-tests=error -R '^spirv_address_window_atomic_' -V` to check the atomic add's returned old value and full 16-DWORD readback for valid, misaligned, out-of-window and index-wrap addresses, with the fixture mapping the substitute index to the last bound DWORD.
 
 ### SPIR-V subgroup compaction across lane widths
 
@@ -2436,7 +2456,22 @@ primitive index order and guard bytes.
 ```text
 python3 -B tests/mesh_entry_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ctest --preset dev --no-tests=error -R "^mesh_entry_draw_" -V
+ctest --preset dev --no-tests=error -R "^mesh_entry_float_draw_" -V
 ```
+
+The per-lane binary32 forms of the translator now also include `v_add_f32_e64`,
+`v_sub_f32`, `v_subrev_f32` and `v_mul_f32` (`_e32` and `_e64`; `v_subrev` is
+source 1 minus source 0). They lower to plain `precise float` expressions, so
+an IEEE multiply, unlike `v_mul_legacy_f32`, does not turn zero times infinity
+into zero. Source modifiers, `clamp` and output modifiers are refused. One
+program chains all seven encodings on binary32 values that are exact; the binary
+mode evaluates the emitted expressions in binary32 and compares the depth with
+an independent hand calculation (0.28125), and each sibling opcode (sub for
+subrev, add for mul and so on) must give a different depth. The draw
+`mesh_entry_float_draw_*` (`draw-float`) compares the exported depth word
+with that reference, and a depth one unit in the last place off, or any sibling
+opcode, must report `Mesh export trace mismatch`. The draw is written for
+Windows and has not been run on Linux; denormal handling is not exercised.
 
 A local scan based on main `933cbad` selected the shortest validated native
 stream among 9,282 MS records (832 bytes, 153 instructions). For the tested
@@ -3175,6 +3210,21 @@ in v2, v3 and v4. The supported exits export depth for surviving lanes or discar
 them. Unknown table addresses, outstanding reads, changed EXEC provenance and
 unrecognized exit sequences reject translation.
 
+The program may also apply `v_add_f32_e32`, `v_sub_f32_e32`,
+`v_subrev_f32_e32`, `v_mul_f32_e32`, `v_min_f32_e32` and `v_max_f32_e32`
+(VGPR destination, constant, scalar word or VGPR first source, VGPR second
+source). `subrev` subtracts the first source from the second. Reading a VGPR
+no earlier instruction wrote rejects translation. Operands are assumed finite
+and normal: NaN and subnormal handling of the original instructions is not
+claimed. Each form has its own fixture in `tests/depth_mask_check.py` that
+computes `op(0.5, v7)` for the discard compare. `depth_mask_ops_draw_*` draws
+each one at two seeds and thresholds against a CPU reference written with
+Python operators and requires every other form's reference to fail on exactly the
+pixels where the two differ. LLVM CI also assembles each fixture, translates it
+through the CLI and pins the lowered line, and changing that one instruction word
+to another form must change the line. On a Linux host only the LLVM part and the
+reference arithmetic were run; no WARP or GPU readback of these six forms exists yet.
+
 The Windows fixture binds distinct seeds and thresholds, changes each separately,
 then exchanges the two root CBV addresses. It checks all 1,024 D32_FLOAT
 pixels and requires comparison against the old reference to fail after the
@@ -3183,7 +3233,7 @@ synthetic container through the CLI.
 
 ```text
 python3 -B tests/depth_mask_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
-ctest --preset dev --no-tests=error -R "^depth_mask_draw_" -V
+ctest --preset dev --no-tests=error -R "^depth_mask_(ops_)?draw_" -V
 ```
 
 In a local inventory based on main `933cbad`, 354 of 12,101 PS records
@@ -4593,6 +4643,8 @@ Measured at commit `f847956`, Windows 11 build 26300, debug layer enabled:
 
 Before `f847956`, the interior block's search tried only the 256 MB directly below the first allocation. That search found no free block in about 1 of 40 hardware runs, and the test failed in setup ("region below the first allocation").
 
+With bottom-up ASLR off, `VirtualAlloc(nullptr, ...)` places each allocation in the lowest free range that fits, so no 64 KB block remained below `first`, and both `gpu_alias_registry` tests failed on every run (Windows 10 build 19045, RTX 3080 and WARP). The test now commits its 64 KB block before `first`. First-fit placement then always puts `first` above it; when randomized placement puts it higher, the test releases it and searches below `first` as before.
+
 Measured at commit `21a65e5`, Windows 11 build 26300, debug layer enabled:
 - The full suite passed: 149 tests, with the same 3 capability skips.
 - `era_title_gpu_alloc` handled 6 failing allocations in a first `track` and 2 in a later one. It passed 50 of 50 repeated runs.
@@ -4643,6 +4695,26 @@ ctest --test-dir out/build/w10 --no-tests=error
 In this configuration all `bvh_*_warp`, `dxr_*_warp` and `bvh_differential_warp` tests pass, and the hardware wave64 check skips at its 32-lane range with SM 6.6 available. `bvh_wave64_warp` now runs and fails at field 25, `WaveReadLaneAt(v, (lane*7+3) % 64)`. In two groups, all 128 lanes received the value of lane m where `7m+3 ≡ lane (mod 64)`, which is the inverse of the requested shuffle. Field 24's shuffle, the mirror read and the native-width run pass. At WARP's native width of 8, `7n+3 ≡ 3-n (mod 8)` is self-inverse, so the default `bvh_waves_warp` cannot show the difference. `wave_shuffle_warp` narrows the cause. WARP 1.0.22 runs a forced wave as blocks of its native 8 lanes, and it picks the source block using the request of the wrong lane: the lane of the reader's block that sits at the requested position. For this shuffle that equals the inverse permutation. A rotation by one lane gets 16 of 64 reads wrong at widths 16, 32 and 64, and none of them match its inverse. Reads where every lane of a block requests the same source block are unaffected. [Open question](https://github.com/R0Y00/Xbox2Windows/issues/145)
 
 On Windows 11 build 26200 at `1ccc326`, the in-box WARP (10.0.26100.9818) reports a 4..4 lane range with SM 6.6, so `bvh_wave64_warp` and the forced 16/32/64 variants of `wave_shuffle_warp` skip on capability; its native-width shuffle reads are all correct (affine and rotation 64/64, no block-misrouted reads, no control errors). The GTX 1660 SUPER (driver 32.0.16.1074) reports 32..32 lanes: `bvh_wave64_hardware` skips, and `wave_shuffle_hardware` passes at native and forced width 32 with every read from the requested lane. The lane-block misroute was observed in the app-local WARP 1.0.22 + Agility SDK setup above. The in-box WARP run could exercise only native width 4, because the fixture has no override for the reported lane range. [Cross-check report](https://github.com/R0Y00/Xbox2Windows/issues/145#issuecomment-7114625084)
+
+### Wave64 emulation with group-shared memory
+
+`src/wave64_emulate.hlsli` gives a 64-thread group the results of 64-lane wave operations without wave intrinsics: `Wave64ReadLaneAt`, `Wave64ReadLaneFirst`, `Wave64ActiveSum` and `Wave64ActiveBallot`. Each lane (its `SV_GroupIndex`) writes its value to a group-shared slot, the group waits on a barrier, every lane reads the slots it needs, and a second barrier frees the slots for the next call. The result does not depend on the native wave width, so it holds on 32-lane NVIDIA waves, on WARP's 8 lanes, and under a forced `[WaveSize(64)]` on WARP 1.0.22, where `WaveReadLaneAt` misroutes. The fixture needs only `cs_6_0`.
+
+Limits: the group must be exactly 64 threads, and every call must be reached by all 64 threads in uniform control flow, because a group barrier inside divergent control flow is undefined. With all 64 lanes active, the first active lane is lane 0. Values are `uint`. Prefix, min/max, bitwise and quad operations are not provided. The `wave_shuffle` and `bvh_wave64` tests still measure the adapters' own wave operations and are unchanged.
+
+`wave64_emulate_<adapter>` compares the affine, rotation and mirror reads of `wave_shuffle`, a first-lane read, a sum and a ballot (`t % 3 == 0`) on all 64 threads with a CPU reference, 448 values per run. It runs at the native width and, where SM 6.6 and the lane range allow it, at a forced width of 64. The negative control is a build whose affine read requests the next lane, and the test requires it to be reported on all 64 threads.
+
+Measured on `31f9ebb` with this change, Windows 10 build 19045, debug layer enabled:
+
+| Adapter | Native width | Forced width 64 | Negative control |
+|---|---|---|---|
+| WARP 1.0.22 (Agility SDK 1.620.2) | 0 of 448 wrong | 0 of 448 wrong; `wave_shuffle_warp` on the same adapter: 64 of 64 affine reads misrouted | 64 of 64 reported |
+| WARP 10.0.19041 (in-box) | 0 of 448 wrong | Skipped, lane range 4..4 | 64 of 64 reported |
+| NVIDIA GeForce RTX 3080 (32.0.15.9174) | 0 of 448 wrong | Skipped, lane range 32..32 | 64 of 64 reported |
+
+```powershell
+ctest --preset dev --no-tests=error -R '^wave64_emulate_' -V
+```
 
 ## Mapped DLL draw with a Windows reference
 
@@ -5653,6 +5725,23 @@ The test compares the first bit of each field group with offsets transcribed fro
 
 The optional capture contains verified, top-down RGBA8 pixels converted from the GPU readback. The mip test binds both levels in one texture and renders to a half-size target so implicit derivatives select the lower mip. An original mode-6 fixture varies endpoints by block and indices by texel. The negative control shifts only the lower level's compressed blocks and requires a pixel mismatch. [Microsoft BC7 mode reference](https://learn.microsoft.com/en-us/windows/win32/direct3d11/bc7-format-mode-reference)
 
+### Reading BC1-BC7 block rows and a synthetic BC7 volume
+
+`tools/texture_blocks.py` records one canonical table entry per BC family: `BC1_UNORM` (DXGI 71, 8 bytes per 4x4 block), `BC2_UNORM` (74, 16), `BC3_UNORM` (77, 16), `BC4_UNORM` (79, 8), `BC5_UNORM` (83, 16), `BC6H_UF16` (95, 16) and `BC7_UNORM` (98, 16). `BC7_UNORM_VOLUME` is the tool-level three-dimensional reading of `BC7_UNORM`: the same DXGI value with a 4x4x1 block and 16 bytes. It is not a DXGI format name. An unknown lookup raises `ValueError("Unknown texture format 'BC9_UNORM'")`, naming the requested format. [Microsoft BC block compression](https://learn.microsoft.com/en-us/windows/win32/direct3d11/texture-block-compression-in-direct3d-11) | [DXGI_FORMAT](https://learn.microsoft.com/en-us/windows/win32/api/dxgiformat/ne-dxgiformat-dxgiformat)
+
+`surface_bytes(width, height, name, pitch_blocks=None)` applies `ceil(width/4) * ceil(height/4) * bytes_per_block` with an optional block-row pitch. `linearize_blocks` copies the visible blocks of a pitched surface into tight block rows, and `tile_blocks` is its inverse. The synthetic test tags every block with its format and coordinates, covers 1x1, 3x5, 4x4, 5x3, 17x9 and 81x69 surfaces for all seven formats at several pitches, and compares bytes. This is compressed-block readback, not BC1-BC6H texel decoding.
+
+`tile_volume_4k_s(slices, width, height, depth, "BC7_UNORM_VOLUME")` and `linearize_volume_4k_s` compose one tested `SW_4K_S` two-dimensional surface per Z slice. The 8x8x4 fixture has 2x2 blocks per slice, four 4 KiB slice surfaces (16 KiB of payload) and 256 visible bytes; a 68x8x2 case covers two tile columns per slice. Every block carries `(z, x, y)` and padding is `0xff`. The test builds the expected payload with an independent bit interleave and slice order, then round-trips every slice byte for byte.
+
+DirectXTex sends three-dimensional tiling to `XGCreateTexture3DComputer`; that address equation is not public. This fixture therefore tests only the slice-major composition of the merged two-dimensional equation. It is not a console three-dimensional layout, a runtime texture path or a title format claim. [DirectXTex Xbox tiling](https://github.com/microsoft/DirectXTex/blob/a8e5dbf42909aeeb9fcf9c2ae399ae3c06737379/Auxiliary/DirectXTexXboxTile.cpp)
+
+The 81x69 control has 21x18 visible blocks. A 22-block source pitch round-trips. A producer that packs rows at 21 blocks but declares 22 first differs at block (0, 1) for both BC1 and BC7. A 20-block pitch raises as narrower than the surface, and a pitch one block above the payload size raises. Swapping volume slices 0 and 1 first differs at (0, 0, 0); swapping slices 1 and 3 first differs at (0, 0, 1). A 48-byte slice raises naming slice 0 and the expected 64 bytes. Three slices for depth four, a payload one 4 KiB slice short or long, and a wrong depth all raise.
+
+```powershell
+python -B tests/texture_bc_volume_check.py
+ctest --preset dev --no-tests=error -R '^texture_bc_volume$' -V
+```
+
 ### Decoding MDU rANS symbol streams
 
 `tools/bcpack_symbols.py` decodes an MDU entropy stream into per-lane integer
@@ -5831,14 +5920,19 @@ the host.
 The pass first looks for a directly loaded standalone sampler that feeds both kinds of
 sampling. Modules without one are returned byte-for-byte unchanged. That includes the
 indexed table above and unrelated samples on other samplers. For the sampler it splits,
-the profile covers direct float32 `Texture2D` and `Texture2DArray` sampling in one compute entry
-point at a constant LOD of zero. Other uses of that sampler, an occupied binding, a
+the profile covers direct float32 `Texture1D`, `Texture2D` and `TextureCube` sampling,
+including their array forms, in one compute entry point at a constant LOD of zero.
+Other uses of that sampler, an occupied binding, a
 nonzero LOD and more than one mixed sampler are rejected with a specific diagnostic.
 
 A [synthetic arrayed variant](../tests/spirv_window/shared_sampler_array.spvasm) of the fixture below
 uses `Texture2DArray` images with a float3 coordinate at layer 0. The test splits it to the same
 bindings, validates both modules for Vulkan 1.2 and checks that SPIRV-Cross emits two
 `SampleCmpLevelZero` calls on the comparison sampler and one `SampleLevel` on the ordinary one.
+The Linux check `python3 -B tests/spirv_window/check.py` generates four more
+variants, `Texture1D`, `Texture1DArray`, `TextureCube` and `TextureCubeArray`.
+It validates each before and after the split for Vulkan 1.2 and checks that only
+the ordinary sample moves from binding 2 to binding 5.
 The GPU readback below runs only the `Texture2D` module.
 
 The [source-built fixture](../tests/spirv_window/shared_sampler.spvasm) compares
@@ -6516,6 +6610,8 @@ interface is rejected. The negative case supplies an unsupported IID after
 adapter selection. It checks the cleared device output, release of the adapter
 and factory references, zero frame bytes and exit code 20 on all three runners.
 
+The `pe_map` run's host process is `python.exe`, so DXGI does not find an app-local WARP (`OFFSCREEN_WARP_DIR`) beside the native EXE. When `d3d10warp.dll` sits beside the EXE, `shim_startup_check.py --map` now loads that copy first, and the mapped run uses the same WARP as the native and AOT runs. With the Windows 10 app-local setup, `cpu_shim_shadow_warp` previously failed (the mapped run created the device and closed it without recording a frame: `shadow close surfaces=0 device=1`) and `cpu_shim_chain_warp` skipped; both now pass. Builds without an app-local WARP are unchanged.
+
 ## First-active-lane vector broadcast readback
 
 The `pixel_aot_warp` and `pixel_aot_hardware` fixtures include a dedicated
@@ -7032,3 +7128,20 @@ python3 -B tests/rdna2_tools_check.py
 ```
 
 Scope: recognition only. No translator lowers these forms through this change, and no hardware or Windows run backs them.
+
+## gfx1013 SOPK and SOPP decoding
+
+`tools/disasm_rdna2.py` decodes 29 more scalar forms: the nine `s_cmpk_*` compare-immediate ops
+(`s_cmpk_ge_i32` through `s_cmpk_le_u32`), `s_call_b64`, and 19 SOPP ops (`s_wakeup`, `s_setkill`,
+`s_sethalt`, `s_sleep`, `s_setprio`, `s_sendmsg`, `s_sendmsghalt`, `s_trap`, `s_icache_inv`,
+`s_incperflevel`, `s_decperflevel`, `s_ttracedata`, `s_ttracedata_imm`, `s_endpgm_saved`,
+`s_endpgm_ordered_ps_done`, `s_wait_idle`, `s_waitcnt_depctr`, `s_round_mode`, `s_denorm_mode`).
+The immediate operand of the SOPP ops with one is printed as the raw 16-bit value, not as a named field.
+`tools/scan_unsupported_shaders.py` recognizes the same mnemonics so they are not reported as unknown.
+
+```sh
+python3 -B tests/rdna2_tools_check.py
+```
+
+Scope: decoding and scanner recognition only. None of these forms is lowered by a translator, and no
+measurement on hardware or in a Windows run backs the descriptions.
