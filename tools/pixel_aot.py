@@ -2805,9 +2805,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             ds_needs_wait = False
         rstate = None
         if region is not None:
-            if re.fullmatch(r"s_or_b64 exec, exec, s\[\d+:\d+\]", line):
-                pass
-            elif region["opener"] == "cmpx" and re.fullmatch(r"s_mov_b64 exec, s\[\d+:\d+\]", line):
+            if re.fullmatch(r"s_or_b64 exec, exec, s\[\d+:\d+\]|s_mov_b64 exec, s\[\d+:\d+\]", line):
                 pass
             elif (re.fullmatch(r"s_cbranch_execz -?(?:0x[0-9a-f]+|\d+)", line)
                     and i == region["start"] + 1 and region["skip"] is None):
@@ -3014,9 +3012,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             wqm_width = None
             scc = None
         elif region is not None and (m := match(r"s_mov_b64 exec, (s\[\d+:\d+\])")):
-            # The v_cmpx region closes with an exact copy of the saved mask. Unlike s_or_b64 it leaves SCC.
-            if region["opener"] != "cmpx":
-                raise ValueError("Unexpected execution mask restore")
+            # Either opener may close with an exact copy of the saved pair (issue #1315 for s_and_saveexec_b64).
+            # EXEC inside the region is a subset of the saved entry mask, so this restores the same mask as
+            # s_or_b64 exec, exec, s[a:b]. Unlike s_or_b64 it leaves SCC; after s_and_saveexec_b64, which wrote
+            # SCC from the new EXEC, SCC is already untracked, so no reader can follow either close.
             close_region(i, sgpr_pair(m[1]))
             region = None
         elif m := match(r"s_mov_b64 (?:exec|exec_lo), (s\[\d+:\d+\])"):
@@ -3107,7 +3106,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Execution skip targets no instruction boundary")
             target = instructions[restore][1] if isinstance(instructions[restore], tuple) else instructions[restore]
             rm = re.fullmatch(r"s_or_b64 exec, exec, s\[(\d+):(\d+)\]", target)
-            if rm is None and region["opener"] == "cmpx":
+            if rm is None:
                 rm = re.fullmatch(r"s_mov_b64 exec, s\[(\d+):(\d+)\]", target)
             if rm is None or [f"s{n}" for n in registers(*rm.groups(), 2)] != region["save"]:
                 raise ValueError("Execution skip does not target the matching restore")
