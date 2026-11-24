@@ -374,7 +374,8 @@ def check_rejections():
             attempt(f"{two} df e0 9e {fcmovu} {pop2} 31 c0 {ret}"), unknown),
         "FCMOVU ST(2) with two values": (attempt(f"{two} {fucomi} da da {pop2} {ret}"), "x87 stack underflow"),
         "FCMOVNU ST(1) with one value": (attempt(f"{fld} db e8 {fcmovnu} dd d8 {ret}"), "x87 stack underflow"),
-        "SETP after FUCOMI": (attempt(f"{two} {fucomi} 0f 9a c0 {pop2} {ret}"), "unsupported query operation"),
+        "SETP after FUCOMI and INC EAX": (attempt(f"{two} {fucomi} ff c0 0f 9a c0 {pop2} {ret}"), parity),
+        "CMOVP after FUCOMI and ADD EAX, 1": (attempt(f"{two} {fucomi} 83 c0 01 0f 4a c1 {pop2} {ret}"), parity),
     }
     for case, (message, needle) in rejected.items():
         if message is None or needle not in message:
@@ -386,6 +387,8 @@ def check_rejections():
         "JP after FUCOMIP and FSTP ST(0)": attempt(f"{two} df e9 dd d8 {jp} {ret}"),
         "a join of a FUCOMI path and a SAHF path": attempt(f"{two} e3 04 {fucomi} eb 03 b4 04 9e {fcmovu} {pop2} {ret}"),
         "FCMOVU after FUCOMI and LEA": attempt(f"{two} {fucomi} 8d 40 01 {fcmovu} {pop2} {ret}"),
+        "SETP after FUCOMI": attempt(f"{two} {fucomi} 0f 9a c0 {pop2} {ret}"),
+        "CMOVP after FUCOMI": attempt(f"{two} {fucomi} 0f 4a c1 {pop2} {ret}"),
     }
     for case, message in accepted.items():
         if message is not None:

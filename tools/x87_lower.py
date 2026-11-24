@@ -386,7 +386,12 @@ def depths(body, exits, checked=None):
 
 
 # Instructions that put a function under the flag and status-word rules.
-GATED = frozenset({*FCMOV, M.FNSTSW, M.SAHF, M.JP, M.JNP})
+GATED = frozenset({*FCMOV, M.FNSTSW, M.SAHF, M.JP, M.JNP, M.SETP, M.SETNP, M.CMOVP, M.CMOVNP})
+VEX_SCALAR_COMPARES = frozenset({M.VCOMISS, M.VUCOMISS, M.VCOMISD, M.VUCOMISD})
+PF_CLEARED = frozenset({
+    M.RDRAND, M.RDSEED, M.PTEST, M.VPTEST, M.VTESTPS, M.VTESTPD,
+    M.PCMPESTRI, M.PCMPESTRM, M.PCMPISTRI, M.PCMPISTRM,
+})
 
 
 # The six status flags. FCMOV reads ZF and CF; DF is not tracked, because the Windows x64 calling
@@ -439,9 +444,10 @@ _INFO = InstructionInfoFactory()
 
 
 def assigns_parity(i):
-    """Whether the integer lowering sets PF for i: SAHF, the FCOMI family, and TEST and AND with an 8-bit
-    destination."""
-    if i.mnemonic == M.SAHF or i.mnemonic in COMPARES:
+    """Whether the integer lowering sets PF for i: SAHF, the FCOMI family, the scalar VEX compares,
+    PF-clearing vector/entropy instructions, and TEST and AND with an 8-bit destination."""
+    if (i.mnemonic == M.SAHF or i.mnemonic in COMPARES
+            or i.mnemonic in VEX_SCALAR_COMPARES or i.mnemonic in PF_CLEARED):
         return True
     if i.mnemonic not in (M.TEST, M.AND):
         return False
@@ -486,8 +492,10 @@ def _ax_access(i):
     return read, written
 
 
-def _after(i, s):
+def _after(i, s, host_ops=None):
     """The state after i (the conditions it may raise are checked separately, in check_flags)."""
+    if host_ops and i.ip in host_ops:
+        return _State(0, 0, False, 0, 0xFFFF)
     op = i.mnemonic
     call = i.flow_control in (FlowControl.CALL, FlowControl.INDIRECT_CALL)
     flags = _flags_after(i, s.flags)
@@ -536,7 +544,7 @@ def _successors(i):
     return successors
 
 
-def states(body):
+def states(body, host_ops=None):
     """The _State before each reachable instruction of body, from body[0], where no flag, PF model or
     condition bit is known and AX holds no status word. The integer lowering starts its flags as false,
     which is not what a native caller passes in, so a reader of an undefined flag would see that
@@ -546,7 +554,7 @@ def states(body):
     work = [body[0].ip]
     while work:
         i = index[work.pop()]
-        after = _after(i, known[i.ip])
+        after = _after(i, known[i.ip], host_ops)
         for target in _successors(i):
             if target in index:
                 joined = after if target not in known else known[target].join(after)
@@ -560,25 +568,27 @@ def _bits(mask):
     return f"{mask:#06x}"
 
 
-def check_flags(body, exits):
+def check_flags(body, exits, *, skip_lahf=False, host_ops=None):
     """Reject a read of an undefined status flag, a read of PF that the integer lowering does not model, and
     a reader of AX, or a point where RAX leaves the function, that sees a status-word bit not known."""
-    known = states(body)
+    known = states(body, host_ops=host_ops)
     for i in body:
         s = known.get(i.ip)
         if s is None:
             continue  # not reachable from the entry
-        missing = i.rflags_read & STATUS_FLAGS & ~s.flags
-        if missing:
-            names = " and ".join(name for name, bit in FLAG_NAMES if missing & bit)
-            if missing & s.tainted == missing:
-                raise ValueError(f"{i} at {i.ip:#x} reads {names}, which depends on a status-word bit that is not "
-                                 "known on every path from the entry")
-            raise ValueError(f"{i} at {i.ip:#x} reads {names}, which no instruction defines on every path from "
-                             "the entry")
-        if i.rflags_read & F.PF and not s.parity:
-            raise ValueError(f"{i} at {i.ip:#x} reads PF, which the integer lowering models only after SAHF, "
-                             "FCOMI, FCOMIP, FUCOMI, FUCOMIP and an 8-bit TEST or AND")
+        if not (skip_lahf and i.mnemonic == M.LAHF):
+            missing = i.rflags_read & STATUS_FLAGS & ~s.flags
+            if missing:
+                names = " and ".join(name for name, bit in FLAG_NAMES if missing & bit)
+                if missing & s.tainted == missing:
+                    raise ValueError(f"{i} at {i.ip:#x} reads {names}, which depends on a status-word bit that is not "
+                                     "known on every path from the entry")
+                raise ValueError(f"{i} at {i.ip:#x} reads {names}, which no instruction defines on every path from "
+                                 "the entry")
+            if i.rflags_read & F.PF and not s.parity:
+                raise ValueError(f"{i} at {i.ip:#x} reads PF, which the integer lowering models only after SAHF, "
+                                 "FCOMI, FCOMIP, FUCOMI, FUCOMIP and an 8-bit TEST or AND, the scalar VEX compares, "
+                                 "or a PF-clearing instruction")
         unknown = 0xFFFF & ~s.ax
         if not unknown:
             continue

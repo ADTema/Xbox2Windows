@@ -450,14 +450,21 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
     # the fixed control word, or an x87_lower.Checked for the checked entry, which also accepts FLDCW.
     checked = x87 if isinstance(x87, x87_lower.Checked) else None
     x87_depth = x87_lower.depths(body, exits, checked) if x87 and any(map(x87_lower.is_x87, body)) else None
-    # JP, JNP, FCMOVU and FCMOVNU read PF, which only a function the x87 profile has checked models
-    # (x87_lower.check_flags); SAHF, the FCOMI family and the 8-bit TEST and AND set it there. Other functions
-    # keep their two flags.
-    parity = x87_depth is not None and any(i.mnemonic in (M.JP, M.JNP, M.FCMOVU, M.FCMOVNU) for i in body)
-    if parity:
-        lines[2] = "bool zero=false, carry=false, overflow=false, sign=false, parity=false;"
     # A register ADD, SUB or CMP that a LAHF reads also assigns AF and PF (lahf_sources).
     lahf_from = lahf_sources(body, host_ops or {})
+    # JP, JNP, SETP, SETNP, CMOVP, CMOVNP, FCMOVU and FCMOVNU read PF, which x87_lower.check_flags
+    # verifies across control-flow joins. Other functions keep their four flags unchanged.
+    parity = (any(i.mnemonic in (M.JP, M.JNP, M.SETP, M.SETNP, M.CMOVP, M.CMOVNP) for i in body)
+              or (x87_depth is not None and any(i.mnemonic in (M.FCMOVU, M.FCMOVNU) for i in body)))
+    if parity and x87_depth is None:
+        if any(i.flow_control == FlowControl.INDIRECT_BRANCH for i in body):
+            raise ValueError("unsupported query operation: PF consumers require known control-flow joins")
+        try:
+            x87_lower.check_flags(body, exits, skip_lahf=bool(lahf_from), host_ops=host_ops)
+        except ValueError as exc:
+            raise ValueError(f"unsupported query operation: {exc}") from exc
+    if parity:
+        lines[2] = "bool zero=false, carry=false, overflow=false, sign=false, parity=false;"
     if lahf_from:
         lines[2] = lines[2][:-1] + ("" if parity else ", parity=false") + ", aux=false;"
     # FNSTSW is the only reader of the x87 status word (x87_lower.statement).
@@ -875,9 +882,11 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
             dst_bits = 8 * RegisterExt.size(i.op0_register)
             stmt = write(f"static_cast<int{dst_bits}_t>(static_cast<int{src_bits}_t>({operand(1)}))")
         elif (op in (M.CMOVE, M.CMOVNE, M.CMOVA, M.CMOVAE, M.CMOVB, M.CMOVBE) or
+              (parity and op in (M.CMOVP, M.CMOVNP)) or
               (x87_depth is None and op in (M.CMOVL, M.CMOVGE, M.CMOVLE, M.CMOVG, M.CMOVS, M.CMOVNS, M.CMOVO, M.CMOVNO))):
             cond = {M.CMOVE: "zero", M.CMOVNE: "!zero", M.CMOVA: "!carry && !zero",
                     M.CMOVAE: "!carry", M.CMOVB: "carry", M.CMOVBE: "carry || zero",
+                    M.CMOVP: "parity", M.CMOVNP: "!parity",
                     M.CMOVL: "sign != overflow", M.CMOVGE: "sign == overflow",
                     M.CMOVLE: "zero || (sign != overflow)", M.CMOVG: "!zero && (sign == overflow)",
                     M.CMOVS: "sign", M.CMOVNS: "!sign",
@@ -3024,9 +3033,11 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
         elif op == M.NOP or (op == M.XCHG and i.op0_register == i.op1_register == R.AX):
             stmt = ";"
         elif (op in (M.SETE, M.SETNE, M.SETA, M.SETAE, M.SETB, M.SETBE) or
+              (parity and op in (M.SETP, M.SETNP)) or
               (x87_depth is None and op in (M.SETL, M.SETGE, M.SETLE, M.SETG, M.SETS, M.SETNS, M.SETO, M.SETNO))):
             cond = {M.SETE: "zero", M.SETNE: "!zero", M.SETA: "!carry && !zero",
                     M.SETAE: "!carry", M.SETB: "carry", M.SETBE: "carry || zero",
+                    M.SETP: "parity", M.SETNP: "!parity",
                     M.SETL: "sign != overflow", M.SETGE: "sign == overflow",
                     M.SETLE: "zero || (sign != overflow)", M.SETG: "!zero && (sign == overflow)",
                     M.SETS: "sign", M.SETNS: "!sign",

@@ -1410,7 +1410,7 @@ The model compares with the `Fraction` model of `cpu_aot_x87_compare` and copies
 | `uinvert` | `fcmovu` moves on a clear PF | 4050/17672 | 1522 in `fucomi_fcmovu` |
 | `nuinvert` | `fcmovnu` moves on a set PF | 2122/17672 | 1522 in `fcomi_fcmovnu` |
 
-`pfkeep` mismatches in `sahf_fucomi` only where the `sahf` before `fucomi` left a different PF. On the AMD Ryzen 7 7700 and the Intel Core Ultra 7 358H (Windows 11 build 26300) every case matched in the native and translated DLLs. Translation rejects 10 sequences: `fcmovu` before any flag writer, `fcmovnu` after `test eax, eax`, `fcmovu` after `fucomi` and `inc eax`, `jp` after `fucomi` and `add eax, 1`, `fcmovu` after a call, a join of a `fucomi` path and a `cmp` path, `sahf` on `fnstsw ax` without a comparison before `fcmovu`, `fcmovu st, st(2)` with two values, `fcmovnu st, st(1)` with one value, and `setp` after `fucomi`, which the integer lowering does not implement. It translates 5 twins: `fcmovu` after `fucomi`, `fcmovnu` after `fucomi` and a `mov`, `jp` after `fucomip` and `fstp st(0)`, a join of a `fucomi` path and a `sahf` path, and `fcmovu` after `fucomi` and `lea`. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_x87_parity$' -V`.
+`pfkeep` mismatches in `sahf_fucomi` only where the `sahf` before `fucomi` left a different PF. On the AMD Ryzen 7 7700 and the Intel Core Ultra 7 358H (Windows 11 build 26300) every case matched in the native and translated DLLs. Translation rejects 11 sequences: `fcmovu` before any flag writer, `fcmovnu` after `test eax, eax`, `fcmovu` after `fucomi` and `inc eax`, `jp` after `fucomi` and `add eax, 1`, `fcmovu` after a call, a join of a `fucomi` path and a `cmp` path, `sahf` on `fnstsw ax` without a comparison before `fcmovu`, `fcmovu st, st(2)` with two values, `fcmovnu st, st(1)` with one value, `setp` after `fucomi` and `inc eax`, and `cmovp` after `fucomi` and `add eax, 1`. It translates 7 accepted sequences: `fcmovu` after `fucomi`, `fcmovnu` after `fucomi` and a `mov`, `jp` after `fucomip` and `fstp st(0)`, a join of a `fucomi` path and a `sahf` path, `fcmovu` after `fucomi` and `lea`, `setp` after `fucomi`, and `cmovp` after `fucomi`. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_x87_parity$' -V`.
 
 `cpu_aot_x87_fprem` checks `fprem` and `fprem1` in the checked entry, with 11 exports and 36952 cases. The fixed profile rejects both. Each replaces `st(0)` by `st(0) - q * st(1)`. q is the quotient of the magnitudes, truncated by `fprem` and rounded to nearest-even by `fprem1`. Each sets C0, C3 and C1 to bits 2, 1 and 0 of q and clears C2. The remainder is exact. A zero remainder keeps the sign of `st(0)`, a zero `st(0)` is kept, and an infinite `st(1)` gives `st(0)` with q = 0. A pseudo-denormal is re-encoded at biased exponent 1. Neither instruction reads the control word. The SDM leaves two outcomes to the implementation, and the checked entry rejects both:
 
@@ -7266,3 +7266,41 @@ python3 -B tests/rdna2_tools_check.py
 
 Scope: decoding and scanner recognition only. None of these forms is lowered by a translator, and no
 measurement on hardware or in a Windows run backs the descriptions.
+
+## PF consumers after scalar VEX compares
+
+`tools/ffx_version_query.py` and `tools/x87_lower.py` lower `SETP`, `SETNP`, `CMOVP`, and `CMOVNP` alongside
+`JP` and `JNP` whenever `x87_lower.check_flags` proves a reaching modeled PF definition at every use.
+`x87_lower.assigns_parity` treats the four scalar VEX compares (`vcomiss`, `vucomiss`, `vcomisd`,
+`vucomisd`) and the already modeled PF-clearing instructions (`rdrand`, `rdseed`, `ptest`, `vptest`,
+`vtestps`, `vtestpd`, `pcmpestri`, `pcmpestrm`, `pcmpistri`, `pcmpistrm`) as PF producers in addition to
+`sahf`, `fcomi`/`fcomip`/`fucomi`/`fucomip`, and 8-bit `test`/`and`. Indirect branches in functions with
+PF consumers are rejected, `host_ops` replacements invalidate tracked flags/PF, and functions without PF
+consumers emit unchanged parity-free C++.
+
+[tests/cpu/vex_parity.asm](../tests/cpu/vex_parity.asm) and
+[tests/cpu/vex_parity.py](../tests/cpu/vex_parity.py) (`cpu_aot_vex_parity`) compare native, translated,
+and `/O2` DLLs across 14 exports and 1618 cases under masked `MXCSR = 0x1F80` (saved and restored via
+`host_exchange_mxcsr`):
+
+- Register and memory RHS forms for `vcomiss`, `vucomiss`, `vcomisd`, and `vucomisd`, covering ordered
+  (`<`, `==`, `>`), signed zeros, `+/-inf`, subnormals, quiet NaNs, and signaling NaNs in each operand
+  (consumed through `setp`, `setnp`, `sete`, `setb`, `jp`, `jnp`, and `setnp + sete + and`).
+- `setp al` / `setnp ah` upper-byte preservation, and both outcomes (`PF = 0` and `PF = 1`) of `cmovp` /
+  `cmovnp` at 32-bit (zero-extending upper 32 bits even when not taken), 64-bit, and 16-bit widths.
+- Unconditional memory reads (`0xC0000005` on `PAGE_NOACCESS` and `NULL` via `cpu_guarded_call`) for
+  `cmovp eax, dword ptr [rdx]` and `cmovnp eax, dword ptr [rdx]` regardless of whether `PF` is 0 or 1.
+- A `vcomiss` / `vucomisd` control-flow join and a back-to-back compare override (`vucomiss` followed by `vcomiss`).
+- Two mutated controls that must fail (`stalepf` dropping `parity = unordered;` caught 3 mismatches; `swap`
+  reversing PF consumer conditions caught 5 mismatches), plus 13 rejected sequences (entry/no writer, `add`,
+  `cmp`, `inc`, 32-bit `test`, `shl`, `call`, ambiguous/uninitialized joins, indirect branch, `host_ops`) and
+  4 accepted sequences.
+
+```sh
+ctest --preset dev --no-tests=error -R "^cpu_aot_vex_parity$" -V
+ctest --preset release --no-tests=error -R "^cpu_aot_vex_parity$" -V
+```
+
+Scope: masked `MXCSR = 0x1F80` scalar VEX comparisons and proven reaching PF consumers only; existing
+floating-point exception behavior outside `vex_parity` is unchanged, and unmodeled PF producers or
+ambiguous joins remain rejected.
