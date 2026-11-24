@@ -7580,10 +7580,13 @@ explicitly.
 - Clamp 1 checked against mip 2, and clamp 1.25 checked against the 1.5 blend,
   must fail at pixel (0, 0).
 
-`spirv_minlod_fractional_*` retains the `ps_6_6` capability gate. It checks
-nearest-mip selection at 1.4375, 1.5625 and 3.75. At the 1.5 tie, either
-neighbor is accepted when both shader sources select the same mip. The
-stale-reference check at 1.5625 must reject mip 1 at pixel (0, 0).
+`spirv_minlod_fractional_*` retains the `ps_6_6` capability gate. It requires
+mip 1 at 1.4375 and mip 3 at 3.75. At 1.5 and 1.5625 it checks for exact
+readback of mip 1 or 2, then requires the translated and direct HLSL shaders
+to agree and reports the selected mip. The wrong-mip control at 1.5625
+must reject mip 0 at pixel (0, 0) under either rounding rule. To test
+nearest-mip selection away from the tie, append `--strict-rounding` to
+the normal arguments to `tests/spirv_window/minlod_fractional.py`.
 [Issue #809](https://github.com/R0Y00/Xbox2Windows/issues/809) records why the
 fractional point cases run separately.
 
