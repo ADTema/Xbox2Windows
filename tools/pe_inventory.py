@@ -436,8 +436,12 @@ def scan(root, *, extra_image=None, system=None):
 
 
 def changes(old, new):
-    if old["schema"] != new["schema"]:
+    if (not isinstance(old, dict) or not isinstance(new, dict)
+            or "schema" not in old or "schema" not in new or old["schema"] != new["schema"]):
         raise ValueError("Inventory schema mismatch")
+    if (not isinstance(old.get("images"), dict) or not isinstance(new.get("images"), dict)
+            or not isinstance(old.get("imports"), list) or not isinstance(new.get("imports"), list)):
+        raise ValueError("Invalid inventory structure")
 
     def edges(report):
         return {(r["image"], r["kind"], r["dll"], r["symbol"]) for r in report["imports"]}
@@ -455,28 +459,41 @@ def changes(old, new):
     }
 
 
-def main():
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--baseline", type=Path)
-    args = parser.parse_args()
-    root = args.directory.resolve(strict=True)
-    output = args.output.resolve()
-    if output.is_relative_to(root) or (args.baseline and output == args.baseline.resolve()):
-        parser.error("Choose an output outside the input tree and separate from the baseline")
-    result = scan(root)
-    if args.baseline:
-        result["diff"] = changes(json.loads(args.baseline.read_text(encoding="utf-8")), result)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with NamedTemporaryFile(dir=output.parent, mode="w", encoding="utf-8", delete=False) as f:
-        json.dump(result, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    Path(f.name).replace(output)
+    args = parser.parse_args(argv)
+    try:
+        root = args.directory.resolve(strict=True)
+        if not root.is_dir():
+            raise ValueError(f"Not a directory: {root}")
+        output = args.output.resolve()
+        if output.is_relative_to(root) or (args.baseline and output == args.baseline.resolve()):
+            parser.error("Choose an output outside the input tree and separate from the baseline")
+        result = scan(root)
+        if args.baseline:
+            result["diff"] = changes(json.loads(args.baseline.read_text(encoding="utf-8")), result)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = None
+        try:
+            with NamedTemporaryFile(dir=output.parent, mode="w", encoding="utf-8", delete=False) as f:
+                tmp_path = Path(f.name)
+                json.dump(result, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+            tmp_path.replace(output)
+        except BaseException:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
+            raise
+    except (OSError, ValueError, json.JSONDecodeError, pefile.PEFormatError) as error:
+        parser.exit(1, f"{error}\n")
     print(f"{len(result['images'])} images | {len(result['imports'])} import edges | {output}")
     print(f"Desktop terminal results: {result['summary']['desktop_terminal_results']} | "
           f"forwarded edges: {result['summary']['desktop_forwarded_edges']}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
