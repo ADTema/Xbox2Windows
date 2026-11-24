@@ -2,6 +2,17 @@
 
 Run commands from the repository root. Start with the [project overview](../README.md) and [contribution guide](../CONTRIBUTING.md). Package-specific observations below used local inputs. Community regression tests use fixtures built from this repository.
 
+## One-dimensional texture sampling in startup draws
+
+The startup translator accepts ordinary 1D image sampling with a single coordinate and a
+nonempty component mask. The image draw test samples the alpha channel of a two-texel
+Texture1D at two coordinates and compares exact words. Selecting red changes both results.
+Run `ctest --preset dev -R startup_image_3d --no-tests=error` for this and the 3D controls.
+
+The runtime binds an explicit or default 1D view and uploads single-array-slice CPU-backed textures
+using their desktop copyable footprints. Run `ctest --preset dev -R '^startup_1d_srv_' --no-tests=error`
+to check RGBA8 texel and alpha values, rebinding, and a mismatched 2D view on hardware and WARP.
+
 ## Offline store context forwarding
 
 The fake-user runtime creates an offline store context token. Unimplemented methods receiving
