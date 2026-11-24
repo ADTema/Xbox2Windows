@@ -1334,6 +1334,117 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertEqual(decoded, llvm_lines)
         self.assertEqual(assemble_with_llvm_mc(decoded, assembler, objcopy), emitted)
 
+    def test_mimg_missing_gfx1013_ops_golden_encodings(self):
+        """Issue #938: sampling, gather, packed-load, MSAA-load and BVH ops decode to the LLVM spelling."""
+        vectors = [
+            ("0807a0f004102303", "image_sample_c",
+             "image_sample_c v[16:18], v[4:6], s[12:19], s[100:103] dmask:0x7 dim:SQ_RSRC_IMG_2D"),
+            ("080f20f104102303", "image_gather4_c",
+             "image_gather4_c v[16:19], v[4:6], s[12:19], s[100:103] dmask:0xf dim:SQ_RSRC_IMG_2D"),
+            ("100fa8f004102303", "image_sample_c_d",
+             "image_sample_c_d v[16:19], v[4:13], s[12:19], s[100:103] dmask:0xf dim:SQ_RSRC_IMG_3D"),
+            ("1103a8f004102303", "image_sample_c_d_g16",
+             "image_sample_c_d_g16 v[16:17], v[4:11], s[12:19], s[100:103] dmask:0x3 dim:SQ_RSRC_IMG_3D"),
+            ("0101b8f104102303", "image_sample_c_cd_o_g16",
+             "image_sample_c_cd_o_g16 v16, v[4:8], s[12:19], s[100:103] dmask:0x1 dim:SQ_RSRC_IMG_1D"),
+            ("080f08f004100300", "image_load_pck",
+             "image_load_pck v[16:19], v[4:5], s[12:19] dmask:0xf dim:SQ_RSRC_IMG_2D"),
+            ("310f00f004100300", "image_msaa_load",
+             "image_msaa_load v[16:19], v[4:6], s[12:19] dmask:0xf dim:SQ_RSRC_IMG_2D_MSAA"),
+            ("019f98f100040100", "image_bvh_intersect_ray", "image_bvh_intersect_ray v[4:7], v[0:10], s[4:7]"),
+            ("019f98f100040140", "image_bvh_intersect_ray", "image_bvh_intersect_ray v[4:7], v[0:7], s[4:7] a16"),
+            ("019f9cf100040100", "image_bvh64_intersect_ray", "image_bvh64_intersect_ray v[4:7], v[0:11], s[4:7]"),
+            ("019f9cf100040140", "image_bvh64_intersect_ray",
+             "image_bvh64_intersect_ray v[4:7], v[0:8], s[4:7] a16"),
+        ]
+        for hex_bytes, opcode, assembly in vectors:
+            with self.subTest(assembly=assembly):
+                records = disasm_rdna2(bytes.fromhex(hex_bytes))
+                self.assertEqual([(r["opcode"], r["assembly"]) for r in records], [(opcode, assembly)])
+
+    def test_mimg_bvh_refuses_modifier_bits_and_keeps_stream_alignment(self):
+        """Issue #938: a ray-intersection word with modifiers the encoding fixes is refused, not mis-decoded."""
+        # dmask 0xe instead of the fixed 0xf, then s_endpgm.
+        records = disasm_rdna2(bytes.fromhex("019e98f100040100" "000081bf"))
+        self.assertEqual(
+            [(r["offset"], r["opcode"]) for r in records],
+            [(0, "image_bvh_intersect_ray_unsupported"), (8, "s_endpgm")],
+        )
+        # d16 set in the second word.
+        records = disasm_rdna2(bytes.fromhex("019f98f1000401" "80" "000081bf"))
+        self.assertEqual(records[0]["opcode"], "image_bvh_intersect_ray_unsupported")
+        self.assertEqual(records[1]["opcode"], "s_endpgm")
+
+    def test_mimg_missing_gfx1013_ops_llvm_round_trip(self):
+        """Issue #938: every listed MIMG op decodes exactly as LLVM prints it, on every dimension LLVM models."""
+        if not os.environ.get("LLVM_LIB"):
+            self.skipTest("LLVM_LIB environment variable not set; verified against golden vectors")
+        resolved_lib = resolve_llvm_lib(os.environ["LLVM_LIB"])
+        ops = {
+            0x02: "image_load_pck", 0x03: "image_load_pck_sgn", 0x04: "image_load_mip_pck",
+            0x05: "image_load_mip_pck_sgn", 0x0a: "image_store_pck", 0x0b: "image_store_mip_pck",
+            0x23: "image_sample_d_cl", 0x29: "image_sample_c_cl", 0x2a: "image_sample_c_d",
+            0x2b: "image_sample_c_d_cl", 0x2e: "image_sample_c_b_cl", 0x31: "image_sample_cl_o",
+            0x32: "image_sample_d_o", 0x33: "image_sample_d_cl_o", 0x36: "image_sample_b_cl_o",
+            0x38: "image_sample_c_o", 0x39: "image_sample_c_cl_o", 0x3a: "image_sample_c_d_o",
+            0x3b: "image_sample_c_d_cl_o", 0x3c: "image_sample_c_l_o", 0x3d: "image_sample_c_b_o",
+            0x3e: "image_sample_c_b_cl_o", 0x3f: "image_sample_c_lz_o", 0x41: "image_gather4_cl",
+            0x45: "image_gather4_b", 0x46: "image_gather4_b_cl", 0x48: "image_gather4_c",
+            0x49: "image_gather4_c_cl", 0x4c: "image_gather4_c_l", 0x4d: "image_gather4_c_b",
+            0x4e: "image_gather4_c_b_cl", 0x4f: "image_gather4_c_lz", 0x50: "image_gather4_o",
+            0x51: "image_gather4_cl_o", 0x54: "image_gather4_l_o", 0x55: "image_gather4_b_o",
+            0x56: "image_gather4_b_cl_o", 0x57: "image_gather4_lz_o", 0x58: "image_gather4_c_o",
+            0x59: "image_gather4_c_cl_o", 0x5c: "image_gather4_c_l_o", 0x5d: "image_gather4_c_b_o",
+            0x5e: "image_gather4_c_b_cl_o", 0x5f: "image_gather4_c_lz_o", 0x68: "image_sample_cd",
+            0x69: "image_sample_cd_cl", 0x6a: "image_sample_c_cd", 0x6b: "image_sample_c_cd_cl",
+            0x6c: "image_sample_cd_o", 0x6d: "image_sample_cd_cl_o", 0x6e: "image_sample_c_cd_o",
+            0x6f: "image_sample_c_cd_cl_o", 0x80: "image_msaa_load", 0xa2: "image_sample_d_g16",
+            0xa3: "image_sample_d_cl_g16", 0xaa: "image_sample_c_d_g16", 0xab: "image_sample_c_d_cl_g16",
+            0xb2: "image_sample_d_o_g16", 0xb3: "image_sample_d_cl_o_g16", 0xba: "image_sample_c_d_o_g16",
+            0xbb: "image_sample_c_d_cl_o_g16", 0xe8: "image_sample_cd_g16", 0xe9: "image_sample_cd_cl_g16",
+            0xea: "image_sample_c_cd_g16", 0xeb: "image_sample_c_cd_cl_g16", 0xec: "image_sample_cd_o_g16",
+            0xed: "image_sample_cd_cl_o_g16", 0xee: "image_sample_c_cd_o_g16",
+            0xef: "image_sample_c_cd_cl_o_g16",
+        }
+        has_sampler = {0x23, 0x29, 0x2a, 0x2b, 0x2e, 0x31, 0x32, 0x33, 0x36, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x41, 0x45, 0x46, 0x48, 0x49, 0x4c, 0x4d, 0x4e, 0x4f, 0x50, 0x51, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5c, 0x5d, 0x5e, 0x5f, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0xa2, 0xa3, 0xaa, 0xab, 0xb2, 0xb3, 0xba, 0xbb, 0xe8, 0xe9, 0xea, 0xeb, 0xec, 0xed, 0xee, 0xef}
+        code = bytearray()
+        names = []
+        for op, name in ops.items():
+            # Dimensions 0..6: LLVM decodes a five-dword address on the MSAA array dimension as a
+            # different operand shape, so that dimension is left out of the comparison.
+            for dim in range(7):
+                word0 = (0xf0000000 | ((op & 0x7f) << 18) | ((op >> 7) & 1) | (0xf << 8) | (dim << 3))
+                word1 = ((5 << 21) if op in has_sampler else 0) | (2 << 16) | 4
+                code += struct.pack("<II", word0, word1)
+                names.append(name)
+        llvm_lines = llvm_disassemble(bytes(code), resolved_lib)
+        records = disasm_rdna2(bytes(code))
+        self.assertEqual(len(llvm_lines), len(names))
+        self.assertEqual([r["assembly"] for r in records], llvm_lines)
+        self.assertEqual([r["opcode"] for r in records], names)
+
+        bvh = bytes.fromhex("019f98f100040100" "019f98f100040140" "019f9cf100040100" "019f9cf100040140")
+        self.assertEqual([r["assembly"] for r in disasm_rdna2(bvh)], llvm_disassemble(bvh, resolved_lib))
+
+    def test_binary_scan_names_newly_decoded_mimg_ops(self):
+        """Issue #938: the scan report names gather, compare-sample and ray-intersection ops as LLVM does."""
+        shader = bytes.fromhex(
+            "080f20f104102303"  # image_gather4_c
+            "0807a0f004102303"  # image_sample_c
+            "019f98f100040100"  # image_bvh_intersect_ray
+            "000081bf"          # s_endpgm
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            (tmp_path / "ps_mimg.bin").write_bytes(shader)
+            result = {r["shader_name"]: r for r in scan_directory_or_files([tmp_path])}["ps_mimg.bin"]
+        self.assertTrue(result["opcodes_recognized"])
+        self.assertEqual(result["unsupported_opcodes"], {})
+        self.assertEqual(
+            [d["raw"].split()[0] for d in result["unsupported_details"]],
+            ["image_gather4_c", "image_sample_c", "image_bvh_intersect_ray"],
+        )
+
     def test_sop2_lshl_add_opcode_table_synthetic_forms(self):
         from disasm_rdna2 import SOP2_OPS
         target_ops = {0x2e, 0x2f, 0x30, 0x31}
