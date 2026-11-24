@@ -6314,6 +6314,14 @@ half. SCC is unchanged. The fixture covers in-place, immediate and `m0` forms.
 Disabling the lowering or swapping the sources fails the check. Wave masks,
 symbolic descriptors and reserved scalar encodings stay refused. [Refs #1996](https://github.com/R0Y00/Xbox2Windows/issues/1996)
 
+**Scalar bit tests.** Startup translation sets SCC for `s_bitcmp0_b32` and
+`s_bitcmp1_b32` by comparing the selected bit of the first word to zero or
+one. Only the low five bits of the index are used. EXEC, VCC and SGPRs tracked
+as lane masks are refused because their per-lane projections lose the other
+bits. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_bitcmp$' -V`.
+The fixture evaluates the emitted expression on the CPU and checks both
+operand positions for mask refusal. It does not execute a GPU draw.
+
 ## Pixel color without a texture sample
 
 For an unsampled pixel program, a matched P1/P2 interpolation in the entry mask can supply attr0.x/y/z/w from a four-component TEXCOORD0. The profile binds entry v0/v1 to the barycentric pair and the observed m0 source to the interpolation base. Each completed P2 produces a distinct value, including when the destination overwrites v0. The test vertex shader varies all four channels across a full-screen triangle. CPU references check all four output words at 1,024 pixel centers; an incorrect channel at an interior pixel must fail. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_attribute_'`.
