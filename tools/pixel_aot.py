@@ -586,7 +586,11 @@ def vgpr_span(token, count):
     return [f"v{n}" for n in range(first, last + 1)]
 
 
-HINT_LIMITS = {"s_clause": 0x3f, "s_setprio": 3, "s_sleep": 0x7f}
+HINT_LIMITS = {"s_clause": 0x3f, "s_setprio": 3, "s_sleep": 0x7f, "s_incperflevel": 0xf, "s_decperflevel": 0xf,
+               "s_ttracedata_imm": 0xffff}
+# Operandless hints: instruction cache invalidation, a thread-trace marker that reads M0, and the wakeup of waves
+# sleeping in s_sleep. None changes a register, memory or the exported result.
+OPERANDLESS_HINTS = ("s_icache_inv", "s_ttracedata", "s_wakeup")
 
 # s_setreg_imm32_b32 is accepted for two targets only.
 # MODE[3:2] is the rounding mode shared by binary16 and binary64 results (LLVM SIDefines.h, FP_ROUND_MODE_DP):
@@ -3245,11 +3249,14 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if mask != "entry":
                 raise ValueError("Unexpected v_nop with non-entry mask")
             continue
-        # Scheduling hints with no effect on results. Each operand is limited to the width
-        # of its RDNA 2 field: clause length minus one, wave priority and sleep duration.
-        if m := match(r"(s_clause|s_setprio|s_sleep) (0x[0-9a-f]+|\d+)"):
+        # Scheduling, performance and trace hints with no effect on results. Each operand is limited to the width of
+        # its RDNA 2 field: clause length minus one, wave priority, sleep duration, the performance counter in
+        # SIMM16[3:0], and the 16-bit trace data.
+        if m := match(rf"({'|'.join(HINT_LIMITS)}) (0x[0-9a-f]+|\d+)"):
             if int(m[2], 0) > HINT_LIMITS[m[1]]:
                 raise ValueError(f"Invalid {m[1]} operand")
+            continue
+        if line in OPERANDLESS_HINTS:
             continue
         # A hardware register write is state, not a hint: it is accepted only where its effect on the
         # lowered program is known, and every other register, field or value is refused.

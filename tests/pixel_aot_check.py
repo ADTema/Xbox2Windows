@@ -8082,7 +8082,11 @@ def check_mode_register_controls():
     assert translate([HALF_RTZ] + with_constants(HALF_BODY)) == translate(["s_nop 0"] + with_constants(HALF_BODY))
 
 
-HINT_NAMES = ("s_clause", "s_setprio", "s_sleep")
+HINT_NAMES = ("s_clause", "s_setprio", "s_sleep", "s_inst_prefetch", "s_incperflevel", "s_decperflevel",
+              "s_ttracedata_imm", "s_icache_inv", "s_ttracedata", "s_wakeup")
+# Operand limits by hint: the RDNA 2 field each operand fills.
+HINT_OPERAND_LIMITS = (("s_clause", 0x3f), ("s_setprio", 3), ("s_sleep", 0x7f), ("s_incperflevel", 0xf),
+                       ("s_decperflevel", 0xf), ("s_ttracedata_imm", 0xffff))
 
 
 def scheduling_hints():
@@ -8093,6 +8097,14 @@ def scheduling_hints():
     program.insert(1, "s_setprio 2")
     program.insert(program.index("s_waitcnt vmcnt(0)"), "v_nop")
     program.insert(program.index("s_waitcnt vmcnt(0)"), "s_sleep 1")
+    # Instruction prefetch and cache hints, performance levels, trace markers and a wakeup.
+    program.insert(1, "s_inst_prefetch 0x1")
+    program.insert(2, "s_icache_inv")
+    program.insert(3, "s_incperflevel 2")
+    program.insert(program.index("s_waitcnt vmcnt(0)"), "s_ttracedata")
+    program.insert(program.index("s_waitcnt vmcnt(0)"), "s_ttracedata_imm 0x5")
+    program.insert(program.index("s_waitcnt vmcnt(0)"), "s_wakeup")
+    program.insert(program.index("s_waitcnt vmcnt(0)"), "s_decperflevel 2")
     return program
 
 
@@ -8105,12 +8117,21 @@ def check_scheduling_hints():
                for line in hinted]
     assert translate(hinted) == translate(as_nops)
     nop = translate(["s_nop 0"] + plain)
-    for hint, limit in (("s_clause", 0x3f), ("s_setprio", 3), ("s_sleep", 0x7f)):
+    for hint, limit in HINT_OPERAND_LIMITS:
         assert translate([f"{hint} {limit}"] + plain) == nop
         assert translate([f"{hint} {hex(limit)}"] + plain) == nop
+        assert translate([f"{hint} 0"] + plain) == nop
         must_reject(translate, [f"{hint} {limit + 1}"] + plain)
+        must_reject(translate, [hint] + plain)
+    for hint in ("s_icache_inv", "s_ttracedata", "s_wakeup"):
+        assert translate([hint] + plain) == nop
+        must_reject(translate, [f"{hint} 0"] + plain)
+        must_reject(translate, plain[:-1] + [hint, plain[-1]])
     assert translate(["v_nop"] + plain) == nop
     must_reject(translate, ["v_nop 0"] + plain)
+    # s_wait_idle and s_waitcnt_depctr are waits, not hints, and stay refused.
+    must_reject(translate, ["s_wait_idle"] + plain)
+    must_reject(translate, ["s_waitcnt_depctr 0xffe3"] + plain)
     # s_code_end stays unknown, and nothing may follow the program end or sit between the color
     # export and s_endpgm.
     must_reject(translate, ["s_code_end"] + plain)
