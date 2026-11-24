@@ -172,6 +172,12 @@ socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do no
 `tools/startup/live_view.py` follows a run in a second console. `X2W_TRAP_DUMP="exe+RVA:len,reg+off:len"`
 adds memory dumps to the stop report.
 
+`tools/startup/triage_run.py` summarizes a log directory (and optional `--shader-cache <dir>`)
+into a path-redacted, address-redacted Markdown report (`Device::slot70` refusals, unhandled
+`x2w-d3d12` / trap slots, `x2w-dstorage` failures and status HRESULTs, `x2w-runtime` failing calls,
+and `.fail` shader reasons). Check with `python3 -B tests/startup_triage_run_check.py` (ctest
+`startup_triage_run`).
+
 ## Launcher check
 
 `tests/startup_launch_check.py` (ctest `startup_launch`) drives `tools/startup/launch.py` on the
