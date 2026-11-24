@@ -179,6 +179,13 @@ These are measured on one executable; treat them as hypotheses for others.
   (a chunked read whose length ends inside a compressed chunk); its cause is open.
 - **Struct-returning methods.** When both register arguments of a wrapped method look like objects,
   the one on the calling thread's stack is the return buffer.
+- **Queue Wait.** Slots 18 (`GetTimestampFrequency`) and 32 (present) put the console queue's
+  Signal and Wait two slots after the desktop's, at 16 and 17. Slot 17 with a fence becomes a desktop
+  `ID3D12CommandQueue::Wait`. After one, Signals on that queue complete when the GPU reaches them,
+  so a fence never completes before the wait ends. Other queue slots that are given a fence are
+  still treated as Signals. The slot numbers are inferred from that layout; no title call to slot
+  17 has been logged yet. Run
+  `ctest --preset dev --no-tests=error -R "^startup_queue_wait_"`.
 - **Inline samplers.** Pixel shaders build sampler descriptors from constants (`s_movk_i32`,
   `s_bfm_b32`, 64-bit moves); the translator folds those into static samplers. A source-built
   pixel stage checks all four manifest words, rejects a mask width from a root constant, and

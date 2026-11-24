@@ -344,6 +344,16 @@ add_executable(startup_stream_consumer tests/startup_stream_consumer.cpp tests/s
 target_compile_features(startup_stream_consumer PRIVATE cxx_std_17)
 target_link_libraries(startup_stream_consumer PRIVATE d3d12_xs_shim startup_stub_xg_xs d3d12 dxgi)
 
+# Console queue Wait (slot 17) waits on the GPU instead of signalling the fence.
+add_executable(startup_queue_wait tests/startup_queue_wait.cpp)
+target_compile_features(startup_queue_wait PRIVATE cxx_std_17)
+target_link_libraries(startup_queue_wait PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_queue_wait_${backend} COMMAND startup_queue_wait ${backend})
+    set_tests_properties(startup_queue_wait_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=1")
+endforeach()
+
 add_executable(startup_nv12_draw tests/startup_nv12_draw.cpp tests/desktop_gpu.cpp)
 target_compile_features(startup_nv12_draw PRIVATE cxx_std_17)
 target_include_directories(startup_nv12_draw PRIVATE src)
