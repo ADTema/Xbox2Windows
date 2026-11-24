@@ -2574,6 +2574,34 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_mxcsr COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/mxcsr.py"
         check "$<TARGET_FILE:cpu_mxcsr_harness>" "$<TARGET_FILE:cpu_mxcsr>" "$<TARGET_FILE:cpu_mxcsr_lifted>"
         ${mxcsr_controls} "${mxcsr_o2}")
+    # VLDMXCSR and VSTMXCSR: the translated part runs without AVX and never skips; the native comparison is its
+    # own test and exits 77 on a host that cannot execute VEX instructions.
+    cpu_asm_fixture(cpu_vmxcsr vmxcsr)
+    set(vmxcsr_controls)
+    foreach(variant IN ITEMS lifted noload fixed)
+        set(vmxcsr_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_vmxcsr_${variant}.cpp")
+        add_custom_command(OUTPUT "${vmxcsr_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/vmxcsr.py"
+                emit "$<TARGET_FILE:cpu_vmxcsr>" "${vmxcsr_fixture}" ${variant}
+            DEPENDS cpu_vmxcsr tests/cpu/vmxcsr.py tests/cpu/mxcsr.py tools/ffx_version_query.py tools/x87_lower.py
+                tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_vmxcsr_${variant} SHARED "${vmxcsr_fixture}")
+        if(NOT variant STREQUAL "lifted")
+            list(APPEND vmxcsr_controls "$<TARGET_FILE:cpu_vmxcsr_${variant}>")
+        endif()
+    endforeach()
+    set(vmxcsr_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_vmxcsr_lifted_o2.dll")
+    add_custom_command(OUTPUT "${vmxcsr_o2}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /EHsc /LD "${CMAKE_CURRENT_BINARY_DIR}/cpu_vmxcsr_lifted.cpp"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_vmxcsr_lifted_o2.obj" "/Fe${vmxcsr_o2}"
+        DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/cpu_vmxcsr_lifted.cpp" VERBATIM)
+    add_custom_target(cpu_vmxcsr_lifted_o2 ALL DEPENDS "${vmxcsr_o2}")
+    add_test(NAME cpu_aot_vmxcsr COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/vmxcsr.py"
+        check translated "$<TARGET_FILE:cpu_mxcsr_harness>" "$<TARGET_FILE:cpu_vmxcsr>" "$<TARGET_FILE:cpu_vmxcsr_lifted>"
+        ${vmxcsr_controls} "${vmxcsr_o2}")
+    add_test(NAME cpu_aot_vmxcsr_native COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/vmxcsr.py"
+        check native "$<TARGET_FILE:cpu_mxcsr_harness>" "$<TARGET_FILE:cpu_vmxcsr>" "$<TARGET_FILE:cpu_vmxcsr_lifted>")
+    set_tests_properties(cpu_aot_vmxcsr_native PROPERTIES SKIP_RETURN_CODE 77)
     # FTZ and DAZ in the profile's denormals opt-in: the lifted DLL, the sim variant that must keep every rule,
     # the noftz, nodaz and nomask controls that must break one, and an /O2 build of the translation.
     cpu_asm_fixture(cpu_mxcsr_denormals mxcsr_denormals)
