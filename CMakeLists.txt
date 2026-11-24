@@ -1702,6 +1702,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(startup_live_view PROPERTIES TIMEOUT 60)
     add_test(NAME startup_uniform_lane COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_uniform_lane_check.py")
+    # NGG primitive-shader cases (#1723): identity triangle against single-change contrasts, reference model.
+    add_test(NAME startup_ngg_slice COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_ngg_slice_check.py")
     add_test(NAME startup_image_sample_l COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_image_sample_l_check.py")
     add_test(NAME startup_image_sample_c COMMAND "${INTAKE_PYTHON}" -B
