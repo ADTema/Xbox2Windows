@@ -75,9 +75,9 @@ def _bounded_code(image, start):
     return image[start:end]
 
 
-def _check_two_exits(code, llvm):
+def _check_two_exits(code, llvm, *, cpu, features):
     """Both decoded exits must be reachable from the single entry."""
-    instructions = dict(disassemble(code, llvm, offsets=True))
+    instructions = dict(disassemble(code, llvm, offsets=True, cpu=cpu, features=features))
     exits = [pc for pc, line in instructions.items() if line == "s_endpgm"]
     if len(exits) != 2 or exits[-1] + 4 != len(code):
         raise ValueError("Expected two decoded exits")
@@ -121,7 +121,8 @@ def _check_two_exits(code, llvm):
         raise ValueError("Unreachable code or unverified alternate exit")
 
 
-def native_program(archive: Path, record: str, *, container_sha256: str | None = None, llvm=None) -> tuple[bytes, bytes]:
+def native_program(archive: Path, record: str, *, container_sha256: str | None = None, llvm=None,
+                   cpu=b"gfx1013", features=b"") -> tuple[bytes, bytes]:
     name = record.encode("ascii")
     if not 0 < len(name) < 255 or b"\0" in name:
         raise ValueError("Invalid length-prefixed record name")
@@ -139,10 +140,10 @@ def native_program(archive: Path, record: str, *, container_sha256: str | None =
             blob = _read_named_container(data, end)
         else:
             blob = _select_named_container(data, needle, container_sha256.lower())
-    return blob, container_code(parts(blob)[b"DXIL"], stage=0, llvm=llvm)
+    return blob, container_code(parts(blob)[b"DXIL"], stage=0, llvm=llvm, cpu=cpu, features=features)
 
 
-def container_code(program, *, stage, llvm=None):
+def container_code(program, *, stage, llvm=None, cpu=b"gfx1013", features=b""):
     """Extract the stage-specific instruction stream from a DXIL program part."""
     if len(program) < 24 or struct.unpack_from("<H", program, 2)[0] != stage:
         raise ValueError("Unexpected shader stage")
@@ -174,7 +175,7 @@ def container_code(program, *, stage, llvm=None):
         # Exactly two exits, verified for pixel (0) and compute (5) only. Mesh and other
         # stages, and three or more markers, stay rejected.
         if stage in (0, 5) and markers == 2 and llvm is not None:
-            _check_two_exits(code, llvm)
+            _check_two_exits(code, llvm, cpu=cpu, features=features)
             return code
         raise ValueError("Unverified multi-exit program")
     # Older fixtures lack the section extent; preserve their unique-marker rule.
@@ -3857,12 +3858,15 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     vector[dst] = f"uv.{component}" if mask == "quad" else ("entry_uv", component)
             else:
                 raise ValueError("Unpaired interpolation")
-        elif m := match(r"(image_sample(?:_lz|_l|_b)?) (?:v\[(\d+):(\d+)\]|v(\d+)), v\[(\d+):(\d+)\], s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0x([1-9a-f]) dim:SQ_RSRC_IMG_2D"):
+        elif m := match(r"(image_sample(?:_lz|_l|_b)?(?:_o)?) (?:v\[(\d+):(\d+)\]|v(\d+)), "
+                        r"v\[(\d+):(\d+)\], s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0x([1-9a-f]) dim:SQ_RSRC_IMG_2D"):
             op, dst_first, dst_last, dst_single, *rest, dmask_hex = m.groups()
             dmask = int(dmask_hex, 16)
             if op != "image_sample" and dmask != 0xf:
                 raise ValueError(f"{op} requires dmask:0xf")
-            coord_width = 3 if op in ("image_sample_l", "image_sample_b") else 2
+            base_op = op.removesuffix("_o")
+            has_offset = base_op != op
+            coord_width = (3 if base_op in ("image_sample_l", "image_sample_b") else 2) + has_offset
             channels = ["xyzw"[bit] for bit in range(4) if (dmask >> bit) & 1]
             if len(channels) == 1:
                 if dst_single is None:
@@ -3892,6 +3896,24 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if op != "image_sample" and second_texture_offset is not None:
                 raise ValueError(f"{op} requires a single texture binding")
             coord_regs = [f"v{n}" for n in coords]
+            offset_arg = ""
+            if has_offset:
+                offset_reg = coord_regs.pop(0)
+                if offset_reg in sample_dest:
+                    raise ValueError("Sample offset used before vmcnt wait")
+                value = vector.get(offset_reg)
+                if not isinstance(value, str) or value not in known_ssa_bits:
+                    raise ValueError("Sample offset must be a known packed integer word")
+                packed = known_ssa_bits[value]
+                # RDNA 2 packs signed six-bit X and Y at bits [5:0] and [13:8].
+                # Require a canonical 2D word and offsets representable in ps_6_0.
+                if packed & ~0x3f3f:
+                    raise ValueError("Sample offset must be a canonical 2D offset word")
+                x = ((packed & 0x3f) ^ 0x20) - 0x20
+                y = (((packed >> 8) & 0x3f) ^ 0x20) - 0x20
+                if not (-8 <= x <= 7 and -8 <= y <= 7):
+                    raise ValueError("Sample offset is outside the DXIL immediate range [-8, 7]")
+                offset_arg = f", int2({x}, {y})"
             if any(reg not in vector for reg in coord_regs):
                 raise ValueError("Unsupported texture coordinate")
 
@@ -3903,21 +3925,21 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     return value
                 return fp_operand(reg, scalar, vector, pending, sample_dest)
 
-            if op in ("image_sample_lz", "image_sample_l"):
+            if base_op in ("image_sample_lz", "image_sample_l"):
                 u, v = [sample_coord(reg) for reg in coord_regs[:2]]
-                lod = sample_coord(coord_regs[2]) if op == "image_sample_l" else "0.0f"
-                call = f"SampleLevel(samp, float2({u}, {v}), {lod})"
+                lod = sample_coord(coord_regs[2]) if base_op == "image_sample_l" else "0.0f"
+                call = f"SampleLevel(samp, float2({u}, {v}), {lod}{offset_arg})"
             else:
                 # RDNA2 places bias before the UV pair. Only UV contributes derivatives.
                 uv = [vector[reg] for reg in coord_regs[-2:]]
                 if any(value not in quad_values for value in uv):
                     raise ValueError("Unsupported texture coordinate")
                 coordinate = f"float2({', '.join(uv)})"
-                if op == "image_sample_b":
+                if base_op == "image_sample_b":
                     bias = sample_coord(coord_regs[0])
-                    call = f"SampleBias(samp, {coordinate}, {bias})"
+                    call = f"SampleBias(samp, {coordinate}, {bias}{offset_arg})"
                 else:
-                    call = f"Sample(samp, {coordinate})"
+                    call = f"Sample(samp, {coordinate}{offset_arg})"
             lines.append(f"    float4 sample{i} = {texture}.{call};")
             samples += 1
             vector_loads += 1
@@ -5641,6 +5663,8 @@ def main():
     parser.add_argument("record")
     parser.add_argument("--container-sha256", help="SHA-256 of the full decoded DXBC container to select by name")
     parser.add_argument("--llvm", required=True, help="LLVM C library with AMDGPU support")
+    parser.add_argument("--cpu", choices=("gfx1013", "gfx1030"), default="gfx1013",
+                        help="Source instruction set (gfx1030 uses the wave64 pixel profile)")
     parser.add_argument("--texture-sgpr", type=int, required=True, help="Entry register for the low descriptor-table address")
     parser.add_argument("--interp-sgpr", type=int, required=True, help="Entry register for the interpolation base")
     profile = parser.add_mutually_exclusive_group(required=True)
@@ -5669,8 +5693,11 @@ def main():
     if dest.suffix.lower() != ".hlsl" or dest == args.archive.resolve():
         parser.error("Choose an HLSL destination distinct from the input")
     try:
-        blob, code = native_program(args.archive, args.record, container_sha256=args.container_sha256, llvm=args.llvm)
-        instructions = disassemble(code, args.llvm, offsets=True)
+        cpu = args.cpu.encode()
+        features = b"+wavefrontsize64,-wavefrontsize32" if cpu == b"gfx1030" else b""
+        blob, code = native_program(args.archive, args.record, container_sha256=args.container_sha256,
+                                    llvm=args.llvm, cpu=cpu, features=features)
+        instructions = disassemble(code, args.llvm, offsets=True, cpu=cpu, features=features)
         if args.rt0_write_mask and any(line.startswith("exp ") and "compr" in line.split()
                                        for _, line in instructions):
             raise ValueError("--rt0-write-mask only supports uncompressed exports")
