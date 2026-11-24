@@ -559,7 +559,7 @@ def cvt_minmax_binary(tmp, tools):
 
 # One-source binary32 math. Every input has an exact result, and the sibling opcode gives a different one: a
 # reciprocal and a reciprocal square root of different powers of two, floor and truncation of negative fractions,
-# a tie rounded to even (3.5 and -2.5; floor of -2.5 is -3, round half away is -3 too), and a fractional part.
+# a tie rounded to even (3.5 and -0.5; floor of -0.5 is -1, round half away is -1 too), and a fractional part.
 UNARY_CASES = [
     ("v_rcp_f32_e32", 4.0, "v_rsq_f32_e32"),
     ("v_rsq_f32_e32", 16.0, "v_rcp_f32_e32"),
@@ -567,13 +567,13 @@ UNARY_CASES = [
     ("v_floor_f32_e32", -2.5, "v_trunc_f32_e32"),
     ("v_trunc_f32_e32", -2.5, "v_floor_f32_e32"),
     ("v_rndne_f32_e32", 3.5, "v_floor_f32_e32"),
-    ("v_fract_f32_e32", -2.25, "v_floor_f32_e32"),
+    ("v_fract_f32_e32", -2.75, "v_floor_f32_e32"),
     ("v_rcp_f32_e64", 0.125, "v_rsq_f32_e64"),
     ("v_rsq_f32_e64", 0.0625, "v_rcp_f32_e64"),
     ("v_sqrt_f32_e64", 0.5625, "v_rsq_f32_e64"),
     ("v_floor_f32_e64", -7.75, "v_trunc_f32_e64"),
     ("v_trunc_f32_e64", -6.75, "v_floor_f32_e64"),
-    ("v_rndne_f32_e64", -2.5, "v_floor_f32_e64"),
+    ("v_rndne_f32_e64", -0.5, "v_floor_f32_e64"),
     ("v_fract_f32_e64", 5.125, "v_floor_f32_e64"),
 ]
 
@@ -615,6 +615,8 @@ def unary_reference():
     z = 0.125 + 0.375  # pointData y plus the matrix value
     for op, x, _ in UNARY_CASES:
         z += exact[op.rsplit("_f32", 1)[0]](x)
+    # The draw keeps depth clipping on, so a final depth outside [0, 1] would clip the whole triangle.
+    assert 0.0 <= z <= 1.0, z
     return z
 
 
