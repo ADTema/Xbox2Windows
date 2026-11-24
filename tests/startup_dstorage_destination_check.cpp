@@ -139,6 +139,25 @@ int main(int argc, char** argv)
     else std::printf("ok: writable control after the refusals wrote every byte\n");
     VirtualFree(region, 0, MEM_RELEASE);
 
+    // Copy-on-write destination (PAGE_WRITECOPY) is also allowed and must succeed.
+    HANDLE mapping = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, bytes, nullptr);
+    auto* cow = mapping ? static_cast<unsigned char*>(MapViewOfFile(mapping, FILE_MAP_COPY, 0, 0, bytes)) : nullptr;
+    if (!cow) {
+        fail("copy-on-write destination", "MapViewOfFile(FILE_MAP_COPY)");
+    } else {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(cow, &info, sizeof(info)) || (info.Protect & 0xFF) != PAGE_WRITECOPY) {
+            fail("copy-on-write destination", "mapping is not PAGE_WRITECOPY");
+        } else {
+            const long cow_hr = run_request(cow, bytes, bytes);
+            if (cow_hr != 0) fail("copy-on-write destination", "request failed");
+            else if (std::memcmp(cow, source, bytes) != 0) fail("copy-on-write destination", "bytes differ");
+            else std::printf("ok: copy-on-write destination wrote every byte\n");
+        }
+        UnmapViewOfFile(cow);
+    }
+    if (mapping) CloseHandle(mapping);
+
     if (failures) return 1;
     std::printf("dstorage destination: refused without writes, queue kept working\n");
     return 0;
