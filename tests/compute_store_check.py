@@ -1130,18 +1130,21 @@ def dpp_controls():
 
     lines = lower()
     assert lines[-2] == "    outputData.Store(tid.x * 4u + 0u, dpp0_value);", lines
-    assert lines[5:10] == [
-        "    uint dpp0_lane = WaveGetLaneIndex();",
+    assert lines[6:14] == [
+        "    uint dpp0_lane = local.x & 31u;",
         "    uint dpp0_quad = dpp0_lane & 3u;",
-        "    uint dpp0_source_lane = (dpp0_lane & ~3u) | (((dpp0_quad == 0u) ? 1u : 0u) | "
+        "    dpp_stage[local.x] = " + source + ";",
+        "    GroupMemoryBarrierWithGroupSync();",
+        "    uint dpp0_source_thread = (local.x & ~3u) | (((dpp0_quad == 0u) ? 1u : 0u) | "
         "((dpp0_quad == 1u) ? 0u : 0u) | ((dpp0_quad == 2u) ? 3u : 0u) | ((dpp0_quad == 3u) ? 2u : 0u));",
-        f"    uint dpp0_source = WaveReadLaneAt({source}, dpp0_source_lane);",
+        "    uint dpp0_source = dpp_stage[dpp0_source_thread];",
+        "    GroupMemoryBarrierWithGroupSync();",
         "    uint dpp0_value = dpp0_source | tid.x;",
     ], lines
     for perm in ("[0,1,2,3]", "[2,0,3,1]", "[3,2,1,0]"):
         changed = variant(DPP_QUAD_PERM, ("quad_perm:[1,0,3,2]", f"quad_perm:{perm}"))
         output = "\n".join(lower(changed))
-        assert f"WaveReadLaneAt({source}, dpp0_source_lane)" in output
+        assert f"dpp_stage[dpp0_source_thread]" in output
         assert f"quad_perm:{perm}" not in output
         for lane, selected in enumerate(map(int, perm[1:-1].split(","))):
             assert f"((dpp0_quad == {lane}u) ? {selected}u : 0u)" in output
@@ -1159,6 +1162,9 @@ def dpp_controls():
             variant(DPP_QUAD_PERM, (instruction, instruction.replace("v_or_b32_dpp", "v_xor_b32_dpp"))))
     partial = variant(DPP_QUAD_PERM, ("v_lshl_add_u32 v0, s2, 5, v0", "v_lshl_add_u32 v0, s2, 1, v0"))
     rejects("Unsupported or masked DPP16 quad permutation", lower, partial, group=2)
+    two_dimensional = variant(
+        DPP_QUAD_PERM, ("v_lshl_add_u32 v0, s2, 5, v0", "v_lshl_add_u32 v0, s2, 3, v0"))
+    rejects("Unsupported or masked DPP16 quad permutation", lower, two_dimensional, group=(8, 2, 1))
     rejects("Unsupported or masked DPP16 quad permutation", lower, cpu="gfx1030")
     rejects("Unsupported or masked DPP16 quad permutation", lower,
             variant(DPP_QUAD_PERM, ("v1, v0 quad_perm", "v256, v0 quad_perm")))
@@ -5673,22 +5679,14 @@ def draw_vop2(directory, compiler, cmd, case, name):
 
 
 def draw_dpp(directory, compiler, renderer, backend):
-    """Check the DPP result against a same-dispatch lane-index and active-mask probe."""
+    """Check DPP against a logical-thread reference and prove full group participation."""
     lane_words = [source_word(lane) for lane in range(32)]
     if len(set(lane_words)) != 32 or any(len(set(lane_words[start:start + 4])) != 4
                                          for start in range(0, 32, 4)):
         raise AssertionError("DPP fixture values must be unique within and between quads")
     source = aot.lower(DPP_QUAD_PERM, 32, **READ_BINDING)
-    source = source.replace("tid.x", "WaveGetLaneIndex()")
-    result_store = "outputData.Store(WaveGetLaneIndex() * 4u + 0u,"
-    if source.count(result_store) != 1:
-        raise AssertionError("DPP fixture could not identify its result store")
-    source = source.replace(result_store, "outputData.Store(tid.x * 4u + 0u,")
     instrumentation = (
-        "    uint4 dpp_active = WaveActiveBallot(true);\n"
-        "    outputData.Store(128u + tid.x * 4u, WaveGetLaneIndex());\n"
-        "    outputData.Store(256u + tid.x * 4u, WaveGetLaneCount());\n"
-        "    outputData.Store4(384u + tid.x * 16u, dpp_active);\n"
+        "    outputData.Store(128u + tid.x * 4u, local.x);\n"
     )
     if source.count("\n}\n") != 1:
         raise AssertionError("DPP fixture has an unexpected entry point shape")
@@ -5703,10 +5701,9 @@ def draw_dpp(directory, compiler, renderer, backend):
     if result.returncode:
         return result.returncode
 
-    # Removing the lane read must be observable on the fixture's non-uniform lane values.
+    # Reading each thread's own staged value is an identity mutant and must fail.
     mutant = source.replace(
-        "WaveReadLaneAt(inputData.Load((WaveGetLaneIndex() << 2u) + 0u), dpp0_source_lane)",
-        "inputData.Load((WaveGetLaneIndex() << 2u) + 0u)")
+        "dpp_stage[dpp0_source_thread]", "dpp_stage[local.x]")
     if mutant == source:
         raise AssertionError("DPP negative control did not alter the generated shader")
     mutant_src, mutant_cso = directory / "dpp-mutant.hlsl", directory / "dpp-mutant.cso"

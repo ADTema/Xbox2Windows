@@ -235,53 +235,15 @@ static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE
         bool mismatch = words[i] != expected;
         if (dpp_case) {
             if (i < 32) {
-                const UINT lane = words[32 + i];
-                const UINT lane_count = words[64 + i];
+                const UINT logical_thread = words[32 + i];
                 constexpr UINT perm[4]{1, 0, 3, 2};
-                mismatch = lane_count < 4 || lane_count > 128 || lane >= lane_count;
-                if (!mismatch) {
-                    const UINT source_lane = (lane & ~3u) | perm[lane & 3u];
-                    mismatch = source_lane >= lane_count;
-                    if (!mismatch) {
-                        const UINT quad_base = lane & ~3u;
-                        for (UINT quad_lane = 0; quad_lane < 4 && !mismatch; ++quad_lane) {
-                            const UINT member = quad_base + quad_lane;
-                            if (member >= lane_count) {
-                                mismatch = true;
-                                break;
-                            }
-                            const UINT active_word = words[96 + i * 4 + member / 32];
-                            mismatch = !(active_word & (1u << (member % 32)));
-                        }
-                        expected = input_word(source_lane) | lane;
-                        mismatch = mismatch || words[i] != expected;
-                    }
-                }
+                mismatch = logical_thread != i;
+                const UINT source_thread = (logical_thread & ~3u) | perm[logical_thread & 3u];
+                expected = input_word(source_thread) | logical_thread;
+                mismatch = mismatch || words[i] != expected;
             } else if (i < 64) {
-                const UINT lane = words[i];
-                const UINT lane_count = words[64 + i - 32];
-                mismatch = lane_count < 4 || lane_count > 128 || lane >= lane_count;
-            } else if (i < 96) {
-                const UINT lane = words[32 + i - 64];
-                const UINT lane_count = words[i];
-                mismatch = lane_count < 4 || lane_count > 128 || lane >= lane_count;
-            } else if (i < 224) {
-                const UINT thread = (i - 96) / 4;
-                const UINT lane = words[32 + thread];
-                const UINT lane_count = words[64 + thread];
-                mismatch = lane_count < 4 || lane_count > 128 || lane >= lane_count;
-                if (!mismatch) {
-                    const UINT quad_base = lane & ~3u;
-                    for (UINT quad_lane = 0; quad_lane < 4 && !mismatch; ++quad_lane) {
-                        const UINT member = quad_base + quad_lane;
-                        if (member >= lane_count) {
-                            mismatch = true;
-                            break;
-                        }
-                        const UINT active_word = words[96 + thread * 4 + member / 32];
-                        mismatch = !(active_word & (1u << (member % 32)));
-                    }
-                }
+                expected = i - 32;
+                mismatch = words[i] != expected;
             } else {
                 expected = sentinel;
                 mismatch = words[i] != expected;
