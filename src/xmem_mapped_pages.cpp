@@ -4,6 +4,7 @@
 
 #include "era_physical.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include "startup_stubs/local_log.h"
@@ -318,6 +319,32 @@ struct TestFault {
 };
 #endif
 
+// Test build only: X2W_XMEM_TEST_HOLD_WINDOW=<name> keeps an unmap in the window where the run is
+// unmapped and not yet mapped again. It sets the event "<name>.unmapped", then waits up to
+// five seconds for "<name>.release", so that a reader thread can reach the window every time.
+#ifdef X2W_XMEM_TEST_CONTROLS
+void hold_window()
+{
+    char name[96];
+    const DWORD length = GetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_WINDOW", name, sizeof(name) - 16);
+    if (!length || length >= sizeof(name) - 16) return;
+    char event_name[128];
+    std::snprintf(event_name, sizeof(event_name), "%s.unmapped", name);
+    HANDLE unmapped = CreateEventA(nullptr, TRUE, FALSE, event_name);
+    std::snprintf(event_name, sizeof(event_name), "%s.release", name);
+    HANDLE release = CreateEventA(nullptr, TRUE, FALSE, event_name);
+    if (unmapped && release) {
+        SetEvent(unmapped);
+        if (WaitForSingleObject(release, 5000) != WAIT_OBJECT_0)
+            x2w_local::logf("x2w-xmem test hold: nobody released the unmapped window within 5 s");
+    }
+    if (unmapped) CloseHandle(unmapped);
+    if (release) CloseHandle(release);
+}
+#else
+void hold_window() {}
+#endif
+
 // Drops a page that has no view any more from the registry, so that the registry never names a
 // page Windows does not show.
 void forget_page(ULONG_PTR address)
@@ -462,6 +489,7 @@ BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& addres
                     memory.views.erase(address);
                 }
             }
+            if (!refused && !unmapped.empty()) hold_window();
             ULONG_PTR lost = 0;
             for (const auto& [base, size] : unmapped)
                 lost += map_recorded(base, size, refused ? test.stage == 3 && test.hit(3) : test.hit(2));
