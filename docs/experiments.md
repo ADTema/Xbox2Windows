@@ -5914,6 +5914,8 @@ start for the non-visible heap. No case failed; the first limit is that the wron
 controls are source-owned because the debug layer was unavailable. The hardware case returns
 77 when no physical adapter is available.
 
+On Windows 11 build 26300.9974 with the debug layer enabled, the Intel Arc 140T (vendor `8086`, device `7d51`, driver `32.0.101.8132`) passed the hardware case with 64-byte view increments on both heaps and a non-zero GPU start for the visible heap. Its positive readback matched all 320 words with the same `0x0afb0285` hash as WARP, and the omitted-dispatch control reported its 192 expected mismatches with the first at word 64.
+
 The boundary is the desktop device path, not a claimed console command-list ABI. The fixture
 uses the desktop allocator, command-list, barrier, clear, copy and queue methods on the
 XCL-08 device. It does not establish a console command-list creation export, console
