@@ -34,6 +34,18 @@ ordinal, using `pe_map_export_ordinal` on the mapped provider. `cpu_native_start
 
 External providers with process-lifetime workers can use `--pin-shim DLL` alongside `--shim DLL PATH`. This pins the provider immediately before the first guest image loads, and only in execution mode. Run packages in a child process when using pinned providers. The guest must still join its own workers and quiesce any host calls into guest code before returning. `cpu_package_shim_lifetime` verifies that the selected provider remains loaded after the entry returns and the ordinary provider unloads.
 
+`--trap-callable DLL!SYMBOL` (or `DLL!#ORDINAL`, repeatable) is a diagnostic execution mode for finding the last startup stage a package reaches. By default the runner refuses any unresolved external before mapping. An import table entry names a symbol, but it does not say whether the caller calls it or reads it as data, so this mode binds only the unresolved externals the caller lists as callable. Each listed name gets a numbered trap, and the traps are listed on stderr in sorted `dll!symbol` order. Any unlisted unresolved external is still refused before mapping, and so is a listed name that is not an unresolved external. A trap never returns: it prints `trap N: <importers>: <dll>!<symbol>` and terminates the process with `0xE7A00000 | N`. The report is best effort, and termination does not depend on it. No DLL is written or loaded under the missing name, and a trap is not a provider. If the entry returns without reaching a trap, the JSON result adds `unhit_traps`. The option cannot be combined with `--preflight-only`, and `plan(report, allow_external=False)` still refuses the same package.
+
+`pe_run_package_trap_missing` checks this with two source-built EXEs that import from a module nothing provides: two functions in one, plus a data import in the other.
+- The default run is refused.
+- With both functions listed, calling either one ends the process with that import's trap code and name, and calling neither reports both traps as unhit.
+- A partial list, a stale or malformed name and the unlisted data import are refused before mapping.
+- A child process that closes fd 2 and replaces `sys.stderr` before calling a trap still ends with the trap's code.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^pe_run_package_trap_missing$' -V
+```
+
 ### Scoped content root on Windows
 
 `startup_content_root` creates generated archive bytes in a package directory and different bytes

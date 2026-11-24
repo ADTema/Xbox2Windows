@@ -195,6 +195,24 @@ target_compile_options(xgameruntime_preflight_exe PRIVATE /GS-)
 target_link_options(xgameruntime_preflight_exe PRIVATE /ENTRY:fixture_entry /NODEFAULTLIB
     /SUBSYSTEM:CONSOLE /DYNAMICBASE /INCREMENTAL:NO)
 
+# pe_run_package --trap-callable fixtures. The import library only names trap_fixture.dll;
+# nothing builds or copies a DLL under that name. The _data variant adds a data import.
+set(trap_missing_import_def "${CMAKE_CURRENT_SOURCE_DIR}/tests/trap_missing_import.def")
+set(trap_missing_import_lib "${CMAKE_CURRENT_BINARY_DIR}/trap_missing_fixture_import.lib")
+add_custom_command(OUTPUT "${trap_missing_import_lib}"
+    COMMAND "${CMAKE_AR}" /nologo /machine:x64 "/def:${trap_missing_import_def}"
+            "/out:${trap_missing_import_lib}"
+    DEPENDS tests/trap_missing_import.def VERBATIM)
+foreach(target IN ITEMS trap_missing_exe trap_missing_data_exe)
+    add_executable(${target} tests/trap_missing_exe.cpp)
+    target_sources(${target} PRIVATE "${trap_missing_import_lib}")
+    target_link_libraries(${target} PRIVATE "${trap_missing_import_lib}" kernel32)
+    target_compile_options(${target} PRIVATE /GS-)
+    target_link_options(${target} PRIVATE /ENTRY:fixture_entry /NODEFAULTLIB
+        /SUBSYSTEM:CONSOLE /DYNAMICBASE /INCREMENTAL:NO)
+endforeach()
+target_compile_definitions(trap_missing_data_exe PRIVATE TRAP_DATA_IMPORT)
+
 find_program(DXC_EXECUTABLE dxc REQUIRED)
 get_filename_component(DXC_BIN_DIR "${DXC_EXECUTABLE}" DIRECTORY)
 target_compile_definitions(root_probe PRIVATE SDK_DXC_DIR=L"${DXC_BIN_DIR}/")
@@ -4520,6 +4538,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:d3d12_xs_shim>" "$<TARGET_FILE_DIR:xgameruntime_shim>"
         "$<TARGET_FILE_DIR:xmem_shim>")
     set_tests_properties(xgameruntime_preflight_stub_refused PROPERTIES TIMEOUT 30)
+    add_test(NAME pe_run_package_trap_missing COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/trap_missing_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:trap_missing_exe>" "$<TARGET_FILE:trap_missing_data_exe>")
+    set_tests_properties(pe_run_package_trap_missing PROPERTIES TIMEOUT 60)
 else()
     message(WARNING
         "Python-driven tests, including the CPU fixtures, are disabled because "
