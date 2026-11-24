@@ -622,6 +622,10 @@ bool suffix_waits_for_prefix(Fixture& f)
         if (!q.queue->work || q.queue->work->waiting.empty() || !has_unrecorded(q.queue)) {
             hold_prefix = false;
             f.submit(q);
+            // The fences are locals the worker still signals: wait until it is done with them.
+            const DWORD start = GetTickCount();
+            while ((prefix_fence.signals == 0 || suffix_fence.signals == 0) && GetTickCount() - start < completion_timeout_ms)
+                Sleep(1);
             continue;
         }
         ++suffix_cases;
