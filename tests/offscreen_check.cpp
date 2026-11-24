@@ -17,9 +17,14 @@
 #include "triangle_vs.h"
 #include "triangle_ps.h"
 #include "ffx_provider_loop.h"
+#include "dispatch_index_cs.h"
+#include "group_index_cs.h"
 #include "desktop_gpu.h"
 
 void check_spirv_window_atomic(ID3D12Device* device, const char* shader_path);
+void check_sampler_index_control(ID3D12Device* device,
+                                const unsigned char* dispatch_bytecode, unsigned int dispatch_size,
+                                const unsigned char* group_bytecode, unsigned int group_size);
 
 #ifdef OFFSCREEN_AGILITY_620
 extern "C" {
@@ -497,6 +502,19 @@ OperationResult run_compute_store_case(const OperationContext& ctx)
 OperationResult run_spirv_sampler_views(const OperationContext& ctx)
 {
     check_sampler_views(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+// Two builds of one shader that differ only in the sampler descriptor index source (#1115). The
+// SV_DispatchThreadID build must match the shared expected words; the SV_GroupID build is printed
+// for the record, because an adapter that folds the index still matches on some drivers.
+OperationResult run_sampler_index_control(const OperationContext& ctx)
+{
+    (void)ctx;
+    check_sampler_index_control(ctx.device, sampler_index_dispatch_cs,
+                                static_cast<unsigned int>(sizeof(sampler_index_dispatch_cs)),
+                                sampler_index_group_cs,
+                                static_cast<unsigned int>(sizeof(sampler_index_group_cs)));
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -997,7 +1015,10 @@ constexpr CapabilityGate kGateSm60CompareSampler{
     D3D_SHADER_MODEL_6_0, false, false, 0,
     "skip: comparison-sampler fixture requires SM 6.0",
     CapsDiagnostic::none};
-constexpr CapabilityGate kGateSm60RawUavDump{
+constexpr CapabilityGate kGateSm60SamplerIndexControl{
+    D3D_SHADER_MODEL_6_0, false, false, 0,
+    "skip: sampler index control requires SM 6.0",
+    CapsDiagnostic::none};constexpr CapabilityGate kGateSm60RawUavDump{
     D3D_SHADER_MODEL_6_0, false, false, 0,
     "skip: raw UAV dump requires SM 6.0",
     CapsDiagnostic::none};
@@ -1041,6 +1062,9 @@ const OperationSpec kOperations[] = {
     {"--ffx-immediate-conversion", 4, 4, nullptr, kNoGate, run_ffx_immediate_conversion},
     {"--compute-store-case", 5, 5, nullptr, kNoGate, run_compute_store_case},
     {"--spirv-sampler-views", 4, 4, nullptr, kGateSm60SamplerViews, run_spirv_sampler_views},
+    // Two builds that differ only in the sampler descriptor index source (#1115): the
+    // SV_DispatchThreadID build is asserted, the SV_GroupID build is recorded per swap.
+    {"--sampler-index-control", 3, 3, nullptr, kGateSm60SamplerIndexControl, run_sampler_index_control},
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},
     {"--spirv-address-window", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window},
@@ -1302,6 +1326,8 @@ int run_self_test()
                    "Unknown GPU operation or invalid arguments: --compute-root-file")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--spirv-sampler-views"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --spirv-sampler-views")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--sampler-index-control", "extra"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --sampler-index-control")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--spirv-compare-sampler", "a.dxil", "5"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --spirv-compare-sampler")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--spirv-compare-sampler", "a.dxil", "5", "ref.bin", "baseline", "extra"},

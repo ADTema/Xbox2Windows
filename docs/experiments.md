@@ -6415,6 +6415,36 @@ ordinary only, or comparison only — read the correct descriptors, so neither
 table is wrong by itself. Whether the driver folds that index as uniform is not
 established here.
 
+`tests/sampler_index_control.hlsl` is that comparison as a fixture: one shader
+built twice, differing only in the source of the sampler descriptor index. The
+`SV_DispatchThreadID` build is the passing control and the `SV_GroupID` build is
+the recorded reproduction. Both keep the same four descriptor ranges (SRV `t0`,
+UAV `u0`, two samplers at `s1` space 0 and two comparison samplers at `s1`
+space 3), the same `cs_6_0` shader model and all three sampler swaps. Both
+compute the output offsets from `SV_DispatchThreadID`. Each run starts with
+distinct output sentinels so a missing write is visible. This fixture uses DXC
+directly:
+
+```powershell
+.\tools\dev.ps1
+cmake --preset dev
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^sampler_index_control_' -V
+```
+
+`offscreen_check <warp|hardware> --sampler-index-control` prints, per swap, the
+expected and actual four words for each build and a status, then one summary
+line carrying the adapter, the driver and the DXC version. The dispatch-thread
+build throws on any mismatch, so a broken descriptor table or swap still fails;
+the group-id build is never asserted, because an adapter that folds the index
+matches on some drivers. The original standalone comparison used the selected
+index for the output offsets as well. On Windows 11 build 26300.9974 with DXC
+1.8.2502.11, its dispatch-thread build matched all three swaps on the RTX 5080
+Laptop (32.0.15.8142), the Intel Arc 140T (32.0.101.8132) and in-box WARP
+(10.0.26100.9818). The group-id build matched on the RTX and WARP, and read
+`0.25 0.25`/`0 0`, `0.75 0.75`/`0 0` and `0.25 0.25`/`1 1` on the Arc.
+An Arc rerun with fixed output indexing can isolate the sampler index.
+
 ### Standalone comparison-sampler split in the SPIR-V bridge
 
 When one standalone SPIR-V sampler variable feeds both depth-comparison and ordinary

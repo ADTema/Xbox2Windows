@@ -255,6 +255,37 @@ add_executable(offscreen_check tests/offscreen_check.cpp tests/compute_check.cpp
 target_sources(offscreen_check PRIVATE tests/spirv_window/readback.cpp tests/spirv_window/sampler_readback.cpp
     tests/spirv_window/compaction_readback.cpp tests/spirv_window/compare_sampler.cpp
     tests/spirv_window/raw_uav_dump.cpp)
+# Two builds of one control shader that differ only in the sampler descriptor index source (#1115).
+# The SV_DispatchThreadID build is the passing control; the SV_GroupID build is the recorded
+# reproduction. Descriptor tables, shader model, output indexing and all three swaps stay identical.
+set(sampler_index_dir "${CMAKE_CURRENT_BINARY_DIR}/sampler_index_control")
+add_custom_command(OUTPUT "${sampler_index_dir}/dispatch_index_cs.h"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${sampler_index_dir}"
+    COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E main -Vn sampler_index_dispatch_cs
+            -Fh "${sampler_index_dir}/dispatch_index_cs.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/sampler_index_control.hlsl"
+    DEPENDS tests/sampler_index_control.hlsl VERBATIM)
+add_custom_command(OUTPUT "${sampler_index_dir}/group_index_cs.h"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${sampler_index_dir}"
+    COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E main -D INDEX_FROM_GROUP_ID=1 -Vn sampler_index_group_cs
+            -Fh "${sampler_index_dir}/group_index_cs.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/sampler_index_control.hlsl"
+    DEPENDS tests/sampler_index_control.hlsl VERBATIM)
+target_sources(offscreen_check PRIVATE tests/spirv_window/sampler_index_control.cpp
+    "${sampler_index_dir}/dispatch_index_cs.h" "${sampler_index_dir}/group_index_cs.h")
+target_include_directories(offscreen_check PRIVATE "${sampler_index_dir}")
+# Record the compiler that produced both builds, so a reproduction can name it alongside the adapter.
+execute_process(COMMAND "${DXC_EXECUTABLE}" --version
+    OUTPUT_VARIABLE sampler_index_dxc_version OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+string(REGEX MATCH "[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+" sampler_index_dxc_version "${sampler_index_dxc_version}")
+if(sampler_index_dxc_version)
+    target_compile_definitions(offscreen_check PRIVATE "DXC_VERSION_STRING=\"${sampler_index_dxc_version}\"")
+endif()
+foreach(adapter IN ITEMS warp hardware)
+    add_test(NAME sampler_index_control_${adapter}
+             COMMAND offscreen_check ${adapter} --sampler-index-control)
+    set_tests_properties(sampler_index_control_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+endforeach()
 target_compile_features(offscreen_check PRIVATE cxx_std_17)
 target_link_libraries(offscreen_check PRIVATE d3d12 dxgi dxguid)
 target_include_directories(offscreen_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
