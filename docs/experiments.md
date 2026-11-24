@@ -9603,3 +9603,24 @@ For the same nine-mip textures, slot 2 returns the byte offset of each mip withi
 cmake --build --preset release --target startup_stream_consumer startup_stub_xg_xs xg_swizzle_select_check
 ctest --preset release --no-tests=error --output-on-failure -R '^(startup_xg_bc_(array|chain)_(hardware|warp)|startup_xg_bc_tiling|xg_bc64_tiling_reference|startup_xg_bc7_layout)$'
 ```
+
+## SSE4a bit-field and non-temporal scalar store leaf recompilation
+
+[The SSE4a leaf translator](../tools/cpu_sse4a_aot.py) lifts bounded straight-line Windows x64 leaf functions covering the six SSE4a instruction forms across the four mnemonics in `docs/coverage/x64_zen2.tsv` group `SSE3-4`:
+
+- `extrq` (immediate form `66 0F 78 /0 ib ib` and register form `66 0F 79 /r`): extracts a bit field of width `len & 0x3f` (`0` means `64`) at bit offset `idx & 0x3f` from `xmm[63:0]` and zero-extends into `xmm[63:0]` (register control read from `xmm2[5:0]` and `xmm2[13:8]`).
+- `insertq` (immediate form `F2 0F 78 /r ib ib` and register form `F2 0F 79 /r`): inserts the low `width` bits of `xmm2[63:0]` at `offset` in `xmm1[63:0]` while preserving the remaining bits of `xmm1[63:0]` (register control read from `xmm2[69:64]` and `xmm2[77:72]`).
+- `movntsd` (`F2 0F 2B /r`) and `movntss` (`F3 0F 2B /r`): unaligned 64-bit and 32-bit stores from `xmm[63:0]` / `xmm[31:0]` to flat `[r8 + disp]` destinations.
+
+Each lifted export takes `(word rcx, word rdx, word r8)` pointing to caller-owned flat buffers (`rcx` and `rdx` inputs, `r8` output) and returns `void`. Register state covers volatile `xmm0`..`xmm5` modeled as `Vec128` (`std::uint64_t q[2]`). Architecturally undefined bits `127:64` after `extrq`/`insertq` are left untouched in the model and not observed by tests. Transport and ABI glue covers `movaps`, `movdqa` (16-byte aligned), `movdqu` (unaligned), and terminal `ret`. The translator rejects static `offset + width > 64` on immediate `extrq`/`insertq`, invalid `extrq /1` encodings, VEX/EVEX non-legacy encodings, nonvolatile `xmm6`..`xmm15` or nonvolatile GPR bases, non-`r8` store bases, unaligned 16-byte `movaps`/`movdqa` operands, undefined register reads, prefixes, unsupported instructions, missing `ret`, and instructions after `ret`.
+
+```powershell
+cmake --build --preset dev --target cpu_sse4a_original cpu_sse4a_original_lifted cpu_sse4a_altered cpu_sse4a_altered_lifted
+ctest --preset dev --no-tests=error -R '^cpu_aot_sse4a$' -V
+```
+
+### Measured results and open scope
+
+The [MASM fixture](../tests/cpu/sse4a.asm) exports 24 translated `op_*` functions covering immediate and register `extrq`/`insertq` (including `length=0` meaning `64`, bits `[7:6]`/`[15:14]` ignored, self-aliasing, and `xmm4`/`xmm5`), aligned and unaligned `movntsd`/`movntss`, a chained `op_pipeline`, and two dead-read fault-ordering controls (`op_discarded_read` and `op_sse4a_discarded_read`), alongside 22 Win64 MASM baseline `ref_*` exports so verification runs on both Intel and AMD hosts without skipping. [The differential check](../tests/cpu/sse4a_check.py) verifies 580 cases across the 22 differential exports bit-for-bit across `dev` and `release` (`/O2`) builds against both the independent Python AMD64 APM reference model and the Win64 MASM `ref_*` baseline (and cross-checks native `op_*` execution when `CPUID.80000001H:ECX[6]` is set), with 32-byte pre/post buffer guards, dead-read fault ordering, 6 `ALTER_IMM` divergence controls (minimum 7 differing cases), an output-mutation control, 6 alternate-encoding lift checks, 54 unit rejection controls, and 11 PE-patched DLL rejection controls. It also records decoded mnemonics of the translated exports through `FORM_COVERAGE_RECORD`.
+
+Not covered by this experiment: non-temporal cache-bypass hints, runtime `offset + width > 64` hardware-undefined behavior in register-form `extrq`/`insertq`, control flow or nonvolatile prologues, and title CPU code execution.
