@@ -725,9 +725,11 @@ INTEGER = {
     "bfe_i32": (3, "s_bfe_i32({0}, ({1} & 31u) | (({2} & 31u) << 16u))"),
     "bfm_b32": (2, "(((1u << ({0} & 31u)) - 1u) << ({1} & 31u))"),
     "bcnt_u32_b32": (2, "(countbits({0}) + {1})"),
-    # Sums of absolute differences, all unsigned and modulo 2^32 (AMD RDNA 2 ISA reference, VOP3 opcodes 347,
+    # Sums of absolute differences, all unsigned and modulo 2^32 (AMD RDNA 2 ISA reference, VOP3 opcodes 346 to
     # 349 and 369). src1 is the reference: v_msad_u8 leaves out each byte lane whose src1 byte is zero.
+    "sad_u8": (3, "sad4_u8({0}, {1}, false) + {2}"),
     "sad_hi_u8": (3, "(sad4_u8({0}, {1}, false) << 16u) + {2}"),
+    "sad_u16": (3, "sad2_u16({0}, {1}) + {2}"),
     "sad_u32": (3, "(max({0}, {1}) - min({0}, {1})) + {2}"),
     "msad_u8": (3, "sad4_u8({0}, {1}, true) + {2}"),
 }
@@ -758,7 +760,7 @@ MUL24_HELPERS = {
 }
 # Two-source integer operations that exist in the VOP3 encoding only on gfx10.
 INTEGER_VOP3_ONLY = ("cvt_pk_u16_u32", "cvt_pk_i16_i32", "bfm_b32", "bcnt_u32_b32", "pack_b32_f16")
-SAD_HELPERS = {"sad_hi_u8": ("sad4_u8",), "msad_u8": ("sad4_u8",)}
+SAD_HELPERS = {"sad_u8": ("sad4_u8",), "sad_hi_u8": ("sad4_u8",), "sad_u16": ("sad2_u16",), "msad_u8": ("sad4_u8",)}
 LANE_MASK = r"(vcc(?:_lo)?|s\d+|s\[\d+:\d+\])"
 
 
@@ -1197,6 +1199,12 @@ uint class64(uint lo, uint hi) {
         "        if (!masked || y != 0u) sum += x > y ? x - y : y - x;\n"
         "    }\n"
         "    return sum;\n"
+        "}"
+    ),
+    "sad2_u16": (
+        "uint sad2_u16(uint a, uint b) {\n"
+        "    uint lo_a = a & 0xffffu, lo_b = b & 0xffffu, hi_a = a >> 16u, hi_b = b >> 16u;\n"
+        "    return (lo_a > lo_b ? lo_a - lo_b : lo_b - lo_a) + (hi_a > hi_b ? hi_a - hi_b : hi_b - hi_a);\n"
         "}"
     ),
     "mul24_u32": (

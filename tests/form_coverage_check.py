@@ -338,7 +338,8 @@ def check_shader_records():
     # The carry-in add and subtracts in both the VOP2 (e32) and the VOP3 (e64) encoding.
     carry_in_forms = {(group, f"v_{op}_co_ci_u32{suffix}") for op in ("add", "sub", "subrev")
                       for group, suffix in (("VOP2", ""), ("VOP3", "_e64"))}
-    sad_forms = {("VOP3", "v_sad_hi_u8"), ("VOP3", "v_sad_u32"), ("VOP3", "v_msad_u8")}
+    sad_forms = {("VOP3", "v_sad_u8"), ("VOP3", "v_sad_hi_u8"), ("VOP3", "v_sad_u16"), ("VOP3", "v_sad_u32"),
+                 ("VOP3", "v_msad_u8")}
     # gfx10 encodes the 64-bit multiply-adds as VOP3B, listed under VOP3 with their plain names.
     mad64_forms = {("VOP3", "v_mad_u64_u32"), ("VOP3", "v_mad_i64_i32")}
     # The exact 32-bit integer to binary64 conversions are VOP1, accepted in their plain and _e32 spellings.
@@ -376,7 +377,7 @@ def check_shader_records():
         "s_lshl0_add_u32", "s_lshl5_add_u32",
         "s_cbranch_execnz", "s_cbranch_vccz", "s_cbranch_vccnz",
         "s_absdiff_i64", "s_absdiff_u32",
-        "v_sad_u8", "v_sad_u16", "v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8", "v_mqsad_u32_u8",
+        "v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8", "v_mqsad_u32_u8",
     }
     assert not (pixel.ACCEPTED & rejected_forms), pixel.ACCEPTED & rejected_forms
     for name in ("gfx1013.tsv", "rdna2.tsv"):
@@ -757,7 +758,7 @@ def check_f16_to_int16_forms():
 
 def check_int16_ternary_forms():
     """The 8 three-operand 16-bit integer VOP3 forms count as covered once the translator accepts their fixtures; the
-    nearby VOP3 forms that stay rejected (v_mad_u32_u16, v_mad_i32_i16, v_sad_u16, f16 ops) stay uncovered."""
+    nearby VOP3 forms that stay rejected (v_mad_u32_u16, v_mad_i32_i16, f16 ops) stay uncovered."""
     import pixel_aot
     import pixel_aot_check as pixel
     saved = set(pixel.ACCEPTED)
@@ -767,8 +768,7 @@ def check_int16_ternary_forms():
             pixel.translate_int(pixel.int16_ternary_ops(group))
         forms = {("VOP3", f"v_{name}") for name in pixel_aot.VOP3_INT16_TERNARY}
         assert len(forms) == 8
-        neighbours = {("VOP3", "v_mad_u32_u16"), ("VOP3", "v_mad_i32_i16"), ("VOP3", "v_sad_u16"),
-                      ("VOP3", "v_min_f16_e64")}
+        neighbours = {("VOP3", "v_mad_u32_u16"), ("VOP3", "v_mad_i32_i16"), ("VOP3", "v_min_f16_e64")}
         for name in ("gfx1013.tsv", "rdna2.tsv"):
             reference = fc.load_reference(name)
             assert forms <= reference, (name, forms - reference)
