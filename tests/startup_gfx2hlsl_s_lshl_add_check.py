@@ -120,6 +120,11 @@ for n in NAMES:
     refused_null = translate(sop2(NAMES[n], NULL, 129, 129))
     check('%s refuses the discard destination without raising a translator error' % NAMES[n],
           refused_null == ['refused: %s destination null' % NAMES[n]], str(refused_null))
+    stage = Probe()
+    stage.varying_s = {1}
+    stage.scc_uniform = True
+    stage.one(NAMES[n], f'{NAMES[n]} s3, s1, s2')
+    check('%s clears a stale SCC uniformity proof' % NAMES[n], not stage.scc_uniform)
 
 if failures:
     print('FAILED: %s' % ', '.join(failures))
