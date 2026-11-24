@@ -8357,7 +8357,7 @@ ctest --preset release --no-tests=error -R '^startup_address_srv_' -V
 The translated draw path can sample a read-only BC3_UNORM or BC7_UNORM SRV
 published through device slot 70 without a prior resource object. The tested
 layout is 0x105, 4 KiB standard non-XOR. Width and height must be multiples of
-64 texels, with one mip, one slice, and one sample. Each tile holds 16¡Á16
+64 texels, with one mip, one slice, and one sample. Each tile holds 16 by 16
 compressed blocks. The runtime copies the 16-byte blocks to their desktop
 footprint rows before uploading them. Ordinary placed R8 views and the XG
 BC7 layout probe retain their existing behavior.
@@ -8369,7 +8369,7 @@ changed bytes on subsequent binds. A same-address republication invalidates
 the cached upload. Direct use of the persistent desktop heap by untracked
 commands is outside this profile.
 
-Each source-built test draws four complete 128¡Á128 panels per format from
+Each source-built test draws four complete 128 by 128 panels per format from
 four 4 KiB tiles. The second address exchanges neighboring tiles. A zero
 address must retain that view, and publishing the first address again must
 restore the first image. On Windows 11 26200.9974 with the debug layer off,
