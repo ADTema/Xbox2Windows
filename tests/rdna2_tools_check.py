@@ -3395,6 +3395,8 @@ class TestRdna2Scanner(unittest.TestCase):
             ("s_or_b32 s44, s40, s41", True), ("s_xor_b32 s44, s40, -1", True),
             ("s_and_b64 s[44:45], s[40:41], 3", True),
             ("s_or_b32 s44, s40, 1.0", True), ("s_and_b32 s44, s40, -0.5", True),
+            ("s_xor_b32 s44, 2.0, s41", True), ("s_lshl_b32 s44, s40, 0.125", True),
+            ("s_or_b32 s44, s40, 1e3", False), ("s_or_b32 s44, s40, 0x1ffffffff", False),
             ("s_and_b64 s[44:45], s[40:41], 1.0", False),
             ("s_and_b32 m0, s40, 3", False), ("s_and_b32 exec_lo, s40, 3", False),
             ("s_and_b32 exec, vcc_lo, s40", False), ("s_or_b32 vcc_lo, s40, s41", False),

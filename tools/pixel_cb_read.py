@@ -6,6 +6,8 @@ is supplied by the probe, so it is never a complete translated archive PS.
 import re
 from typing import NamedTuple
 
+from pixel_aot import scalar_u32
+
 
 SPAN = r"s\[(\d+):(\d+)\]"
 IMM = r"(null|0x[0-9a-f]+)"
@@ -13,8 +15,6 @@ DESCRIPTOR = re.compile(rf"s_load_dwordx4 {SPAN}, {SPAN}, {IMM}")
 BUF_READ = re.compile(rf"s_buffer_load_dword(x[248]|x16)? (s\d+|s\[\d+:\d+\]), {SPAN}, (null|0x[0-9a-f]+|s\d+)")
 SALU_B32 = ("s_lshl_b32", "s_lshr_b32", "s_and_b32", "s_or_b32", "s_xor_b32")
 SALU_OPERAND = re.compile(r"s\d+|-?[0-9]{1,10}|0x[0-9a-f]{1,8}")
-# The 32-bit lowering also reads a decimal float as its bit pattern; the 64-bit form does not.
-SALU_OPERAND_B32 = re.compile(SALU_OPERAND.pattern + r"|-?[0-9]+\.[0-9]+")
 EXEC_NAMES = ("exec", "exec_lo")
 WAIT_LIMITS = {"vmcnt": 63, "lgkmcnt": 63, "expcnt": 7}
 FLAT_SCRATCH_WRITE = re.compile(r"s_setreg_imm32_b32 hwreg\(HW_REG_FLAT_SCR_(?:LO|HI)\), (\S+)")
@@ -77,12 +77,23 @@ def flat_scratch_value(value):
     return bool(re.fullmatch(r"-?[0-9]{1,10}", value)) and -0x80000000 <= int(value) <= 0xffffffff
 
 
+def operand_b32(token):
+    """A 32-bit scalar ALU source: a register, or any immediate pixel_aot.scalar_u32 lowers (including floats)."""
+    if re.fullmatch(r"s\d+", token):
+        return True
+    try:
+        scalar_u32(token, {}, set())
+    except ValueError:
+        return False
+    return True
+
+
 def salu_form(line):
     """Destination and source registers of a lowered scalar ALU line, or None."""
     op, _, args = line.partition(" ")
     operands = args.split(", ")
     if op in SALU_B32 and len(operands) == 3 and re.fullmatch(r"s\d+", operands[0]) \
-            and all(SALU_OPERAND_B32.fullmatch(arg) for arg in operands[1:]):
+            and all(operand_b32(arg) for arg in operands[1:]):
         dest = written_registers(operands[0])
         if dest.stop > 106:
             return None
