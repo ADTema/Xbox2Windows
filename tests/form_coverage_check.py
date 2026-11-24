@@ -1202,6 +1202,25 @@ def check_fma3_leaf():
         assert only_fail["blocked_by_skip"] == []
 
 
+def check_sse_fp_native_driver():
+    """cpu_aot_sse_fp credits only the forms the translator lifts: the MXCSR driver the check calls
+    natively lives in sse_fp_harness.asm, which no test counts as translated."""
+    source = (fc.ROOT / "tests" / "cpu" / "sse_fp.asm").read_text(encoding="utf-8-sig")
+    driver = (fc.ROOT / "tests" / "cpu" / "sse_fp_harness.asm").read_text(encoding="utf-8-sig")
+    assert {"ldmxcsr", "stmxcsr"} <= fc.masm_mnemonics(driver)
+    passed = fc.measure({"cpu_aot_sse_fp": "pass"}, gaps_for="x64_zen2")
+    assert passed["fixtures"]["sse_fp.asm"] == "pass"
+    assert passed["fixtures"]["sse_fp_harness.asm"] == "not translated"
+    assert "sse_fp_harness.asm" not in passed["unclassified"]
+    assert not {"ldmxcsr", "stmxcsr", "call"} & fc.masm_mnemonics(source)
+    assert passed["x64_zen2"]["covered"] == 16, passed["x64_zen2"]["covered"]
+    assert passed["x64_zen2"]["groups"]["SSE"] == {"covered": 13, "total": 69}
+    with tempfile.TemporaryDirectory() as tmp:
+        root = sample_repo(tmp, {"sse_fp": source, "sse_fp_harness": driver})
+        only_driver = fc.measure({"cpu_aot_sse_fp": "fail"}, root)["x64_zen2"]
+        assert only_driver["covered"] == 0, only_driver["covered"]
+
+
 def check_swap_coverage():
     """v_swap_b32 is VOP1 in both references and counts as covered only through the accepted spelling.
     The _e64, DPP and SDWA spellings reach only rejections, and the neighbouring v_swaprel_b32 stays uncovered."""
@@ -1273,4 +1292,5 @@ if __name__ == "__main__":
     check_avx_move_regs()
     check_sse2_regs()
     check_fma3_leaf()
+    check_sse_fp_native_driver()
     print("form coverage checks passed")
