@@ -9538,6 +9538,33 @@ cmake --build --preset release --target startup_stream_consumer d3d12_xs_shim
 ctest --preset release --no-tests=error -R '^startup_address_srv_' -V
 ```
 
+### Name the cause of a refused slot 70 call
+
+A slot 70 call that the runtime refuses leaves the destination descriptor as it was and logs one
+line, for the first eight refusals of a process (stderr and `X2W_TRAP_LOG`). The line names the first
+check that refused it, in the order the checks run: `null_destination`, `unreadable_resource`,
+`unreadable_view`, `null_address`, `unsupported_description`, `destination_outside_view_heaps`, or
+`texture_unavailable` (the description passed but no single live texture or published view matches the
+address). Keep full logs from private inputs local. In public reports, give the reason and general resource/view categories. Use source-built inputs for full diagnostic lines. The line prints what the checks read: resource dimension, format, width by height by depth or
+array size, mips, layout, flags, alignment and sample count and quality; view dimension, format and
+component mapping, with the mip, plane and array fields for 2D and 2D-array views and the first
+element, count, stride and flags for buffer views (any other dimension prints its six raw words);
+the destination handle and whether it is a descriptor of a known CBV/SRV/UAV heap; the address and
+whether its first byte is readable. Only 2D textures are supported: a buffer view or an
+acceleration-structure view is refused with `unsupported_description` and the line says so. No
+buffer or acceleration-structure semantics are implemented; what a title expects from such a call
+has not been observed in a source-built fixture.
+
+`startup_memory_srv_report` compares the line field by field for buffer, acceleration-structure
+and array views and for unreadable arguments. `startup_address_srv_hardware` and
+`startup_address_srv_warp` also match the five lines of their refused calls (zero address, other
+width, interior address, a buffer view, a destination off the heap) and show the descriptor unchanged.
+
+```powershell
+cmake --build --preset release --target startup_memory_srv_report_check startup_stream_consumer d3d12_xs_shim
+ctest --preset release --no-tests=error -R '^(startup_memory_srv_report|startup_address_srv_)' -V
+```
+
 ### Sample address-only BC3/BC7 textures in translated draws
 
 The translated draw path can sample a read-only BC3_UNORM or BC7_UNORM SRV

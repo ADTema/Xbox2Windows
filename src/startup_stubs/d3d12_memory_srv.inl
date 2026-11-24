@@ -142,20 +142,45 @@ ID3D12Resource* sampled_address_texture(Wrapper* resource)
     return sampled.desktop.Get();
 }
 
+// The first check that refuses a call, in the order the checks run; null when every check passes.
+const char* memory_srv_refusal(const D3D12_RESOURCE_DESC* resource, const MemoryShaderResourceView* input, u64 destination)
+{
+    if (!destination) return "null_destination";
+    if (!x2w_local::readable(resource, sizeof(*resource))) return "unreadable_resource";
+    if (!x2w_local::readable(input, sizeof(*input))) return "unreadable_view";
+    if (!input->address) return "null_address";
+    if (!supports_memory_srv(*resource, input->view)) return "unsupported_description";
+    if (!memory_srv_destination(destination)) return "destination_outside_view_heaps";
+    return nullptr;
+}
+
+// One line with every field the checks read; the caller rate-limits it.
+void log_refused_memory_srv(const char* what, const char* reason, const D3D12_RESOURCE_DESC* resource,
+                            const MemoryShaderResourceView* input, u64 destination)
+{
+    const bool resource_ok = x2w_local::readable(resource, sizeof(*resource));
+    const bool input_ok = x2w_local::readable(input, sizeof(*input));
+    const u64 address = input_ok ? input->address : 0;
+    char line[640];
+    x2w_startup::report_refused_memory_srv(line, sizeof(line), what, reason, resource_ok ? resource : nullptr,
+        input_ok ? &input->view : nullptr, address, address && x2w_local::readable(reinterpret_cast<const void*>(address), 1),
+        destination, destination && memory_srv_destination(destination));
+    log("%s", line);
+}
+
 void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resource,
                                  const MemoryShaderResourceView* input, u64 destination)
 {
     static LONG refused;
-    if (!destination || !x2w_local::readable(resource, sizeof(*resource)) ||
-        !x2w_local::readable(input, sizeof(*input)) || !input->address ||
-        !supports_memory_srv(*resource, input->view) || !memory_srv_destination(destination)) {
-        if (first_calls(refused, 8)) log("x2w-d3d12 Device::slot70 unsupported memory SRV arguments");
+    if (const char* reason = memory_srv_refusal(resource, input, destination)) {
+        if (first_calls(refused, 8)) log_refused_memory_srv("unsupported memory SRV arguments", reason, resource, input, destination);
         return;
     }
     Wrapper* texture = (tiled_bc_srv(*resource) || x2w_startup::bc64::supports(*resource)) ? publish_tiled_texture(self, input->address, *resource)
                                               : existing_memory_texture(input->address, *resource);
     if (!texture) {
-        if (first_calls(refused, 8)) log("x2w-d3d12 Device::slot70 unavailable texture at the supplied base and layout");
+        if (first_calls(refused, 8))
+            log_refused_memory_srv("unavailable texture at the supplied base and layout", "texture_unavailable", resource, input, destination);
         return;
     }
     view_slot<18, 2>(self, reinterpret_cast<u64>(texture), reinterpret_cast<u64>(&input->view), destination, 0);
