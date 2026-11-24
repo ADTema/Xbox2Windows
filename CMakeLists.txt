@@ -201,6 +201,42 @@ foreach(mutation_and_check
     FAIL_REGULAR_EXPRESSION "unknown mutation|xmem_commit_protection: PASS")
 endforeach()
 
+# Startup blocks below 2^40 (#1758, under #874): X2W_XMEM_STARTUP_BELOW_40=1 places the 0x283 large-page
+# startup blocks entirely below 2^40 or refuses them. The check loads xmem.dll by path; the deployed
+# shim must ignore the test-build mutants, and each mutant in the test-controls build must make the
+# named check fail.
+add_executable(xmem_startup_below_40_check tests/xmem_startup_below_40_check.cpp)
+target_link_libraries(xmem_startup_below_40_check PRIVATE OneCore)
+target_compile_features(xmem_startup_below_40_check PRIVATE cxx_std_17)
+add_dependencies(xmem_startup_below_40_check xmem_shim xmem_shim_test_controls)
+add_test(NAME xmem_startup_below_40 COMMAND xmem_startup_below_40_check "$<TARGET_FILE:xmem_shim>")
+add_test(NAME xmem_startup_below_40_deployed_ignores_mutants
+         COMMAND xmem_startup_below_40_check "$<TARGET_FILE:xmem_shim>")
+set_tests_properties(xmem_startup_below_40 xmem_startup_below_40_deployed_ignores_mutants PROPERTIES
+    TIMEOUT 60 PASS_REGULAR_EXPRESSION "xmem_startup_below_40: PASS")
+set_tests_properties(xmem_startup_below_40_deployed_ignores_mutants PROPERTIES
+    ENVIRONMENT "X2W_XMEM_TEST_BELOW_40=no_limit+no_check+no_release")
+# Each entry: mutant @ output that must appear @ output that must not. Without the limit the check
+# after the allocation still refuses and releases the high block (no NULL or leak failure); without
+# the check the high block is returned; without the release it stays allocated.
+foreach(entry
+        "no_limit@check_failed: exhausted_host_refusal@xmem_startup_below_40: PASS|check_failed: exhausted_(null|no_leak)"
+        "no_limit+no_check@check_failed: exhausted_null@xmem_startup_below_40: PASS"
+        "no_limit+no_release@check_failed: exhausted_no_leak@xmem_startup_below_40: PASS|check_failed: exhausted_null")
+  string(REPLACE "@" ";" fields "${entry}")
+  list(GET fields 0 mutant)
+  list(GET fields 1 expected_output)
+  list(GET fields 2 forbidden_output)
+  string(REPLACE "+" "_" mutant_name "${mutant}")
+  add_test(NAME xmem_startup_below_40_mutant_${mutant_name}
+           COMMAND xmem_startup_below_40_check "$<TARGET_FILE:xmem_shim_test_controls>")
+  set_tests_properties(xmem_startup_below_40_mutant_${mutant_name} PROPERTIES
+    TIMEOUT 60
+    ENVIRONMENT "X2W_XMEM_TEST_BELOW_40=${mutant}"
+    PASS_REGULAR_EXPRESSION "${expected_output}"
+    FAIL_REGULAR_EXPRESSION "${forbidden_output}")
+endforeach()
+
 add_executable(windows_placeholder_partition_check tests/windows_placeholder_partition_check.cpp)
 target_compile_features(windows_placeholder_partition_check PRIVATE cxx_std_17)
 target_link_libraries(windows_placeholder_partition_check PRIVATE OneCore)
