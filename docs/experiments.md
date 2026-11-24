@@ -2877,6 +2877,23 @@ one operand at a time, and a third changes the first inactive word. The test
 requires each control to fail at the expected word. Run
 `ctest --preset dev --no-tests=error -R '^compute_store_aot_guard_read_(warp|hardware)$' -V`.
 
+### Scalar ALU on known words
+
+The store profile also accepts these scalar 32-bit operations. Both sources are known words: an SGPR that holds one, an integer inline constant or a 32-bit literal.
+
+| Instruction | Result |
+|---|---|
+| `s_add_u32 sD, a, b` | `a + b`, modulo 2^32 |
+| `s_sub_u32 sD, a, b` | `a - b`, modulo 2^32 |
+| `s_and_b32 sD, a, b` | `a & b` |
+| `s_or_b32 sD, a, b` | `a \| b` |
+| `s_xor_b32 sD, a, b` | `a ^ b` |
+| `s_lshr_b32 sD, a, b` | `a >> (b & 31)`, logical |
+
+The result becomes an inline HLSL expression, like a vector result, and a vector instruction can read it as a source. SCC is not modelled: no accepted instruction reads it. A destination past s105, a destination or source that waits for a load, a source that is not a known word (an unwritten SGPR, a descriptor, the saved exec mask), a vector source and the carry-in, signed, 64-bit and inverted forms stop the lowering, as does an expression over 1024 characters. A scalar result is data only: it cannot form an address or be a lane-guard compare operand. Overwriting the saved exec mask is rejected at the guard restore.
+
+The check assembles one fixture that chains all six operations over the cap word and the bound, and requires the decoded program to lower to the same HLSL as its text.
+
 ### Two- and three-dimensional thread groups
 
 The PSV0 group size can be any `numthreads(x,y,z)` within the `cs_6_0` limits
