@@ -832,6 +832,9 @@ def check_junit_errors():
         "no_timestamp.xml": ('<testsuite time="1"><testcase name="a" status="run"/></testsuite>',
                              "timestamp"),
         "bad_time.xml": ('<testsuite time="soon" timestamp="2026-11-21T21:05:21"/>', "time"),
+        "unnamed.xml": (valid.replace(' name="a"', ""), "CTest <testcase> needs a nonempty name"),
+        "empty_name.xml": (valid.replace('name="a"', 'name=""'), "CTest <testcase> needs a nonempty name"),
+        "blank_name.xml": (valid.replace('name="a"', 'name=" "'), "CTest <testcase> needs a nonempty name"),
         "valid.xml": (valid, None),
     }
     # Names from different CTest directories can be identical. Neither order

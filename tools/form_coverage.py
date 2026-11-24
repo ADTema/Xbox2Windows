@@ -197,6 +197,8 @@ def read_results(junit):
     results = {}
     for case in suite.iter("testcase"):
         name = case.get("name")
+        if not name or not name.strip():
+            raise ValueError("CTest <testcase> needs a nonempty name")
         if name in results:
             # Coverage records have only the test name, not its CTest directory.
             raise ValueError(f"duplicate CTest <testcase> name {name!r}; coverage records require unique names")
