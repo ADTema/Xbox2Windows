@@ -150,10 +150,10 @@ set_target_properties(d3d12_xs_shim PROPERTIES OUTPUT_NAME d3d12_xs)
 target_compile_features(d3d12_xs_shim PRIVATE cxx_std_17)
 target_link_libraries(d3d12_xs_shim PRIVATE d3d12)
 
-# Fixture-only desktop xgameruntime.dll skeleton. Every exported thunk is
-# generated from the single X-macro table in xgameruntime_shim.cpp and returns
-# E_NOTIMPL. Keep it out of the normal shim directory so a package cannot treat
-# the production-named DLL as a provider.
+# Fixture-only desktop xgameruntime.dll. The single X-macro table in
+# xgameruntime_shim.cpp distinguishes implemented synchronous contracts from
+# logged E_NOTIMPL stubs. Keep it out of the normal shim directory so a package
+# cannot treat the production-named DLL as a provider.
 add_library(xgameruntime_shim SHARED src/xgameruntime_shim.cpp src/xgameruntime_shim.def)
 set(xgameruntime_fixture_dir "${CMAKE_BINARY_DIR}/fixture-shims")
 set_target_properties(xgameruntime_shim PROPERTIES
@@ -170,6 +170,14 @@ add_test(NAME xgameruntime_thunks COMMAND xgameruntime_shim_check
     "$<TARGET_FILE:xgameruntime_shim>" "$<TARGET_FILE_DIR:xgameruntime_shim>"
     "$<TARGET_FILE_DIR:xmem_shim>")
 set_tests_properties(xgameruntime_thunks PROPERTIES TIMEOUT 30)
+
+add_executable(xgameruntime_contracts_check tests/xgameruntime_contracts_check.cpp)
+target_link_libraries(xgameruntime_contracts_check PRIVATE xgameruntime_shim)
+target_compile_features(xgameruntime_contracts_check PRIVATE cxx_std_17)
+add_test(NAME xgameruntime_contracts COMMAND xgameruntime_contracts_check
+    "$<TARGET_FILE:xgameruntime_shim>" "$<TARGET_FILE_DIR:xgameruntime_shim>"
+    "$<TARGET_FILE_DIR:xmem_shim>")
+set_tests_properties(xgameruntime_contracts PROPERTIES TIMEOUT 30)
 
 # A real source-built EXE import fixture. The import library below only names
 # xgameruntime.dll; no build product or test package copies the fixture DLL.
