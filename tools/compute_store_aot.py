@@ -1098,20 +1098,25 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 # Track only the low half of an odd trailing component. Whole-word consumers cannot read it.
                 kind = "source_low16" if packed and components % 2 and reg == dst + count - 1 else "source"
                 loading[reg] = (kind, address)
-        elif m := re.fullmatch(r"image_load (v\d+|v\[\d+:\d+\]), v\[(\d+):(\d+)\], "
-                               r"s\[(\d+):(\d+)\] dmask:0x([0-9a-f]+) dim:SQ_RSRC_IMG_2D( unorm)?", line):
-            # One typed 2D read: (x, y) come from two packed address dwords, and dmask selects the
-            # leading components of the caller-declared texel format in ascending order. LLVM 15
-            # encodes non-sampler loads with the unorm (un-normalized address) flag, which has no
-            # effect on this integer-address lowering.
-            x, y, base, high = int(m[2]), int(m[3]), int(m[4]), int(m[5])
-            dmask = int(m[6], 16)
+        elif m := re.fullmatch(r"image_load (v\d+|v\[\d+:\d+\]), (?:v\[(\d+):(\d+)\]|v(\d+)), "
+                               r"s\[(\d+):(\d+)\] dmask:0x([0-9a-f]+) dim:SQ_RSRC_IMG_2D( unorm)?( a16)?", line):
+            # One typed 2D read. Without a16 the two packed address dwords are (x, y); with a16 they
+            # are one word holding x in bits [15:0] and y in bits [31:16]. dmask selects the leading
+            # components of the caller-declared texel format in ascending order. LLVM 15 encodes
+            # non-sampler loads with the unorm (un-normalized address) flag, which has no effect here.
+            x = int(m[2]) if m[2] else None
+            y = int(m[3]) if m[3] else None
+            packed = int(m[4]) if m[4] else None
+            base, high = int(m[5]), int(m[6])
+            dmask = int(m[7], 16)
             count = bin(dmask).count("1")
+            a16 = bool(m[9])
             destination = [int(n) for n in re.findall(r"\d+", m[1])]
             first, last = destination[0], destination[-1]
             if (cpu != "gfx1030" or image_format is None or guard_span is not None
-                    or last != first + count - 1 or dmask != (1 << count) - 1
-                    or count > IMAGE_FORMATS[image_format][1] or y != x + 1
+                    or a16 != (packed is not None) or last != first + count - 1
+                    or dmask != (1 << count) - 1 or count > IMAGE_FORMATS[image_format][1]
+                    or (not a16 and y != x + 1)
                     or any(first + index > 255 or first + index in loading for index in range(count))):
                 raise ValueError("Unsupported image load target")
             if high != base + 7 or base % 4 or pending.intersection(range(base, high + 1)):
@@ -1119,11 +1124,18 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             if tuple(scalar.get(base + index) for index in range(8)) != tuple(
                     (("image", index // 4), index % 4) for index in range(8)):
                 raise ValueError("Unverified image descriptor")
-            coordinates = (vector.get(x), vector.get(y))
-            if not all(is_word(value) for value in coordinates):
-                raise ValueError("Unverified image coordinates")
+            if a16:
+                coordinate = vector.get(packed)
+                if not is_word(coordinate):
+                    raise ValueError("Unverified image coordinates")
+                address = (f"int3(asint({hlsl_word(coordinate)} & 0xffffu), "
+                           f"asint({hlsl_word(coordinate)} >> 16u), 0)")
+            else:
+                coordinates = (vector.get(x), vector.get(y))
+                if not all(is_word(value) for value in coordinates):
+                    raise ValueError("Unverified image coordinates")
+                address = f"int3(asint({hlsl_word(coordinates[0])}), asint({hlsl_word(coordinates[1])}), 0)"
             name = f"image_load_{len(image_steps)}"
-            address = f"int3(asint({hlsl_word(coordinates[0])}), asint({hlsl_word(coordinates[1])}), 0)"
             image_steps.append(f"    {IMAGE_FORMATS[image_format][0]} {name} = imageData.Load({address});")
             for index in range(count):
                 reg = first + index

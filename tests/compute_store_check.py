@@ -2966,7 +2966,11 @@ def scalar_alu_binary(directory, assembler, objcopy, library):
 def mimg_load_binary(directory, assembler, objcopy, library):
     """Assemble and decode each dmask form, then lower the decoded program through the CLI."""
     mimg_load_controls()
-    cases = [(f"mimg_load_{count}", lines, MIMG_BINDING) for count, groups, shift, lines in mimg_load_cases()]
+    mimg_a16_controls()
+    cases = []
+    for a16 in (False, True):
+        cases += [(f"mimg_load{'_a16' if a16 else ''}_{count}", lines, MIMG_BINDING)
+                  for count, groups, shift, lines in mimg_load_cases(a16)]
     gfx1030_binary(directory, assembler, objcopy, library, cases, "image_", group=(8, 8, 1))
 
 
@@ -3330,8 +3334,11 @@ def texture_word(x, y, channel):
     return TEXTURE_WORDS[y * TEXTURE_WIDTH + x][channel]
 
 
-def mimg_load_cases():
-    """dmask x/xy/xyz/xyzw on one descriptor, with dispatch counts that fill the 320-word UAV."""
+def mimg_load_cases(a16=False):
+    """dmask x/xy/xyz/xyzw on one descriptor, with dispatch counts that fill the 320-word UAV.
+
+    The a16 spelling packs both coordinates into one address VGPR: x in bits [15:0], y in [31:16].
+    """
     for count, groups, shift in ((1, 4, 2), (2, 2, 3), (3, 1, 4), (4, 1, 4)):
         mask = (1 << count) - 1
         data = "v14" if count == 1 else f"v[14:{13 + count}]"
@@ -3342,8 +3349,16 @@ def mimg_load_cases():
             "s_load_dwordx8 s[24:31], s[12:13], 0x40",
             "v_lshl_add_u32 v8, s10, 3, v0",
             "v_lshl_add_u32 v9, s11, 3, v1",
-            "s_waitcnt lgkmcnt(0)",
-            f"image_load {data}, v[8:9], s[24:31] dmask:0x{mask:x} dim:SQ_RSRC_IMG_2D",
+        ]
+        if a16:
+            lines.append("v_mad_u32_u24 v10, v9, 0x10000, v8")
+        lines.append("s_waitcnt lgkmcnt(0)")
+        if a16:
+            lines.append(f"image_load {data}, v10, s[24:31] dmask:0x{mask:x} "
+                         "dim:SQ_RSRC_IMG_2D unorm a16")
+        else:
+            lines.append(f"image_load {data}, v[8:9], s[24:31] dmask:0x{mask:x} dim:SQ_RSRC_IMG_2D")
+        lines += [
             "v_mov_b32_e32 v12, v9",
             f"v_lshlrev_b32_e32 v13, {shift}, v8",
             "s_waitcnt vmcnt(0)",
@@ -3377,7 +3392,7 @@ def mimg_load_controls():
         ("dmask:0x1", "dmask:0x3", "Unsupported image load target"),
         ("dmask:0x1", "dmask:0x0", "Unsupported image load target"),
         ("dim:SQ_RSRC_IMG_2D", "dim:SQ_RSRC_IMG_1D", "Unsupported compute instruction"),
-        ("dim:SQ_RSRC_IMG_2D", "dim:SQ_RSRC_IMG_2D a16", "Unsupported compute instruction"),
+        ("dim:SQ_RSRC_IMG_2D", "dim:SQ_RSRC_IMG_2D a16", "Unsupported image load target"),
         ("dim:SQ_RSRC_IMG_2D", "dim:SQ_RSRC_IMG_2D d16", "Unsupported compute instruction"),
         ("dim:SQ_RSRC_IMG_2D", "dim:SQ_RSRC_IMG_2D glc", "Unsupported compute instruction"),
         ("s[24:31]", "s[20:27]", "Unverified image descriptor"),
@@ -3409,51 +3424,78 @@ def mimg_load_controls():
             **{key: value for key, value in binding.items() if key not in ("image_descriptor", "image_format")})
 
 
+def mimg_a16_controls():
+    count, groups, shift, lines = next(mimg_load_cases(a16=True))
+    image = next(line for line in lines if line.startswith("image_load"))
+
+    def changed(old, new):
+        return [line.replace(old, new) if line == image else line for line in lines]
+
+    # The packed address is required; a two-dword address with the a16 flag, the NSA register list
+    # and an unverified packed register are each refused.
+    rejects("Unsupported image load target", aot.lower, changed(" unorm a16", ""),
+            (8, 8, 1), **MIMG_BINDING)
+    rejects("Unsupported compute instruction", aot.lower, changed(" unorm a16", " d16"),
+            (8, 8, 1), **MIMG_BINDING)
+    rejects("Unsupported image load target", aot.lower, changed("v10,", "v[8:9],"),
+            (8, 8, 1), **MIMG_BINDING)
+    rejects("Unsupported compute instruction", aot.lower, changed("v10,", "[v9, v8],"),
+            (8, 8, 1), **MIMG_BINDING)
+    rejects("Unverified image coordinates", aot.lower, changed("v10,", "v30,"),
+            (8, 8, 1), **MIMG_BINDING)
+
+
 def mimg_load_draw(directory, compiler, renderer, backend):
     mimg_load_controls()
+    mimg_a16_controls()
     # Each mutation is a translation mistake that must change the readback at a named word: the
     # dmask selects ascending texel components, and the first address dword is the x coordinate.
-    mutations = {
-        1: [("component order", "image_load_0.x", "image_load_0.y", 0)],
-        4: [("coordinate order", "int3(asint(tid.x), asint(tid.y), 0)",
-             "int3(asint(tid.y), asint(tid.x), 0)", 4),
-            ("channel order", "uint4(image_load_0.x, image_load_0.y, image_load_0.z, image_load_0.w)",
-             "uint4(image_load_0.y, image_load_0.x, image_load_0.z, image_load_0.w)", 0)],
-    }
+    families = (
+        (False, {
+            1: [("component order", "image_load_0.x", "image_load_0.y", 0)],
+            4: [("coordinate order", "int3(asint(tid.x), asint(tid.y), 0)",
+                 "int3(asint(tid.y), asint(tid.x), 0)", 4),
+                ("channel order", "uint4(image_load_0.x, image_load_0.y, image_load_0.z, image_load_0.w)",
+                 "uint4(image_load_0.y, image_load_0.x, image_load_0.z, image_load_0.w)", 0)],
+        }),
+        (True, {4: [("packed high half", ">> 16u", ">> 0u", 4)]}),
+    )
     texture = [word for texel in TEXTURE_WORDS for word in texel]
     packed_texture = struct.pack(f"<{len(texture)}I", *texture)
-    for count, groups, shift, lines in mimg_load_cases():
-        src, cso, case = (directory / f"mimg_load_{count}.{ext}" for ext in ("hlsl", "cso", "case"))
-        source = aot.lower(lines, (8, 8, 1), **MIMG_BINDING)
-        src.write_text(source, encoding="ascii")
-        compile_shader = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
-        subprocess.run(compile_shader, check=True)
-        run = [renderer, backend, "--compute-texture-case", cso, case]
-        expected = mimg_load_words(count, shift, groups)
-        reference = struct.pack("<321I", groups, *expected) + packed_texture
-        case.write_bytes(reference)
-        result = subprocess.run(run)
-        if result.returncode:
-            return result.returncode
-        # The comparison itself must fail on one wrong written word and one wrong untouched word.
-        for word in (0, 300):
-            wrong = list(expected)
-            wrong[word] ^= 1
-            case.write_bytes(struct.pack("<321I", groups, *wrong) + packed_texture)
-            bad = subprocess.run(run, capture_output=True, text=True)
-            if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
-                raise AssertionError(f"mimg_load_{count}: wrong word {word} escaped detection\n{bad.stderr}")
-            print(bad.stderr, end="")
-        case.write_bytes(reference)
-        for label, old, new, word in mutations.get(count, ()):
-            mutated = source.replace(old, new)
-            assert mutated != source, label
-            src.write_text(mutated, encoding="ascii")
+    for a16, mutations in families:
+        for count, groups, shift, lines in mimg_load_cases(a16):
+            stem = f"mimg_load{'_a16' if a16 else ''}_{count}"
+            src, cso, case = (directory / f"{stem}.{ext}" for ext in ("hlsl", "cso", "case"))
+            source = aot.lower(lines, (8, 8, 1), **MIMG_BINDING)
+            src.write_text(source, encoding="ascii")
+            compile_shader = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
             subprocess.run(compile_shader, check=True)
-            bad = subprocess.run(run, capture_output=True, text=True)
-            if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
-                raise AssertionError(f"mimg_load_{count}: {label} mutation escaped detection\n{bad.stderr}")
-            print(bad.stderr, end="")
+            run = [renderer, backend, "--compute-texture-case", cso, case]
+            expected = mimg_load_words(count, shift, groups)
+            reference = struct.pack("<321I", groups, *expected) + packed_texture
+            case.write_bytes(reference)
+            result = subprocess.run(run)
+            if result.returncode:
+                return result.returncode
+            # The comparison itself must fail on one wrong written word and one wrong untouched word.
+            for word in (0, 300):
+                wrong = list(expected)
+                wrong[word] ^= 1
+                case.write_bytes(struct.pack("<321I", groups, *wrong) + packed_texture)
+                bad = subprocess.run(run, capture_output=True, text=True)
+                if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+                    raise AssertionError(f"{stem}: wrong word {word} escaped detection\n{bad.stderr}")
+                print(bad.stderr, end="")
+            case.write_bytes(reference)
+            for label, old, new, word in mutations.get(count, ()):
+                mutated = source.replace(old, new)
+                assert mutated != source, label
+                src.write_text(mutated, encoding="ascii")
+                subprocess.run(compile_shader, check=True)
+                bad = subprocess.run(run, capture_output=True, text=True)
+                if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+                    raise AssertionError(f"{stem}: {label} mutation escaped detection\n{bad.stderr}")
+                print(bad.stderr, end="")
     if record := os.environ.get("FORM_COVERAGE_RECORD"):
         path = Path(record)
         path.parent.mkdir(parents=True, exist_ok=True)
