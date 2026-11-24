@@ -9685,3 +9685,22 @@ For the same nine-mip textures, slot 2 returns the byte offset of each mip withi
 cmake --build --preset release --target startup_stream_consumer startup_stub_xg_xs xg_swizzle_select_check
 ctest --preset release --no-tests=error --output-on-failure -R '^(startup_xg_bc_(array|chain)_(hardware|warp)|startup_xg_bc_tiling|xg_bc64_tiling_reference|startup_xg_bc7_layout)$'
 ```
+
+## Host-CPU FSGSBASE and RDPID lifting in cpu_switch_aot
+
+[The switch translator](../tools/cpu_switch_aot.py) adds an opt-in `--host-cpu` (`host_cpu=True`) mode lifting `rdfsbase`, `rdgsbase`, `wrfsbase`, `wrgsbase` (32- and 64-bit register forms), and `rdpid` (64-bit register form) from `docs/coverage/x64_zen2.tsv` group `Integer` to the `<immintrin.h>` intrinsics (`_readfsbase_u32`, `_readfsbase_u64`, `_readgsbase_u32`, `_readgsbase_u64`, `_writefsbase_u32`, `_writefsbase_u64`, `_writegsbase_u32`, `_writegsbase_u64`, `_rdpid_u32`):
+
+- `rdfsbase` / `rdgsbase` / `rdpid` read into a `const volatile` temporary before assigning the destination (zero-extending 32-bit `rdfsbase`/`rdgsbase` and 64-bit `rdpid` into the full 64-bit register) so `/O2` preserves unreferenced reads and execution order.
+- `wrfsbase` / `wrgsbase` record their operand as a source read (not a destination write), wrap the intrinsic in `std::atomic_signal_fence(std::memory_order_seq_cst)`, and reject undefined source registers.
+- All five instructions are registered in `FLAG_NEUTRAL` so arithmetic flags are preserved across them, and all five are refused when `host_cpu` is omitted, when `rsp`/`esp` is addressed, when a `lock`/`rep`/`repne`/segment prefix is present, or when `rdpid` uses its 32-bit encoding.
+
+```powershell
+cmake --build --preset dev --target cpu_switch_fsgsbase_rdpid cpu_switch_fsgsbase_rdpid_lifted
+ctest --preset dev --no-tests=error -R '^cpu_aot_switch_fsgsbase_rdpid$' -V
+```
+
+### Measured results and open scope
+
+The [MASM fixture](../tests/cpu/switch_fsgsbase_rdpid.asm) exports 13 translated functions covering 32- and 64-bit `rdfsbase`/`rdgsbase` (with high-bit prefill), canonical `wrfsbase`/`wrgsbase` round-trips that save and restore `FS_BASE` and the Windows TEB `GS_BASE`, nonvolatile `rbx`/`r12` save/restore, `rdpid` single and repeated reads, `FLAG_NEUTRAL` flag preservation across `add` to `setb`/`sete`/`sets`/`seto`/`setp`, and unused reads, plus native `CPUID.07H` and `RDTSCP` helpers and four rejected negative exports. [The differential check](../tests/cpu/switch_fsgsbase_rdpid_check.py) exits 77 if `CPUID.07H` lacks `FSGSBASE` (`EBX[0]`) or `RDPID` (`ECX[22]`) and otherwise pins the thread to up to four logical processors, verifying 376 CMake-lifted and 376 `/O2`-lifted checks across `dev` and `release` builds against native execution and `RDTSCP` `IA32_TSC_AUX` (while preserving `FS_BASE`/`GS_BASE` on every call), four `/O2` mutated-C++ negative controls (`keep_high32`, `drop_wrfsgsbase`, `constant_rdpid`, `clobber_flags`), 20 unit rejection controls, and 6 PE-patched DLL rejection controls, while recording decoded mnemonics through `FORM_COVERAGE_RECORD`.
+
+Not covered by this experiment: non-canonical `wrfsbase`/`wrgsbase` `#GP` fault behavior, cross-thread `FS_BASE`/`GS_BASE` migration, and title CPU code execution.

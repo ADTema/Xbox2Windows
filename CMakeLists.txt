@@ -1535,7 +1535,7 @@ if(EXISTS "${INTAKE_PYTHON}")
         target_link_options(${image} PRIVATE /NOENTRY /NODEFAULTLIB /INCREMENTAL:NO)
     endfunction()
     function(cpu_translation image translator entry)
-        cmake_parse_arguments(BIND "FFX_DESTROY;IMAGE_DATA"
+        cmake_parse_arguments(BIND "FFX_DESTROY;IMAGE_DATA;HOST_CPU"
             "PROVIDER;SYMBOL;LINK_NAME;CALLBACK_OFFSET;IMPORT_ARGUMENTS;RETURN_BYTES;NAME;RANGES;SECOND_PROVIDER;SECOND_SYMBOL;SECOND_LINK_NAME;SECOND_IMPORT_ARGUMENTS;SECOND_RETURN_BYTES" "STACK_OUTPUT" ${ARGN})
         if(NOT BIND_NAME)
             set(BIND_NAME ${image}_lifted)
@@ -1573,6 +1573,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         endif()
         if(BIND_IMAGE_DATA)
             list(APPEND binding --image-data)
+        endif()
+        if(BIND_HOST_CPU)
+            list(APPEND binding --host-cpu)
         endif()
         set(lifted "${CMAKE_CURRENT_BINARY_DIR}/${BIND_NAME}.cpp")
         add_custom_command(OUTPUT "${lifted}"
@@ -2105,6 +2108,18 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_switch_bswap COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/switch_bswap_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_switch_bswap>" "$<TARGET_FILE:cpu_switch_bswap_lifted>")
+    cpu_asm_fixture(cpu_switch_fsgsbase_rdpid switch_fsgsbase_rdpid)
+    cpu_translation(cpu_switch_fsgsbase_rdpid cpu_switch_aot
+        "rdfsbase_32,rdfsbase_64,rdgsbase_32,rdgsbase_64,wrfsbase_32_roundtrip,wrfsbase_64_roundtrip,wrgsbase_32_roundtrip,wrgsbase_64_roundtrip,wrfsgsbase_nonvolatile,rdpid_64,rdpid_twice,flag_preserve_fsgsbase_rdpid,unused_host_reads"
+        HOST_CPU)
+    add_test(NAME cpu_aot_switch_fsgsbase_rdpid COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/switch_fsgsbase_rdpid_check.py"
+        "$<TARGET_FILE:cpu_switch_fsgsbase_rdpid>"
+        "$<TARGET_FILE:cpu_switch_fsgsbase_rdpid_lifted>"
+        "${CMAKE_CXX_COMPILER}")
+    set_tests_properties(cpu_aot_switch_fsgsbase_rdpid PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_switch_fsgsbase_rdpid.txt")
     # BSF and BSR; the swapped build assembles three exports with the other scan and must follow the exchanged reference.
     foreach(variant IN ITEMS original swapped)
         cpu_asm_fixture(cpu_switch_bit_scans_${variant} switch_bit_scans)
