@@ -113,6 +113,14 @@ ctest --preset release --no-tests=error -R '^startup_launch$' -V
 | `X2W_XG_BC7_4K_S_LAYOUT=1` | enables the BC7 tiled layout, copy and draw upload when `X2W_D3D12_PERMISSIVE=1` |
 | `X2W_TRAP_CONTINUE=<exports>` | lets listed trap exports return 0 instead of ending the process |
 
+The startup shader cache key includes the translator revision. After updating from
+the earlier wide-descriptor translation, run the recording build once to emit
+requests, run `python tools/startup/gfx2hlsl.py --pending <cache-directory>`,
+then start the build again. The new key keeps the former bytecode and manifest
+together under their original name. A 16-dword table load can contain two
+independent image descriptors at offsets 0 and 32 from the load address.
+
+
 ## Findings
 
 These are measured on one executable; treat them as hypotheses for others.

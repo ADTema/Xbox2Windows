@@ -150,7 +150,11 @@ void load_translation(Translation& tr, const void* a, std::size_t a_bytes, const
 Translation* cached_translation(const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes,
                                 const std::vector<unsigned char>& root_blob)
 {
-    const u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes)));
+    // Keep pre-fix desktop bytecode and manifests out of this ABI's cache.
+    // tools/startup/gfx2hlsl.py hashes the same bytes, without a trailing NUL.
+    constexpr char revision[] = "x2w-startup-srv-2";
+    const u64 seed = fnv_bytes(revision, sizeof(revision) - 1);
+    const u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes, seed)));
     auto& entry = translation_by_key()[key];
     if (!entry) {
         entry = new Translation;
