@@ -1277,6 +1277,10 @@ target_include_directories(startup_local_log_cache_failure_check PRIVATE "${CMAK
 target_compile_features(startup_local_log_cache_failure_check PRIVATE cxx_std_17)
 add_test(NAME startup_local_log_cache_failure_control COMMAND startup_local_log_cache_failure_check --mutate cache-failure)
 set_tests_properties(startup_local_log_cache_failure_control PROPERTIES WILL_FAIL TRUE)
+# The counting gate the stand-ins used before must let calls through again at the wrap point.
+add_test(NAME startup_local_log_wrap_control COMMAND startup_local_log_check --mutate wrap)
+set_tests_properties(startup_local_log_wrap_control PROPERTIES
+    PASS_REGULAR_EXPRESSION "FAIL first_calls passes no call at the wrap point")
 # Trap-by-default export macros and env switches (src/startup_stubs/trap.h, #1149).
 add_executable(startup_trap_header_check tests/startup_trap_header_check.cpp)
 target_include_directories(startup_trap_header_check PRIVATE src)
