@@ -189,6 +189,18 @@ def check_cli():
                 check('missing directory fails with a parser error', error.code == 2 and 'existing directory' in stderr.getvalue())
             check('missing directory is never created', not missing.exists())
 
+            # Every spelling and order of the flag stays in the diagnostic and writes nothing.
+            out = io.StringIO()
+            with patch.object(sys, 'argv', ['gfx2hlsl.py', '--refusals', str(cache), '--json']), \
+                    contextlib.redirect_stdout(out):
+                G.main()
+            check('flag after the directory is accepted', json.loads(out.getvalue())['per_request']['examined'] == 3)
+            out = io.StringIO()
+            with patch.object(sys, 'argv', ['gfx2hlsl.py', '--refusals=' + str(cache)]), \
+                    contextlib.redirect_stdout(out):
+                G.main()
+            check('--refusals=DIR stays in the diagnostic', 'Requests examined: 3' in out.getvalue())
+
         check('diagnostics leave cache filenames and contents unchanged',
               {p.name: p.read_bytes() for p in cache.iterdir()} == before)
         for key in (base, variant):
@@ -202,6 +214,8 @@ def check_cli():
             check('normal dangling RTV retains the upstream raw file error',
                   G.translate_request(work, dangling) == 'unsupported: ' + str(error) and
                   (cache / ('%016x.fail' % dangling)).read_text() == str(error) + '\n')
+        else:
+            check('normal dangling RTV retains the upstream raw file error', False)
 
 
 def check_request_failures():
@@ -213,13 +227,18 @@ def check_request_failures():
         stages = put_request(cache, ps, ps, root_blob())
         truncated = put_request(cache, vs, struct.pack('<I', 0) + b'\xff', root_blob())
         undecodable = put_request(cache, struct.pack('<2I', 0, 255), ps, root_blob())
-        with patch.object(G, 'check_encoding', side_effect=G.Unsupported(ENCODING)):
-            check('short tail retains earlier decode refusals',
-                  G.request_refusals(cache, truncated) == [(ENCODING, 'decode')] * 3 +
-                  [('invalid binary shader request', 'pipeline')])
+        # The census follows the translator: a short tail is accepted on both paths, and a
+        # disassembler struct.error is the same undecodable-word refusal the default path writes.
+        census = G.request_refusals(cache, truncated)
+        check('short tail is not a census-only refusal',
+              all('truncated' not in reason and 'invalid binary' not in reason for reason, _ in census))
+        default = G.translate_request(work, truncated)
+        check('short tail: census first site matches the default result',
+              (census[0][0] if census else 'ok') == default.replace('unsupported: ', '', 1))
         with patch.object(G.D, 'decode_instruction', side_effect=struct.error('short instruction')):
-            check('disassembler struct.error becomes a pipeline refusal',
-                  G.request_refusals(cache, base) == [('invalid binary shader request', 'pipeline')])
+            found = G.request_refusals(cache, base)
+            check('disassembler struct.error is the default undecodable-word refusal',
+                  [(G.normalize_refusal(reason), scope) for reason, scope in found] == [('undecodable word', 'pipeline')])
         found = G.request_refusals(cache, undecodable)
         check('undecodable word before exports ends the pipeline',
               [(G.normalize_refusal(reason), scope) for reason, scope in found] == [('undecodable word', 'pipeline')])
@@ -281,7 +300,8 @@ def check_normalization():
             ('s_load of 4 dwords from (2, 3)', 's_load of 4 dwords from (N, N)'),
             ('SampleCmpLevel needs shader model 6.7', 'SampleCmpLevel needs shader model 6.7'),
             ('s_load_dword s[4:7], v8, 0x10, 16, -1.5', 's_load_dword s[N:N], vN, N, N, N'),
-            ('operand s4, v[2:5]', 'operand sN, v[N:N]')):
+            ('operand s4, v[2:5]', 'operand sN, v[N:N]'),
+            ('word_0xdeadbeef', 'word_N')):
         check('normalization of ' + normalized, G.normalize_refusal(raw) == normalized)
 
 

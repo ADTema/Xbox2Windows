@@ -228,10 +228,6 @@ def decode(code, refusals=None):
     while off + 4 <= len(code):
         try:
             n, name, asm, _ = D.decode_instruction(code, off)
-        except struct.error as error:
-            if refusals is not None:
-                raise
-            raise Unsupported('undecodable word at +0x%x: %s' % (off, error))
         except Exception as error:
             raise Unsupported('undecodable word at +0x%x: %s' % (off, error))
         try:
@@ -243,8 +239,6 @@ def decode(code, refusals=None):
         else:
             out.append((off, n, name, asm))
         off += n
-    if refusals is not None and off != len(code):
-        raise struct.error('truncated instruction tail')
     last = max((i for i, x in enumerate(out) if x[2] == 's_endpgm'), default=len(out) - 1)
     return out[:last + 1]
 
@@ -1773,8 +1767,8 @@ class Pipeline:
             self.ps = Stage(self, 'ps', ps_code)
         else:
             decoded = {} if decoded is None else decoded
-            self.vs = Stage(self, 'vs', vs_code, refusals, decoded.get('vs'))
-            self.ps = Stage(self, 'ps', ps_code, refusals, decoded.get('ps'))
+            self.vs = Stage(self, 'vs', vs_code, refusals=refusals, decoded=decoded.get('vs'))
+            self.ps = Stage(self, 'ps', ps_code, refusals=refusals, decoded=decoded.get('ps'))
         self.params = sorted(int(k[5:]) for k in self.vs.exports if k.startswith('param'))
         self.flat = sorted(a for a, how in self.ps.attrs.items() if 'flat' in how)
         missing = [a for a in self.ps.attrs if a not in self.params]
@@ -2129,6 +2123,7 @@ def normalize_refusal(reason):
     reason = re.sub(r'\b([sv])\d+\b', r'\1N', reason)
     reason = re.sub(r'\b(pos|param|mrt)\d+\b', r'\1N', reason)
     reason = re.sub(r'\blabel_[0-9a-f]+\b', 'label_N', reason, flags=re.IGNORECASE)
+    reason = re.sub(r'\bword_0x[0-9a-f]+\b', 'word_N', reason, flags=re.IGNORECASE)
     # Preserve cause numbers. Redact hex operands and offsets, and decimal operands
     # in instruction operand lists, symbolic values, and named operand fields.
     number = r'[+-]?(?:0x[0-9a-f]+|(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)'
@@ -2140,8 +2135,7 @@ def normalize_refusal(reason):
 
 
 def handler_error(op, error, refusals):
-    had_refusal = any(not reason.startswith('translator crash in ') for reason, _ in refusals)
-    label = 'internal error' if had_refusal else 'translator crash'
+    label = 'internal error' if refusals else 'translator crash'
     return '%s in %s: %s' % (label, op, type(error).__name__)
 
 
@@ -2253,7 +2247,7 @@ def refusals_main(argv):
 
 
 def main():
-    if '--refusals' in sys.argv[1:]:
+    if any(arg == '--refusals' or arg.startswith('--refusals=') for arg in sys.argv[1:]):
         return refusals_main(sys.argv[1:])
     out_dir = sys.argv[2]
     os.makedirs(out_dir, exist_ok=True)
