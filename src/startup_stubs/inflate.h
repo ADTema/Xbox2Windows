@@ -9,14 +9,23 @@
 #include <cstdint>
 #include <cstring>
 
-// tests/startup_inflate_check.py builds its reference probe with 0 (bit-at-a-time decoding only).
+// tests/startup_inflate_check.py builds its reference probe with 0 (bit-at-a-time decoding only) and
+// its negative controls with the X2W_INFLATE_FAULTY_* macros. The functions here are inline, so every
+// translation unit linked into one binary must see the same values (one-definition rule).
 #ifndef X2W_INFLATE_FAST_BITS
 #define X2W_INFLATE_FAST_BITS 10
+#endif
+
+// The fast loop's 8-byte loads take the first input byte as the lowest.
+#if !defined(_MSC_VER) && !(defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+#error "inflate.h assumes a little-endian target"
 #endif
 
 namespace x2w_inflate {
 
 constexpr int fast_bits = X2W_INFLATE_FAST_BITS;
+// Table entries keep the code length in 4 bits.
+static_assert(fast_bits >= 0 && fast_bits <= 15, "X2W_INFLATE_FAST_BITS must be 0 to 15");
 #ifndef X2W_INFLATE_FAULTY_MARGIN
 constexpr std::size_t fast_out_margin = 258;  // the longest match
 #else  // negative control for tests/startup_inflate_check.py: one byte short of the longest match
@@ -158,7 +167,7 @@ inline bool codes(Stream& s, const Huffman& lencode, const Huffman& distcode) no
             std::size_t in_pos = s.in_pos, out_pos = s.out_pos;
             while (s.in_size - in_pos >= 8 && s.out_size - out_pos >= fast_out_margin) {
                 std::uint64_t next;
-                std::memcpy(&next, s.in + in_pos, 8);  // x64: little endian, first input bit lowest
+                std::memcpy(&next, s.in + in_pos, 8);  // little endian: first input bit lowest
                 buffer |= next << count;
                 in_pos += (63 - count) >> 3;
                 count |= 56;
