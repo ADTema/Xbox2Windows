@@ -545,6 +545,18 @@ OperationResult run_dual_uav(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_descriptor_window_submissions(const OperationContext& ctx)
+{
+    check_descriptor_window_submissions(ctx.device, false);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_descriptor_window_stale(const OperationContext& ctx)
+{
+    check_descriptor_window_submissions(ctx.device, true);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_texture_mips(const OperationContext& ctx)
 {
     check_texture_mips(ctx.device);
@@ -964,6 +976,8 @@ const OperationSpec kOperations[] = {
     {"--ffx-provider-loop", 3, 3, nullptr, kNoGate, run_ffx_provider_loop},
     {"--ffx-recurrent", 3, 3, nullptr, kNoGate, run_ffx_recurrent},
     {"--dual-uav", 3, 3, nullptr, kNoGate, run_dual_uav},
+    {"--descriptor-window-submissions", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_window_submissions},
+    {"--descriptor-window-stale", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_window_stale},
     {"--texture-mips", 3, 3, nullptr, kNoGate, run_texture_mips},
     {"--check-bc7-tail", 6, kUnboundedArgc, nullptr, kNoGate, run_check_bc7_tail},
     {"--check-bc7-mip1", 6, 6, nullptr, kNoGate, run_check_bc7_mip1},
