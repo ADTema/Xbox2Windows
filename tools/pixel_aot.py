@@ -3201,13 +3201,15 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             scalar.masked = True
             scc = None
         elif m := match(rf"v_cmpx_(?:({'|'.join(COMPARE)})_f32|({'|'.join(INT_COMPARE)})_(i32|u32|i64|u64)"
-                        rf"|(eq|ne|lt|le|gt|ge)_(i16|u16))_e32 ([^,]+), ([^,]+)"):
+                        rf"|(eq|ne|lt|le|gt|ge)_(i16|u16)|(class)_f32)_e32 ([^,]+), ([^,]+)"):
             # A masked-if opened by a VOPC e32 compare that writes EXEC (issue #932). It must directly
             # follow `s_mov_b64 s[a:b], exec` of the known entry mask, so EXEC becomes the entry mask
             # intersected with the comparison, as after s_and_saveexec_b64. v_cmpx writes neither VCC nor
             # SCC, so both keep their tracked values; the region closes with s_mov_b64 or s_or_b64.
             # The integer forms compare as the v_cmp of the same width (gfx10 has no f/t forms at 16 bits).
-            fop, iop, kind, op16, kind16, src0, src1 = m.groups()
+            # v_cmpx_class_f32 tests the class of the raw binary32 encoding in src0 against the mask in VSRC1,
+            # as the e32 v_cmp_class_f32 does.
+            fop, iop, kind, op16, kind16, cls, src0, src1 = m.groups()
             if op16 is not None:
                 iop, kind = op16, kind16
             previous = instructions[i - 1] if i else ""
@@ -3223,6 +3225,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError(f"Invalid VOPC e32 operands: {line}")
             if fop is not None:
                 expr = f32_comparison(fop, [src0, src1], scalar, vector, pending, sample_dest)
+            elif cls is not None:
+                operand = fp_operand(src0, scalar, vector, pending, sample_dest)
+                bits = fp_operand(src1, scalar, vector, pending, sample_dest)
+                expr = f"(class32({operand}) & asuint({bits})) != 0u"
             elif kind in ("i64", "u64"):
                 declarations, expr = int64_comparison(i, iop, kind, [src0, src1], "e32",
                                                       scalar, vector, pending, sample_dest)
