@@ -5143,6 +5143,39 @@ For a single 2D RGBA sample, `image_sample_lz` lowers to `SampleLevel` at level 
 
 For the same single-texture RGBA profile, `image_sample_l` takes `(u, v, lod)` and lowers to `SampleLevel`; `image_sample_b` takes `(bias, u, v)` and lowers to `SampleBias`. Explicit LOD also accepts defined numeric coordinates, including constant-buffer values. Bias sampling still needs whole-quad UVs for derivatives. Both new forms keep the full `dmask:0xf` requirement. The `pixel_aot_sample_lod_{warp,hardware}` tests compare mips with distinct colors, check an 8 by 8 UV ramp and exercise constant-buffer coordinates without whole-quad mode. Substituting implicit sampling for LOD zero, changing the explicit LOD or bias from one to zero, or swapping the bias sample's UVs must each cause a mismatch.
 
+The single-texture pixel lowerer also accepts four offset forms with
+contiguous 32-bit 2D addresses and `dmask:0xf`. Use `--cpu gfx1030` for the
+wave64 `gfx1030` pixel profile. The first address word packs
+signed six-bit offsets in bits `[5:0]` and `[13:8]`. The following address words
+hold UV for `image_sample_o` and `image_sample_lz_o`, bias then UV for
+`image_sample_b_o`, and UV then LOD for `image_sample_l_o`. The lowerer requires
+a statically known canonical 2D offset and bounds each component to `[-8, 7]`.
+It passes the displacement as an immediate `int2` to `Sample`, `SampleBias`, or
+`SampleLevel`, using zero LOD for `_lz_o`. The profile assumes matching desktop
+texture and sampler bindings and integer mip levels for offset sampling. See
+[AMD RDNA 2 ISA §§8.2.4–8.2.5](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+and [DXIL sampling](https://github.com/microsoft/DirectXShaderCompiler/blob/main/docs/DXIL.rst#texturing).
+
+The LLVM 15 check round-trips all four `gfx1030` encodings and checks the
+CLI output from a source-built container. The draw fixture
+reuses the point-clamp sampler, 8×8 UV ramp, and two-color mip texture from the
+LOD check. It expects offset `(1, -2)` on the ramp, including edge clamping,
+and expects LOD or bias `1` to select mip 1. Zero-offset and zero-LOD or
+zero-bias mutations must produce `pixel_mismatch`. A scaled-quad control
+checks that `_lz_o` still selects mip 0 when `_o` selects mip 1. Both the offset
+and existing LOD cases passed on Windows 11 build 26300.9974 with the Intel
+Arc B390 (32.0.101.8509) and Microsoft Basic Render Driver for WARP
+(10.0.26100.9818). The debug layer was unavailable on both runs. The four
+offset forms appear in each passing offset test's coverage record.
+
+```bash
+python3 -B tests/pixel_sample_offset_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
+```powershell
+ctest --preset dev --no-tests=error -R '^pixel_aot_sample_offset_' -V
+```
+
 Depth-comparison sampling covers one form: `image_sample_c_lz vD, v[a:a+2], ... dmask:0x1 dim:SQ_RSRC_IMG_2D` and its NSA spelling `[vR, vU, vV]`. In RDNA 2 the reference comes before the coordinates. The result lowers to `tex.SampleCmpLevelZero(samp, float2(u, v), reference)` on `Texture2D<float> tex : register(t0)` and `SamplerComparisonState samp : register(s0)`. The four sampler words must still match the caller binding. `comparison_sampler_state()` decodes them, and the generated HLSL names the desktop state it needs in a comment. The compare function comes from word 0 bits 14:12, in the same order as `D3D12_COMPARISON_FUNC` minus one, and the result is `reference OP texel`. One point or bilinear XY filter maps to `D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT` or `..._MIN_MAG_LINEAR_MIP_POINT`. Other values are refused, each with its own message:
 - X/Y addressing other than `CLAMP_LAST_TEXEL`;
 - anisotropy, unnormalized coordinates, `MC_COORD_TRUNC` or `FORCE_DEGAMMA`;
