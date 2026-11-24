@@ -1563,6 +1563,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_inflate COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_inflate_check.py" "$<TARGET_FILE:startup_inflate_probe>")
     set_tests_properties(startup_inflate PROPERTIES TIMEOUT 60)
+    add_test(NAME startup_live_view COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_live_view_check.py")
+    set_tests_properties(startup_live_view PROPERTIES TIMEOUT 60)
     add_test(NAME startup_uniform_lane COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_uniform_lane_check.py")
     add_test(NAME startup_image_sample_l COMMAND "${INTAKE_PYTHON}" -B
