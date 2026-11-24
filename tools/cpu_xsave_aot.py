@@ -33,9 +33,9 @@ group XSAVE):
                        first extended offset 576, which is also its compacted
                        offset because x87/SSE own no extended slot), header
                        XSTATE_BV = XINUSE & RFBM, XCOMP_BV = bit 63 | RFBM, and
-                       the 48 reserved header bytes [528..575] cleared; MXCSR
-                       and MXCSR_MASK are stored when RFBM selects SSE or AVX.
-                       Every check runs before the first store.
+                       the reserved header bytes [528..575] left untouched.
+                       MXCSR and MXCSR_MASK are stored with selected live SSE state.
+                       Alignment and mask checks run before the first store.
   - xrstor / xrstor64: require 64-byte-aligned [base + disp] and bounded mask
                        (edx == 0 && (eax & ~7) == 0); validate XCOMP_BV == 0,
                        header [528..535] == 0, (XSTATE_BV & ~7) == 0, and
