@@ -4597,7 +4597,7 @@ A source is a VGPR, an SGPR that holds a known word, an integer inline constant 
 
 Results are data only. They can be stored or copied, but they cannot form a store or read address. A result or a word read from t0 is also rejected as a lane-guard compare operand. These instructions leave `vcc` intact, so the guard compare stays valid. A result written under the guard is unknown after the restore, like any other register.
 
-Anything else stops the lowering at that instruction, with the instruction in the error. This includes signed and other operations (`v_min_i32`, `v_max_i32`, `v_xnor_b32`, `v_mad_i32_i24`), carry forms that write `vcc` (`v_add_co_u32`), 16-bit, 64-bit and SDWA forms, register ranges, an SGPR as a VOP2 second source, and output modifiers such as `clamp`.
+Anything else stops the lowering at that instruction, with the instruction in the error. This includes signed and other operations (`v_min_i32`, `v_max_i32`, `v_xnor_b32`), carry forms that write `vcc` (`v_add_co_u32`), 16-bit, 64-bit and SDWA forms, register ranges, an SGPR as a VOP2 second source, and output modifiers such as `clamp`.
 
 The fixture is unchanged LLVM 15 code generator output for an original `amdgpu_cs` source, with the read bindings and `cap = params[0].y`:
 
@@ -4657,6 +4657,20 @@ Every source word is above `0x8b000000`, and the cap and the literal are above `
 The fixture in `tests/compute_alu_med3_check.py` keeps the guarded read and store of the fixture above, with hand-written VOP3 forms and `cap = params[0].y = 0x3a5c0f1d`. For the source word `w` and `a = w << 9`, whose bit 31 differs between lanes, it stores `(umed3(a, cap, 0x80000000) - smed3(a, cap, 0x80000000)) + (smed3(a, w, a) ^ umed3(-1, w, w))`. Unsigned, `0x80000000` is the largest of the three, but signed it is the smallest, so the two medians differ in every lane. The last two medians have equal operands in src0/src2 and in src1/src2. A CPU reference sorts the three words in each order. It does not use the lowering. Lane 0 is worked by hand as `0xc359730e`. The Windows readback uses the read harness and its three dispatches and compares all 320 words. On five groups with `n = 150`, each of these must fail at its first differing word: references that compare `v_med3_u32` signed, compare `v_med3_i32` unsigned, take the minimum or the maximum instead of the median, or let lane 150 write. So must recompiled HLSL with either form lowered in the other signedness, with a minimum for each median, or with the third operand of `v_med3_u32` dropped.
 
 The translator rejects `clamp`, `op_sel`, neg and abs on a source, which LLVM does not accept for these opcodes. It also rejects the 16-bit and binary32 medians, a register range, an unknown, pending or descriptor SGPR, an unknown VGPR and a literal wider than 32 bits, each with `Unsupported compute instruction`. A destination past `v255` gets `Unverified ALU operand`. A result used as a store address or as a guard operand is rejected, and so is a chain of medians whose expression exceeds the limit. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_alu_med3_(warp|hardware)$' -V`. Without Windows, `tests/compute_alu_med3_check.py controls` runs the exact-text and rejection checks.
+
+#### Signed 24-bit multiply-add
+
+`v_mad_i32_i24 vD, a, b, c` (VOP3 opcode 0x142) is the signed counterpart of `v_mad_u32_u24`: each multiplicand is the signed integer in bits [23:0] of its word, and `c` is a whole word, so the result is `sext24(a) * sext24(b) + c`, modulo 2^32. It takes the same sources as `v_mad_u32_u24`. The lowering sign-extends with `asuint(asint(x << 8u) >> 8u)` and multiplies and adds as `uint`, which gives the same low 32 bits as the signed product. `clamp`, the text forms `-v` and `|v|` (LLVM rejects them for this opcode), a source that is not a known word, a byte offset (which stays a row pitch only for `v_mad_u32_u24`) and a destination past v255 each stop the lowering. `v_mul_i32_i24` and `v_mad_i64_i32` are still outside the subset.
+
+The fixture replaces the ALU lines of the read-compute-write program above with three steps, with `w` the word read from t0, `gid` the dispatch index and `cap = params[0].y = 0x5a876543`:
+
+```c
+a = sext24(w) * sext24(cap) + gid;          // VGPR, SGPR and VGPR sources
+b = sext24(0x12fffffd) * sext24(w) + a;     // a literal with garbage above bit 23: -3
+out[gid] = sext24(a) * -16 + b;             // a computed multiplicand, a negative inline constant
+```
+
+The words read from t0 keep a nonzero top byte, and bit 23 is set in 63 of the first 150, so both signs occur. The cap is negative as a multiplicand. `a` has bit 23 set in 74 of the 150 lanes. Each result is the addend of the next step, so a wrong extension of any multiplicand reaches the stored word. The expected words come from a Python model written from the instruction definition, checked against three lanes worked out by hand: `0xab528010` (lane 0), `0x9d457413` (lane 3, negative `a`) and `0xda21042f` (lane 31, negative `w`). The full 320-word readback covers zero active lanes, a split group and five groups with 150 active lanes. On the last run, each of these references must fail at its first differing word: one word off, zero-extended multiplicands, untruncated multiplicands, a 24-bit addend, and lane 150 also writing. So must recompiled HLSL with the cap zero-extended, the literal untruncated, the inline constant zero-extended, or the source word shifted logically. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_alu_mad_i24_(warp|hardware)$' -V`. Without a Windows GPU, `python -B tests/compute_alu_mad_i24_check.py controls` runs the exact-text and rejection checks.
 
 #### Guarded binary32 add, subtract and multiply
 
