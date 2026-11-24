@@ -380,8 +380,11 @@ Kind kind_for(REFIID iid)
     if (iid == __uuidof(ID3D12Device) || iid == __uuidof(ID3D12Device1) || iid == __uuidof(ID3D12Device2) ||
         iid == __uuidof(ID3D12Device3) || iid == __uuidof(ID3D12Device4) || iid == __uuidof(ID3D12Device5) ||
         iid == __uuidof(ID3D12Device6) || iid == __uuidof(ID3D12Device7) || iid == __uuidof(ID3D12Device8) ||
-        iid == __uuidof(ID3D12Device9) || iid == __uuidof(ID3D12Device10) || iid == __uuidof(ID3D12Device11))
+        iid == __uuidof(ID3D12Device9) || iid == __uuidof(ID3D12Device10))
         return device_kind;
+    // ID3D12Device11 arrived after the 10.0.22621 SDK headers; match its IID literally.
+    static const GUID device11 = {0x5405c344, 0xd457, 0x444e, {0xb4, 0xdd, 0x23, 0x66, 0xe4, 0x5a, 0xee, 0x39}};
+    if (iid == device11) return device_kind;
     if (iid == __uuidof(ID3D12CommandQueue)) return queue_kind;
     if (iid == __uuidof(ID3D12Fence) || iid == __uuidof(ID3D12Fence1)) return fence_kind;
     if (iid == __uuidof(ID3D12CommandAllocator)) return allocator_kind;
