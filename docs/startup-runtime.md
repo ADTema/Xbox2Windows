@@ -223,6 +223,13 @@ entry mask when its active VGPR holds an integer conversion of a fixed-offset sc
 value. Run `python -B tests/startup_uniform_lane_check.py` to check the producer and the
 varying-source, register-clobber, mask and branch controls.
 
+## Frame capture reader
+
+`tools/startup/capture.py` reads the `capture.bin` the frame capture writes. A truncated file, a chunk
+with a short header, or an unknown tag raises a `ValueError` that names the tag and offset.
+`ctest --preset dev --no-tests=error -R '^startup_capture$' -V` checks every chunk layout against a
+synthetic file.
+
 ## NV12 plane upload
 
 For a single-mip, single-sample, even-sized 2D NV12 image the desktop stand-in
