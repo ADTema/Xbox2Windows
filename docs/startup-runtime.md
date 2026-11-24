@@ -89,8 +89,12 @@ Checks:
 - `ctest --preset release --no-tests=error -R '^startup_packed_target$' -V`: the selection rule
   against adapters described by their support bits (B5G6R5_UNORM, arrays of 2, 6, 16 and 2048
   slices, and the refused 0, 2049, multisampled and 3D cases), and the view verdicts, without a
-  device. The four `startup_packed_target_*_control` runs perturb the helper's answer (wrong
-  stand-in format, arrays left alone, B5G6R5_UNORM left alone, view kept packed) and must fail.
+  device. It also tags fake resources: an R8G8B8A8_UNORM stand-in must read back the packed format it was
+  asked for, and a texture created in the packed format must carry no tag. The five
+  `startup_packed_target_*_control` runs perturb the helper's answer (wrong stand-in format, arrays
+  left alone, B5G6R5_UNORM left alone, view kept packed, tag read back as none) and must fail
+  (`ctest --preset release --no-tests=error -R '^startup_packed_target_.*_control$'`). On the WARP
+  build tested, all three packed formats were created as described, so the draw check below did not read a tag.
 - `ctest --preset release --no-tests=error -R '^startup_packed_target_draw_' -V`: through the
   wrapper, a texture of each packed format is created (slot 133), cleared through a render-target
   view, sampled in a draw and read back. The expected pixel follows the format this adapter
@@ -143,6 +147,17 @@ by reading a render log. The device prints the counts by cause value, so
 `ctest --preset dev --no-tests=error -R "^startup_null_cause_labels(_buffer_token_control)?$" -V`
 checks without a device that each cause lands in the slot printed under its label, and that the
 header's names follow the same order. The control swaps the buffer and token slots and must fail.
+
+## Root constant buffer views
+
+Command-list slot 42 (desktop `SetGraphicsRootConstantBufferView` plus four) records the title address for a root
+parameter that the root signature declares as a CBV. A translated shader that reads through its root pointer sees that
+address. The call is ignored when the parameter is out of range or is not a CBV (one log line, `root CBV N ignored`);
+a null or unreadable address clears the slot to zero so a previous binding is not left stale. It is not forwarded to the
+desktop list and does not set the vertex-fetch bit of `srv_bound`. The slot number is derived from the desktop order and
+the console shift, not yet seen in a title log; `startup_root_cbv_{warp,hardware}` checks the handler with a bound, an
+unbound, a null-overwrite and a wrong-type call. Rebinding the same root signature keeps
+the address. Switching to a different signature invalidates the stored root addresses.
 
 ## Composite provenance fixture
 
@@ -219,7 +234,18 @@ It runs the debugger with `out/pe-env/Scripts/python.exe` when that environment 
 `-HostCpu` needs `iced-x86` from `requirements-dev.txt`; otherwise it falls back to `python` from
 `PATH`.
 The debugger runs the process in a kill-on-close job with a memory cap, **offline**: file opens of
-socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do not). It writes:
+socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do not).
+
+A process that Windows creates under a debugger normally gets the debug heap: the loader sets the
+heap tail-check, free-check and parameter-validation flags and the low-fragmentation heap is not
+used, so every allocation and free costs more. The debugger starts the process with
+`_NO_DEBUG_HEAP=1` unless the environment already sets `_NO_DEBUG_HEAP`; set `_NO_DEBUG_HEAP=0` to
+keep the debug heap, for example to look for heap corruption. In one local startup run on Windows 11
+the debug heap spent about 8.9 s freeing the nodes of a 99,776-entry map built by a single
+`XMemMapPhysicalPages` call; without it the whole call took 0.46 s and the first DirectStorage batch
+completed about 20 s earlier. `startup_debug` checks both settings on its probe.
+
+It writes:
 
 | File | Content |
 |---|---|
@@ -304,10 +330,10 @@ ctest --preset dev --no-tests=error -R '^startup_local_log(_guard_drop_control)?
 | `X2W_XMEM_GPU_MIRROR=1` | pairs a no-access graphics reservation with the read-write reservation of the same size made just before it, and maps every physical page into both (same section) |
 | `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking |
 | `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` |
-| `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}` and, when needed, RTV variants `req_<key>.rtv`. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running. Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. |
+| `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}` and, when needed, RTV variants `req_<key>.rtv`. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running. Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` and no manifest; `X2W_FXC=` (empty) skips compilation and publishes the manifest alone. |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_D3D12_DUMP_SURFACE=<bmp>` | writes the last presented surface |
-| `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. |
+| `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. At most 48 copies are pending or written; a copy whose fence reports device removal (`UINT64_MAX`) is released unwritten and frees its slot (`src/startup_stubs/draw_dump_tracking.h`, `ctest --preset dev --no-tests=error -R '^startup_dump_fence_(removed_control_)?warp$' -V`; the control must fail). |
 | `X2W_AUDIO_PERMISSIVE=1` | audio HAL / APU stand-ins accept their calls (no output) |
 | `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call |
 | `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user, and creates one offline store context for that user |
@@ -495,6 +521,15 @@ These are measured on one executable; treat them as hypotheses for others.
   entire page detects the wrong stream. Moving the second request by the same distance reaches
   EOF and leaves the destination untouched. A subsequent request using its directory offset succeeds.
   Reproduce with `ctest --preset release --no-tests=error -R '^startup_storage_directory_batch$' -V`.
+- **DirectStorage refusal order (#1586).** One Submit carries, for a raw file read and again for a
+  zlib stream, a valid request, a request at an offset equal to the file size, a request with a source
+  size of `0x98cabbec` at a valid offset, and a valid request. The stand-in refuses the two bad ones with
+  `read failed`, their whole 4 KiB destinations keep the poison pattern, their status entries report
+  `E_FAIL`, and the valid requests before and after complete with exact bytes. Each status entry is
+  followed by an `EnqueueSignal` fence, which runs after its own entry and before the next. The inputs
+  are generated by the test. It does not add a per-file offset or a size-based lookup, and it does not show
+  what the title expects for a refused request.
+  Reproduce with `ctest --preset release --no-tests=error -R '^startup_storage_refusal_order$' -V`.
 - **DirectStorage allocation failure (#1199, item 3).** A queue worker runs each entry inside
   a handler that turns any exception, including `std::bad_alloc` from a buffer sized by a request
   field, into a failed request: the next status entry reports `E_FAIL`, the destination is
@@ -557,7 +592,7 @@ These are measured on one executable; treat them as hypotheses for others.
   `src/startup_stubs/logical_view_table.h` without a device. It covers the first and last records, one
   past the end, handles inside a record or below the heap, missing heap fields, memory that wraps past
   the top of the address space, and records crossing the end of a window.
-- BCPack DirectStorage requests are decoded for BC7 and BC1 streams into destination memory as single atomic texture payloads; each request decompresses a complete multi-lane rANS chunk directly into its destination buffer and is excluded from chunk continuation caching. Unhandled formats fall back to zero-filled destinations.
+- BCPack DirectStorage requests are decoded for BC7 and BC1 streams into destination memory as single atomic texture payloads; each request decompresses a complete multi-lane rANS chunk directly into its destination buffer and is excluded from chunk continuation caching. Unhandled formats fall back to zero-filled destinations. At process exit, one `x2w-dstorage BCPack summary` line reports request and zero-filled counts for every format 1..15 that was requested. The consumer fixture sends a format 6 request and checks that it succeeds, leaves a zero-filled destination, and appears in both counts; BC1 and BC7 requests must not be counted as zero-filled.
 - The XG stand-in normally uses desktop copyable footprints. Its opt-in BC7 diagnostic
   reports standard GFX10 4 KiB tiled geometry for a single-slice, single-mip, non-MSAA
   `BC7_UNORM` 2D texture with an unknown layout, default alignment, and no resource flags.
