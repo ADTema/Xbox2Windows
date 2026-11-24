@@ -7506,7 +7506,7 @@ values, including signed zeros, infinities, quiet and signaling NaNs with payloa
 at a rounding boundary and overflow and underflow, plus 30 random vectors with biased exponents). It then runs
 all 29 exports under 16 control words (round to nearest, down, up and toward zero, each with neither, DAZ,
 FTZ or both) through a native harness export, `op_call_with_mxcsr`, that sets the word for one call and restores
-the caller's word afterwards. A lane the reference cannot decide stays unconstrained and the translated code
+the caller's word afterwards. The export lives in its own [native-only source](../tests/cpu/sse_fp_harness.asm), built as a separate image and never translated, so the form coverage report credits `cpu_aot_sse_fp` with only the 16 mnemonics of the translated fixture (13 SSE forms) and not the driver's `ldmxcsr`, `stmxcsr` and `call`. A lane the reference cannot decide stays unconstrained and the translated code
 must then still equal the processor: FTZ when the exact result is below the smallest normal number but rounds up
 to it (the manuals leave open whether tininess is judged before or after rounding), and `minps`/`maxps` under DAZ
 when the returned operand is a denormal (it is not established here whether the processor returns the original bits or

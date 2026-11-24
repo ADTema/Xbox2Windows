@@ -63,4 +63,3 @@ EXPORTS
     op_sqrtps_mem_disp
     op_sqrtps_self
     op_arith_pipeline
-    op_call_with_mxcsr

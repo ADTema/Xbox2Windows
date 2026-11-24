@@ -720,25 +720,4 @@ ENDIF
     ret
 op_arith_pipeline ENDP
 
-; Test harness, not translated: runs fn(a, b, out) with MXCSR set to the fifth argument and
-; restores the caller's MXCSR before returning, so the host control word never leaks into the
-; checker. RCX = fn, RDX = a, R8 = b, R9 = out, [stack] = MXCSR value.
-op_call_with_mxcsr PROC FRAME
-    sub rsp, 56
-    .allocstack 56
-    .endprolog
-    mov r10, rcx
-    stmxcsr DWORD PTR [rsp+36]
-    mov eax, DWORD PTR [rsp+96]
-    mov DWORD PTR [rsp+40], eax
-    ldmxcsr DWORD PTR [rsp+40]
-    mov rcx, rdx
-    mov rdx, r8
-    mov r8, r9
-    call r10
-    ldmxcsr DWORD PTR [rsp+36]
-    add rsp, 56
-    ret
-op_call_with_mxcsr ENDP
-
 END

@@ -1620,11 +1620,13 @@ if(EXISTS "${INTAKE_PYTHON}")
         cpu_translation(cpu_sse_fp_${variant} cpu_sse_fp_aot "${cpu_sse_fp_exports}")
     endforeach()
     target_compile_definitions(cpu_sse_fp_altered PRIVATE ALTER_IMM)
+    cpu_asm_fixture(cpu_sse_fp_harness sse_fp_harness)
     add_test(NAME cpu_aot_sse_fp COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/sse_fp_check.py"
         "$<TARGET_FILE:cpu_sse_fp_original>"
         "$<TARGET_FILE:cpu_sse_fp_original_lifted>"
-        "$<TARGET_FILE:cpu_sse_fp_altered_lifted>")
+        "$<TARGET_FILE:cpu_sse_fp_altered_lifted>"
+        "$<TARGET_FILE:cpu_sse_fp_harness>")
     set(cpu_avx_fp_move_exports
         "op_vmovq_xmm_xmm,op_vmovq_xmm_m64,op_vmovq_m64_xmm,op_vmovq_xmm_r64,op_vmovq_r64_xmm,"
         "op_vmaskmovdqu,op_pipeline,op_discarded_read,op_discarded_read64")

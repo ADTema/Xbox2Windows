@@ -440,9 +440,10 @@ def function_address(fn):
     return ctypes.cast(fn, ctypes.c_void_p).value
 
 
-def bind_mxcsr_driver(native_path):
-    """op_call_with_mxcsr(fn, a, b, out, mxcsr): the native harness that runs fn under a control word."""
-    driver = ctypes.CDLL(str(Path(native_path).resolve())).op_call_with_mxcsr
+def bind_mxcsr_driver(harness_path):
+    """op_call_with_mxcsr(fn, a, b, out, mxcsr): the native-only harness image (never translated) that
+    runs fn under a control word."""
+    driver = ctypes.CDLL(str(Path(harness_path).resolve())).op_call_with_mxcsr
     driver.argtypes = [ctypes.c_uint64] * 4 + [ctypes.c_uint32]
     driver.restype = None
     return driver
@@ -478,8 +479,8 @@ REFERENCE_QUIRKS = (
 )
 
 
-def check_arithmetic_modes(native_path, lifted_path):
-    driver = bind_mxcsr_driver(native_path)
+def check_arithmetic_modes(native_path, lifted_path, harness_path):
+    driver = bind_mxcsr_driver(harness_path)
     native = bind_exports(native_path, "", ARITH_EXPORTS)
     lifted = bind_exports(lifted_path, "lifted_", ARITH_EXPORTS)
     pairs = arith_pairs()
@@ -856,5 +857,5 @@ def check_alt_encodings_and_rejections(original_path):
 if __name__ == "__main__":
     check_discarded_read(*sys.argv[1:3])
     check_differential(*sys.argv[1:4])
-    check_arithmetic_modes(*sys.argv[1:3])
+    check_arithmetic_modes(*sys.argv[1:3], sys.argv[4])
     check_alt_encodings_and_rejections(sys.argv[1])
