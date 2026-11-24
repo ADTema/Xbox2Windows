@@ -7,12 +7,29 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <ctime>
 #include <string>
 #include <thread>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 using x2w_save::Status;
+
+// Unique per process and per call even when several tests start in the same
+// second (std::rand() without srand() is constant on some runtimes).
+static std::string unique_suffix() {
+#ifdef _WIN32
+    const unsigned long pid = static_cast<unsigned long>(GetCurrentProcessId());
+#else
+    const unsigned long pid = static_cast<unsigned long>(getpid());
+#endif
+    return std::to_string(pid) + "-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+}
 
 namespace {
 constexpr int exit_missing = 10, exit_mismatch = 11;
@@ -96,7 +113,7 @@ int main(int argc, char** argv)
     if (argc != 1) return 2;
 
     std::error_code ec;
-    const fs::path root = fs::temp_directory_path(ec) / ("x2w-gamesave-persist-" + std::to_string(std::rand()) + "-" + std::to_string(std::time(nullptr)));
+    const fs::path root = fs::temp_directory_path(ec) / ("x2w-gamesave-persist-" + unique_suffix());
     fs::remove_all(root, ec);
     const x2w_save::Store store(root / "store");
     const std::string self = argv[0];
