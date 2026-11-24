@@ -88,7 +88,7 @@ adds memory dumps to the stop report.
 | `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses (0x4 = A); keyboard and XInput pad 0 also work |
 | `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into a bounded table, `SamplerState qh[2048] : register(s0, space1)`, and writes `smpheap 2048 1 fallback 2047` to the manifest. Entries 0 to 2046 are the title's sampler-heap entries (entry n at byte offset 16 n); entry 2047 is reserved for a fallback sampler. The generated shader reads the fallback for an offset that is not a multiple of 16 or is at or past 2047 × 16, because the host cannot check an offset the shader computes. The stand-in does not bind that table yet, so leave this off for startup runs ([#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143)) |
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
-  | `X2W_XG_BC7_4K_S_LAYOUT=1` | opts into the BC7 layout-query diagnostic when `X2W_D3D12_PERMISSIVE=1` |
+| `X2W_XG_BC7_4K_S_LAYOUT=1` | enables the BC7 tiled layout and diagnostic copy when `X2W_D3D12_PERMISSIVE=1` |
 | `X2W_TRAP_CONTINUE=<exports>` | lets listed trap exports return 0 instead of ending the process |
 
 ## Findings
@@ -123,9 +123,10 @@ These are measured on one executable; treat them as hypotheses for others.
   reports standard GFX10 4 KiB tiled geometry for a single-slice, single-mip, non-MSAA
   `BC7_UNORM` 2D texture with an unknown layout, default alignment, and no resource flags.
   The diagnostic selects the profile explicitly. Native XG selector values still need
-  independent evidence. `CopyIntoSubresource` returns `E_NOTIMPL` for this profile because
-  the copy and upload paths still use desktop footprints. The reported pitch describes the
-  padded block-row extent of the surface.
+  independent evidence. `CopyIntoSubresource` writes the visible BC7 blocks from pitched source rows
+  and preserves tile padding. With `X2W_D3D12_RENDER=1`, it returns `E_NOTIMPL` pending a detiler for
+  the upload path. The reported pitch describes the padded block-row extent of the surface.
+  The synthetic copy check runs with `ctest --preset dev --no-tests=error -R '^startup_xg_bc7_layout$' -V`.
 - Dynamically indexed sampler-heap loads become a default sampler. `X2W_SAMPLER_HEAP=1`
   translates them into an indexed table instead (`tests/startup_sampler_heap_check.py`).
   Binding that table in the stand-in is the remaining step. Constant sampler-heap offsets
