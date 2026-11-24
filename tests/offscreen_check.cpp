@@ -22,6 +22,7 @@
 #include "desktop_gpu.h"
 
 void check_spirv_window_atomic(ID3D12Device* device, const char* shader_path);
+void check_spirv_window_signed(ID3D12Device* device, const char* shader_path);
 void check_spirv_window_qword(ID3D12Device* device, const char* shader_path);
 void check_spirv_window_qword_narrow(ID3D12Device* device, const char* shader_path);
 void check_sampler_index_control(ID3D12Device* device,
@@ -501,6 +502,14 @@ OperationResult run_compute_store_case(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// The image-load readback extends the store case with the source texture words and uses the
+// descriptor-table signature, because a texture SRV cannot be a root descriptor.
+OperationResult run_compute_texture_case(const OperationContext& ctx)
+{
+    check_compute_texture_file(ctx.device, ctx.argv[3], ctx.argv[4]);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_spirv_sampler_views(const OperationContext& ctx)
 {
     check_sampler_views(ctx.device, ctx.argv[3]);
@@ -541,6 +550,12 @@ OperationResult run_spirv_address_window(const OperationContext& ctx)
 OperationResult run_spirv_address_window_atomic(const OperationContext& ctx)
 {
     check_spirv_window_atomic(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_spirv_address_window_signed(const OperationContext& ctx)
+{
+    check_spirv_window_signed(ctx.device, ctx.argv[3]);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -1114,6 +1129,7 @@ const OperationSpec kOperations[] = {
     {"--compute-root-file", 4, 4, nullptr, kNoGate, run_compute_root_file},
     {"--ffx-immediate-conversion", 4, 4, nullptr, kNoGate, run_ffx_immediate_conversion},
     {"--compute-store-case", 5, 5, nullptr, kNoGate, run_compute_store_case},
+    {"--compute-texture-case", 5, 5, nullptr, kNoGate, run_compute_texture_case},
     {"--spirv-sampler-views", 4, 4, nullptr, kGateSm60SamplerViews, run_spirv_sampler_views},
     {"--dynamic-sampler-index", 3, 3, nullptr, kGateSm60SamplerViews, run_dynamic_sampler_index},
     // Two builds that differ only in the sampler descriptor index source (#1115): the
@@ -1124,6 +1140,7 @@ const OperationSpec kOperations[] = {
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},
     {"--spirv-address-window", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window},
     {"--spirv-address-window-atomic", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_atomic},
+    {"--spirv-address-window-signed", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_signed},
     {"--spirv-address-window-qword", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_qword},
     {"--spirv-address-window-qword-narrow", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_qword_narrow},
     {"--spirv-compare-sampler", 6, 7, nullptr, kGateSm60CompareSampler, run_spirv_compare_sampler},

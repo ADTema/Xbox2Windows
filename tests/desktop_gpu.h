@@ -25,6 +25,7 @@ void check_spirv_compaction(ID3D12Device* device, const char* shader_path);
 void check_spirv_compare_sampler(ID3D12Device* device, const char* shader_path, const char* ordinary_register,
                                  const char* reference_path, const char* descriptors = nullptr);
 void check_compute_file(ID3D12Device* device, const char* path, bool conversion_pair, const char* reference = nullptr);
+void check_compute_texture_file(ID3D12Device* device, const char* path, const char* reference);
 void check_ffx_device_init(ID3D12Device* device);
 void check_ffx_recurrent(ID3D12Device* device);
 void check_dual_uav(ID3D12Device* device);

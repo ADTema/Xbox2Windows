@@ -8,6 +8,15 @@ This is not a port and not an emulator. No executable is playable. Every stand-i
 most answers are shortcuts that are logged as such. The open problems are tracked in the issues
 whose titles start with `startup-runtime:`.
 
+## Output window and fallback diagnostics
+
+The desktop swap chain has its own top-level window, class `X2WOutputWindow`.
+When a present cannot show its surface, the GDI fallback selects a visible,
+unowned guest window in the same process. If only the presenter is visible,
+the fallback leaves it alone. To exercise both z-orders with source-built
+windows, build `startup_overlay_window` and run
+`ctest --preset release --no-tests=error -R '^startup_overlay_window$' -V`.
+
 ## Null Texture2D descriptors
 
 When the adapter lacks typed UAV support for B5G5R5A1_UNORM or render-target support for
@@ -88,7 +97,7 @@ adds memory dumps to the stop report.
 | `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses (0x4 = A); keyboard and XInput pad 0 also work |
 | `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into `SamplerState qh[2048] : register(s0, space1)` and writes `smpheap 2048 1 fallback 2047`. The stand-in uses entries 0 to 2046 for the bound heap and reserves entry 2047 for unaligned or out-of-range offsets. It also accepts the original `smpheap 2048 1` manifest with all 2,048 entries available. [#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143) |
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
-| `X2W_XG_BC7_4K_S_LAYOUT=1` | opts into the BC7 layout-query diagnostic when `X2W_D3D12_PERMISSIVE=1` |
+| `X2W_XG_BC7_4K_S_LAYOUT=1` | enables the BC7 tiled layout and diagnostic copy when `X2W_D3D12_PERMISSIVE=1` |
 | `X2W_TRAP_CONTINUE=<exports>` | lets listed trap exports return 0 instead of ending the process |
 
 ## Findings
@@ -115,6 +124,11 @@ These are measured on one executable; treat them as hypotheses for others.
   the one on the calling thread's stack is the return buffer.
 - **Inline samplers.** Pixel shaders build sampler descriptors from constants (`s_movk_i32`,
   `s_bfm_b32`, 64-bit moves); the translator folds those into static samplers.
+- **Stream-cache identity.** A cached zlib stream is served only to the exact queued
+  continuation entries in the same DirectStorage queue. The lookup checks the enqueued request
+  id, the source, the compressed size and the destination chunk size. A later independent
+  request at a matching offset still decodes its own bytes or fails without touching its
+  destination.
 
 ## Shortcuts that are known to be wrong
 
@@ -135,9 +149,10 @@ These are measured on one executable; treat them as hypotheses for others.
   reports standard GFX10 4 KiB tiled geometry for a single-slice, single-mip, non-MSAA
   `BC7_UNORM` 2D texture with an unknown layout, default alignment, and no resource flags.
   The diagnostic selects the profile explicitly. Native XG selector values still need
-  independent evidence. `CopyIntoSubresource` returns `E_NOTIMPL` for this profile because
-  the copy and upload paths still use desktop footprints. The reported pitch describes the
-  padded block-row extent of the surface.
+  independent evidence. `CopyIntoSubresource` writes the visible BC7 blocks from pitched source rows
+  and preserves tile padding. With `X2W_D3D12_RENDER=1`, it returns `E_NOTIMPL` pending a detiler for
+  the upload path. The reported pitch describes the padded block-row extent of the surface.
+  The synthetic copy check runs with `ctest --preset dev --no-tests=error -R '^startup_xg_bc7_layout$' -V`.
 - The default translator uses a static default sampler for a dynamically indexed sampler-heap load.
   With the sampler-heap opt-in, translated draws snapshot the bound heap's 16-byte sampler entries and
   bind a private desktop table beside the static samplers. Missing, out-of-range, or unreadable entries
