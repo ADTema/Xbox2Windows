@@ -9471,7 +9471,7 @@ line, for the first eight refusals of a process (stderr and `X2W_TRAP_LOG`). The
 check that refused it, in the order the checks run: `null_destination`, `unreadable_resource`,
 `unreadable_view`, `null_address`, `unsupported_description`, `destination_outside_view_heaps`, or
 `texture_unavailable` (the description passed but no single live texture or published view matches the
-address). It then prints what the checks read: resource dimension, format, width by height by depth or
+address). Keep full logs from private inputs local. In public reports, give the reason and general resource/view categories. Use source-built inputs for full diagnostic lines. The line prints what the checks read: resource dimension, format, width by height by depth or
 array size, mips, layout, flags, alignment and sample count and quality; view dimension, format and
 component mapping, with the mip, plane and array fields for 2D and 2D-array views and the first
 element, count, stride and flags for buffer views (any other dimension prints its six raw words);

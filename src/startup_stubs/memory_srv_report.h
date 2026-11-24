@@ -1,8 +1,8 @@
 // Experimental (docs/startup-runtime.md): one compact diagnostic line for a refused device slot 70
 // call (a shader resource view whose resource is an address).
 //
-// The line names the first check that refused the call and the fields the checks read, so a tester
-// can paste it into an issue: the resource description, the view description, the destination handle
+// The line names the first check that refused the call and the fields the checks read, for
+// local diagnosis: the resource description, the view description, the destination handle
 // and whether it lies in a known CBV/SRV/UAV heap, and the address and whether it is readable. It is
 // formatted into a caller-supplied fixed buffer and allocates nothing. A null resource or view pointer
 // means the guest memory could not be read; its fields are then shown as "unreadable".
