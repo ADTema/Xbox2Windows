@@ -306,10 +306,13 @@ def check_normalization():
 
 
 if __name__ == '__main__':
-    check_stage()
-    check_decode()
-    check_cli()
-    check_request_failures()
-    check_pairs()
-    check_normalization()
+    # An empty X2W_FXC publishes the manifest only, so no default-path call here ever starts fxc
+    # and the check behaves the same on hosts with and without the Windows SDK.
+    with patch.dict(os.environ, {'X2W_FXC': ''}):
+        check_stage()
+        check_decode()
+        check_cli()
+        check_request_failures()
+        check_pairs()
+        check_normalization()
     sys.exit(bool(failures))
