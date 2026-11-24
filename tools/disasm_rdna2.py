@@ -2207,25 +2207,23 @@ def _decode_interp_f32_e64(op: int, w0: int, w1: int) -> tuple[int, str, str, st
     and w1[30]); the modifier bits of index 0 (the attribute) and index 2 (the operand this
     profile does not have), the f16-only high bit and the SRC2 field are fixed zero and are
     reported as an unsupported encoding when set, because LLVM's TableGen decoder only matches
-    the zeroes. The source operand is a VRegSrc_32, decoded exactly as _decode_interp_f16 does.
+    the zeroes. The data source in SRC1 is a VGPR_32 (VOPInterp_gfx10 fixes it to a VGPR, unlike
+    the VRegSrc_32 of _decode_interp_f16), so only source codes 256..511 are legal there.
     """
     name, comment = INTERP_F32_E64_OPS[op]
     attr, attrchan = w1 & 0x3f, (w1 >> 6) & 0x3
     source_code = (w1 >> 9) & 0x1ff
     abs_bits, neg_bits = (w0 >> 8) & 0x7, (w1 >> 29) & 0x7
+    # SRC1 is a VGPR_32 field, so codes 0..255 -- SGPRs, inline constants, literals, and every code
+    # in INTERP_F16_REFUSED_SOURCES -- are not a legal data operand. LLVM's gfx1013 disassembler
+    # marks them as an invalid register instead of printing an operand, so refuse them.
     if abs_bits & 0x5 or neg_bits & 0x5 or w1 & 0x100 or (w1 >> 18) & 0x1ff \
-            or source_code in INTERP_F16_REFUSED_SOURCES:
+            or not 256 <= source_code <= 511:
         return (8, f"{name}_unsupported", f"{name} <unsupported VOP3 encoding>",
                 f"LLVM 15 refuses this {name} encoding for gfx1013")
 
     is_abs, is_neg = (abs_bits >> 1) & 1, (neg_bits >> 1) & 1
-    if source_code in INTERP_F16_IMMEDIATES:
-        # Same as _decode_interp_f16: a lone negation of a numeric operand is printed as
-        # neg(...) so that it is not read as a sign.
-        source = ("neg(/*invalid immediate*/)" if is_neg and not is_abs
-                  else _format_operand_modifiers("/*invalid immediate*/", is_abs, is_neg))
-    else:
-        source = _format_operand_modifiers(decode_v_reg(source_code), is_abs, is_neg)
+    source = _format_operand_modifiers(decode_v_reg(source_code), is_abs, is_neg)
     asm = f"{name} v{w0 & 0xff}, {source}, attr{attr}.{'xyzw'[attrchan]}"
     asm += _vop3_output_modifiers((w0 >> 15) & 1, (w1 >> 27) & 0x3)
     return (8, name, asm, comment)

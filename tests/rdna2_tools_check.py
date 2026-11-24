@@ -2741,6 +2741,57 @@ class TestRdna2Disasm(unittest.TestCase):
                 record, = disasm_rdna2(struct.pack("<2I", w0_base | w0_extra, w1_base | w1_extra))
                 self.assertEqual(record["assembly"], f"v_interp_p1_f32_e64 v5, {expected}, attr0.x")
 
+    def test_vop3_interp_f32_e64_non_vgpr_source_is_refused(self):
+        """Issue #1233 review: the SRC1 data operand of the gfx10 p1/p2 forms is a VGPR_32.
+
+        VOPInterp_gfx10 fixes that operand to a VGPR, so source codes below 256 (SGPRs, inline
+        constants, literals) are not a legal data operand; LLVM 15 reports them as an invalid
+        register. They keep the eight-byte record and become `<op>_unsupported` with an
+        `<unsupported VOP3 encoding>` assembly, the same refusal convention as the fixed-zero
+        fields above.
+        """
+        # The golden vector 050000d600040200 decodes as `v_interp_p1_f32_e64 v5, v2, attr0.x`, so its
+        # data operand is SRC1 = (w1 >> 9) & 0x1ff == 258 == v2. Rewriting bits 9..17 of w1 rewrites
+        # only that data-operand field: SRC0 (the attribute number and channel, w1[8:0]) is untouched.
+        w0_p1 = 0xd6000000 | (0x200 << 16) | 5  # op 0x200, vdst v5
+        w1_v2 = (258 << 9)  # attr0.x, SRC1 = 258 (v2)
+        record, = disasm_rdna2(struct.pack("<2I", w0_p1, w1_v2))
+        self.assertEqual(record["assembly"], "v_interp_p1_f32_e64 v5, v2, attr0.x")
+        # Before the fix, SRC1 = 0 decoded as `v_interp_p1_f32_e64 v5, s0, attr0.x` and SRC1 = 128
+        # (an inline constant) as `v_interp_p1_f32_e64 v5, /*invalid immediate*/, attr0.x`; both are
+        # now refused, matching LLVM 15's invalid-register diagnosis for gfx1013.
+        refused_sources = {
+            "scalar s0 (0)": 0,
+            "inline constant 1.0 (128)": 128,
+            "source code 209": 209,
+            "source code 249": 249,
+            "last code below the VGPR range (255)": 255,
+        }
+        end = struct.pack("<I", 0xbf810000)
+        for label, code in refused_sources.items():
+            for op, name in ((0x200, "v_interp_p1_f32_e64"), (0x201, "v_interp_p2_f32_e64")):
+                with self.subTest(field="SRC1", op=name, source=label):
+                    w0 = 0xd6000000 | (op << 16) | 5
+                    w1 = (w1_v2 & ~(0x1ff << 9)) | (code << 9)
+                    records = disasm_rdna2(struct.pack("<2I", w0, w1) + end)
+                    self.assertEqual([r["length"] for r in records], [8, 4])
+                    self.assertEqual(records[0]["opcode"], f"{name}_unsupported")
+                    self.assertIn("<unsupported VOP3 encoding>", records[0]["assembly"])
+                    self.assertEqual(records[1]["opcode"], "s_endpgm")
+        # The VGPR range itself still decodes: 256 is v0 (the lower boundary) and 511 is v255 (the
+        # upper boundary; the 9-bit field cannot encode anything above it), plus an interior value.
+        for code, expected in ((256, "v0"), (258, "v2"), (511, "v255")):
+            with self.subTest(field="SRC1", source=expected):
+                w1 = (w1_v2 & ~(0x1ff << 9)) | (code << 9)
+                record, = disasm_rdna2(struct.pack("<2I", w0_p1, w1))
+                self.assertEqual(record["assembly"], f"v_interp_p1_f32_e64 v5, {expected}, attr0.x")
+        # The attribute operand in SRC0 is unaffected: attr32.x still decodes beside a boundary VGPR.
+        for attr, expected_attr in ((0, "attr0.x"), (32, "attr32.x"), (0x1f, "attr31.x")):
+            with self.subTest(field="SRC0", attribute=expected_attr):
+                w1 = attr | (256 << 9)
+                record, = disasm_rdna2(struct.pack("<2I", w0_p1, w1))
+                self.assertEqual(record["assembly"], f"v_interp_p1_f32_e64 v5, v0, {expected_attr}")
+
     def test_vop3_interp_f32_e64_llvm_round_trip(self):
         """Issue #938: the vectors re-assemble to the same bytes and disassemble to the same strings on LLVM."""
         if not os.environ.get("LLVM_LIB"):
