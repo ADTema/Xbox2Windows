@@ -328,6 +328,7 @@ def controls():
     guard_controls()
     read_controls()
     alu_controls()
+    scalar_alu_controls()
 
 
 def grid_controls():
@@ -776,11 +777,20 @@ READ_VOP2 = variant(
     ("v_min_u32_e32 v1, s0, v1", "v_add_nc_u32_e32 v2, s0, v1\nv_or_b32_e32 v2, 0x80000010, v2\n"
                                  "v_xor_b32_e32 v2, 0x80000001, v2\nv_max_u32_e32 v1, v1, v2"),
 )
+# The shift and subtract operations of the subset on a computed word: the product is shifted left until its
+# bit 14 is the sign bit, shifted right arithmetically, subtracted from the cap (src0 - src1), and the literal
+# 0x1234 is reverse-subtracted (src1 - src0).
+READ_SHIFT_SUB = variant(
+    READ_COMPUTE,
+    ("v_min_u32_e32 v1, s0, v1", "v_lshlrev_b32_e32 v2, 17, v1\nv_ashrrev_i32_e32 v2, 20, v2\n"
+                                 "v_sub_nc_u32_e32 v3, s0, v2\nv_subrev_nc_u32_e32 v1, 0x1234, v3"),
+)
 ALU_CASES = [
     ("read_compute", READ_COMPUTE, 32, READ_BINDING),
     ("read_mad24", READ_MAD24, 32, READ_BINDING),
     ("read_mul_lo", READ_MUL_LO, 32, READ_BINDING),
     ("read_vop2", READ_VOP2, 32, READ_BINDING),
+    ("read_shift_sub", READ_SHIFT_SUB, 32, READ_BINDING),
 ]
 
 
@@ -1003,6 +1013,11 @@ def alu_controls():
     vop2 = aot.lower(READ_VOP2, 32, **READ_BINDING).splitlines()
     assert vop2[-3] == ("        outputData.Store(tid.x * 4u + 0u, max(" + mad_word + ", (0x80000001u ^ (0x80000010u | "
                         f"(params[0].y + {mad_word})))));"), vop2
+    # Shift and subtract in order; src0 prints first for the reversed-operand forms, so each operand order is pinned.
+    shift_sub = aot.lower(READ_SHIFT_SUB, 32, **READ_BINDING).splitlines()
+    product = f"((((0x0000ffffu & {load}) & 0xffffffu) * (({load} >> (0x00000010u & 31u)) & 0xffffffu)) + tid.x)"
+    assert shift_sub[-3] == ("        outputData.Store(tid.x * 4u + 0u, ((params[0].y - asuint(asint((" + product
+                             + " << (0x00000011u & 31u))) >> (0x00000014u & 31u))) - 0x00001234u));"), shift_sub
     mul = "v_mul_lo_u32 v1, s0, v1"
     lines = aot.lower(READ_MUL_LO, 32, **READ_BINDING).splitlines()
     assert lines[-4:] == [GUARD_IF, f"        outputData.Store(tid.x * 4u + 0u, (params[0].y * {load}));",
@@ -1021,7 +1036,7 @@ def alu_controls():
         # Wrong opcodes: signed or other operations, and a carry form that would write vcc.
         (unsupported + "v_min_i32_e32", (("v_min_u32_e32", "v_min_i32_e32"),)),
         (unsupported + "v_max_i32_e32", (("v_min_u32_e32", "v_max_i32_e32"),)),
-        (unsupported + "v_ashrrev_i32_e32", (("v_lshrrev_b32_e32", "v_ashrrev_i32_e32"),)),
+        (unsupported + "v_mul_hi_u32_e32", (("v_lshrrev_b32_e32", "v_mul_hi_u32_e32"),)),
         (unsupported + "v_xnor_b32_e32", (("v_and_b32_e32", "v_xnor_b32_e32"),)),
         (unsupported + "v_mad_i32_i24", ((mad, "v_mad_i32_i24 v1, v2, v1, v0"),)),
         (unsupported + "v_add_co_u32", ((mad, "v_add_co_u32 v1, vcc_lo, v2, v0"),)),
@@ -1069,6 +1084,63 @@ def alu_controls():
     assert alu(*restored, ("s_or_b32 exec_lo, exec_lo, s2", "s_or_b32 exec_lo, exec_lo, s2\nv_mov_b32_e32 v1, 9"),
                stride=8)[-5:] == [GUARD_IF, "        outputData.Store(tid.x * 8u + 0u, tid.x);", "    }",
                                   "    outputData.Store(tid.x * 8u + 4u, 0x00000009u);", "}"]
+
+
+# The read-compute-write fixture with a scalar chain over the cap word s0 and the bound s3 feeding the min:
+# add and sub that both wrap, and with a literal, or, xor with the bound and a logical shift right, each reading the
+# previous result.
+SCALAR_CHAIN = ("s_add_u32 s16, s0, -16\ns_sub_u32 s17, s16, 0x10000\ns_and_b32 s18, s17, 0xffffffe0\n"
+                "s_or_b32 s19, s18, 10\ns_xor_b32 s20, s19, s3\ns_lshr_b32 s21, s20, 3")
+READ_SCALAR = variant(READ_COMPUTE, ("v_and_b32_e32 v2, 0xffff, v1", SCALAR_CHAIN + "\nv_and_b32_e32 v2, 0xffff, v1"),
+                      ("v_min_u32_e32 v1, s0, v1", "v_min_u32_e32 v1, s21, v1"))
+SCALAR_WORD = ("min(((((((params[0].y + 0xfffffff0u) - 0x00010000u) & 0xffffffe0u) | 0x0000000au) ^ params[0].x)"
+               " >> (0x00000003u & 31u)), ")
+
+SCALAR_CASES = [("read_scalar", READ_SCALAR, 32, READ_BINDING)]
+
+
+def scalar_alu_controls():
+    """Scalar ALU on known words: exact output, then one rejection per operand or opcode outside the subset."""
+    def scalar(*changes):
+        return aot.lower(variant(READ_SCALAR, *changes), 32, **READ_BINDING).splitlines()
+
+    lines = scalar()
+    assert SCALAR_WORD in lines[-3] and lines[-3].startswith("        outputData.Store(tid.x * 4u + 0u, "), lines
+    # The earliest scalar results stay inline in the chain: the first operand prints before the second.
+    assert scalar(("s_lshr_b32 s21, s20, 3", "s_sub_u32 s21, 100, s20"))[-3].count("(0x00000064u - ") == 1
+    # A scalar result can feed a vector instruction as a source, and a copy of it is the same program.
+    assert scalar(("v_min_u32_e32 v1, s21, v1", "s_mov_b32 s22, s21\nv_min_u32_e32 v1, s22, v1")) == lines
+    unsupported, operand = "Unsupported compute instruction: ", "Unverified scalar ALU operand"
+    for message, changes in (
+        # Opcodes outside the subset: signed, carry-in and 64-bit forms.
+        (unsupported + "s_ashr_i32", (("s_lshr_b32 s21", "s_ashr_i32 s21"),)),
+        (unsupported + "s_addc_u32", (("s_add_u32 s16", "s_addc_u32 s16"),)),
+        (unsupported + "s_and_b64", (("s_and_b32 s18, s17, 0xffffffe0", "s_and_b64 s[18:19], s[16:17], 0xffffffe0"),)),
+        # Sources that are not known words: an unwritten SGPR, a descriptor SGPR, the saved exec mask, and a
+        # constant word still waiting for its s_waitcnt.
+        (operand, (("s_add_u32 s16, s0, -16", "s_add_u32 s16, s30, 7"),)),
+        (operand, (("s_add_u32 s16, s0, -16", "s_add_u32 s16, s8, 7"),)),
+        (operand, (("s_add_u32 s16, s0, -16", "s_add_u32 s16, s2, 7"),)),
+        (operand, (("s_add_u32 s16, s0, -16", "s_buffer_load_dword s23, s[4:7], 0x8\ns_add_u32 s16, s23, 7"),)),
+        # A destination past s105, and a pending destination.
+        (operand, (("s_add_u32 s16, s0, -16", "s_add_u32 s106, s0, 7"),)),
+        (operand, (("s_add_u32 s16, s0, -16", "s_buffer_load_dword s16, s[4:7], 0x8\ns_add_u32 s16, s0, 7"),)),
+        # A source wider than 32 bits.
+        (operand, (("s_add_u32 s16, s0, -16", "s_add_u32 s16, s0, 0x1ffffffff"),)),
+        # A vector register is not a scalar source.
+        (unsupported + "s_add_u32", (("s_add_u32 s16, s0, -16", "s_add_u32 s16, s0, v1"),)),
+        # Overwriting the saved exec mask breaks the guard restore.
+        ("Unverified lane guard restore", (("s_cbranch_execz .LBB0_2", ""), (".LBB0_2:", "s_add_u32 s2, s0, 7"),
+                                           ("s_endpgm", "s_or_b32 exec_lo, exec_lo, s2\ns_endpgm"))),
+        # A scalar result is data only: not an address and not a lane-guard compare operand.
+        ("Unsupported store address", (("v1, v0, s[8:11]", "v1, v21, s[8:11]"),
+                                       ("v_min_u32_e32 v1, s21, v1", "v_min_u32_e32 v1, s21, v1\nv_mov_b32_e32 v21, s21"))),
+        ("Unverified lane guard compare", (("v_min_u32_e32 v1, s21, v1",
+                                            "v_min_u32_e32 v1, s21, v1\nv_cmp_gt_u32_e32 vcc_lo, s21, v1"),)),
+        # Expressions are inline, so a scalar result that keeps doubling is rejected.
+        ("ALU expression too large", (("s_lshr_b32 s21, s20, 3", "s_lshr_b32 s21, s20, 3" + "\ns_add_u32 s21, s21, s21" * 8),)),
+    ):
+        rejects(message, scalar, *changes)
 
 
 def assemble(directory, assembler, objcopy, lines):
@@ -1719,6 +1791,42 @@ LDS_QWORD_RETURNS = {f"{stem}_rtn_{width}": op for op in LDS_QWORD_UPDATES
                      for stem, width in [op.rsplit("_", 1)]}
 
 
+LDS_QWORD_COUNTERS = ("ds_inc_u64", "ds_inc_rtn_u64", "ds_dec_u64", "ds_dec_rtn_u64", "ds_condxchg32_rtn_b64")
+
+
+def lds_qword_counter_program(op):
+    returns = "_rtn" in op
+    dest = "v[18:19], " if returns else ""
+    inputs = (["v_mov_b32_e32 v18, 0x92345678", "v_mov_b32_e32 v19, 0x12345678"]
+              if "condxchg" in op else ["v_mov_b32_e32 v18, 8", "v_mov_b32_e32 v19, 1"])
+    return LDS_WIDE_SETUP + [
+        "v_and_b32_e32 v16, 31, v8", "v_mad_u32_u24 v16, 1, v16, 0xfffffff0", "v_lshrrev_b32_e32 v17, 5, v8",
+        "ds_write_b64 v5, v[16:17] offset:8", "s_waitcnt lgkmcnt(0)",
+    ] + inputs + [
+        f"{op} {dest}v5, v[18:19] offset:8", "s_waitcnt lgkmcnt(0)",
+        "ds_read_b64 v[10:11], v5 offset:8", "s_waitcnt lgkmcnt(0)",
+    ] + (["v_mov_b32_e32 v12, v18", "v_mov_b32_e32 v13, v19",
+          "buffer_store_dwordx4 v[10:13], v8, s[20:23], 0 idxen"] if returns else
+         ["buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen"]) + ["s_endpgm"]
+
+
+def lds_qword_counter_reference(op, groups):
+    words = []
+    for lane in range(groups * 32):
+        old = (lane // 32 << 32) | ((0xfffffff0 + lane % 32) & 0xffffffff)
+        limit = 0x100000008
+        if "inc" in op:
+            new = 0 if old >= limit else old + 1
+        elif "dec" in op:
+            new = limit if old == 0 or old > limit else old - 1
+        else:
+            new = old & 0xffffffff00000000 | 0x92345678
+        words.extend((new & 0xffffffff, new >> 32))
+        if "_rtn" in op:
+            words.extend((old & 0xffffffff, old >> 32))
+    return words
+
+
 def lds_qword_program(op):
     returns = op in LDS_QWORD_RETURNS
     ret_operand = "v[18:19], " if returns else ""
@@ -1947,6 +2055,8 @@ LDS_QWORD_BINDING = LDS_WIDE_BINDING | {"stride": 8}
 LDS_QWORD_CASES = [(op, lds_qword_program(op), LDS_QWORD_BINDING) for op in LDS_QWORD_UPDATES]
 LDS_QWORD_RETURN_BINDING = LDS_WIDE_BINDING | {"stride": 16}
 LDS_QWORD_CASES += [(op, lds_qword_program(op), LDS_QWORD_RETURN_BINDING) for op in LDS_QWORD_RETURNS]
+LDS_QWORD_CASES += [(op, lds_qword_counter_program(op),
+                     LDS_QWORD_RETURN_BINDING if "_rtn" in op else LDS_QWORD_BINDING) for op in LDS_QWORD_COUNTERS]
 
 
 LDS_F64_CMPST = ("ds_cmpst_f64", "ds_cmpst_rtn_f64")
@@ -2195,7 +2305,7 @@ def lds_controls():
         ("ds_add_u32 v5, v254", "Unverified private LDS update"),
         ("ds_add_u32 v5, v6 offset:4", "Unsupported compute instruction"),
         ("ds_add_u32 v5, v6 gds", "Unsupported compute instruction"),
-        ("ds_inc_rtn_u64 v[10:11], v5, v[6:7]", "Unsupported compute instruction"),
+        ("ds_inc_rtn_u64 v[10:11], v5, v[6:7] offset:4", "Unsupported compute instruction"),
     ):
         rejects(message, aot.lower, variant(lines, (update, bad)), 32, **LDS_BINDING)
     i = lines.index(update)
@@ -2354,6 +2464,16 @@ def ds_mutants(name, lines, binding, source):
     elif name == "lds_wave_counter":
         yield aot.lower(variant(lines, ("ds_append v10", "ds_consume v10")), 32, **binding), 1
         yield aot.lower(variant(lines, ("ds_consume v12", "ds_append v12")), 32, **binding), 3
+    elif name in LDS_QWORD_COUNTERS:
+        if "condxchg" in name:
+            # Incorrectly perform the high-half store when its sign bit is clear.
+            wrong = source.replace("(0x12345678u & 0x80000000u) != 0u", "true")
+            yield wrong, 1
+        else:
+            # Returning forms use the read to keep the old pair observable.
+            no_update = ("ds_read_b64 v[18:19], v5 offset:8" if "_rtn" in name else "s_nop 0")
+            instruction = next(line for line in lines if line.startswith(name + " "))
+            yield aot.lower(variant(lines, (instruction, no_update)), 32, **binding), 0
     elif name in LDS_QWORD_RETURNS:
         # Substitute the post-update word pair for the returned pre-update pair.
         changed = variant(lines, ("v_mov_b32_e32 v12, v18", "v_mov_b32_e32 v12, v10"),
@@ -2488,6 +2608,7 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
         four_words = (name in ("lds_wave_counter", "lds_xchg2_b32") or name in LDS_QWORD_RETURNS
                       or name in LDS_WIDE_QUADS or name in LDS_STRIDED_PROGRAMS
                       or name in LDS_F64_CMPST and "_rtn" in name
+                      or name in LDS_QWORD_COUNTERS and "_rtn" in name
                       or name in LDS_WIDE_REPLACEMENTS and "_rtn" in name)
         group_counts = (1, 2) if four_words else (1, 3)
         if name == "lds_st64_xchg_b64":
@@ -2509,6 +2630,8 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
                 words = lds_overlap_reference(groups)
             elif name == "lds_wave_counter":
                 words = lds_wave_counter_reference(groups)
+            elif name in LDS_QWORD_COUNTERS:
+                words = lds_qword_counter_reference(name, groups)
             elif name in LDS_QWORD_UPDATES or name in LDS_QWORD_RETURNS:
                 words = lds_qword_reference(name, groups)
             elif name in LDS_WIDE_PROGRAMS or name in LDS_WIDE_QUADS:
@@ -2548,7 +2671,18 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
     return 0
 
 
+def scalar_alu_binary(directory, assembler, objcopy, library):
+    """The assembled scalar chain decodes to the same program as its text."""
+    src, obj, raw = [directory / x for x in ("scalar.s", "scalar.o", "scalar.bin")]
+    src.write_text("\n".join(READ_SCALAR) + "\n", encoding="ascii")
+    subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-filetype=obj", src, "-o", obj], check=True)
+    subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, raw], check=True)
+    decoded = aot.labelled(disassemble(raw.read_bytes(), library, offsets=True))
+    assert aot.lower(decoded, 32, **READ_BINDING) == aot.lower(READ_SCALAR, 32, **READ_BINDING)
+
+
 def binary(directory, assembler, objcopy, library):
+    scalar_alu_binary(directory, assembler, objcopy, library)
     ds_controls()
     lds_controls()
     ds_binary(directory, assembler, objcopy, library)
@@ -2881,6 +3015,85 @@ def draw_alu(directory, compiler, cmd, case, name):
     return 0
 
 
+SCALAR_CAP = 0x8068  # cap + 0xfffffff0 and then - 0x10000 both wrap; bits 5 and 6 survive the and mask
+
+
+def scalar_chain(cap, bound, *, skip=(), shift=3, bound_word=None):
+    """Independent CPU reference of the scalar chain: add -16, sub 0x10000, and, or 10, xor the bound, shift."""
+    word = (cap + 0xfffffff0) & 0xffffffff if "add" not in skip else cap
+    word = (word - 0x10000) & 0xffffffff if "sub" not in skip else word
+    word = word & 0xffffffe0 if "and" not in skip else word
+    word = word | 10 if "or" not in skip else word
+    word = word ^ (bound if bound_word is None else bound_word) if "xor" not in skip else word
+    return word >> shift
+
+
+def scalar_word(gid, bound, *, pick=min, **chain):
+    """Reference of read_scalar for one lane: the unsigned minimum of the chain and the product plus the lane index."""
+    word = source_word(gid)
+    product = ((word & 0xffff) * (word >> 16) + gid) & 0xffffffff
+    return pick(product, scalar_chain(SCALAR_CAP, bound, **chain))
+
+
+def scalar_words(groups, bound, **reference):
+    words = [SENTINEL] * 320
+    for gid in range(min(32 * groups, bound)):
+        words[gid] = scalar_word(gid, bound, **reference)
+    return words
+
+
+def draw_scalar(directory, compiler, cmd, case, name):
+    """Scalar chain against scalar_word, from the 320-word case format, with wrong references and mutated sources."""
+    constants = [0x5eed0000 + i for i in range(16)]
+    constants[1] = SCALAR_CAP
+
+    def write(groups, bound, words):
+        case.write_bytes(struct.pack("<337I", groups, *words, bound, *constants[1:]))
+
+    for groups, bound in READ_RUNS:
+        write(groups, bound, scalar_words(groups, bound))
+        result = subprocess.run(cmd)
+        if result.returncode:
+            return result.returncode
+    groups, bound = READ_RUNS[-1]
+    expected = scalar_words(groups, bound)
+    products = [scalar_word(g, bound, pick=lambda p, c: p) for g in range(bound)]
+    chain = scalar_chain(SCALAR_CAP, bound)
+    # Inputs must show both add and sub wrapping, and the minimum taking each operand.
+    assert SCALAR_CAP + 0xfffffff0 >= 1 << 32 and (SCALAR_CAP + 0xfffffff0) & 0xffffffff < 0x10000, "no wrap"
+    assert any(p < chain for p in products) and any(p >= chain for p in products), "min takes one operand only"
+    controls = (("max for min", dict(pick=max)), ("add dropped", dict(skip=("add",))),
+                ("sub dropped", dict(skip=("sub",))), ("and dropped", dict(skip=("and",))),
+                ("or dropped", dict(skip=("or",))), ("xor dropped", dict(skip=("xor",))),
+                ("shift by 2", dict(shift=2)), ("cap for bound", dict(bound_word=SCALAR_CAP)))
+    for label, reference in controls:
+        wrong = scalar_words(groups, bound, **reference)
+        word = next(i for i, (a, b) in enumerate(zip(expected, wrong)) if a != b)
+        write(groups, bound, wrong)
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"{name}: reference '{label}' escaped detection\n{bad.stderr}")
+    write(groups, bound, expected)
+    source = (directory / "store.hlsl").read_text(encoding="ascii")
+    for label, old, new in (("max for min", "min(((((((params", "max(((((((params"),
+                            ("add dropped", "(params[0].y + 0xfffffff0u)", "params[0].y"),
+                            ("sub dropped", "- 0x00010000u)", "- 0x00000000u)"),
+                            ("and dropped", "& 0xffffffe0u", "& 0xffffffffu"),
+                            ("or dropped", "| 0x0000000au", "| 0x00000000u"),
+                            ("xor dropped", "^ params[0].x", "^ 0x00000000u"),
+                            ("shift by 2", ">> (0x00000003u", ">> (0x00000002u")):
+        mutated = source.replace(old, new)
+        if mutated == source:
+            raise AssertionError(f"{name}: mutation '{label}' did not change the source")
+        src, cso = directory / "mutated.hlsl", directory / "mutated.cso"
+        src.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+        bad = subprocess.run([*cmd[:3], cso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"{name}: mutation '{label}' escaped detection")
+    return 0
+
+
 VOP2_CAP = 0xe0000000  # large enough that the product plus the cap wraps for many lanes
 
 
@@ -2940,6 +3153,73 @@ def draw_vop2(directory, compiler, cmd, case, name):
     for label, old, new in (("min for max", "max(((((", "min((((("), ("xor dropped", "0x80000001u ^", "0x00000000u ^"),
                             ("or dropped", "0x80000010u |", "0x00000000u |"),
                             ("add dropped", "(params[0].y + (", "(0u + (")):
+        mutated = source.replace(old, new)
+        if mutated == source:
+            raise AssertionError(f"{name}: mutation '{label}' did not change the source")
+        src, cso = directory / "mutated.hlsl", directory / "mutated.cso"
+        src.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+        bad = subprocess.run([*cmd[:3], cso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"{name}: mutation '{label}' escaped detection")
+    return 0
+
+
+SHIFT_SUB_CAP = 0x0badf00d
+
+
+def shift_sub_word(gid, *, logical=False, shift=17, reverse_sub=False, reverse_subrev=False, skip=()):
+    """Independent CPU reference of the read_shift_sub result for one lane: the product is shifted left, shifted
+    right (arithmetically unless logical), subtracted from the cap, and 0x1234 is reverse-subtracted."""
+    word = source_word(gid)
+    value = (((word & 0xffff) * (word >> 16) + gid) & 0xffffffff)
+    value = value if "shl" in skip else (value << shift) & 0xffffffff
+    signed = value - (1 << 32) if value >> 31 else value
+    value = value >> 20 if logical else (signed >> 20) & 0xffffffff
+    value = (value - SHIFT_SUB_CAP if reverse_sub else SHIFT_SUB_CAP - value) & 0xffffffff
+    return (0x1234 - value if reverse_subrev else value - 0x1234) & 0xffffffff
+
+
+def shift_sub_words(groups, bound, **reference):
+    words = [SENTINEL] * 320
+    for gid in range(min(32 * groups, bound)):
+        words[gid] = shift_sub_word(gid, **reference)
+    return words
+
+
+def draw_shift_sub(directory, compiler, cmd, case, name):
+    """Shift and subtract chain against shift_sub_word, from the 320-word case format."""
+    constants = [0x5eed0000 + i for i in range(16)]
+    constants[1] = SHIFT_SUB_CAP
+    groups, bound = READ_RUNS[-1]
+
+    def write(words):
+        case.write_bytes(struct.pack("<337I", groups, *words, bound, *constants[1:]))
+
+    expected = shift_sub_words(groups, bound)
+    wrong = (("logical right shift", dict(logical=True)), ("shift by 16", dict(shift=16)),
+             ("shift dropped", dict(skip=("shl",))), ("sub reversed", dict(reverse_sub=True)),
+             ("subrev not reversed", dict(reverse_subrev=True)))
+    for label, reference in wrong:
+        assert expected != shift_sub_words(groups, bound, **reference), f"{label} would go unseen"
+    write(expected)
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+    # Each wrong reference must fail the run at the first word where it differs from the right one.
+    for label, reference in wrong:
+        wrong_words = shift_sub_words(groups, bound, **reference)
+        word = next(i for i, (a, b) in enumerate(zip(expected, wrong_words)) if a != b)
+        write(wrong_words)
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"{name}: reference '{label}' escaped detection\n{bad.stderr}")
+    write(expected)
+    source = (directory / "store.hlsl").read_text(encoding="ascii")
+    for label, old, new in (("logical right shift", "asuint(asint(", "(("),
+                            ("shift by 16", "(0x00000011u & 31u)", "(0x00000010u & 31u)"),
+                            ("sub dropped", "(params[0].y - ", "(0u - "),
+                            ("subrev dropped", " - 0x00001234u)", " - 0x00000000u)")):
         mutated = source.replace(old, new)
         if mutated == source:
             raise AssertionError(f"{name}: mutation '{label}' did not change the source")
@@ -3027,6 +3307,11 @@ def draw(directory, compiler, renderer, backend, cases=None):
             if result:
                 return result
             continue
+        if name == "read_scalar":
+            result = draw_scalar(directory, compiler, cmd, case, name)
+            if result:
+                return result
+            continue
         if name == "read_mad24":
             result = draw_mad24(directory, compiler, cmd, case)
             if result:
@@ -3034,7 +3319,8 @@ def draw(directory, compiler, renderer, backend, cases=None):
             continue
         if name.startswith(("guard_", "read_")):
             result = (draw_guard if name.startswith("guard_") else draw_alu if name == "read_compute"
-                      else draw_vop2 if name == "read_vop2" else draw_read)(directory, compiler, cmd, case, name)
+                      else draw_vop2 if name == "read_vop2" else draw_shift_sub if name == "read_shift_sub"
+                      else draw_read)(directory, compiler, cmd, case, name)
             if result:
                 return result
             continue
@@ -3094,5 +3380,5 @@ if __name__ == "__main__":
                  "draw-lds-packed": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_PACKED_CASES),
                  "draw-lds-arithmetic": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_ARITHMETIC_CASES),
                  "draw-lds-replacement": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_REPLACEMENT_CASES),
-                 "draw-guard-read": lambda d, *a: draw(d, *a, cases=GUARD_CASES + READ_CASES + ALU_CASES)}
+                 "draw-guard-read": lambda d, *a: draw(d, *a, cases=GUARD_CASES + READ_CASES + ALU_CASES + SCALAR_CASES)}
         sys.exit(modes[mode](Path(tmp), *args))

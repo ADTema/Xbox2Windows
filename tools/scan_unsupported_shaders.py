@@ -56,6 +56,7 @@ PIXEL_VOP3P_INT16 = pixel_aot.VOP3P_INT16 if pixel_aot is not None else {}
 PIXEL_VOP3_INT16 = pixel_aot.VOP3_INT16 if pixel_aot is not None else {}
 PIXEL_VOP2_F16 = tuple(pixel_aot.VOP2_F16) if pixel_aot is not None else ()
 PIXEL_VOP1_F16_ROUND = tuple(pixel_aot.VOP1_F16_ROUND) if pixel_aot is not None else ()
+PIXEL_VOP2_F16_FUSED_SCALE = tuple(pixel_aot.VOP2_F16_FUSED_SCALE) if pixel_aot is not None else ()
 PIXEL_INLINE_F16 = tuple(pixel_aot.INLINE_F16) if pixel_aot is not None else ()
 PIXEL_VCC = r"(?:vcc(?:_lo)?)"
 PIXEL_VOP3_INT16_TERNARY = pixel_aot.VOP3_INT16_TERNARY if pixel_aot is not None else {}
@@ -211,6 +212,12 @@ if PIXEL_VOP2_F16:
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_(?:{'|'.join(map(re.escape, PIXEL_VOP2_F16))})_f16_e32\s+{INT16_VGPR},\s+{F16_ARITH_SOURCE},\s+{INT16_VGPR}"
     )
+# The accumulating v_fmac_f16 and the scaling v_ldexp_f16 have the same e32 shape; pixel_aot additionally needs the accumulator
+# and the exponent to be statically proven.
+if PIXEL_VOP2_F16_FUSED_SCALE:
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_(?:{'|'.join(map(re.escape, PIXEL_VOP2_F16_FUSED_SCALE))})_f16_e32\s+{INT16_VGPR},\s+{F16_ARITH_SOURCE},\s+{INT16_VGPR}"
+    )
 if PIXEL_VOP1_F16_ROUND:
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_(?:{'|'.join(map(re.escape, PIXEL_VOP1_F16_ROUND))})_f16_e32\s+{INT16_VGPR},\s+{F16_ARITH_SOURCE}"
@@ -340,6 +347,13 @@ KNOWN_RDNA2_BASE_OPCODES = {
 }
 
 
+# Scalar program-control and compare-immediate forms the disassembler decodes: recognition only, no lowering.
+KNOWN_RDNA2_BASE_OPCODES |= {
+    "s_wakeup", "s_setkill", "s_sethalt", "s_sendmsg", "s_sendmsghalt", "s_icache_inv", "s_incperflevel",
+    "s_decperflevel", "s_ttracedata", "s_ttracedata_imm", "s_endpgm_saved", "s_endpgm_ordered_ps_done",
+    "s_wait_idle", "s_waitcnt_depctr", "s_denorm_mode", "s_call_b64",
+}
+
 KNOWN_RDNA2_BASE_OPCODES |= (
     SUPPORTED_ALU
     | {f"v_{name}" for name in PIXEL_INTEGER}
@@ -349,7 +363,7 @@ KNOWN_RDNA2_BASE_OPCODES |= (
     | {f"v_pk_{name}" for name in PIXEL_VOP3P_INT16}
     | {f"v_{name}" for name in PIXEL_VOP3_INT16}
     | {f"v_{name}" for name in PIXEL_VOP3_INT16_TERNARY}
-    | {f"v_{name}_f16" for name in PIXEL_VOP2_F16 + PIXEL_VOP1_F16_ROUND}
+    | {f"v_{name}_f16" for name in PIXEL_VOP2_F16 + PIXEL_VOP2_F16_FUSED_SCALE + PIXEL_VOP1_F16_ROUND}
     | {"v_cvt_f16_i16", "v_cvt_f16_u16"}
     | {name for name, _, _ in MUBUF_OPS.values()}
     | {name for name, _, _ in MTBUF_OPS.values()}
