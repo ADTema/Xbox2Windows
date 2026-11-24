@@ -7477,7 +7477,10 @@ separate support.
 
 Each table is decided on its own. A table gets a set 3 view only if some
 depth-reference sample and some ordinary sample (including a sparse one) both
-reach it; a table used for only one of the two is left alone. The first view
+reach it; a table used for only one of the two is left alone. An `OpImageQueryLod` on a
+sampled image counts as an ordinary use, because HLSL `CalculateLevelOfDetail` takes a `SamplerState`: before
+this, a table used only for a level-of-detail query and a depth-reference sample was returned unchanged and
+SPIRV-Cross wrote the query against a `SamplerComparisonState`. The first view
 is `%bridge_cmp` and later ones `%bridge_cmp_table_N`. These are refused with
 a message: a table without exactly one literal `DescriptorSet` and `Binding`
 decoration, a decorated or initialized table, set 3 already in use or a
@@ -7501,7 +7504,9 @@ original, so a view wired to the wrong table changes a precise word. The
 driver also checks, without a GPU, a runtime-sized table at set 2, binding 7
 (the emitted HLSL has the comparison view at `register(s7, space3)`), two
 split tables at their own bindings with an ordinary-only and a
-comparison-only table left alone, `;` comments after any declaration, and each refusal above. The renamed GPU run
+comparison-only table left alone, a fragment `OpImageQueryLod` plus a depth-reference sample (the query
+uses the `SamplerState` table, the sample the set 3 view; DXC compiles it as `ps_6_0` only on Windows, and no
+readback of the LOD value is drawn), `;` comments after any declaration, and each refusal above. The renamed GPU run
 has not been executed on a physical adapter by the author; the Windows CI jobs
 `spirv_sampler_views_{hardware,warp}` are the check.
 
