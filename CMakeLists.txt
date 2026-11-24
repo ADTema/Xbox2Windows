@@ -1323,11 +1323,17 @@ if(EXISTS "${INTAKE_PYTHON}")
     # gfx2hlsl 3D image sampling (#1149): translation controls, then a desktop draw that names the texel.
     add_test(NAME startup_image_3d_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_image_3d_check.py")
+    add_test(NAME startup_image_load_mip_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_image_load_mip_check.py")
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME startup_image_3d_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_image_3d_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_image_3d_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_image_load_mip_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_image_load_mip_check.py" --draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_image_load_mip_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
     # gfx2hlsl 2D array images: translation controls, then a desktop draw that names the slice's texel.
     add_test(NAME startup_image_2d_array_controls COMMAND "${INTAKE_PYTHON}" -B

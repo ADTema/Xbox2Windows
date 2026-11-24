@@ -304,6 +304,11 @@ These are measured on one executable; treat them as hypotheses for others.
   a `float3` of the three address registers in order; 1D images are refused. A source-built pixel
   stage draws one texel of a 2x2x2 texture on WARP and hardware with DXC and FXC
   (`ctest --preset release --no-tests=error -R "^startup_image_3d_"`).
+- **Explicit mip loads.** For 2D and 3D textures, `image_load_mip` passes the final address
+  register to `Texture.Load` as the mip level. Ordinary `image_load` still reads mip zero.
+  The source-built 2D draw reads distinct colors from mips zero and two, and a wrong-mip
+  reference must fail at pixel (0, 0). The 3D case checks nonconsecutive address registers
+  during translation. Run `ctest --preset release --no-tests=error -R '^startup_image_load_mip_' -V`.
 - **2D array images.** `image_sample`, `image_sample_lz`, `image_sample_l` and `image_load` with
   `dim:SQ_RSRC_IMG_2D_ARRAY` use a `Texture2DArray<float4>` (manifest kind `tex2da`). The slice is
   the third address component, as `float3(u, v, slice)` for a sample and `int4(x, y, slice, 0)`
