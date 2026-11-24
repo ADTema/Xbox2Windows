@@ -210,6 +210,9 @@ class Stage:
         if tok in ('exec_lo', 'exec'):
             return 'exec'
         if tok == 'm0':
+            m = self.sym.get('m0')
+            if m:
+                raise Unsupported('numeric use of m0 holding %s' % m[0])
             return 'm0'
         r = reg_range(tok)
         if r:
@@ -462,10 +465,20 @@ class Stage:
             return ('s%d' % r[1]) if r and r[0] == 's' and r[1] != r[2] else tok
         srcs = [low(t) for t in srcs]
         dname = low(ops[0])
-        if dname == 'm0':
-            return None
-        syms = [self.sym.get(reg_range(t)[1]) if reg_range(t) and reg_range(t)[0] == 's' else None for t in srcs]
+        if pair and ('m0' in srcs or dname == 'm0'):
+            raise Unsupported('64-bit scalar operand m0')
+        def src_sym(t):
+            if t == 'm0':
+                return self.sym.get('m0')
+            r = reg_range(t)
+            return self.sym.get(r[1]) if r and r[0] == 's' else None
+        syms = [src_sym(t) for t in srcs]
         if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
+            if dname == 'm0':
+                if scc:
+                    raise Unsupported('scc from descriptor data')
+                self.sym['m0'] = syms[0] if base == 's_mov_b32' else ('descnum',)
+                return None
             if dname in ('exec', 'vcc', 'exec_lo', 'vcc_lo'):
                 raise Unsupported('mask from descriptor data')
             d = reg_range(dname)[1]
@@ -486,6 +499,12 @@ class Stage:
             return None
         values = [self.u(t) for t in srcs]
         expr = text.format(*values)
+        if dname == 'm0':
+            self.sym.pop('m0', None)
+            self.emit('m0 = %s;' % expr)
+            if scc:
+                self.emit('scc = %s;' % scc.replace('$', 'm0'))
+            return None
         if dname in ('exec', 'exec_lo', 'vcc', 'vcc_lo'):
             var = dname[:4].rstrip('_') if dname.startswith('exec') else 'vcc'
             if var == 'exec':
@@ -528,7 +547,10 @@ class Stage:
         return None
 
     def op_s_and_saveexec_b64(self, ops, mods, text='exec & {0}'):
-        d = reg_range(ops[0])[1]
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's':
+            raise Unsupported('saveexec destination %s' % ops[0])
+        d = dst[1]
         src = ops[1] if not reg_range(ops[1]) else 's%d' % reg_range(ops[1])[1]
         self.set_s(d, 'exec')
         self.masks.add(d)
@@ -546,8 +568,11 @@ class Stage:
         self.op_s_and_saveexec_b64(ops, mods, '{0} & ~exec')
 
     def op_s_andn2_wrexec_b64(self, ops, mods):
-        d = reg_range(ops[0])[1]
-        src = 's%d' % reg_range(ops[1])[1]
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's':
+            raise Unsupported('wrexec destination %s' % ops[0])
+        d = dst[1]
+        src = ops[1] if not reg_range(ops[1]) else 's%d' % reg_range(ops[1])[1]
         self.exec_known = False
         self.emit('exec = (%s & ~exec) & 1; scc = exec != 0;' % self.u(src))
         self.set_s(d, 'exec')
@@ -563,7 +588,13 @@ class Stage:
 
     def scalar_select(self, ops, pair):
         low = [('s%d' % reg_range(t)[1]) if reg_range(t) and reg_range(t)[0] == 's' else t for t in ops]
+        if pair and 'm0' in low:
+            raise Unsupported('64-bit scalar operand m0')
         expr = 'scc ? %s : %s' % (self.u(low[1]), self.u(low[2]))
+        if low[0] == 'm0':
+            self.sym.pop('m0', None)
+            self.emit('m0 = %s;' % expr)
+            return
         if low[0] in ('exec', 'vcc'):
             if low[0] == 'exec':
                 self.exec_known = False
@@ -610,7 +641,6 @@ class Stage:
 
     def op_s_bfm_b32(self, ops, mods):
         """Fold constant bitfield masks: titles build inline sampler words with them."""
-        d = reg_range(ops[0])[1]
         vals = []
         for o in ops[1:3]:
             r = reg_range(o)
@@ -621,6 +651,15 @@ class Stage:
                     vals.append(int(o, 0))
                 except ValueError:
                     vals.append(None)
+        if ops[0] == 'm0':
+            self.sym.pop('m0', None)
+            if None not in vals:
+                value = (((1 << (vals[0] & 31)) - 1) << (vals[1] & 31)) & 0xffffffff
+                self.emit('m0 = 0x%08xu;' % value)
+            else:
+                self.emit('m0 = (((1u << (%s & 31)) - 1) << (%s & 31));' % (self.u(ops[1]), self.u(ops[2])))
+            return None
+        d = reg_range(ops[0])[1]
         if None not in vals:
             value = (((1 << (vals[0] & 31)) - 1) << (vals[1] & 31)) & 0xffffffff
             self.set_s(d, '0x%08xu' % value, ('const', value))
