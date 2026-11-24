@@ -9,7 +9,7 @@
 // selects what the title does with that parameter before the draw:
 //   bound       SetGraphicsRootConstantBufferView(0, address of the colour)
 //   unbound     no call
-//   null        SetGraphicsRootConstantBufferView(0, 0)
+//   null        SetGraphicsRootConstantBufferView(0, address) then (0, 0) to clear it
 //   wrong_type  parameter 0 is declared as an SRV; the same call is made twice
 int draw_root_cbv(void* list)
 {
@@ -23,6 +23,7 @@ int draw_root_cbv(void* list)
     if (!std::strcmp(mode, "bound")) {
         invoke(list, 42, 0, address);
     } else if (!std::strcmp(mode, "null")) {
+        invoke(list, 42, 0, address);
         invoke(list, 42, 0, 0);
     } else if (!std::strcmp(mode, "wrong_type")) {
         invoke(list, 42, 0, address);

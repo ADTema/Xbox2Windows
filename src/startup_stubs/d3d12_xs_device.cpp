@@ -1883,8 +1883,7 @@ void __stdcall list_root_cbv(Wrapper* self, UINT parameter, u64 address)
             log("x2w-render root CBV %u ignored: the root signature declares parameter type %d", parameter, static_cast<int>(type));
         return;
     }
-    if (!address || !readable_window(address, 1)) return;
-    pass.root_address[parameter] = address;
+    pass.root_address[parameter] = (address && readable_window(address, 1)) ? address : 0;
 }
 extern LONG translated_draws, untranslated_draws, frame_number;
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance);
