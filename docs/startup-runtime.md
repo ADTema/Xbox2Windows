@@ -38,6 +38,23 @@ requested view. This applies only to Texture2D views with no resource or counter
 `ctest --test-dir out/bin --no-tests=error -R "^startup_null_views_" -V` against your build
 directory to exercise both slots on hardware and WARP.
 
+## Null bindings in translated draws
+
+The `x2w-render totals` line reports `null bindings N`, then the same count split by cause as
+`(entry, buffer, token, wrapper, dimension)`. Each null binding falls in exactly one cause, so
+the five parts add up to N:
+
+- entry: the descriptor table entry is null, empty or unreadable.
+- buffer: the buffer address or size is missing or unreadable, or the frame copy failed.
+- token: the descriptor memory names a view id the wrapper never issued.
+- wrapper: the texture's resource is missing or is not a resource wrapper.
+- dimension: the view dimension does not match the shader, so a null texture is bound.
+
+The classification lives in `src/startup_stubs/null_binding_cause.h`. The source-built
+`startup_null_views_check` fixture checks every cause, that the parts sum to the total, and that
+valid bindings add nothing. It does not draw, so the counters in the totals line itself are checked
+by reading a render log.
+
 ## What is measured
 
 With the switches below, an x64 console executable on an AMD RDNA4 GPU (Windows 11, release
@@ -164,7 +181,11 @@ These are measured on one executable; treat them as hypotheses for others.
 - **Struct-returning methods.** When both register arguments of a wrapped method look like objects,
   the one on the calling thread's stack is the return buffer.
 - **Inline samplers.** Pixel shaders build sampler descriptors from constants (`s_movk_i32`,
-  `s_bfm_b32`, 64-bit moves); the translator folds those into static samplers.
+  `s_bfm_b32`, 64-bit moves); the translator folds those into static samplers. A source-built
+  pixel stage checks all four manifest words, rejects a mask width from a root constant, and
+  decodes the folded words with the stand-in's static sampler path. The clamp sampler reads
+  column 1 at x=1.25, while the wrap control reads column 0. Run
+  `ctest --preset release --no-tests=error -R "^startup_inline_sampler_"`.
 - **3D images.** `image_sample` with `dim:SQ_RSRC_IMG_3D` becomes a `Texture3D<float4>` sampled with
   a `float3` of the three address registers in order; 1D images are refused. A source-built pixel
   stage draws one texel of a 2x2x2 texture on WARP and hardware with DXC and FXC
@@ -183,6 +204,12 @@ These are measured on one executable; treat them as hypotheses for others.
 - **DirectStorage file ranges.** A nonempty file request checks its byte offset and length against
   the current file size before allocating the staging buffer. A range ending at EOF is valid.
   An overrun or short read fails the queue request and preserves the destination.
+  The `startup_storage_directory_batch` fixture submits ten requests across two synthetic RDS5/ETPF
+  files on one queue. In each file, moving the first absolute source offset by 896 KiB selects a
+  different valid 28-byte zlib stream. Both return success and produce 4096 bytes. Comparing the
+  entire page detects the wrong stream. Moving the second request by the same distance reaches
+  EOF and leaves the destination untouched. A subsequent request using its directory offset succeeds.
+  Reproduce with `ctest --preset release --no-tests=error -R '^startup_storage_directory_batch$' -V`.
 
 ## Shortcuts that are known to be wrong
 
@@ -236,13 +263,25 @@ These are measured on one executable; treat them as hypotheses for others.
   zero-valued entry constant so optimized FXC keeps denormal bit patterns. UNORM outputs still
   undergo float-to-UNORM conversion. Packed integer exports and other integer formats remain
   unsupported by this path.
-- Translating the captured console colour-blend register state blocks remains open (#1216).
+- Colour-blend registers reach the draw path for pipelines created through device slot 57 only
+  (#1216): state block A holds the eight `CB_BLENDn_CONTROL` words at +0xD0, and
+  `src/startup_stubs/state_block_blend.h` decodes them into the translated pipeline's blend
+  state. `CB_TARGET_MASK` is not located, so all four channels are written; no fixture covers a
+  write mask on this path. A word the decoder refuses for any of the eight targets leaves the
+  registers unused: the pipeline keeps the path it had before and the refusal is logged. No target
+  is drawn unblended in place of a refused word
+  (`ctest --preset release --no-tests=error -R "^startup_state_block_blend$"`).
+  `tests/startup_slot57_blend_draw_check.py` draws through a source-built slot 57 pipeline: red
+  with alpha 0.5 over opaque blue reads (128, 0, 128, 191) within one step with SRC_ALPHA /
+  INV_SRC_ALPHA in target 0's word and (255, 0, 0, 128) with ENABLE clear or with the word four
+  bytes before or after +0xD0. With two targets bound each follows its own word, and a refused
+  word for the second leaves both unblended
+  (`ctest --preset release --no-tests=error -R "^startup_slot57_blend_draw_" -V`).
   A graphics stream can supply a desktop `D3D12_BLEND_DESC` directly. `src/startup_stubs/cb_blend.h`
   decodes `CB_BLENDn_CONTROL` and a `CB_TARGET_MASK` nibble into `D3D12_RENDER_TARGET_BLEND_DESC`. It
   refuses forms D3D12 can't express (`BOTH_SRC_ALPHA`, constant alpha without alpha blend factor
   support, MIN/MAX with factors other than ONE). Its draws match a CPU model of the register fields
-  (`ctest --preset release --no-tests=error -R "^startup_cb_blend"`). Where those registers sit in the
-  state block is not measured yet, so the draw path doesn't call it.
+  (`ctest --preset release --no-tests=error -R "^startup_cb_blend"`).
 - Audio produces no output from the console audio path. A separate desktop render sink exists
   (see "Audio output"); nothing connects the console path to it yet.
 
@@ -359,3 +398,63 @@ The `startup_heartbeat_commit` check starts the heartbeat before loading the pag
 maps two synthetic sections and compares the reported values with `GetProcessMemoryInfo` in the
 same process. It releases a separate commit allocation to check that a current-only change
 produces another report.
+
+## Physical pages in shared sections
+
+`XMemAllocatePhysicalPages` pages are 64 KiB slots of 256 MiB pagefile-backed sections. With
+`X2W_XMEM_SHARED_VIEWS=1`, adjacent pages of one mapping call that are adjacent slots share one
+view (`src/xmem_mapped_pages.cpp`). Before, every page had a section and a view of its own, which is
+slow for a start-up batch of about 100,000 pages (measured under Wine: 42.9 s for 100,000 pages,
+82 ms with shared sections and views).
+
+Unmapping a page inside a shared view unmaps that view and maps its other pages again. A thread
+that touches one of those pages in between takes an access violation. A vectored handler retries
+it only when the address is inside a view that the unmap in progress, or the last finished one,
+took apart, the page is recorded and covered by a view once that unmap is over, and the thread
+has not already retried that page for that unmap. Any other fault is passed on, after at most one
+retry.
+
+Shared views are opt-in. The caller chooses before the first mapping call by setting
+`X2W_XMEM_SHARED_VIEWS=1` in the process environment; the shim reads it once, on that call.
+
+| | Default | `X2W_XMEM_SHARED_VIEWS=1` |
+|---|---|---|
+| Views | one per page | one per run of adjacent pages |
+| Fault handler | none | registered by the first mapping call, never removed |
+| `FreeLibrary` | unloads `xmem.dll` | module is pinned and stays until the process ends |
+
+The handler is process-wide, and Windows has no removal that also waits for a dispatch already
+under way, so the opt-in keeps the module, the handler and the shim's state in place for the life
+of the process, also across a host's unload and reload. Nothing is torn down or waited for at DLL
+detach. A host that needs to unload the shim keeps the default. If the handler cannot be
+registered or the module cannot be pinned, the opt-in is refused, logged, and pages get a view
+each.
+
+What the shim records always matches what Windows shows. If an unmap is refused part of the way,
+the views already unmapped are mapped again whole, nothing is removed and the call fails with
+that error. If a surviving page cannot be mapped again, it is forgotten (its bytes stay in the
+section), the batch is unmapped and the call fails. A freed slot is zeroed when it is reused, and
+freed slots are reused in address order so that pages reused together share a view again.
+
+`VirtualQuery` on a page of a shared view reports the view's base as the allocation base and the
+bytes from the queried page to the end of the view, not one page. A placed buffer on such memory
+is not affected: section-backed pages already took the committed, not-aliased path.
+
+- `ctest --preset release --no-tests=error -R '^xmem_shim_(mapped_pages|page_runs)$' -V` runs the
+  earlier contract check and `tests/xmem_page_runs_check.py`: a batch across two sections with
+  holes, moved and reused pages; `VirtualQuery` before and after a view is split; two views of
+  the same pages with writes seen both ways; an unmap refused at each of three steps
+  (`X2W_XMEM_TEST_FAULT`); and a reader on a page while its neighbour is unmapped and mapped
+  again. Two cases must end in an access violation, the reader without the handler
+  (`X2W_XMEM_NO_FAULT_RETRY=1`) and a read of a forgotten page; each runs in a child process
+  whose exit code the parent checks. Those controls and `X2W_XMEM_TEST_FAULT` exist only in a
+  second build of the shim (`xmem_shim_test_controls`, `X2W_XMEM_TEST_CONTROLS`); the check shows
+  that the deployed `xmem.dll` ignores both switches. Four more children cover the lifetime on
+  the deployed shim: without the opt-in, pages mapped with a view each and the shim unloading
+  after that mapping, twice; with it, an unused shim unloads, a used one stays loaded through `FreeLibrary` with an
+  unrelated handled access violation still delivered and the handler still working; `FreeLibrary`
+  is called repeatedly while one thread reads a page and another toggles its neighbour; and the
+  process exits with those two threads still running.
+- `ctest --preset release --no-tests=error -R '^xmem_page_runs_device_' -V` places a buffer
+  (slot 133) inside one view and across three kinds of boundary: two mapping calls, two backing
+  sections, and single-page views.
