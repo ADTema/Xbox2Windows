@@ -1008,11 +1008,20 @@ bool validate_dxr_opacity_args(int argc, char** argv)
     return parse_dxr_opacity_tmin(argc, argv).has_value();
 }
 
-OperationResult run_dxr_opacity(const OperationContext& ctx)
+OperationResult run_dxr_opacity_fixture(const OperationContext& ctx, bool use_pipeline)
 {
     const float nearT = parse_dxr_opacity_tmin(ctx.argc, ctx.argv).value();
-    const bool pipeline = std::string_view(ctx.argv[2]) == "--dxr-opacity-pipeline";
-    return skip_if_false(check_dxr_opacity(ctx.device, ctx.mode == "warp", pipeline, nearT));
+    return skip_if_false(check_dxr_opacity(ctx.device, ctx.mode == "warp", use_pipeline, nearT));
+}
+
+OperationResult run_dxr_opacity(const OperationContext& ctx)
+{
+    return run_dxr_opacity_fixture(ctx, false);
+}
+
+OperationResult run_dxr_opacity_pipeline(const OperationContext& ctx)
+{
+    return run_dxr_opacity_fixture(ctx, true);
 }
 
 OperationResult run_ray_query(const OperationContext& ctx)
@@ -1408,7 +1417,7 @@ const OperationSpec kOperations[] = {
     {"--dxr-facing", 3, 3, nullptr, kNoGate, run_dxr_facing},
     {"--dxr-facing-pipeline", 3, 3, nullptr, kNoGate, run_dxr_facing_pipeline},
     {"--dxr-opacity", 3, 5, validate_dxr_opacity_args, kNoGate, run_dxr_opacity},
-    {"--dxr-opacity-pipeline", 3, 5, validate_dxr_opacity_args, kNoGate, run_dxr_opacity},
+    {"--dxr-opacity-pipeline", 3, 5, validate_dxr_opacity_args, kNoGate, run_dxr_opacity_pipeline},
     {"--ray-query", 3, 3, nullptr, kNoGate, run_ray_query},
     {"--dxr-address-ranges", 3, 3, nullptr, kNoGate, run_dxr_address_ranges},
     {"--dxr-placed-build", 3, 3, nullptr, kNoGate, run_dxr_placed_build},
