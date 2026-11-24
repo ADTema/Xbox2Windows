@@ -2,6 +2,14 @@
 
 Run commands from the repository root. Start with the [project overview](../README.md) and [contribution guide](../CONTRIBUTING.md). Package-specific observations below used local inputs. Community regression tests use fixtures built from this repository.
 
+## Startup vertex fetch from an unsigned byte
+
+`gfx2hlsl` reads `BUF_FMT_8_UINT` from the aligned dword containing the requested byte and zero-extends it. Missing Y, Z and W components read as integer 0, 0 and 1. The source-built fixture loads vertex-buffer slot 1 with stride 3 and byte offset 1. It compiles the generated vertex shader and calls its vertex body from a compute wrapper to read all four register values without interpolation. All 16 vertex indices agree with a little-endian byte reference on WARP and hardware, and switching the instruction to R8_UNORM changes the readback.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_r8_uint_(warp|hardware)$' -V
+```
+
 ## Counted cache-line zero loops
 
 `cpu_switch_aot.py` accepts the three-byte CLZERO with full-width RAX addressing for 64-byte guest cache lines. A translated instruction zeroes the aligned line containing RAX. It preserves RAX and flags. The original function controls advancement and termination with ADD, CMP and JB. The supported memory domain is ordinary writable host-backed storage; this test checks final memory, registers and conditions on a single thread.
