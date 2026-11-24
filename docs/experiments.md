@@ -3283,6 +3283,49 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^compute_store_aot_mtbuf_load_(warp|hardware)$' -V
 ```
 
+### gfx1013 2D float image stores and mip loads
+
+The fixed compute profile accepts a 2D `R32G32B32A32_FLOAT` `image_store`
+with full-width coordinates and data and requires DMASK `0xf`. Four
+consecutive VGPRs supply R, G, B and A. The caller declares the eight-word
+descriptor with `--image-descriptor`, binds `--image-uav-mip 0` at `u0` and
+supplies a distinct destination texel for each invocation. All other store
+masks are refused.
+
+`image_load_mip` reads a matching `Texture2D<float4>` at `t0`. It passes the
+last full-width address VGPR as the view-relative mip in `Load(int3(x,y,mip))`.
+For a raw UAV output, `--image-descriptor` names this SRV. For a typed image
+output, `--image-srv-descriptor` declares a distinct eight-word SRV descriptor.
+The caller supplies distinct, non-aliasing desktop resources in that combined
+case. Wait for descriptors with `lgkmcnt(0)` and the load with `vmcnt(0)`.
+This profile refuses same-descriptor reads and writes, sample instructions,
+atomics, A16, D16 and non-2D dimensions.
+
+The source-built fixture loads red and blue from mip 1 into consecutive VGPRs.
+A full store writes those two words and two distinct constants into 16 unique
+texels in destination mip 0. The readback checks all 1,344 DWORDs across three
+mips, including 1,280 sentinels in the surrounding texels and untouched mips.
+Swapping the sparse load's register order or forcing mip zero independently
+changes the readback. A sparse store is a translation refusal control. So are
+a plain `image_load` and an `image_store_mip`, SRV descriptors that overlap or
+misalign with the UAV descriptor, a UINT UAV format and the gfx1030 target. The
+LLVM 15 job checks the recorded machine words, disassembly, and synthetic
+container CLI output.
+
+The words pass through `asuint` and `asfloat` unchanged, but every fixture
+value is a normal binary32 number. NaN payloads, denormals and negative zero
+are not tested; D3D12 does not promise to preserve them bit-exactly through
+typed float UAV stores on every adapter.
+
+```powershell
+cmake --build --preset dev --target offscreen_check -j 2
+ctest --preset dev --no-tests=error -j 1 -R '^compute_store_aot_gfx1013_image_store_(warp|hardware)$' -V
+```
+
+```bash
+python3 -B tests/compute_mimg_float_store_check.py --binary llvm-mc-15 llvm-objcopy-15 --llvm libLLVM-15.so.1
+```
+
 ### gfx1030 2D image loads
 
 The `gfx1030` compute store profile lowers the typed MIMG form
