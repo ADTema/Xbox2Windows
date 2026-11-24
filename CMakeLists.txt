@@ -479,6 +479,15 @@ add_custom_command(OUTPUT "${startup_sampler_x_cs}" COMMAND "${DXC_EXECUTABLE}" 
 target_sources(offscreen_check PRIVATE tests/startup_sampler_x.cpp "${startup_sampler_x_cs}")
 target_sources(offscreen_check PRIVATE tests/startup_sampler_heap.cpp)
 target_sources(offscreen_check PRIVATE tests/startup_image_3d.cpp)
+# Console allocation sizes for depth-with-stencil and multisampled textures
+# (src/startup_stubs/console_plane_size.h); the mutated run is the negative control.
+add_executable(startup_plane_size_check tests/startup_plane_size_check.cpp)
+target_include_directories(startup_plane_size_check PRIVATE src)
+target_compile_features(startup_plane_size_check PRIVATE cxx_std_17)
+add_test(NAME startup_plane_size COMMAND startup_plane_size_check)
+add_test(NAME startup_plane_size_packed_control COMMAND startup_plane_size_check --mutate packed)
+set_tests_properties(startup_plane_size_packed_control PROPERTIES WILL_FAIL TRUE)
+
 # Colour-blend register decoding (src/startup_stubs/cb_blend.h, #1216): decoder table plus draws
 # compared with a CPU model of the register fields.
 set(startup_cb_blend_vs "${CMAKE_CURRENT_BINARY_DIR}/startup_cb_blend_vs.h")

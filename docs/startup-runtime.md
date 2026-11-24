@@ -280,3 +280,33 @@ The `startup_heartbeat_commit` check starts the heartbeat before loading the pag
 maps two synthetic sections and compares the reported values with `GetProcessMemoryInfo` in the
 same process. It releases a separate commit allocation to check that a current-only change
 produces another report.
+
+## Allocation sizes for depth with stencil and multisampled textures
+
+A console executable reserves memory of its own for every placed texture, sized by the device's
+allocation-info answer. The stand-in forwarded the desktop answer. For two families that answer
+is larger than the console's: depth with stencil (the R32G8X24 family takes 8 bytes a texel on the
+desktop adapters measured, where the console keeps a 4-byte depth plane and a 1-byte stencil
+plane) and multisampled textures (4 MiB placement alignment on desktop, 64 KiB on the console).
+
+For a single description of one of those families the stand-in now answers the console size
+(`src/startup_stubs/console_plane_size.h`): each plane padded to whole 64 KiB tiles, where a tile
+holds 64 KiB of samples (128 x 128 texels at 4 bytes, 256 x 128 at 2, 256 x 256 at 1, 64 x 64 at
+4 bytes with four samples). The first eight uses are logged as `x2w-d3d12 allocation info:
+console size ...`. The desktop texture behind the description is unchanged; only the amount of
+memory the executable sets aside for it changes.
+
+Measured on one console executable under the startup debugger, with an NVIDIA adapter through
+vkd3d-proton: the executable commits one fixed block at start-up and takes its texture memory
+from it. With desktop sizes the block was exhausted after 352 texture allocations, the next
+allocation returned null, and the run stopped on a null object about 18 s in. Over the 1,561
+distinct descriptions queried up to that point the desktop answers were 154 MiB larger in total
+than the sizes above. With this change the same run passes that point. Whether native Windows
+drivers return the same larger sizes is not measured here; an adapter that already answers 5
+bytes a texel for the R32G8X24 family is left alone, because the console size is then not smaller.
+
+The tile rule reproduces the nine reference sizes that `tests/startup_plane_size_check.cpp`
+lists first. Those are console allocation sizes for descriptions the executable queries, taken
+from the log of an independent implementation of the same device interface; no code was taken
+from it. Other formats, mip chains, 3D textures and sample counts outside 1, 2, 4 and 8 keep the
+desktop answer. Run `ctest --preset release --no-tests=error -R '^startup_plane_size' -V`.

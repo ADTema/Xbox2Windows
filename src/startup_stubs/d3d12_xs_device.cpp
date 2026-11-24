@@ -24,6 +24,7 @@
 #include "startup_stubs/slice_footprints.h"
 
 #include <d3d12.h>
+#include "console_plane_size.h"
 #include "null_texture_view.h"
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
@@ -796,6 +797,14 @@ HRESULT __stdcall device_create_pipeline(Wrapper*, const void* desc, const GUID*
     return E_NOTIMPL;
 }
 
+void note_console_size(const D3D12_RESOURCE_DESC& desc, const D3D12_RESOURCE_ALLOCATION_INFO& info)
+{
+    static LONG calls;
+    if (first_calls(calls, 8))
+        log("x2w-d3d12 allocation info: console size 0x%llx for %llux%u format %d samples %u (shortcut: desktop is larger)",
+            info.SizeInBytes, desc.Width, desc.Height, desc.Format, desc.SampleDesc.Count);
+}
+
 // Device slot 25, desktop GetResourceAllocationInfo(visibleMask, count, descs), returned by value.
 void* __stdcall device_resource_allocation_info(void* a, void* b, UINT mask, UINT count, const D3D12_RESOURCE_DESC* descs)
 {
@@ -803,7 +812,9 @@ void* __stdcall device_resource_allocation_info(void* a, void* b, UINT mask, UIN
     Wrapper* self = receiver(a, b, &result, "Device::GetResourceAllocationInfo(no receiver)");
     std::vector<D3D12_RESOURCE_DESC> copies(count);
     for (UINT i = 0; i < count; ++i) copies[i] = sanitized(descs[i]);
-    const D3D12_RESOURCE_ALLOCATION_INFO info = device_of(self)->GetResourceAllocationInfo(mask, count, copies.data());
+    D3D12_RESOURCE_ALLOCATION_INFO info = device_of(self)->GetResourceAllocationInfo(mask, count, copies.data());
+    // A single description of a family that is larger on desktop gets its console size (console_plane_size.h).
+    if (count == 1 && x2w_startup::console_plane_size(descs[0], info)) note_console_size(descs[0], info);
     *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(result) = info;
     static LONG calls, invalid;
     if (first_calls(calls))
@@ -872,6 +883,10 @@ void* __stdcall device_resource_allocation_info1(void* a, void* b, UINT mask, UI
     if (SUCCEEDED(device_of(self)->QueryInterface(IID_PPV_ARGS(&device4)))) {
         info = device4->GetResourceAllocationInfo1(mask, count, copies.data(), info1);
         device4->Release();
+    }
+    if (count == 1 && x2w_startup::console_plane_size(descs[0], info)) {
+        if (info1) *info1 = {0, info.Alignment, info.SizeInBytes};
+        note_console_size(descs[0], info);
     }
     *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(result) = info;
     static LONG calls, invalid;
