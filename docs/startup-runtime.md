@@ -815,7 +815,9 @@ These are measured on one executable; treat them as hypotheses for others.
   exported registers, so integer words reach the pixel stage unchanged. FXC folds `asfloat()` of a
   constant and flushes binary32 denormal patterns such as 1 or 2 to 0, which a float copy lost
   ([#1259](https://github.com/R0Y00/Xbox2Windows/issues/1259)). Colour exports of constant integer
-  words still go through `float4` and have the same loss. Reproduce with
+  words still go through `float4` and have the same loss. Only the `p0` selector is lowered;
+  `p10` and `p20` are refused in both encodings
+  ([#1890](https://github.com/R0Y00/Xbox2Windows/issues/1890)). Reproduce with
   `ctest --preset release --no-tests=error -R "^startup_flat_param_"`.
 - **Non-fused multiply-add.** The gfx1013 `v_mad_f32`, `v_mac_f32`, `v_madmk_f32`,
   `v_madak_f32` and `v_mad_legacy_f32` forms round the product before the sum and flush
@@ -1215,18 +1217,26 @@ on it is not handled.
 ## Startup memory accounting
 
 The DirectStorage heartbeat (`x2w-dstorage heartbeat <n> s:` in `stderr.txt`) reports this
-process's peak and current commit charge in MiB and the number of live 64 KiB physical-page
-sections, so runs that stop at different points can be compared by memory spent rather than by
-elapsed time. A physical-page section exists from a page's first use (a mapping or a DirectStorage
-write) until its grant is released; `xmem.dll` publishes that count through the experimental
-`x2w_xmem_page_stats` export. The heartbeat also prints while the request counters are unchanged
+process's peak and current commit charge in MiB and the number of live 64 KiB physical pages
+(the heartbeat still calls them sections), so runs that stop at different points can be compared by
+memory spent rather than by elapsed time. A physical page holds a slot from its first use (a mapping
+or a DirectStorage write) until its grant is released; `xmem.dll` publishes that count through the
+experimental `x2w_xmem_page_stats` export.
+
+The slots are 64 KiB pieces of shared 256 MiB slabs (4096 slots each, `src/xmem_slab_slots.h`). A slab is
+created with the default `CreateFileMappingW` commit behaviour, so all of it is charged to commit when it is
+created, and it is closed only when the process ends: freeing pages returns slots, not commit. A released
+slot is reused lowest first. The experimental `x2w_xmem_slab_stats` export reports the slabs open, the slots
+in use and the slots free in the open slabs, which are the units that matter for commit now. This only
+reports; it does not change when commit is charged. `xmem_slab_slots` checks the bookkeeping on any platform
+without Windows calls. The heartbeat also prints while the request counters are unchanged
 when either memory value changed, so the cost of a stalled load is visible. Each report is followed
 by a line of failed requests by cause and a line of page-destination requests by end (see
 DirectStorage failure causes and DirectStorage page-request ends under Findings).
 
 ```powershell
-cmake --build --preset release --target xmem_shim startup_stub_xcrdapi
-ctest --preset release --no-tests=error -R '^(xmem_page_stats|startup_heartbeat_commit)$' -V
+cmake --build --preset release --target xmem_shim startup_stub_xcrdapi xmem_slab_slots_check
+ctest --preset release --no-tests=error -R '^(xmem_slab_slots|xmem_page_stats|startup_heartbeat_commit)$' -V
 ```
 
 The `startup_heartbeat_commit` check starts the heartbeat before loading the page provider, then
@@ -1354,6 +1364,41 @@ is not affected: section-backed pages already took the committed, not-aliased pa
 - `ctest --preset release --no-tests=error -R '^xmem_page_runs_device_' -V` places a buffer
   (slot 133) inside one view and across three kinds of boundary: two mapping calls, two backing
   sections, and single-page views.
+
+## Placed buffer allocation walk (device slot 133)
+
+Slot 133 aliases a buffer only when every byte from the base of the allocation holding the address
+to the end of the buffer is committed in that allocation, and the memory is private. It used to
+measure the whole committed run from the base with one `VirtualQuery` per region and compare the
+buffer with that length. `VirtualQuery` scans page-table entries from the queried address to the end
+of the run of identical attributes, so on a large private region with touched pages each call costs
+milliseconds (about 5 ms per GiB with one touched page per 64 KiB, measured on Windows 10 19045).
+
+`src/startup_stubs/placed_buffer_range.h` first asks `QueryVirtualMemoryInformation`
+(`MemoryRegionInfo`, Windows 10 1607 and later, resolved at run time) for the allocation's base, size
+and committed bytes, which come from the allocation's bookkeeping without that scan. When the
+allocation is private and its committed bytes equal its size, every page is committed, so the full
+walk's run is the whole allocation and the decision follows from base and size. Otherwise (a partly
+committed or mapped allocation, a free address, the call missing) it walks the regions from the base
+and stops at the end of the buffer, because regions after it cannot change the answer. The alias or
+refusal is the same as before; nothing is remembered between placements, so a page decommitted,
+released or replaced directly through the Windows API is seen by the next placement. The alignment,
+memory-type and state rules are unchanged. The five-second `x2w-d3d12 views noted` line in
+`stderr.txt` reports `placed buffers <n> (region-information proofs <n>, region queries <n>)`.
+
+- `ctest --preset release --no-tests=error -R '^startup_placed_buffer_range$' -V` compares every
+  decision with the full walk on the same memory: 256 buffers spread over a 64 MiB private block
+  whose alternating 64 KiB pages have different protections (it prints the region queries per
+  placement of both walks); a middle page decommitted under a buffer, before a buffer and five pages
+  before a buffer, then committed again; a block released and replaced by a 1 MiB block at the same
+  base; a mapped view; a reservation committed in two steps; and a placeholder piece replaced by
+  committed private memory. Each case places a buffer before changing the memory, so state kept
+  between placements would show up as a mismatch. A 512 MiB committed block with one touched page per
+  64 KiB must be proven without any `VirtualQuery` call; the check prints the time per placement of
+  the full walk, the bounded walk and the proof. `_region_only_control` trusts the allocation size
+  without the committed-bytes check and must fail only in the partly committed cases;
+  `_walk_only_control` never uses the region information and must fail only that call count. A
+  refused allocation or mapping is a capability skip (77) in the controls.
 
 ## Buffer memory SRVs (device slot 70)
 
