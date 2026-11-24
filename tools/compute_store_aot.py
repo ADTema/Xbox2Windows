@@ -1075,6 +1075,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or row_tag[1] == column_tag[1]):
                 raise ValueError("Unverified row pitch byte offset")
             vector[dst] = ("pitch_bytes", row_tag[1], int(pitch, 0), *column_tag[1:])
+        elif cpu == "gfx1030" and line in ("buffer_gl0_inv", "buffer_gl1_inv"):
+            # The desktop profile has no mapping for these cache levels or their acknowledgments.
+            raise ValueError(f"Unsupported MUBUF cache invalidation: {line}")
         elif m := re.fullmatch(r"(?:buffer_load_(?:dword(?:x(?P<raw_count>[234]))?|(?P<subword>[us](?:byte|short))"
                                r"|(?P<d16_kind>[us]byte|short)_d16(?P<hi>_hi)?)"
                                r"|tbuffer_load_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))"

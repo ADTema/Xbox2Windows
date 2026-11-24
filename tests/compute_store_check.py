@@ -1234,10 +1234,12 @@ def scalar_alu_controls():
         rejects(message, scalar, *changes)
 
 
-def assemble(directory, assembler, objcopy, lines):
+def assemble(directory, assembler, objcopy, lines, *, cpu="gfx1013", features=None):
     src, obj, raw = [directory / x for x in ("exit.s", "exit.o", "exit.bin")]
     src.write_text("\n".join(lines) + "\n", encoding="ascii")
-    subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-filetype=obj", src, "-o", obj], check=True)
+    attributes = [f"-mattr={features}"] if features is not None else []
+    subprocess.run([assembler, "-triple=amdgcn--amdpal", f"-mcpu={cpu}", *attributes,
+                    "-filetype=obj", src, "-o", obj], check=True)
     subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, raw], check=True)
     return raw.read_bytes()
 
@@ -3158,7 +3160,36 @@ def mimg_load_binary(directory, assembler, objcopy, library):
     gfx1030_binary(directory, assembler, objcopy, library, cases, "image_", group=(8, 8, 1))
 
 
+def mubuf_cache_invalidate_binary(directory, assembler, objcopy, library):
+    """Check that recognized cache operations stop before the CLI emits HLSL."""
+    binding = INDEX_BINDING | {"cpu": "gfx1030"}
+    dims = aot.checked_group(32)
+    original = aot.lower(INDEXED, dims, **binding)
+    options = [item for key, value in binding.items() for item in ("--" + key.replace("_", "-"), str(value))]
+    for op in ("s_nop 0", "buffer_gl0_inv", "buffer_gl1_inv"):
+        lines = INDEXED[:-1] + [op, "s_waitcnt vmcnt(0)", INDEXED[-1]]
+        code = assemble(directory, assembler, objcopy, lines, cpu="gfx1030", features=DS_FEATURES)
+        decoded = aot.labelled(disassemble(code, library, offsets=True, cpu=b"gfx1030",
+                                          features=DS_FEATURES.encode()))
+        assert decoded[-3:] == lines[-3:], decoded
+        name = op.split()[0]
+        container, output = directory / f"{name}.dxbc", directory / f"{name}.hlsl"
+        container.write_bytes(store_container(code, dims))
+        cli = subprocess.run([sys.executable, "-B", aot.__file__, container, "--output", output,
+                              "--llvm", library, *options], capture_output=True, text=True)
+        if op == "s_nop 0":
+            assert cli.returncode == 0, cli.stderr
+            assert output.read_text() == original
+            continue
+        diagnostic = f"Unsupported MUBUF cache invalidation: {op}"
+        assert cli.returncode == 1 and cli.stderr.splitlines()[-1:] == [f"ValueError: {diagnostic}"], cli.stderr
+        assert not output.exists()
+        rejects(diagnostic, aot.lower, lines, dims, **binding)
+        print(diagnostic)
+
+
 def binary(directory, assembler, objcopy, library):
+    mubuf_cache_invalidate_binary(directory, assembler, objcopy, library)
     mubuf_reduction_controls()
     gfx1030_binary(directory, assembler, objcopy, library, mubuf_reduction_cases(), "buffer_atomic_")
     mubuf_subword_controls()
