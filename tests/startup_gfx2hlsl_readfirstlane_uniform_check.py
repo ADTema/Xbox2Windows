@@ -125,9 +125,19 @@ REFUSED = [
     ('VGPR buffer address', (MOVE, 'buffer_load_dword v7, v0, s[4:7], 0 offen', READ)),
     ('branch after read', ('v_mov_b32_e32 v7, s2', READ, 's_branch label_000C', 's_endpgm')),
 ]
+# Since #1755 the float lowering itself refuses an op_sel it does not model, before the read.
+EARLIER = {'op_sel overwrite': 'modifier op_sel:[0,0]'}
 for label, instructions in REFUSED:
     got = run(*instructions)
-    check(f'{label} refused', got == REFUSAL, repr(got))
+    check(f'{label} refused', got in (REFUSAL, EARLIER.get(label)), repr(got))
+# SCC written through m0 (#1931 review): a compare mask carried into m0 makes SCC varying, so the
+# select that reads it, and a VGPR copied from that select, stay unproven; EXEC is left unchanged.
+got = run('v_cmp_lt_f32_e32 vcc_lo, v0, v1', 's_and_b32 m0, vcc_lo, -1', 's_cselect_b32 s2, 1, 0',
+          'v_mov_b32_e32 v7, s2', READ)
+check('compare mask through m0 into SCC refused', got == REFUSAL, repr(got))
+# The same chain from a uniform scalar still proves the copy uniform.
+got = run('s_and_b32 m0, s2, 0xff', 's_cselect_b32 s3, 1, 0', 'v_mov_b32_e32 v7, s3', READ)
+check('uniform m0 write into SCC accepted', got != REFUSAL and got[-1:] == ['s9 = v7;'], repr(got))
 got = run('v_mov_b32_e32 v7, s2', READ, exec_known=False)
 check('unknown exec refused', got == REFUSAL, repr(got))
 

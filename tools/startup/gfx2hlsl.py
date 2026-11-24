@@ -475,9 +475,11 @@ class Stage:
                 return False
         return True
 
-    def set_scc(self, expr):
+    def set_scc(self, expr, proof=None):
+        """Emit an SCC assignment and track its uniformity from `proof` (an expression over the
+        sources) when the emitted text names a register, such as m0, that the proof cannot judge."""
         if self.tracks_uniformity():
-            self.scc_uniform = self.scalar_expr_uniform(expr)
+            self.scc_uniform = self.scalar_expr_uniform(expr if proof is None else proof)
         self.emit('scc = %s;' % expr)
 
     def set_s(self, n, expr, sym=None, scc=None, uniform=None):
@@ -776,7 +778,9 @@ class Stage:
             self.sym.pop('m0', None)
             self.emit('m0 = %s;' % expr)
             if scc:
-                self.emit('scc = %s;' % scc.replace('$', 'm0'))
+                # Through set_scc, so an SCC derived from a lane mask (s_and_b32 m0, vcc_lo, -1)
+                # is tracked as varying like any other scalar result.
+                self.set_scc(scc.replace('$', 'm0'), proof=scc.replace('$', '(%s)' % expr))
             return None
         if dname in ('exec', 'exec_lo', 'vcc', 'vcc_lo'):
             var = dname[:4].rstrip('_') if dname.startswith('exec') else 'vcc'
