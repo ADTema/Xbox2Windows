@@ -9276,6 +9276,8 @@ opcodes `buffer_load_format_d16_hi_x` (0x26) and `buffer_store_format_d16_hi_x` 
 printed with its parameter selector and attribute (`p10`, `p20` or `p0`, then `attrN.x` to `.w`), as llvm-mc prints it.
 `tools/scan_unsupported_shaders.py` recognizes the mnemonics so they are not reported as unknown.
 
+`v_mqsad_u32_u8` (VOP3 0x175) is decoded as well. Its destination and accumulator (src2) are four-register VGPR quads, src0 is a register pair and src1 a single register, so it prints as `v_mqsad_u32_u8 v[0:3], v[4:5], v6, v[8:11]`, the text llvm-mc 19.1.7 gives for gfx1013. It takes `clamp` but no `abs`, `neg` or `mul`/`div` output modifier, and an SGPR, constant or special-register accumulator is refused because llvm-mc rejects it. A destination or accumulator that would run past `v255` prints as `<invalid VGPR quad>`. Ten words assembled with llvm-mc 19.1.7 are the golden vectors, and the modifier grid and the refused forms are compared with llvm-mc 19's disassembler. LLVM 15 was not available on the machine that ran these checks. `tools/pixel_aot.py` does not lower this instruction; this change touches only the disassembler.
+
 The decoder follows the modifier grammar llvm-mc accepts for these ops. Abs and neg bits are refused on all four
 VOP3 forms, clamp is refused on `v_mul_lo_i32`, an output modifier is refused on all but `v_interp_mov_f32_e64`, and a
 set src2 field is refused on the two-source forms. The op_sel bits are ignored, as they are by the assembler.
