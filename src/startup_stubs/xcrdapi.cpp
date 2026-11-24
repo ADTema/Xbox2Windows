@@ -756,7 +756,25 @@ void fail_unstarted(Object* self, Entry::Type type, Object* array, unsigned inde
 
 // An entry the queue has no room for (its work could not be built or grown): remembered in a small
 // record that needs no queue storage, failed by the next Submit. Only when even that record cannot be
-// allocated is the entry failed here, because nothing is left to remember it with.
+// allocated is the entry failed here, because nothing is left to remember it with (a documented last
+// resort: that entry may then be failed ahead of the ones stored before it).
+//
+// Order. One accumulator (Object::pending) holds the worst failure since the previous status entry,
+// and a status entry consumes it, so an entry that lost its place in the queue order would leak a
+// failure past the status entry it belongs to. Therefore, once an entry of this queue has been
+// deferred, every later entry until the next Submit is deferred too, even if it could be stored:
+// the stored entries (`waiting`) are an in-order prefix and the deferred ones an in-order suffix.
+// Submit handles the prefix first (moves it to the worker, or fails it), then fails the suffix.
+// Limitation: when the prefix runs on the worker, a status entry in the suffix fails synchronously
+// inside Submit and cannot see a failure the worker finds later in the prefix; the next status entry
+// will. After the first allocation failure the rest of the batch fails with E_OUTOFMEMORY even if
+// memory has recovered, which is acceptable under out-of-memory and preferable to reordering.
+bool has_unrecorded(Object* self)
+{
+    const std::lock_guard guard(setup_mutex());
+    return self->unrecorded_head != nullptr;
+}
+
 void defer_unrecorded(Object* self, const Entry& entry)
 {
     auto* node = new (std::nothrow) Unrecorded{nullptr, entry.type, entry.array, entry.index, entry.fence, entry.value};
@@ -800,18 +818,22 @@ void fail_waiting(Object* self, QueueWork* work)
     }
 }
 
-// Submit: entries that could not be stored fail now; waiting entries go to the worker, which is
-// started if it is not running yet (resources may have recovered since Enqueue). If it still cannot
-// be started, or the worker's list cannot grow, the waiting entries fail too: their status entries
-// and fences complete here, not earlier in Enqueue. No exception leaves Submit.
+// Submit: waiting entries (the in-order prefix) go to the worker, which is started if it is not
+// running yet (resources may have recovered since Enqueue). If it still cannot be started, or the
+// worker's list cannot grow, the waiting entries fail. Only then do the entries that could not be
+// stored (the in-order suffix, see defer_unrecorded) fail, so every failure reaches the status entry
+// after it, in order. Their status entries and fences complete here, not earlier in Enqueue. No
+// exception leaves Submit.
 void submit(Object* self)
 {
     QueueWork* work = ensure_work(self);
-    const bool started = work && start_worker(self, work);
-    fail_unrecorded(self);
-    if (!work) return;
-    if (!started) {
+    if (!work) {
+        fail_unrecorded(self);
+        return;
+    }
+    if (!start_worker(self, work)) {
         fail_waiting(self, work);
+        fail_unrecorded(self);
         return;
     }
     bool all_moved = true;
@@ -832,13 +854,14 @@ void submit(Object* self)
     }
     work->wake.notify_one();
     if (!all_moved) fail_waiting(self, work);
+    fail_unrecorded(self);
 }
 
 // Enqueue only records the entry, whether or not a worker runs; nothing completes before Submit.
 void push(Object* self, Entry&& entry)
 {
     QueueWork* work = ensure_work(self);
-    if (!work) {
+    if (!work || has_unrecorded(self)) {  // after a deferred entry every later one is deferred: order
         defer_unrecorded(self, entry);
         return;
     }

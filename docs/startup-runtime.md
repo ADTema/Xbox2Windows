@@ -424,11 +424,22 @@ These are measured on one executable; treat them as hypotheses for others.
   the small record itself cannot be allocated is the entry failed inside Enqueue. No exception
   leaves Enqueue or Submit: a request whose page tokens cannot be copied is recorded the same way,
   and if Submit cannot grow the worker's list the entries still waiting fail there.
+  Entry order is kept: once an entry has been deferred, every later entry until the next Submit is
+  deferred too, so the stored entries are an in-order prefix and the deferred ones the in-order
+  suffix. Submit handles the prefix first (worker or failure), then fails the suffix, so a failure
+  reaches the next status entry after it and never stays pending behind a status entry that
+  completed. Limits: when the prefix runs on the worker, a suffix status entry fails synchronously
+  inside Submit and cannot see a failure the worker finds later in the prefix (a later status entry
+  will); after the first allocation failure the rest of the batch fails with `E_OUTOFMEMORY` even if
+  memory recovered, which is preferable to reordering.
   `startup_storage_worker_start` compiles the stand-in into the test, redirects `CreateThread`
   and replaces `operator new` with one that fails the N-th allocation once and then behaves
   normally. It sweeps N over Enqueue and Submit, and checks pending status and an unsignaled fence
   before Submit, then a request that completed with correct data or a failure, a fence signaled
-  once, and a correct request on the same queue afterwards. A crash names the stage it was in.
+  once, and a correct request on the same queue afterwards. A second control fails the N-th allocation
+  of Enqueue and the M-th of Submit for 1 to 9 requests with the status entry before or after them
+  and checks that a failure is reported by one status entry only and that a later clean request and
+  status entry complete correctly. A crash names the stage it was in.
 
 ## Shortcuts that are known to be wrong
 

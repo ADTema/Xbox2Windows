@@ -426,6 +426,128 @@ bool page_tokens_allocation_fails(Fixture& f)
     return true;
 }
 
+// The entries of one queue keep their order when an allocation fails in the middle of Enqueue: the
+// failure of an entry must reach the next status entry after it and no other. A control enqueues
+// requests, a status entry and a fence signal (status_first: the status entry before the requests),
+// fails the N-th allocation of Enqueue and the M-th of Submit, and checks what a caller can see:
+//   - nothing completes inside Enqueue, no exception leaves Enqueue or Submit;
+//   - status 0 and the fence complete (the fence exactly once) and no destination holds partial data;
+//   - a clean request plus status 1 afterwards completes with the right bytes, and with S_OK when
+//     every failure came before status 0 (requests first); with the status entry first a request lost
+//     after it is reported once, by status 1, and
+//   - a second clean request plus status 2 completes with S_OK: a failure is reported by one status
+//     entry only and never stays pending behind it.
+// The number of requests is swept too, because the standard libraries differ in which entry needs a
+// new block of the queue's list. This is not a speculative sweep: for the old code, in which an entry
+// that could not be stored was failed at Submit before the entries that were stored, some (N, M,
+// requests) triple leaves a failure behind a status entry that already completed.
+constexpr int max_ordered_requests = 9;
+
+struct CleanRound {
+    bool completed = false;
+    long result = -1;
+    bool data = false;
+};
+
+CleanRound clean_round(Fixture& f, Fixture::Queue& q, unsigned index)
+{
+    CleanRound round;
+    std::vector<unsigned char> destination(f.plain.size(), untouched);
+    f.request(q, destination);
+    f.status_entry(q, index);
+    f.submit(q);
+    round.completed = f.wait(q, index);
+    if (round.completed) {
+        round.result = f.hresult(q, index);
+        round.data = destination == f.plain;
+    }
+    return round;
+}
+
+bool ordered_failure(Fixture& f, bool status_first, int requests, int fail_enqueue, int fail_submit)
+{
+    sweep_n = fail_enqueue;
+    sweep_m = fail_submit;
+    sweep_name = status_first ? "order_status_first" : "order_status_last";
+    sweep_all_threads = false;
+    trace("create");
+    Fixture::Queue q;
+    if (!f.create(q, f.vtables)) return fail("cannot create the queue");
+    std::vector<unsigned char> destination(f.plain.size(), untouched);
+    int failed_requests_at_enqueue = 0;
+    try {
+        trace("arm_enqueue");
+        arm(fail_enqueue);
+        if (status_first) {
+            trace("enqueue_status");
+            f.status_entry(q, 0);
+        }
+        for (int i = 0; i < requests; ++i) {
+            trace("enqueue_request", i + 1);
+            const int before = thrown;
+            f.request(q, destination);
+            failed_requests_at_enqueue += thrown - before;
+        }
+        if (!status_first) {
+            trace("enqueue_status");
+            f.status_entry(q, 0);
+        }
+        trace("enqueue_signal");
+        f.signal(q, 7);
+        disarm();
+        trace("enqueue_done");
+    } catch (...) {
+        disarm();
+        return fail("an exception left an Enqueue call");
+    }
+    if (f.complete(q, 0) || f.hresult(q, 0) != pending_status) return fail("the status entry completed inside Enqueue");
+    if (q.fence.signals != 0) return fail("the fence was signaled inside Enqueue");
+    if (!untouched_bytes(destination)) return fail("the destination changed inside Enqueue");
+    try {
+        trace("submit");
+        arm(fail_submit);
+        f.submit(q);
+        disarm();
+        trace("submit_done");
+    } catch (...) {
+        disarm();
+        return fail("an exception left Submit");
+    }
+    trace("serve_next_request");
+    const CleanRound first = clean_round(f, q, 1);
+    if (!first.completed) return fail("a request after the failure never completed");
+    if (!first.data) return fail("a request after the failure returned wrong data");
+    if (!status_first && first.result != 0) return fail("a failure that came before status 0 was reported again by status 1");
+    trace("serve_second_request");
+    const CleanRound second = clean_round(f, q, 2);
+    if (!second.completed) return fail("a second request after the failure never completed");
+    if (second.result != 0 || !second.data) return fail("a failure stayed pending behind a status entry that had completed");
+    trace("check_result");
+    if (!f.complete(q, 0)) return fail("status 0 stayed pending after later work completed");
+    if (f.hresult(q, 0) > 0 || (!untouched_bytes(destination) && destination != f.plain))
+        return fail("a failed request left partial data or a success-like status");
+    const DWORD start = GetTickCount();
+    while (q.fence.signals == 0 && GetTickCount() - start < completion_timeout_ms) Sleep(5);
+    if (q.fence.signals != 1 || q.fence.value != 7) return fail("the fence was not signaled exactly once");
+    return true;
+}
+
+bool entries_keep_their_order(Fixture& f)
+{
+    int cases = 0;
+    for (int status_first = 0; status_first <= 1; ++status_first)
+        for (int requests = 1; requests <= max_ordered_requests; ++requests)
+            for (int at_enqueue = 1; at_enqueue <= 14; ++at_enqueue)
+                for (int at_submit = 0; at_submit <= 3; ++at_submit, ++cases)
+                    if (!ordered_failure(f, status_first != 0, requests, at_enqueue, at_submit)) {
+                        std::fprintf(stderr, "  (%d requests, allocation %d at Enqueue, allocation %d at Submit)\n", requests,
+                                     at_enqueue, at_submit);
+                        return false;
+                    }
+    std::printf("entry order under allocation failure: %d cases\n", cases);
+    return true;
+}
+
 // A crash is never silent: whatever ends the process names the stage it was in.
 const char* volatile current_stage = "start";
 
@@ -545,6 +667,7 @@ int main()
     if (!stage("every_allocation_can_fail", every_allocation_can_fail, f)) return 1;
     if (!stage("every_allocation_on_every_thread_can_fail", every_allocation_on_every_thread_can_fail, f)) return 1;
     if (!stage("page_tokens_allocation_fails", page_tokens_allocation_fails, f)) return 1;
+    if (!stage("entries_keep_their_order", entries_keep_their_order, f)) return 1;
     std::puts("a queue that cannot start its worker or allocate completes status and fences at Submit, and recovers");
     return 0;
 }
