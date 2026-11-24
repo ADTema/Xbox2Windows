@@ -9370,6 +9370,59 @@ MAD64_WRONG = {
         (0, 2, lambda a, b, c, d: _words64(_mad64(True, 3, b, c | (d << 32))[0])[0], "inline -3 read as 3"),
     ),
 }
+# v_cvt_f64_i32 and v_cvt_f64_u32: exact conversion of a 32-bit signed or unsigned integer to binary64 in a VGPR pair
+# (LLVM 15 VOP1Instructions.td, the VOP1 opcodes for v_cvt_f64_i32 and v_cvt_f64_u32; every 32-bit integer is exact in
+# binary64, so there is no rounding and no mode dependence; not checked against the ISA document here and not measured
+# on a console). Bodies for uncompressed_export(): x = s44, XOR mask = s45, sentinels s46 and s47. v12 and v15 are
+# the sentinels next to the pair v[13:14] (an unaligned pair), and the pair words are exported as lo ^ M and hi ^ M:
+# the readback is bit exact, but the constant and every exported word stay a normal binary32 or zero, which the test
+# asserts, and a per-row M (chosen by the test) makes that possible for words such as 0xffe00000 (a NaN). The
+# references are Python's struct.pack('<d', float(x)), independent of the lowering.
+CVT_F64_INT_HEAD = ["v_mov_b32_e32 v12, s46", "v_mov_b32_e32 v15, s47"]
+CVT_F64_INT_TAIL = ["v_xor_b32_e32 v13, s45, v13", "v_xor_b32_e32 v14, s45, v14"]
+CVT_F64_INT_BODIES = {
+    "i32_sgpr": [*CVT_F64_INT_HEAD, "v_cvt_f64_i32_e32 v[13:14], s44", *CVT_F64_INT_TAIL],
+    "u32_sgpr": [*CVT_F64_INT_HEAD, "v_cvt_f64_u32 v[13:14], s44", *CVT_F64_INT_TAIL],
+    "i32_vgpr": [*CVT_F64_INT_HEAD, "v_mov_b32_e32 v18, s44", "v_cvt_f64_i32 v[13:14], v18", *CVT_F64_INT_TAIL],
+    "u32_vgpr": [*CVT_F64_INT_HEAD, "v_mov_b32_e32 v18, s44", "v_cvt_f64_u32_e32 v[13:14], v18", *CVT_F64_INT_TAIL],
+}
+CVT_F64_INT_OPS = ("v_cvt_f64_i32", "v_cvt_f64_u32")
+# Zero, both signed endpoints and their neighbours, -1, UINT_MAX and UINT_MAX - 1, 0x7fffffff as an unsigned value, the
+# values around 2^24 with their negative counterparts, and two normal binary32 patterns (1.0 and -1.0 as integers).
+CVT_F64_INT_ROWS = (0, 0x80000000, 0x7FFFFFFF, 0xFFFFFFFF, 1, 0xFFFFFFFE, 0x00FFFFFF, 0x01000000, 0x01000001,
+                    0xFF000001, 0xFF000000, 0xFEFFFFFF, 0x80000001, 0x3F800000, 0xBF800000)
+CVT_F64_INT_SENTINELS = (0x3E123457, 0x40490FDB)
+_CVT_F64_INT_MASKS = (0x3F800000, 0x40000000, 0x20000000, 0x10000000)
+
+
+def cvt_f64_int_group(group):
+    return uncompressed_export(CVT_F64_INT_BODIES[group])
+
+
+def cvt_f64_int_ref(signed, x):
+    """(low, high) binary64 words of the integer x read as signed or unsigned, from Python's own double."""
+    return struct.unpack("<II", struct.pack("<d", float(_sext32(x) if signed else x)))
+
+
+def cvt_f64_int_mask(x):
+    """A mask M with both words of x, read either way, normal or zero after the xor."""
+    words = [word for signed in (False, True) for word in cvt_f64_int_ref(signed, x)]
+    return next(m for m in _CVT_F64_INT_MASKS if all(binary32_normal_or_zero(word ^ m) for word in words))
+
+
+def cvt_f64_int_rows(group):
+    """Rows of a group: the whole set from an SGPR, and the rows that are normal binary32 words from a VGPR (a VGPR
+    holds a float, so only a normal word or zero is moved through one)."""
+    return [x for x in CVT_F64_INT_ROWS if group.endswith("sgpr") or binary32_normal_or_zero(x)]
+
+
+def cvt_f64_int_exported(signed, x, mask=None):
+    """The four exported words: sentinel, low ^ M, high ^ M, sentinel."""
+    mask = cvt_f64_int_mask(x) if mask is None else mask
+    lo, hi = cvt_f64_int_ref(signed, x)
+    return (CVT_F64_INT_SENTINELS[0], lo ^ mask, hi ^ mask, CVT_F64_INT_SENTINELS[1])
+
+
 # v_add_co_ci_u32, v_sub_co_ci_u32 and v_subrev_co_ci_u32: the carry-out add and subtracts above, plus the carry or
 # borrow of each lane read from a lane mask. Bodies for uncompressed_export(): A, B, C and D are the constants in
 # s44 to s47, v18 = B and v19 = D. The carry-out form of the same operation leaves the carry of op(A, B) in vcc_lo
@@ -10250,6 +10303,76 @@ def check_mad64_lowering():
         *MAD64_PREFIX, "v_mad_i64_i32 v[12:13], null, s44, v18, v[20:21]", "v_cndmask_b32_e64 v14, 0.5, 1.0, vcc_lo"]))
     must_reject(translate_int, uncompressed_export([
         *MAD64_PREFIX, "v_mad_u64_u32 v[12:13], s60, s44, v18, v[20:21]", "v_cndmask_b32_e64 v14, 0.5, 1.0, vcc_lo"]))
+
+
+def check_cvt_f64_int_lowering():
+    """Static checks for v_cvt_f64_i32 and v_cvt_f64_u32 as written by cvt_f64_int_group()."""
+    assert set(CVT_F64_INT_BODIES) == {"i32_sgpr", "u32_sgpr", "i32_vgpr", "u32_vgpr"}
+    sources = {group: translate_int(cvt_f64_int_group(group)) for group in CVT_F64_INT_BODIES}
+    assert len(set(sources.values())) == 4
+    for group, source in sources.items():
+        signed = group.startswith("i32")
+        # The sign is taken from bit 31 and the magnitude negated for the signed form only.
+        negate = re.search(r"uint c(\d+)u = c\1s != 0u \? 0u - c\1x : c\1x;", source)
+        assert bool(negate) == signed, group
+        assert "firstbithigh(" in source and "(1023u + c" in source, group
+        assert "double" not in source and "asdouble" not in source, group
+    # The pair is v[13:14]: the sentinels in v12 and v15 stay the constants s46 and s47.
+    exports = [line for line in sources["i32_sgpr"].splitlines() if line.strip().startswith("return uint4(")]
+    assert len(exports) == 1 and exports[0].count("asuint(") == 4, exports
+    assert set(CVT_F64_INT_OPS) <= {op.removesuffix("_e32") for op in ACCEPTED}, CVT_F64_INT_OPS
+
+    def program(*lines):
+        return uncompressed_export([*MAD64_PREFIX, *lines])
+
+    for good in ("v_cvt_f64_i32 v[12:13], v18", "v_cvt_f64_u32_e32 v[12:13], s44", "v_cvt_f64_i32_e32 v[254:255], v18",
+                 "v_cvt_f64_u32 v[12:13], 0x12345678", "v_cvt_f64_i32 v[12:13], -1", "v_cvt_f64_u32 v[12:13], 64",
+                 "v_cvt_f64_i32 v[12:13], 1.0", "v_cvt_f64_u32 v[0:1], v18", "v_cvt_f64_i32 v[17:18], v18",
+                 "v_cvt_f64_i32 v[12:13], v20"):
+        translate_int(program(good))
+    # A word of the pair is an ordinary numeric register to a later integer or float reader.
+    translate_int(program("v_cvt_f64_i32 v[12:13], v18", "v_add_f32_e32 v14, v12, v13"))
+    # Only the unmodified VOP1 spellings are lowered: an _e64 suffix, clamp, omod and the source modifiers (which LLVM 15
+    # does not assemble for an integer source), DPP and SDWA, a destination that is not a two-register VGPR range,
+    # an untracked source or a source that is not one dword, and any f64 consumer of the pair.
+    for op in ("i32", "u32"):
+        for bad in (f"v_cvt_f64_{op}_e64 v[12:13], v18", f"v_cvt_f64_{op}_e64 v[12:13], v18 clamp",
+                    f"v_cvt_f64_{op} v[12:13], v18 clamp", f"v_cvt_f64_{op}_e64 v[12:13], v18 mul:2",
+                    f"v_cvt_f64_{op} v[12:13], v18 div:2", f"v_cvt_f64_{op}_e64 v[12:13], -v18",
+                    f"v_cvt_f64_{op}_e64 v[12:13], |v18|", f"v_cvt_f64_{op} v[12:13], -v18", f"v_cvt_f64_{op} v[12:13], |v18|",
+                    f"v_cvt_f64_{op}_dpp v[12:13], v18 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+                    f"v_cvt_f64_{op} v[12:13], v18 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+                    f"v_cvt_f64_{op}_sdwa v[12:13], v18 dst_sel:DWORD src0_sel:WORD_1",
+                    f"v_cvt_f64_{op} v[12:13], v18 src0_sel:WORD_1",
+                    f"v_cvt_f64_{op} v12, v18", f"v_cvt_f64_{op} v[12:12], v18", f"v_cvt_f64_{op} v[12:14], v18",
+                    f"v_cvt_f64_{op} v[13:12], v18", f"v_cvt_f64_{op} v[255:256], v18", f"v_cvt_f64_{op} v[256:257], v18",
+                    f"v_cvt_f64_{op} s[12:13], v18", f"v_cvt_f64_{op} v[012:13], v18", f"v_cvt_f64_{op} v[12:13]",
+                    f"v_cvt_f64_{op} v[12:13], v18, v18", f"v_cvt_f64_{op} v[12:13], v[18:19]",
+                    f"v_cvt_f64_{op} v[12:13], s[44:45]", f"v_cvt_f64_{op} v[12:13], vcc_lo",
+                    f"v_cvt_f64_{op} v[12:13], v99", f"v_cvt_f64_{op} v[12:13], s60", f"v_cvt_f64_{op} v[12:13], 1e9"):
+            must_reject(translate_int, program(bad))
+    translate_f64(program("v_cvt_f64_i32 v[12:13], v18", "v_cmp_lt_f64_e64 s52, v[12:13], v[12:13]"))
+    # Arithmetic on the pair and the conversions back are refused.
+    for consumer in ("v_add_f64 v[14:15], v[12:13], v[12:13]", "v_mul_f64 v[14:15], v[12:13], v[12:13]",
+                     "v_cvt_f32_f64_e32 v14, v[12:13]", "v_cvt_i32_f64_e32 v14, v[12:13]",
+                     "v_cvt_u32_f64_e32 v14, v[12:13]", "v_mov_b32_e32 v14, v[12:13]"):
+        must_reject(translate_int, program("v_cvt_f64_i32 v[12:13], v18", consumer))
+    # The conversion is refused inside a masked region, like the other integer arithmetic.
+    must_reject(translate_int, uncompressed_export([
+        *MAD64_PREFIX, "v_cmp_lt_f32_e64 vcc_lo, v12, s44", "s_and_saveexec_b64 s[60:61], vcc",
+        "v_cvt_f64_i32 v[12:13], v18", MASKED_OR_RESTORE]))
+    # Bookkeeping of the draw: every exported word is a normal binary32 or zero and no sentinel equals a pair word.
+    for group in CVT_F64_INT_BODIES:
+        for x in cvt_f64_int_rows(group):
+            for signed in (False, True):
+                words = cvt_f64_int_exported(signed, x)
+                assert all(binary32_normal_or_zero(word) for word in words), (group, hex(x), [hex(w) for w in words])
+                assert not set(CVT_F64_INT_SENTINELS) & set(words[1:3]), (group, hex(x))
+    assert binary32_normal_or_zero(0x3F800000) and all(binary32_normal_or_zero(m) for m in _CVT_F64_INT_MASKS)
+    # Reference sanity: the independent Python words for known values.
+    assert cvt_f64_int_ref(True, 0x80000000) == (0, 0xC1E00000) and cvt_f64_int_ref(False, 0x80000000) == (0, 0x41E00000)
+    assert cvt_f64_int_ref(False, 0xFFFFFFFF) == (0xFFE00000, 0x41EFFFFF) and cvt_f64_int_ref(True, 0xFFFFFFFF) == (0, 0xBFF00000)
+    assert cvt_f64_int_ref(False, 0) == cvt_f64_int_ref(True, 0) == (0, 0)
 
 
 def check_carry_in_lowering():
@@ -13429,6 +13552,7 @@ def check_controls(directory):
     check_carry_out_lowering()
     check_carry_in_lowering()
     check_mad64_lowering()
+    check_cvt_f64_int_lowering()
     check_sdwa_integer_lowering()
     check_pack_int16_lowering()
     check_sat_pack_u8_lowering()
@@ -15348,6 +15472,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((uncompressed_export(carry_out_group(op)), translate_int) for op in CARRY_OUT_OPS)
     fixtures.extend((uncompressed_export(carry_in_group(op)), translate_int) for op in CARRY_IN_OPS)
     fixtures.extend((uncompressed_export(mad64_group(group)), translate_int) for group in MAD64_BODIES)
+    fixtures.extend((cvt_f64_int_group(group), translate_int) for group in CVT_F64_INT_BODIES)
     fixtures.extend((uncompressed_export(sdwa_integer_group(group)), translate_int) for group in SDWA_INT_BODIES)
     fixtures.extend((uncompressed_export(pack_group(group)), translate_int) for group in PACK_BODIES)
     fixtures.append((sat_pack_u8_program(), translate_int))
@@ -16191,6 +16316,68 @@ def check_mad64_draws(directory, compiler, renderer, backend):
             wrong_words[channel] = wrong(*rows[index]) & 0xffffffff
             assert wrong_words[channel] != right[index][channel], (group, reason)
             add_case(cases, rows[index], wrong_words, "mismatch")
+        try:
+            run_pixel_batch(renderer, backend, shader, cases)
+        except subprocess.CalledProcessError as error:
+            if error.returncode == 77:
+                return 77
+            raise
+    return 0
+
+
+def check_cvt_f64_int_draws(directory, compiler, renderer, backend):
+    """Draw v_cvt_f64_i32 and v_cvt_f64_u32 through the integer readback target, bit for bit.
+
+    Each program of cvt_f64_int_group() is compiled once and drawn in one renderer batch: every row with the words
+    of Python's own double, then negative controls that must report a mismatch: the two words swapped, the other
+    signedness, a sentinel replaced by a pair word (so a write next to the pair would show), the exponent one too
+    high and one mantissa bit flipped. The shader uses no double, so the draws need no capability. On a desktop
+    GPU the draws establish that the translated shader computes the stated operation, not what the console does.
+    """
+    source = directory / "cvt_f64_int.hlsl"
+    shader = directory / "cvt_f64_int.cso"
+
+    def add_case(cases, x, mask, words, status):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, x, mask, *CVT_F64_INT_SENTINELS)
+        case = directory / f"cvt_f64_int-{len(cases)}.case"
+        case.write_bytes(bytes(constants) + struct.pack("<4I", *words) * 64)
+        cases.append((case, status))
+
+    for group in CVT_F64_INT_BODIES:
+        signed = group.startswith("i32")
+        source.write_text(translate_int(cvt_f64_int_group(group)), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        rows = cvt_f64_int_rows(group)
+        cases = []
+        controls = {"swapped words": 0, "other signedness": 0, "sentinel": 0, "exponent": 0, "mantissa": 0}
+        for x in rows:
+            mask = cvt_f64_int_mask(x)
+            right = cvt_f64_int_exported(signed, x, mask)
+            add_case(cases, x, mask, right, "pass")
+            first, low, high, last = right
+            if low != high:
+                add_case(cases, x, mask, (first, high, low, last), "mismatch")
+                controls["swapped words"] += 1
+            other = cvt_f64_int_exported(not signed, x, mask)
+            if other != right:
+                add_case(cases, x, mask, other, "mismatch")
+                controls["other signedness"] += 1
+            add_case(cases, x, mask, (low, low, high, last), "mismatch")
+            add_case(cases, x, mask, (first, low, high, high), "mismatch")
+            controls["sentinel"] += 2
+            if x:
+                add_case(cases, x, mask, (first, low, ((high ^ mask) + 0x00100000 & 0xffffffff) ^ mask, last), "mismatch")
+                add_case(cases, x, mask, (first, low ^ 1, high, last), "mismatch")
+                controls["exponent"] += 1
+                controls["mantissa"] += 1
+        # The controls are not vacuous: every kind is drawn, the two signednesses differ on a drawn row, and the
+        # endpoints and the 2^24 neighbours are in the rows.
+        assert all(controls.values()), (group, controls)
+        assert any(cvt_f64_int_exported(True, x) != cvt_f64_int_exported(False, x) for x in rows), group
+        assert {0, 0x01000000} <= set(rows), group
+        if group.endswith("sgpr"):
+            assert {0x80000000, 0x7FFFFFFF, 0xFFFFFFFF, 0x00FFFFFF, 0x01000001} <= set(rows), group
         try:
             run_pixel_batch(renderer, backend, shader, cases)
         except subprocess.CalledProcessError as error:
@@ -20397,7 +20584,7 @@ def main():
         if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc",
                     "draw-e64-integer", "draw-bfm", "draw-brev", "draw-align",
                     "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap",
-                    "draw-mac-legacy", "draw-carry-out", "draw-carry-in", "draw-mad64", "draw-pack-int16", "draw-pack-b32",
+                    "draw-mac-legacy", "draw-carry-out", "draw-carry-in", "draw-mad64", "draw-cvt-f64-int", "draw-pack-int16", "draw-pack-b32",
                     "draw-sad",
                     "draw-int16-vop3", "draw-int16-ternary", "draw-compressed-export", "draw-uncompressed-export",
                     "draw-uncompressed-integer-export",
@@ -20417,6 +20604,7 @@ def main():
                         "draw-carry-out": check_carry_out_draws,
                         "draw-carry-in": check_carry_in_draws,
                         "draw-mad64": check_mad64_draws,
+                        "draw-cvt-f64-int": check_cvt_f64_int_draws,
                         "draw-sdwa-integer": check_sdwa_integer_draws,
                         "draw-bfm": check_bfm_draw,
                         "draw-brev": check_brev_draw,

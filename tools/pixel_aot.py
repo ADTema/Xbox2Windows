@@ -4342,6 +4342,32 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    precise float alu{i}l = asfloat(m{i}lo);")
             lines.append(f"    precise float alu{i}h = asfloat(m{i}hi);")
             vector[names[0]], vector[names[1]] = f"alu{i}l", f"alu{i}h"
+        elif m := match(r"v_cvt_f64_(i32|u32)(?:_e32)? v\[(0|[1-9]\d*):(0|[1-9]\d*)\], ([^,\s]+)"):
+            # Exact 32-bit integer to binary64 conversion into a VGPR pair v[d:d+1]. Every 32-bit integer is
+            # representable, so there is no rounding: the two binary64 words are built from uint operations (sign,
+            # exponent 1023 + the index of the highest set bit, the bits below it shifted to the top of the 52-bit
+            # fraction) and no HLSL double is used. Zero gives +0.0 (both words 0); INT_MIN gives 0xc1e00000_00000000.
+            # Only the unmodified VOP1 forms are lowered (plain and _e32, as LLVM 15 prints them); an _e64 suffix, clamp,
+            # omod, DPP and SDWA are left to the fall-through. The source is read before the pair is written. The two
+            # words are ordinary numeric registers, including for the supported binary64 comparisons.
+            kind, first, last, src = m.groups()
+            first, last = int(first), int(last)
+            names = (f"v{first}", f"v{last}")
+            if (mask != "entry" or last != first + 1 or last > 255 or any(name in sample_dest for name in names)):
+                raise ValueError("Invalid 32-bit integer to binary64 conversion")
+            signed = kind == "i32"
+            lines.append(f"    uint c{i}x = {int_operand(src, scalar, vector, pending, sample_dest, signed=False)};")
+            if signed:
+                lines.append(f"    uint c{i}s = c{i}x & 0x80000000u;")
+                lines.append(f"    uint c{i}u = c{i}s != 0u ? 0u - c{i}x : c{i}x;")
+            else:
+                lines.append(f"    uint c{i}s = 0u;")
+                lines.append(f"    uint c{i}u = c{i}x;")
+            lines.append(f"    uint c{i}n = c{i}u == 0u ? 0u : firstbithigh(c{i}u);")
+            lines.append(f"    uint c{i}f = (c{i}u << (31u - c{i}n)) & 0x7fffffffu;")
+            lines.append(f"    precise float alu{i}l = asfloat(c{i}u == 0u ? 0u : c{i}f << 21);")
+            lines.append(f"    precise float alu{i}h = asfloat(c{i}u == 0u ? 0u : c{i}s | ((1023u + c{i}n) << 20) | (c{i}f >> 11));")
+            vector[names[0]], vector[names[1]] = f"alu{i}l", f"alu{i}h"
         elif m := match(rf"v_(add|sub|subrev)_co_ci_u32_(e32|e64) (v\d+), {LANE_MASK}, ([^,\s]+), ([^,\s]+), {LANE_MASK}"):
             # The carry-out add and subtracts above with a carry or borrow of each lane read from a lane mask.
             # LLVM 15 prints both encodings with their suffix. The VOP2 (e32) encoding reads and writes VCC and
