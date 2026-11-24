@@ -132,23 +132,30 @@ inline bool stored(Stream& s) noexcept
     return true;
 }
 
+struct FixedTables {
+    Huffman lencode;
+    Huffman distcode;
+};
+
+inline FixedTables make_fixed_tables() noexcept
+{
+    FixedTables tables{};
+    std::uint8_t lengths[288];
+    int i = 0;
+    for (; i < 144; ++i) lengths[i] = 8;
+    for (; i < 256; ++i) lengths[i] = 9;
+    for (; i < 280; ++i) lengths[i] = 7;
+    for (; i < 288; ++i) lengths[i] = 8;
+    construct(tables.lencode, lengths, 288);
+    for (i = 0; i < 30; ++i) lengths[i] = 5;
+    construct(tables.distcode, lengths, 30);
+    return tables;
+}
+
 inline bool fixed_block(Stream& s) noexcept
 {
-    static Huffman lencode, distcode;
-    static bool ready = false;
-    if (!ready) {
-        std::uint8_t lengths[288];
-        int i = 0;
-        for (; i < 144; ++i) lengths[i] = 8;
-        for (; i < 256; ++i) lengths[i] = 9;
-        for (; i < 280; ++i) lengths[i] = 7;
-        for (; i < 288; ++i) lengths[i] = 8;
-        construct(lencode, lengths, 288);
-        for (i = 0; i < 30; ++i) lengths[i] = 5;
-        construct(distcode, lengths, 30);
-        ready = true;
-    }
-    return codes(s, lencode, distcode);
+    static const FixedTables tables = make_fixed_tables();
+    return codes(s, tables.lencode, tables.distcode);
 }
 
 inline bool dynamic_block(Stream& s) noexcept
