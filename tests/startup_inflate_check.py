@@ -434,6 +434,9 @@ def main(probe, bitwise, faulty, faulty_margin):
         # before the output and must be rejected with only the four literals decoded.
         expect_decoded(probe, work, "raw_distance_4", fixed_match_block(b"ABCD", 3, 0, 0), b"ABCDABC", 64, "raw")
         expect_rejected(probe, work, "raw_distance_5", fixed_match_block(b"ABCD", 4, 1, 0), 64, "raw", 4)
+        # The same with input and capacity to spare, so the decoder's fast loop meets the match.
+        expect_rejected(probe, work, "raw_distance_5_fast", fixed_match_block(b"ABCD", 4, 1, 0) + bytes(32), 4096,
+                        "raw", 4)
 
         cases, reference = expect_differential(probe, bitwise, work, rng)
         expect_faulty_caught(faulty, work, cases, reference)

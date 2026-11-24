@@ -326,7 +326,7 @@ zlib encodes seeded synthetic data as stored, fixed and dynamic Huffman blocks, 
 the 32 KiB window and a sync flush between blocks; each result must equal the input. A stream with
 one byte too little capacity and a truncated stream must be rejected without writes past the
 destination. On bare deflate data, a match that starts at the first output byte decodes and one that
-starts a byte earlier is rejected before it copies anything.
+starts a byte earlier is rejected before it copies anything, also with input and capacity to spare.
 
 The decoder looks Huffman codes of up to 10 bits up in a table filled when the code is built; longer
 codes and the last byte of input are decoded one bit at a time. A differential case decodes 900
