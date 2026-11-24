@@ -65,6 +65,8 @@ int main()
     for (const Case& test : cases) {
         const Fn native = reinterpret_cast<Fn>(const_cast<unsigned char*>(test.native_bytes));
         const word a = test.inaccessible ? reinterpret_cast<word>(page) : 0x0123456789ABCDEFull;
+        // The memory forms address [base + b], i.e. page+17 or page+25 here, which is still inside the one
+        // inaccessible page, so an evaluated operand would fault rather than read something mapped.
         const word b = 17;
         word native_out = 0;
         bool faulted = false;
@@ -73,11 +75,20 @@ int main()
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             faulted = true;
         }
-        const word lifted_out = test.lifted(a, b, 0);
-        const bool ok = !faulted && native_out == lifted_out;
-        std::printf("%s (%s): native=0x%llx lifted=0x%llx faulted=%d %s\n", test.name, test.description,
-                    static_cast<unsigned long long>(native_out), static_cast<unsigned long long>(lifted_out),
-                    faulted ? 1 : 0, ok ? "ok" : "MISMATCH");
+        // The lifted body is called under the same guard: a lowering that evaluated the operand must be
+        // reported as a mismatch, not crash the fixture.
+        word lifted_out = 0;
+        bool lifted_faulted = false;
+        __try {
+            lifted_out = test.lifted(a, b, 0);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            lifted_faulted = true;
+        }
+        const bool ok = !faulted && !lifted_faulted && native_out == lifted_out;
+        std::printf("%s (%s): native=0x%llx lifted=0x%llx faulted=%d lifted_faulted=%d %s\n", test.name,
+                    test.description, static_cast<unsigned long long>(native_out),
+                    static_cast<unsigned long long>(lifted_out), faulted ? 1 : 0, lifted_faulted ? 1 : 0,
+                    ok ? "ok" : "MISMATCH");
         if (!ok) ++failures;
     }
 

@@ -33,11 +33,19 @@ ACCEPTED = {
     "0f19c0": "reserved nop register form",
     "0f1d00": "reserved nop 0F 1D [rax]",
     "0f1e00": "reserved nop 0F 1E [rax]",
+    "f30f1e00": "reserved nop F3 0F 1E [rax] (same iced code; only reg=1/mod=11 is RDSSP)",
     "0f1f4000": "nop dword [rax+0]",
 }
 
-# Encodings in the same space that must stay refused (each decodes as its own mnemonic).
+# Encodings in the same space that iced also decodes as RESERVEDNOP but that are not part of this slice, plus
+# the ones that decode as their own mnemonic. Listing them keeps a wider accepted set a visible change.
 REFUSED = {
+    "0f0dc0": "0F 0D Group P (aliases PREFETCH Exclusive)",
+    "0f18f0": "0F 18 /6 (PREFETCHIT1 under CPUID Fn8000_0021_EAX)",
+    "0f18f8": "0F 18 /7 (PREFETCHIT0)",
+    "0f1a00": "0F 1A",
+    "0f1b00": "0F 1B",
+    "0f1c08": "0F 1C /1",
     "f30f1efa": "endbr64",
     "f30f1efb": "endbr32",
     "0f1c00": "cldemote [rax]",

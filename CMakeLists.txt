@@ -2959,21 +2959,21 @@ if(EXISTS "${INTAKE_PYTHON}")
         DEPENDS cpu_integer_flags_original tests/cpu/integer_flags_check.py tools/ffx_version_query.py
             tools/x87_lower.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
     add_library(cpu_integer_flags_controls SHARED "${cpu_integer_flags_controls_cpp}")
-# Reserved/hint NOP forms in the shared lowering (#1476): each accepted encoding must lower to a no-op,
-# and the neighbours that decode as another mnemonic (ENDBR64/32, CLDEMOTE, RDSSPD) must stay refused.
-add_test(NAME cpu_hint_nop COMMAND "${INTAKE_PYTHON}" -B
-    "${CMAKE_SOURCE_DIR}/tests/cpu/hint_nop_check.py")
-# Native-versus-lifted comparison for the same hint-NOP encodings: the native bytes and the lowered C++
-# are generated from one byte list, the memory forms are handed a PAGE_NOACCESS pointer, and two controls
-# prove the fixture can see a memory access and a register write at all (#1476).
-add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/hint_nop_fixture.cpp"
-    COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/hint_nop_fixture.py" emit
-        "${CMAKE_CURRENT_BINARY_DIR}/hint_nop_fixture.cpp"
-    DEPENDS tests/cpu/hint_nop_fixture.py tools/ffx_version_query.py VERBATIM)
-add_executable(cpu_hint_nop_fixture "${CMAKE_CURRENT_BINARY_DIR}/hint_nop_fixture.cpp")
-target_compile_features(cpu_hint_nop_fixture PRIVATE cxx_std_17)
-add_test(NAME cpu_hint_nop_fixture COMMAND cpu_hint_nop_fixture)
-set_tests_properties(cpu_hint_nop_fixture PROPERTIES SKIP_RETURN_CODE 77)
+    # Reserved/hint NOP forms in the shared lowering (#1476): each accepted encoding must lower to a no-op,
+    # and the neighbours that decode as another mnemonic (ENDBR64/32, CLDEMOTE, RDSSPD) must stay refused.
+    add_test(NAME cpu_hint_nop COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/hint_nop_check.py")
+    # Native-versus-lifted comparison for the same hint-NOP encodings: the native bytes and the lowered C++
+    # are generated from one byte list, the memory forms are handed a PAGE_NOACCESS pointer, and two controls
+    # prove the fixture can see a memory access and a register write at all (#1476).
+    add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/hint_nop_fixture.cpp"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/hint_nop_fixture.py" emit
+            "${CMAKE_CURRENT_BINARY_DIR}/hint_nop_fixture.cpp"
+        DEPENDS tests/cpu/hint_nop_fixture.py tools/ffx_version_query.py VERBATIM)
+    add_executable(cpu_hint_nop_fixture "${CMAKE_CURRENT_BINARY_DIR}/hint_nop_fixture.cpp")
+    target_compile_features(cpu_hint_nop_fixture PRIVATE cxx_std_17)
+    add_test(NAME cpu_hint_nop_fixture COMMAND cpu_hint_nop_fixture)
+    set_tests_properties(cpu_hint_nop_fixture PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME cpu_aot_integer_flags COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/integer_flags_check.py" check
         "$<TARGET_FILE:cpu_integer_flags_original>"
