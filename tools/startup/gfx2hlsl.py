@@ -770,12 +770,15 @@ class Stage:
             return ('s%d' % r[1]) if r and r[0] == 's' and r[1] != r[2] else tok
         srcs = [low(t) for t in srcs]
         dname = low(ops[0])
+        shift_add = base in SHIFT_ADD
         word_complement = base in ('s_nand_b32', 's_nor_b32', 's_xnor_b32')
         word_pack = base == 's_pack_hh_b32_b16'
-        if word_complement or word_pack:
+        if shift_add or word_complement or word_pack:
             # The per-lane mask cannot supply the full word needed by these operations.
             if self.is_lane_mask(dname) or any(self.is_lane_mask(t) for t in srcs):
                 raise Unsupported('%s on a lane mask' % base)
+        if shift_add and dname != 'm0' and (not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105):
+            raise Unsupported('%s destination %s' % (base, dname))
         if word_pack:
             if dname != 'm0' and (dst is None or dst[0] != 's' or dst[1] > 105):
                 raise Unsupported('%s destination %s' % (base, dname))
@@ -794,7 +797,7 @@ class Stage:
         if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
             if scc and self.tracks_uniformity():
                 self.scc_uniform = False  # nothing is emitted here, so the run-time scc is stale
-            if word_complement:
+            if shift_add or word_complement:
                 raise Unsupported('scc from descriptor data')
             if word_pack:
                 raise Unsupported('%s on descriptor data' % base)
@@ -825,6 +828,10 @@ class Stage:
             return None
         values = [self.u(t) for t in srcs]
         expr = text.format(*values)
+        if shift_add:
+            # carry = bits shifted out of S0, or a wrap of the 32-bit sum; read before the destination is written
+            n = SHIFT_ADD[base]
+            self.set_scc('(%s >> %d) != 0 || (%s) < %s' % (values[0], 32 - n, expr, values[1]))
         if dname == 'm0':
             self.sym.pop('m0', None)
             self.emit('m0 = %s;' % expr)
@@ -1882,7 +1889,12 @@ SCA = {
     's_pack_hh_b32_b16': ('({0} >> 16) | ({1} & 0xffff0000u)', None),
     # s_bfm_b32: a mask of S0[4:0] ones shifted left by S1[4:0]; SCC unchanged.
     's_bfm_b32': ('(((1u << ({0} & 31)) - 1) << ({1} & 31))', None),
+    # s_lshlN_add_u32: low 32 bits of (S0 << N) + S1. SHIFT_ADD also supplies SCC for wide overflow.
+    's_lshl1_add_u32': ('({0} << 1) + {1}', None), 's_lshl2_add_u32': ('({0} << 2) + {1}', None),
+    's_lshl3_add_u32': ('({0} << 3) + {1}', None), 's_lshl4_add_u32': ('({0} << 4) + {1}', None),
 }
+# shift amount of the scalar shift-and-add forms; their SCC is a carry from the sources, not a rule over the result
+SHIFT_ADD = {'s_lshl1_add_u32': 1, 's_lshl2_add_u32': 2, 's_lshl3_add_u32': 3, 's_lshl4_add_u32': 4}
 for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt', '<'), ('le', '<=')):
     for _typ, _cast in (('i32', 'int({0}) %s int({1})'), ('u32', '{0} %s {1}')):
         def _make(op=_op, cast=_cast):
@@ -1899,7 +1911,7 @@ for _bit in (0, 1):
                 raise Unsupported('scalar bit test requires two unmodified operands')
             if any(self.is_lane_mask(tok) for tok in ops):
                 raise Unsupported('scalar bit test on a lane mask')
-            self.emit('scc = ((%s >> (%s & 31)) & 1u) == %du;' % (self.u(ops[0]), self.u(ops[1]), bit))
+            self.set_scc('((%s >> (%s & 31)) & 1u) == %du' % (self.u(ops[0]), self.u(ops[1]), bit))
         return handler
     setattr(Stage, 'op_s_bitcmp%d_b32' % _bit, _make_bitcmp())
 
