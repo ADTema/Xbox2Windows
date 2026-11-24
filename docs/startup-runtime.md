@@ -115,6 +115,10 @@ These are measured on one executable; treat them as hypotheses for others.
   the one on the calling thread's stack is the return buffer.
 - **Inline samplers.** Pixel shaders build sampler descriptors from constants (`s_movk_i32`,
   `s_bfm_b32`, 64-bit moves); the translator folds those into static samplers.
+- **3D images.** `image_sample` with `dim:SQ_RSRC_IMG_3D` becomes a `Texture3D<float4>` sampled with
+  a `float3` of the three address registers in order; 1D images are refused. A source-built pixel
+  stage draws one texel of a 2x2x2 texture on WARP and hardware with DXC and FXC
+  (`ctest --preset release --no-tests=error -R "^startup_image_3d_"`).
 
 ## Shortcuts that are known to be wrong
 
