@@ -260,6 +260,21 @@ def expect_value_error(function, program, message):
         raise AssertionError(f"Expected rejection: {message}")
 
 
+def expect_unbound_operand(function, program, bank, register, index, offset, instruction):
+    """Require pixel_aot.UnboundOperand (a ValueError) naming the register and the instruction that reads it."""
+    try:
+        function(program)
+    except Exception as error:  # the type is the assertion
+        assert type(error).__name__ == "UnboundOperand" and isinstance(error, ValueError), \
+            f"Expected UnboundOperand for {register}, got {type(error).__name__}: {error}"
+        fields = (error.bank, error.register, error.index, error.offset, error.instruction)
+        assert fields == (bank, register, index, offset, instruction), fields
+        where = "" if offset is None else f" (byte offset {offset:#x})"
+        assert str(error) == f"Unbound {bank} operand {register} at instruction {index}{where}: {instruction}", error
+    else:
+        raise AssertionError(f"An unbound {register} was accepted")
+
+
 def compile_shader(compiler, source, shader, *, listing=None, mode=F32_DENORM_MODE, ieee=True):
     """Run DXC on one translated shader under an explicit binary32 denormal mode."""
     # DXC accepts -denorm only at shader model 6.2 and above; ps_6_2 is the minimum target.
@@ -2330,12 +2345,7 @@ def check_mac_legacy_lowering():
         expect_value_error(translate, changed, "Invalid arithmetic operation")
     # The accumulator must hold a tracked value, as for v_mac_f32: v20 was never written.
     changed = swap("v_mac_legacy_f32_e32 v12, s44, v18", "v_mac_legacy_f32_e32 v20, s44, v18")
-    try:
-        translate(changed)
-    except KeyError as error:
-        assert error.args == ("v20",), error
-    else:
-        raise AssertionError("An untracked accumulator was accepted")
+    expect_unbound_operand(translate, changed, "vector", "v20", pos, None, "v_mac_legacy_f32_e32 v20, s44, v18")
 
 
 def check_e64_approx_draws(directory, compiler, renderer, backend):
@@ -6714,12 +6724,8 @@ def check_three_constant_buffers() -> None:
                        "Constant descriptor differs from binding contract")
     expect_value_error(lambda p: bound(p, None, ()), program, "Unresolved constant buffer binding")
     # An entry register outside the contract stays unbound.
-    try:
-        bound(program, extra_constants=((20, 0x60),))
-    except KeyError as error:
-        assert error.args == ("s9",), error
-    else:
-        raise AssertionError("An unbound table register was accepted")
+    expect_unbound_operand(lambda p: bound(p, extra_constants=((20, 0x60),)), program,
+                           "scalar", "s9", program.index("s_mov_b32 s64, s9"), None, "s_mov_b32 s64, s9")
     # The table address needs a zero high word, and its low word is not a number.
     for high in ("s_mov_b32 s65, 1", "s_mov_b32 s65, s9", "s_mov_b32 s65, s20"):
         expect_value_error(bound, changed("s_mov_b32 s65, 0", high), "Unresolved constant buffer binding")
@@ -12642,7 +12648,101 @@ def check_f16_to_int_controls():
         expect_value_error(translate_f16, export, "Unsupported export")
 
 
+UNBOUND_SAMPLE = [
+    "s_mov_b64 s[50:51], exec",
+    "s_wqm_b64 exec, exec",
+    "s_mov_b32 m0, s24",
+    "v_interp_p1_f32_e32 v8, v0, attr0.x",
+    "v_interp_p1_f32_e32 v9, v0, attr0.y",
+    "v_interp_p2_f32_e32 v9, v1, attr0.y",
+    "v_interp_p2_f32_e32 v8, v1, attr0.x",
+    "s_and_b64 exec, exec, s[50:51]",
+    "s_mov_b32 s21, 0",
+    "s_load_dwordx8 s[28:35], s[20:21], null",
+    "s_mov_b32 s40, 1",
+    "s_mov_b32 s41, 2",
+    "s_mov_b32 s42, 3",
+    "s_mov_b32 s43, 4",
+    "s_waitcnt lgkmcnt(0)",
+    "image_sample v[12:15], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
+    "s_waitcnt vmcnt(0)",
+    "v_cvt_pkrtz_f16_f32_e32 v16, v12, v13",
+    "v_cvt_pkrtz_f16_f32_e32 v17, v14, v15",
+    "exp mrt0 v16, v16, v17, v17 done compr vm",
+    "s_endpgm",
+]
+
+
+def check_unbound_operand_diagnostics():
+    """Issue #1314: a read of a register with no tracked value names the register and the instruction.
+
+    The sample binds the texture table (s20), the interpolation base (s24) and v0/v1, as the shader scan does.
+    Reading another entry register is an UnboundOperand (a ValueError), an unknown opcode stays a plain
+    rejection, and a missing key that is not a guest register stays a KeyError, so an internal lookup fault
+    is never reported as a missing binding.
+    """
+    def run(program):
+        return lower(program, 20, 24, [1, 2, 3, 4])
+
+    def expect_unbound(program, *diagnostic):
+        expect_unbound_operand(run, program, *diagnostic)
+
+    def replaced(old, new):
+        assert old in UNBOUND_SAMPLE
+        return [new if line == old else line for line in UNBOUND_SAMPLE]
+
+    # The bound sample still translates.
+    source = run(UNBOUND_SAMPLE)
+    assert "SV_Target0" in source and "tex." in source, source
+    # An unbound SGPR: the interpolation base copied from an entry register the caller did not bind. The
+    # positioned form also carries the byte offset.
+    at = UNBOUND_SAMPLE.index("s_mov_b32 m0, s24")
+    expect_unbound(replaced("s_mov_b32 m0, s24", "s_mov_b32 m0, s9"), "scalar", "s9", at, None, "s_mov_b32 m0, s9")
+    positioned = list(enumerate(replaced("s_mov_b32 m0, s24", "s_mov_b32 m0, s9")))
+    expect_unbound([(4 * k, line) for k, line in positioned], "scalar", "s9", at, 4 * at, "s_mov_b32 m0, s9")
+    # An unbound VGPR: v3 is neither a barycentric input nor written before the read.
+    expect_unbound(["v_mov_b32_e32 v2, v3", *UNBOUND_SAMPLE], "vector", "v3", 0, None, "v_mov_b32_e32 v2, v3")
+    # An unsupported opcode is a plain rejection, not an unbound operand.
+    unknown = UNBOUND_SAMPLE[:1] + ["v_imaginary_op_xyz v2, v0"] + UNBOUND_SAMPLE[1:]
+    try:
+        run(unknown)
+    except ValueError as error:
+        assert type(error) is ValueError and str(error) == "Unsupported instruction 1: v_imaginary_op_xyz v2, v0", \
+            f"{type(error).__name__}: {error}"
+    else:
+        raise AssertionError("An unknown opcode was accepted")
+    # Only s0-s105, vcc and v0-v255 read inside an instruction are unbound operands; any other missing key in
+    # the register state is an internal lookup error and stays a KeyError.
+    scalar = pixel_aot.TrackedScalar({}, {})
+    vector = pixel_aot.TrackedVector()
+    for registers, key in ((scalar, "s9"), (vector, "v3")):
+        try:
+            registers[key]
+        except KeyError as error:
+            assert type(error) is KeyError and error.args == (key,), error
+        else:
+            raise AssertionError(f"{key} read outside an instruction was accepted")
+    scalar.site = vector.site = (7, None, "s_nop 0")
+    for registers, key in ((scalar, "s106"), (scalar, "ttmp0"), (scalar, "v3"), (scalar, ("s9",)),
+                           (vector, "v256"), (vector, "s9")):
+        try:
+            registers[key]
+        except KeyError as error:
+            assert type(error) is KeyError and error.args == (key,), error
+        else:
+            raise AssertionError(f"{key!r} was accepted")
+    for registers, key, bank in ((scalar, "s105", "scalar"), (scalar, "vcc", "scalar"), (vector, "v255", "vector")):
+        try:
+            registers[key]
+        except Exception as error:  # the type is the assertion
+            assert type(error).__name__ == "UnboundOperand", f"Expected UnboundOperand for {key}, got {error!r}"
+            assert (error.bank, error.register, error.index) == (bank, key, 7), error
+        else:
+            raise AssertionError(f"{key} was accepted")
+
+
 def check_controls(directory):
+    check_unbound_operand_diagnostics()
     check_dpp_cvt_refusals()
     check_dpp_f16_contract_controls()
     check_smem_pointer_controls()
