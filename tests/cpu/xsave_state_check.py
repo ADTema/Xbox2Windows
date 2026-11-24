@@ -42,6 +42,20 @@ XSAVEOPT_EXPORTS = (
 )
 XSAVEOPT_DYNMASK_EXPORT = "op_xsaveopt64_dynmask"
 
+# XSAVEC then XRSTOR of the same buffer: (xsavec RFBM, xrstor RFBM). The save mask leaves a component out of XCOMP_BV
+# when it is not 7, and the restore mask selects which components come back from the compacted image.
+COMPACTED_ROUNDTRIPS = {
+    "op_xsavec_xrstor_all": (7, 7),
+    "op_xsavec_xrstor_x87_avx": (5, 7),
+    "op_xsavec_xrstor_x87_sse": (3, 7),
+    "op_xsavec_xrstor_avx_only": (7, 4),
+    "op_xsavec_xrstor_sse_only": (7, 2),
+}
+COMPACTED_DYNMASK_EXPORT = "op_xrstor64_compacted_dynmask"
+COMPACTED_EXPORTS = tuple(COMPACTED_ROUNDTRIPS) + (COMPACTED_DYNMASK_EXPORT,)
+ALTERED_COMPACTED_EXPORTS = ("op_xsavec_xrstor_all", "op_xsavec_xrstor_avx_only")
+GP_MESSAGE = "access violation reading 0xffffffffffffffff"
+
 DEFINED_EXPORTS = (
     "op_xrstor_xsave",
     "op_xrstor64_xsave64",
@@ -319,12 +333,47 @@ class XStateModel:
         self.ymm_hi = [bytearray(16) for _ in range(16)]
         self.xinuse = 0
 
-    def xrstor(self, buf: bytes, rfbm: int, is64: bool) -> None:
+    def xrstor(
+        self,
+        buf: bytes,
+        rfbm: int,
+        is64: bool,
+        *,
+        check_subset: bool = True,
+        check_reserved: bool = True,
+        check_xcomp: bool = True,
+        compacted_mxcsr: bool = True,
+    ) -> None:
+        """Standard and compacted XRSTOR; the keyword flags are the mutation controls, each off drops one rule.
+
+        Compacted (XCOMP_BV[63] set, measured on hardware): the header must list only x87|SSE|AVX, XSTATE_BV must be
+        a subset of it, and bytes [528..575] must be zero. A requested component restores when XSTATE_BV lists it
+        and initializes otherwise (a component XCOMP_BV leaves out is initialized). MXCSR belongs to the SSE
+        component: loaded when RFBM[1] and XSTATE_BV[1] are set, reset to 0x1F80 when only RFBM[1] is set, and left
+        alone when RFBM[1] is clear. compacted_mxcsr=False applies the standard rule (loaded for RFBM[2:1] != 0).
+        """
         rfbm &= 7
         xstate_bv, xcomp_bv, hdr_reserved = struct.unpack_from("<QQQ", buf, 512)
-        if xcomp_bv != 0 or hdr_reserved != 0 or (xstate_bv & ~7):
-            raise ValueError("invalid XSAVE header")
-        if rfbm & 6:
+        compacted = bool(xcomp_bv >> 63)
+        if compacted:
+            listed = xcomp_bv & ~(1 << 63)
+            if check_reserved and any(buf[528:576]):
+                raise ValueError("compacted header bytes [528..575] are not zero")
+            if check_xcomp and listed & ~7:
+                raise ValueError(f"XCOMP_BV lists components outside x87|SSE|AVX: {listed:#x}")
+            if check_subset and xstate_bv & ~listed:
+                raise ValueError(f"XSTATE_BV {xstate_bv:#x} is not a subset of XCOMP_BV {listed:#x}")
+            xstate_bv &= listed
+            loads_mxcsr = bool(xstate_bv & 2) and bool(rfbm & 2)
+            resets_mxcsr = bool(rfbm & 2) and not loads_mxcsr
+            if not compacted_mxcsr:
+                loads_mxcsr, resets_mxcsr = bool(rfbm & 6), False
+        else:
+            if xcomp_bv != 0 or hdr_reserved != 0 or (xstate_bv & ~7):
+                raise ValueError("invalid XSAVE header")
+            loads_mxcsr, resets_mxcsr = bool(rfbm & 6), False
+        new_mxcsr = DEFAULT_MXCSR if resets_mxcsr else self.mxcsr
+        if loads_mxcsr:
             new_mxcsr = struct.unpack_from("<I", buf, 24)[0]
             if new_mxcsr & ~self.mxcsr_mask:
                 raise ValueError(f"reserved MXCSR bits set: {new_mxcsr:#x}")
@@ -366,8 +415,7 @@ class XStateModel:
                 self.fds = 0
                 self.st = [bytearray(16) for _ in range(8)]
                 self.xinuse &= ~1
-        if rfbm & 6:
-            self.mxcsr = new_mxcsr
+        self.mxcsr = new_mxcsr
         if rfbm & 2:
             if xstate_bv & 2:
                 for i in range(16):
@@ -689,7 +737,7 @@ def _xsave_header_flex(name: str) -> tuple[int, int] | None:
         return 64 + 512, 7
     if name == "op_xrstor64_mask_sse":
         return 512, 2
-    if name in EXPORTS:
+    if name in EXPORTS or name in COMPACTED_EXPORTS:
         return 512, 7
     return None
 
@@ -785,11 +833,16 @@ def assert_equal_output(label: str, name: str, idx, got: bytes, want: bytes) -> 
 
 
 def native_exports_for_host(native: dict, has_xsavec: bool, has_xsaveopt: bool = True) -> dict:
-    """Drop native xsavec/xsaveopt fixtures on hosts without them: executing them would raise #UD."""
+    """Drop native xsavec/xsaveopt fixtures on hosts without them: executing them would raise #UD.
+
+    The compacted XRSTOR fixtures go with XSAVEC: the compacted format is enumerated by the same CPUID bit, and
+    without it a restore with XCOMP_BV[63] set always raises #GP.
+    """
     return {
         name: fn
         for name, fn in native.items()
-        if (has_xsavec or name not in XSAVEC_EXPORTS) and (has_xsaveopt or name not in XSAVEOPT_EXPORTS)
+        if (has_xsavec or (name not in XSAVEC_EXPORTS and name not in COMPACTED_EXPORTS))
+        and (has_xsaveopt or name not in XSAVEOPT_EXPORTS)
     }
 
 
@@ -1314,6 +1367,297 @@ def check_xsaveopt_controls(mxcsr_mask: int, deprecates_cs_ds: bool) -> int:
     return controls + 1
 
 
+# --- Compacted-format XRSTOR ---
+
+def reference_compacted(
+    name: str, a: bytes, b: bytes, mxcsr_mask: int, deprecates_cs_ds: bool, altered: bool = False, **mutations
+) -> bytes:
+    """Expected output of a compacted-XRSTOR export; ValueError where the instruction raises #GP."""
+    out = bytearray(FILL)
+    model = XStateModel(mxcsr_mask, deprecates_cs_ds)
+    model.xrstor(a, rfbm=7, is64=True)
+    if name == COMPACTED_DYNMASK_EXPORT:
+        mask_lo, mask_hi = struct.unpack_from("<II", b, 832)[0], struct.unpack_from("<I", b, 840)[0]
+        if mask_hi or mask_lo & ~7:
+            raise ValueError("request mask outside x87|SSE|AVX")
+        model.xrstor(b, rfbm=mask_lo, is64=True, **mutations)
+        model.xsave(out, 0, rfbm=7, is64=True)
+        return bytes(out)
+    save_rfbm, restore_rfbm = COMPACTED_ROUNDTRIPS[name]
+    out[528:576] = bytes(48)  # xsavec leaves the reserved header bytes alone and the restore rejects them
+    model.xsavec(out, 0, rfbm=save_rfbm, is64=True)
+    model.xrstor(b, rfbm=7, is64=True)
+    if altered and name == "op_xsavec_xrstor_all":
+        model.xrstor(b, rfbm=7, is64=True)
+    else:
+        if altered:
+            restore_rfbm = 6
+        model.xrstor(bytes(out), rfbm=restore_rfbm, is64=name != "op_xsavec_xrstor_x87_avx", **mutations)
+    model.xsave(out, 0, rfbm=7, is64=True)
+    return bytes(out)
+
+
+def compact_state_pairs(mxcsr_mask: int):
+    """(input_a, input_b) standard images: the state saved with xsavec, then a second live state that replaces it.
+
+    FIP, FDP and FOP stay zero so host x87 pointer quirks cannot show, and the two MXCSR values differ.
+    """
+    specs = [
+        (7, 0x5F80, 31), (7, 0x1F80, 32), (3, 0x3F80, 33), (5, 0x1F80, 34), (6, 0x9FC0, 35),
+        (4, 0x1F80, 36), (2, 0x7FC0, 37), (1, 0x1F80, 38), (0, 0x3F80, 39), (0, 0x1F80, 40),
+    ]
+    pairs = []
+    for xbv, mxcsr, seed in specs:
+        image_a = make_xsave_image(mxcsr_mask, xstate_bv=xbv, fcw=0x027F, fop=0, mxcsr=mxcsr, seed=seed)
+        image_b = make_xsave_image(mxcsr_mask, xstate_bv=7, fcw=0x0F7F, fop=0, mxcsr=0x7F80, seed=seed + 100)
+        pairs.append((image_a, image_b))
+    return pairs
+
+
+def compacted_image(
+    mxcsr_mask: int, xstate_bv: int, xcomp_bv: int, rfbm: int, *, mxcsr: int = 0x5F80, seed: int = 7, pokes=()
+) -> bytes:
+    """Hand-built compacted image for the dynmask export: header, payloads at their compacted slots, RFBM at [832]."""
+    buf = bytearray(
+        make_xsave_image(mxcsr_mask, xstate_bv=xstate_bv, fcw=0x0F7F, fop=0, mxcsr=mxcsr, seed=seed)
+    )
+    struct.pack_into("<QQ", buf, 512, xstate_bv, xcomp_bv)
+    struct.pack_into("<QQ", buf, 832, rfbm, 0)
+    for offset, value in pokes:
+        buf[offset] = value
+    return bytes(buf)
+
+
+COMPACTED_BIT = 1 << 63
+BAD_MXCSR = 0x11F80
+
+
+def compacted_cases(mxcsr_mask: int):
+    """(label, input_a, input_b) for the dynmask export: the full valid matrix and every invalid header field."""
+    base = make_xsave_image(mxcsr_mask, xstate_bv=7, fcw=0x027F, fop=0, mxcsr=0x3F80, seed=50)
+    cases = []
+    for listed in range(8):
+        for rfbm in range(8):
+            for xstate_bv in range(8):
+                if xstate_bv & ~listed:
+                    continue
+                cases.append((
+                    f"xcomp{listed}-rfbm{rfbm}-xstate{xstate_bv}",
+                    base,
+                    compacted_image(mxcsr_mask, xstate_bv, COMPACTED_BIT | listed, rfbm, seed=60 + listed),
+                ))
+    invalid = (
+        ("xcomp-bit3", 0, COMPACTED_BIT | 7 | 8, 7, ()),
+        ("xcomp-bit4", 0, COMPACTED_BIT | 7 | 0x10, 7, ()),
+        ("xcomp-bit9", 0, COMPACTED_BIT | 7 | (1 << 9), 7, ()),
+        ("xcomp-bit62", 0, COMPACTED_BIT | 7 | (1 << 62), 7, ()),
+        ("xcomp-bit3-only", 0, COMPACTED_BIT | 8, 0, ()),
+        ("xstate-avx-not-in-xcomp", 4, COMPACTED_BIT | 3, 7, ()),
+        ("xstate-sse-not-in-xcomp", 2, COMPACTED_BIT | 5, 7, ()),
+        ("xstate-x87-not-in-xcomp", 1, COMPACTED_BIT | 6, 7, ()),
+        ("xstate-x87-xcomp-empty", 1, COMPACTED_BIT, 7, ()),
+        ("xstate-subset-violation-rfbm0", 7, COMPACTED_BIT | 6, 0, ()),
+        ("xstate-bit3", 8, COMPACTED_BIT | 7, 7, ()),
+        ("xstate-bit63", 1 << 63, COMPACTED_BIT | 7, 7, ()),
+        ("reserved-528", 0, COMPACTED_BIT | 7, 7, ((528, 1),)),
+        ("reserved-536", 0, COMPACTED_BIT | 7, 7, ((536, 0x80),)),
+        ("reserved-552", 0, COMPACTED_BIT | 7, 7, ((552, 1),)),
+        ("reserved-575", 0, COMPACTED_BIT | 7, 7, ((575, 1),)),
+        ("standard-xcomp-sse", 0, 2, 7, ()),
+        ("standard-xcomp-bit62", 0, 1 << 62, 7, ()),
+    )
+    for label, xstate_bv, xcomp_bv, rfbm, pokes in invalid:
+        cases.append((label, base, compacted_image(mxcsr_mask, xstate_bv, xcomp_bv, rfbm, pokes=pokes)))
+    # MXCSR is checked only when it is loaded: SSE restored from the image, never the init, untouched or absent cases.
+    mxcsr_pokes = tuple((24 + i, (BAD_MXCSR >> (8 * i)) & 0xFF) for i in range(4))
+    for label, xstate_bv, listed, rfbm in (
+        ("bad-mxcsr-sse-restored", 2, 7, 7),
+        ("bad-mxcsr-sse-only", 2, 7, 2),
+        ("bad-mxcsr-sse-init", 0, 7, 7),
+        ("bad-mxcsr-avx-only-request", 4, 7, 4),
+        ("bad-mxcsr-sse-not-listed", 1, 5, 7),
+        ("bad-mxcsr-x87-only-request", 3, 7, 1),
+    ):
+        cases.append((
+            label, base, compacted_image(mxcsr_mask, xstate_bv, COMPACTED_BIT | listed, rfbm, pokes=mxcsr_pokes)
+        ))
+    return cases
+
+
+def run_compacted(label: str, harness, fn, a: bytes, b: bytes, *, b_offset: int = 0):
+    """Call one export (harness is None for lifted code); returns (faulted with #GP, output bytes)."""
+    buf_a, ptr_a, a_pre, a_off, a_post = alloc_aligned_buffer(a)
+    buf_b, ptr_b, b_pre, b_off, b_post = alloc_aligned_buffer(b, offset=b_offset)
+    buf_out, ptr_out, o_pre, o_off, o_post = alloc_aligned_buffer(FILL)
+    faulted = False
+    try:
+        if harness is not None:
+            harness.call_native(fn, ptr_a, ptr_b, ptr_out)
+        else:
+            fn(ptr_a, ptr_b, ptr_out)
+    except OSError as exc:
+        assert GP_MESSAGE in str(exc).lower(), (label, exc)
+        faulted = True
+    check_guards_and_read(buf_a, a_pre, a_off, a_post, f"{label} input_a")
+    check_guards_and_read(buf_b, b_pre, b_off, b_post, f"{label} input_b")
+    return faulted, check_guards_and_read(buf_out, o_pre, o_off, o_post, f"{label} output")
+
+
+def expected_compacted(*args, **kwargs):
+    """The reference output, or None where the instruction raises #GP."""
+    try:
+        return reference_compacted(*args, **kwargs)
+    except ValueError:
+        return None
+
+
+def check_compacted_run(side: str, name: str, label, harness, fn, a: bytes, b: bytes, want, *, b_offset: int = 0) -> None:
+    faulted, got = run_compacted(f"{side} {name} {label}", harness, fn, a, b, b_offset=b_offset)
+    if want is None:
+        assert faulted, f"{side} {name} {label} accepted a header the instruction rejects"
+        assert got == FILL, f"{side} {name} {label}: output written before the #GP"
+    else:
+        assert not faulted, f"{side} {name} {label} raised #GP for a valid compacted restore"
+        want_bv = struct.unpack_from("<Q", want, 512)[0]
+        got_bv = struct.unpack_from("<Q", got, 512)[0]
+        if (
+            side == "native"
+            and want_bv & 2
+            and not got_bv & 2
+            and want[160:416] == bytes(256)
+            and struct.unpack_from("<I", want, 24)[0] != DEFAULT_MXCSR
+        ):
+            # A host may report XSTATE_BV[1] clear for SSE held only by a non-default MXCSR over zero XMM state,
+            # as for xsaveopt; the XMM bytes and the MXCSR word stay compared.
+            want = want[:512] + struct.pack("<Q", want_bv & ~2) + want[520:]
+        assert_equal_output(side, name, label, got, want)
+
+
+def check_compacted_xrstor(
+    harness, native: dict, lifted: dict, altered: dict, mxcsr_mask: int, deprecates_cs_ds: bool
+) -> dict:
+    """XSAVEC -> XRSTOR round trips, hand-built compacted headers, their #GP rules and the mutation controls."""
+    counts = {"roundtrip": 0, "header": 0, "gp": 0, "altered": {}, "controls": 0}
+
+    def model(name, a, b, **mutations):
+        return expected_compacted(name, a, b, mxcsr_mask, deprecates_cs_ds, **mutations)
+
+    for name in COMPACTED_ROUNDTRIPS:
+        for idx, (a, b) in enumerate(compact_state_pairs(mxcsr_mask)):
+            want = model(name, a, b)
+            assert want is not None
+            check_compacted_run("lifted", name, idx, None, lifted[name], a, b, want)
+            if name in native:
+                check_compacted_run("native", name, idx, harness, native[name], a, b, want)
+            counts["roundtrip"] += 1
+            if name == "op_xsavec_xrstor_all":
+                # Independent oracle: a full save and restore of the same state brings back exactly what a direct
+                # restore of the image gives, in the legacy area and the AVX area.
+                direct = reference("op_xrstor64_xsave64", a, a, mxcsr_mask, deprecates_cs_ds)
+                assert want[:512] == direct[:512] and want[576:832] == direct[576:832], f"round trip case {idx}"
+
+    cases = compacted_cases(mxcsr_mask)
+    for label, a, b in cases:
+        want = model(COMPACTED_DYNMASK_EXPORT, a, b)
+        check_compacted_run("lifted", COMPACTED_DYNMASK_EXPORT, label, None, lifted[COMPACTED_DYNMASK_EXPORT], a, b, want)
+        if COMPACTED_DYNMASK_EXPORT in native:
+            check_compacted_run(
+                "native", COMPACTED_DYNMASK_EXPORT, label, harness, native[COMPACTED_DYNMASK_EXPORT], a, b, want
+            )
+        counts["header"] += want is not None
+        counts["gp"] += want is None
+
+    # A misaligned compacted image faults like a misaligned standard one, before anything is stored.
+    mis_a, mis_b = compact_state_pairs(mxcsr_mask)[0][0], compacted_image(mxcsr_mask, 7, COMPACTED_BIT | 7, 7)
+    for off in (8, 16):
+        check_compacted_run("lifted", COMPACTED_DYNMASK_EXPORT, f"misaligned+{off}", None,
+                            lifted[COMPACTED_DYNMASK_EXPORT], mis_a, mis_b, None, b_offset=off)
+        if COMPACTED_DYNMASK_EXPORT in native:
+            check_compacted_run("native", COMPACTED_DYNMASK_EXPORT, f"misaligned+{off}", harness,
+                                native[COMPACTED_DYNMASK_EXPORT], mis_a, mis_b, None, b_offset=off)
+        counts["gp"] += 1
+
+    # Request masks outside x87|SSE|AVX are this translator's own bound (hardware masks them with XCR0): lifted only.
+    for mask_lo, mask_hi in ((8, 0), (0xF, 0), (7, 1)):
+        bad_mask_image = bytearray(compacted_image(mxcsr_mask, 0, COMPACTED_BIT | 7, 0))
+        struct.pack_into("<QQ", bad_mask_image, 832, mask_lo, mask_hi)
+        check_compacted_run("lifted", COMPACTED_DYNMASK_EXPORT, f"mask {mask_hi:#x}:{mask_lo:#x}", None,
+                            lifted[COMPACTED_DYNMASK_EXPORT], cases[0][1], bytes(bad_mask_image), None)
+        counts["gp"] += 1
+
+    for name in ALTERED_COMPACTED_EXPORTS:
+        diffs = 0
+        for idx, (a, b) in enumerate(compact_state_pairs(mxcsr_mask)):
+            want_alt = model(name, a, b, altered=True)
+            _, got_alt = run_compacted(f"altered {name} {idx}", None, altered[name], a, b)
+            assert_equal_output("altered", name, idx, got_alt, want_alt)
+            diffs += got_alt != model(name, a, b)
+        assert diffs, f"altered control {name} did not diverge from original"
+        counts["altered"][name] = diffs
+
+    counts["controls"] = check_compacted_controls(lifted, cases, mxcsr_mask, deprecates_cs_ds)
+    return counts
+
+
+def check_compacted_controls(lifted: dict, cases, mxcsr_mask: int, deprecates_cs_ds: bool) -> int:
+    """Mutation controls: dropping one validity rule or the compacted MXCSR rule from the model must be caught."""
+    by_label = {label: (a, b) for label, a, b in cases}
+    dyn = COMPACTED_DYNMASK_EXPORT
+    controls = 0
+
+    # Each validity rule has a case only that rule rejects: the model without it accepts the header, the lifted code
+    # (and the host) fault, so a lowering that dropped the rule would show up as an accepted header.
+    for label, mutation in (
+        ("xstate-avx-not-in-xcomp", {"check_subset": False}),
+        ("xstate-x87-xcomp-empty", {"check_subset": False}),
+        ("reserved-536", {"check_reserved": False}),
+        ("reserved-575", {"check_reserved": False}),
+        ("xcomp-bit3", {"check_xcomp": False}),
+        ("xcomp-bit62", {"check_xcomp": False}),
+    ):
+        a, b = by_label[label]
+        assert expected_compacted(dyn, a, b, mxcsr_mask, deprecates_cs_ds) is None, label
+        accepted = expected_compacted(dyn, a, b, mxcsr_mask, deprecates_cs_ds, **mutation)
+        assert accepted is not None, f"mutation {mutation} still rejects {label}"
+        faulted, _ = run_compacted(f"control {label}", None, lifted[dyn], a, b)
+        assert faulted, f"lifted {label}"
+        try:
+            check_compacted_run("lifted", dyn, label, None, lifted[dyn], a, b, accepted)
+        except AssertionError:
+            controls += 1
+        else:
+            raise AssertionError(f"comparison accepted the mutation {mutation} on {label}")
+
+    # The compacted MXCSR rule against the standard one: the first differing byte is inside the MXCSR word [24..27].
+    mxcsr_cases = []
+    for label in ("xcomp7-rfbm7-xstate0", "xcomp7-rfbm4-xstate4", "xcomp5-rfbm7-xstate1"):
+        a, b = by_label[label]
+        mxcsr_cases.append((dyn, a, b, label))
+    for name in ("op_xsavec_xrstor_avx_only", "op_xsavec_xrstor_x87_avx"):
+        a, b = compact_state_pairs(mxcsr_mask)[0]
+        mxcsr_cases.append((name, a, b, "roundtrip"))
+    for name, a, b, label in mxcsr_cases:
+        right = expected_compacted(name, a, b, mxcsr_mask, deprecates_cs_ds)
+        standard_rule = expected_compacted(name, a, b, mxcsr_mask, deprecates_cs_ds, compacted_mxcsr=False)
+        if right == standard_rule:
+            continue  # the rules agree here: the loaded image MXCSR equals what the compacted rule gives
+        if standard_rule is None:
+            controls += 1  # the standard rule would load a reserved MXCSR the compacted save never wrote and fault
+            continue
+        _, got = run_compacted(f"control {name} {label}", None, lifted[name], a, b)
+        assert_equal_output("lifted", name, label, got, right)
+        try:
+            assert_equal_output("lifted", name, label, got, standard_rule)
+        except AssertionError as err:
+            assert any(f"first mismatch at byte {pos}:" in str(err) for pos in range(24, 28)), err
+            controls += 1
+        else:
+            raise AssertionError(f"comparison accepted the standard MXCSR rule on {name} {label}")
+    assert controls >= 9, controls
+    return controls
+
+
+
 def check_differential(
     native_path: Path,
     lifted_path: Path,
@@ -1322,7 +1666,9 @@ def check_differential(
     canonical_altered_path: Path,
     native_altered_path: Path,
 ) -> None:
-    lifted_lib, lifted = bind_exports(lifted_path, "lifted_", DEFINED_EXPORTS + (DYNMASK_EXPORT, XSAVEOPT_DYNMASK_EXPORT))
+    lifted_lib, lifted = bind_exports(
+        lifted_path, "lifted_", DEFINED_EXPORTS + (DYNMASK_EXPORT, XSAVEOPT_DYNMASK_EXPORT) + COMPACTED_EXPORTS
+    )
     lifted_lib.host_has_xsave.argtypes = []
     lifted_lib.host_has_xsave.restype = ctypes.c_uint32
     if not lifted_lib.host_has_xsave():
@@ -1356,10 +1702,10 @@ def check_differential(
     fp_cpuid = int(lifted_lib.host_fp_err_cpuid_info())
     mxcsr_mask = int(lifted_lib.host_mxcsr_mask())
 
-    _, native = bind_exports(native_path)
+    _, native = bind_exports(native_path, "", EXPORTS + COMPACTED_EXPORTS)
     native = native_exports_for_host(native, has_xsavec, has_xsaveopt)
     _, native_altered = bind_exports(native_altered_path, "", ALTERED_CANONICAL_EXPORTS)
-    altered_lib, altered = bind_exports(altered_path, "lifted_", ALTERED_DEFINED_EXPORTS)
+    altered_lib, altered = bind_exports(altered_path, "lifted_", ALTERED_DEFINED_EXPORTS + ALTERED_COMPACTED_EXPORTS)
     canonical_lib, canonical = bind_exports(canonical_path, "lifted_", CANONICAL_EXPORTS)
     canonical_altered_lib, canonical_altered = bind_exports(
         canonical_altered_path, "lifted_", ALTERED_CANONICAL_EXPORTS
@@ -1455,6 +1801,7 @@ def check_differential(
         liveness_checks = check_xsavec_mxcsr_liveness(harness, native, lifted, mxcsr_mask, deprecates_cs_ds)
         layout_checks = check_xsaveopt_layout(harness, native, lifted, mxcsr_mask)
         opt_controls = check_xsaveopt_controls(mxcsr_mask, deprecates_cs_ds)
+        compacted = check_compacted_xrstor(harness, native, lifted, altered, mxcsr_mask, deprecates_cs_ds)
 
         # Native comparison keeps active x87/SSE payloads: a flipped FCW, ST0 or XMM0 byte must fail, while an
         # initialized component carrying extra host bytes must still pass.
@@ -1481,7 +1828,7 @@ def check_differential(
 
         # A host without XSAVEC must not be handed native xsavec fixtures.
         gated = native_exports_for_host(native, False, False)
-        unsupported = set(XSAVEC_EXPORTS) | set(XSAVEOPT_EXPORTS)
+        unsupported = set(XSAVEC_EXPORTS) | set(XSAVEOPT_EXPORTS) | set(COMPACTED_EXPORTS)
         assert not unsupported & set(gated) and set(native) - unsupported == set(gated)
         check_fault_controls(harness, gated, lifted, canonical, mxcsr_mask)
 
@@ -1495,7 +1842,10 @@ def check_differential(
             f"{hdr_mxcsr_checks} header/MXCSR #GP checks, {mask_checks} unsupported-mask #GP checks, entry-state contract, non-default entry controls, "
             f"dead-read, host-state, and output mutation controls passed; "
             f"{liveness_checks} xsavec MXCSR-liveness checks passed; "
-            f"{layout_checks} xsaveopt layout readbacks and {opt_controls} xsaveopt mutation controls passed"
+            f"{layout_checks} xsaveopt layout readbacks and {opt_controls} xsaveopt mutation controls passed; "
+            f"compacted xrstor: {compacted['roundtrip']} xsavec round trips, {compacted['header']} valid and "
+            f"{compacted['gp']} #GP header cases, ALTER_OP diverged on {compacted['altered']}, "
+            f"{compacted['controls']} mutation controls passed"
         )
     finally:
         harness.close()
@@ -1555,6 +1905,14 @@ def check_alt_encodings_and_rejections(original_path: Path, altered_path: Path) 
         Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.RCX)),
         Instruction.create_mem(Code.XSAVEOPT64_MEM, MemoryOperand(R.R8)),
         ret_ins)))
+    alt_accept.append(("xsavec_then_xrstor_same_buffer", (
+        mov_eax_7,
+        xor_edx,
+        Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.RCX)),
+        Instruction.create_mem(Code.XSAVEC64_MEM, MemoryOperand(R.R8)),
+        Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.R8)),
+        Instruction.create_mem(Code.XSAVE64_MEM, MemoryOperand(R.R8)),
+        ret_ins)))
     # MXCSR is defined by a restore selecting SSE or AVX; an x87-only save stores no MXCSR.
     alt_accept.append(("xrstor_avx_vzeroupper_xsaveopt64_avx", (
         mov_eax_4,
@@ -1573,6 +1931,7 @@ def check_alt_encodings_and_rejections(original_path: Path, altered_path: Path) 
         "xrstor_r9_saved_rdx": "op_xrstor(state, r9, rax, rdx, true);",
         "xrstor3_vzeroupper_xsave7": "op_vzeroupper(state);",
         "xrstor_xsavec64": "op_xsavec(state, r8, rax, rdx, true);",
+        "xsavec_then_xrstor_same_buffer": "op_xrstor(state, r8, rax, rdx, true);",
         "xrstor_xsaveopt64": "op_xsaveopt(state, r8, rax, rdx, true);",
         "xrstor_avx_vzeroupper_xsaveopt64_avx": "op_xsaveopt(state, r8, rax, rdx, true);",
         "xrstor_x87_xsaveopt64_x87": "op_xsaveopt(state, r8, rax, rdx, true);",

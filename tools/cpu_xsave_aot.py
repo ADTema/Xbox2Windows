@@ -14,7 +14,9 @@ Entry-state contract (`--entry-state`):
     and partially initialized restore/save paths that observe uninitialized
     components from entry are rejected. MXCSR is tracked apart from the
     components: only an xrstor whose RFBM selects SSE or AVX defines it, so
-    vzeroupper alone does not, and a save that stores MXCSR (xsaveopt with SSE
+    vzeroupper alone does not (the format is data, not known when lifting: a compacted
+    restore selecting AVX without SSE leaves MXCSR alone, and the lifted state then
+    still holds its reset value 0x1F80), and a save that stores MXCSR (xsaveopt with SSE
     or AVX selected, xsave/xsavec with SSE selected) is rejected without it.
   - canonical (opt-in): permits xsave/xsave64 before full component definition
     assuming the native caller establishes canonical architectural XSAVE state
@@ -47,17 +49,33 @@ group XSAVE):
                        modified optimization (XMODIFIED after a prior XRSTOR to the same address) is
                        not modeled: the lifted code writes every component that is in use.
   - xrstor / xrstor64: require 64-byte-aligned [base + disp] and bounded mask
-                       (edx == 0 && (eax & ~7) == 0); validate XCOMP_BV == 0,
+                       (edx == 0 && (eax & ~7) == 0). The header selects the format.
+                       Standard (XCOMP_BV[63] clear): validate XCOMP_BV == 0,
                        header [528..535] == 0, (XSTATE_BV & ~7) == 0, and
                        (when rfbm & 6 != 0) MXCSR against host MXCSR_MASK
                        (#GP before mutating state), then restore or init each
                        requested component and update XINUSE[2:0].
+                       Compacted (XCOMP_BV[63] set, the layout xsavec writes):
+                       validate that XCOMP_BV[62:0] lists nothing outside
+                       x87|SSE|AVX, that XSTATE_BV is a subset of XCOMP_BV[62:0]
+                       and that every header byte [528..575] is zero (#GP before
+                       mutating state). A requested component restores from its
+                       compacted slot (x87 and SSE in the legacy area, AVX at 576, the
+                       first extended slot) when XSTATE_BV and XCOMP_BV both list it,
+                       and is initialized otherwise, which includes a component
+                       XCOMP_BV does not list. MXCSR belongs to the SSE component:
+                       loaded (and checked against MXCSR_MASK) when RFBM[1] and
+                       XSTATE_BV[1] are set, reset to 0x1F80 when RFBM[1] is set and
+                       XSTATE_BV[1] is clear, untouched when RFBM[1] is clear, so an
+                       AVX-only restore keeps the current MXCSR. The xsavec writer
+                       leaves bytes [528..575] alone, so a caller that restores a
+                       buffer xsavec filled must have zeroed them first.
 
 Transport/ABI glue: vmovdqa/vmovdqu (XMM0..5, YMM0..5), vzeroupper,
 movdqa/movdqu (XMM0..5), paddd (XMM0..5), movq (MM0..7 <-> m64 / volatile
 scratch r64), emms, 32/64-bit volatile GPR mov/xor, and terminal ret.
 
-XSAVES/XRSTORS, compacted XRSTOR, FXSAVE/FXRSTOR, EVEX encodings, nonvolatile
+XSAVES/XRSTORS, FXSAVE/FXRSTOR, EVEX encodings, nonvolatile
 registers (XMM6..15, YMM6..15, ZMM0..15, RBX/RBP/RSI/RDI/R12..R15/RSP),
 non-argument memory bases, stores outside r8, RIP-relative/indexed addressing,
 prefixes, branches, unclosed MMX state before ret, and trailing bytes reject.
@@ -316,6 +334,12 @@ static inline std::uint64_t load64(word address) {
     return value;
 }
 
+static inline void store64(word address, std::uint64_t value) {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    *reinterpret_cast<volatile std::uint64_t __unaligned*>(address) = value;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+}
+
 static inline Vec128 load128(word address, bool aligned) {
     if (aligned && (address & 15ull) != 0ull) raise_gp();
     std::atomic_signal_fence(std::memory_order_seq_cst);
@@ -468,13 +492,43 @@ static inline void op_xrstor(XState& state, word address, word rax_val, word rdx
     std::memcpy(&xstate_bv, raw + 512, 8);
     std::memcpy(&xcomp_bv, raw + 520, 8);
     std::memcpy(&hdr_reserved, raw + 528, 8);
-    if (xcomp_bv != 0ull || hdr_reserved != 0ull) raise_gp();
-    if ((xstate_bv & ~7ull) != 0ull) raise_gp();
+    // XCOMP_BV[63] selects the compacted format. Only x87 (bit 0), SSE (bit 1) and AVX (bit 2) exist here.
+    const bool compacted = (xcomp_bv >> 63) != 0ull;
+    const std::uint64_t xcomp_components = xcomp_bv & ~(1ull << 63);
+    if (compacted) {
+        // Compacted header: every header byte after XCOMP_BV is reserved, XSTATE_BV must be a subset of the
+        // components XCOMP_BV lists, and XCOMP_BV may list nothing outside x87|SSE|AVX.
+        for (unsigned i = 528u; i < 576u; i += 8u) {
+            std::uint64_t word = 0ull;
+            std::memcpy(&word, raw + i, 8);
+            if (word != 0ull) raise_gp();
+        }
+        if ((xcomp_components & ~7ull) != 0ull) raise_gp();
+        if ((xstate_bv & ~xcomp_components) != 0ull) raise_gp();
+    } else {
+        if (xcomp_bv != 0ull || hdr_reserved != 0ull) raise_gp();
+        if ((xstate_bv & ~7ull) != 0ull) raise_gp();
+    }
 
+    // MXCSR: the standard format loads it whenever RFBM selects SSE or AVX. The compacted format keeps it with
+    // the SSE component only: loaded when RFBM[1] and XSTATE_BV[1] are set, reset to 0x1F80 when RFBM[1] is set
+    // and XSTATE_BV[1] is clear, and left alone when RFBM[1] is clear (an AVX-only restore does not touch it).
+    // The #GP check applies to a loaded value only.
     std::uint32_t new_mxcsr = 0u;
-    if ((rfbm & 6ull) != 0ull) {
-        std::memcpy(&new_mxcsr, raw + 24, 4);
-        if ((new_mxcsr & ~state.mxcsr_mask) != 0u) raise_gp();
+    bool restores_mxcsr = false;
+    if (!compacted) {
+        restores_mxcsr = (rfbm & 6ull) != 0ull;
+        if (restores_mxcsr) {
+            std::memcpy(&new_mxcsr, raw + 24, 4);
+            if ((new_mxcsr & ~state.mxcsr_mask) != 0u) raise_gp();
+        }
+    } else if ((rfbm & 2ull) != 0ull) {
+        restores_mxcsr = true;
+        new_mxcsr = 0x1F80u;
+        if ((xstate_bv & 2ull) != 0ull) {
+            std::memcpy(&new_mxcsr, raw + 24, 4);
+            if ((new_mxcsr & ~state.mxcsr_mask) != 0u) raise_gp();
+        }
     }
 
     if ((rfbm & 1ull) != 0ull) {
@@ -522,7 +576,7 @@ static inline void op_xrstor(XState& state, word address, word rax_val, word rdx
         }
     }
 
-    if ((rfbm & 6ull) != 0ull) {
+    if (restores_mxcsr) {
         state.mxcsr = new_mxcsr;
     }
 
@@ -540,6 +594,7 @@ static inline void op_xrstor(XState& state, word address, word rax_val, word rdx
 
     if ((rfbm & 4ull) != 0ull) {
         if ((xstate_bv & 4ull) != 0ull) {
+            // The compacted AVX slot is the first extended slot, 576, as x87 and SSE live in the legacy area.
             for (unsigned i = 0; i < 16u; ++i) {
                 std::memcpy(state.ymm_hi[i], raw + 576u + i * 16u, 16);
             }
