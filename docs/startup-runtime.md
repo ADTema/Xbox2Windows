@@ -110,7 +110,9 @@ on each call. Heaps whose desktop start is an address are unchanged, so nothing 
 adapter whose handles are addresses.
 
 - `ctest --preset release --no-tests=error -R '^startup_title_heap(_tags_control)?$' -V`: the
-  rule, without a device.
+  rule, without a device. `ctest --preset release --no-tests=error -R '^startup_title_heap$' -V`
+  also checks that for an aligned view heap and a tagged sampler heap without memory of their own,
+  the allocator is asked for the whole heap's size and its address becomes the heap's memory.
 - `ctest --preset release --no-tests=error -R '^startup_title_heap_device_' -V`: through the
   wrapper, the starts of two sampler heaps, a render-target heap and a depth heap must be aligned
   addresses, a heap whose desktop start is tagged must have memory of its own, and three samplers
