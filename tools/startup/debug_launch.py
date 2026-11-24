@@ -54,6 +54,7 @@ def main():
     # X2W_HOST_CPU=1: rewrite main-image instructions the host processor lacks (host_cpu.py).
     host_cpu_on = os.environ.get("X2W_HOST_CPU") == "1"
     host_cpu_sites = {}
+    flushopt_missing = [False]  # set when a CLFLUSHOPT faults: CLWB then becomes a NOP instead
     stub_area = [0, 0]  # next free address and end of the block the stubs go to
     os.makedirs(logdir, exist_ok=True)
     trap_log = os.path.join(logdir, "trap.log")
@@ -136,8 +137,13 @@ def main():
         """Rewrites the instruction at a faulting main-image address; returns its name, or None."""
         code = read(address, 48)
         clwb = host_cpu.clwb_rewrite(code)
-        if clwb:
+        if clwb and not flushopt_missing[0]:
             return "clwb" if write(address + clwb[0], clwb[1]) else None
+        nop = host_cpu.flush_nop(code)
+        if nop:
+            # CLFLUSHOPT itself faulted (a host older than it), or a CLWB after that was seen.
+            flushopt_missing[0] = True
+            return ("clwb-nop" if clwb else "clflushopt-nop") if write(address, nop) else None
         wait = host_cpu.wait_rewrite(code)
         if wait:
             return ("mwaitx" if code[2] == 0xFB else "monitorx") if write(address, wait) else None
