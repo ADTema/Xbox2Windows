@@ -1,12 +1,20 @@
 // Experimental (docs/startup-runtime.md): a small zlib (RFC 1950) / deflate (RFC 1951)
-// decoder for the DirectStorage stand-in. Written from the RFCs with canonical-code decoding one bit
-// at a time; correct but slow, to be replaced by a real decoder if loading time matters.
+// decoder for the DirectStorage stand-in. Written from the RFCs. Huffman codes up to fast_bits long
+// decode with one table lookup; longer codes and the last byte of input take canonical-code decoding
+// one bit at a time.
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
 
+// tests/startup_inflate_check.py builds its reference probe with 0 (bit-at-a-time decoding only).
+#ifndef X2W_INFLATE_FAST_BITS
+#define X2W_INFLATE_FAST_BITS 10
+#endif
+
 namespace x2w_inflate {
+
+constexpr int fast_bits = X2W_INFLATE_FAST_BITS;
 
 struct Stream {
     const unsigned char* in;
@@ -40,6 +48,8 @@ inline std::uint32_t bits(Stream& s, int need) noexcept
 struct Huffman {
     std::uint16_t count[16];
     std::uint16_t symbol[288];
+    // Indexed by the next fast_bits input bits: symbol << 4 | code length, or 0 for the slow path.
+    std::uint16_t fast[1 << fast_bits];
 };
 
 // Builds canonical decoding tables from code lengths; returns false for an over-subscribed set.
@@ -58,11 +68,36 @@ inline bool construct(Huffman& h, const std::uint8_t* lengths, int n) noexcept
     for (int len = 1; len < 15; ++len) offsets[len + 1] = static_cast<std::uint16_t>(offsets[len] + h.count[len]);
     for (int i = 0; i < n; ++i)
         if (lengths[i]) h.symbol[offsets[lengths[i]]++] = static_cast<std::uint16_t>(i);
+    for (auto& f : h.fast) f = 0;
+    // Canonical codes in order; input bits arrive first bit lowest, so each code is stored reversed.
+    for (int len = 1, code = 0, index = 0; len <= fast_bits; ++len, code <<= 1) {
+        for (int k = 0; k < h.count[len]; ++k, ++code, ++index) {
+            int reversed = 0;
+            for (int b = 0; b < len; ++b) reversed |= ((code >> b) & 1) << (len - 1 - b);
+#ifndef X2W_INFLATE_FAULTY_TABLE
+            const int entry = h.symbol[index] << 4 | len;
+#else  // negative control for tests/startup_inflate_check.py: codes fast_bits long decode as the next symbol
+            const int entry = (h.symbol[index] + (len == fast_bits)) << 4 | len;
+#endif
+            for (int i = reversed; i < (1 << fast_bits); i += 1 << len) h.fast[i] = static_cast<std::uint16_t>(entry);
+        }
+    }
     return true;
 }
 
 inline int decode(Stream& s, const Huffman& h) noexcept
 {
+    // bit_count stays below 8 between calls, so two more input bytes hold at least 16 bits. The peek
+    // does not consume them; bits() takes only the code's length, as the loop below would.
+    if (s.in_size - s.in_pos >= 2) {
+        const std::uint32_t window = s.bit_buffer | std::uint32_t{s.in[s.in_pos]} << s.bit_count |
+                                     std::uint32_t{s.in[s.in_pos + 1]} << (s.bit_count + 8);
+        const int entry = h.fast[window & ((1u << fast_bits) - 1)];
+        if (entry) {
+            bits(s, entry & 15);
+            return entry >> 4;
+        }
+    }
     int code = 0, first = 0, index = 0;
     for (int len = 1; len <= 15; ++len) {
         code |= static_cast<int>(bits(s, 1));

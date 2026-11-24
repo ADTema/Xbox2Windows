@@ -10,11 +10,20 @@ without writing past the destination: one byte too little capacity and a truncat
 
 The distance bound is checked on bare deflate data, so neither the zlib header nor the Adler-32
 check can reject it: after four literals, a match at distance 4 decodes and the same block with
-distance 5 is rejected before the match copies anything. tests/startup_inflate_probe.cpp runs the
+distance 5 is rejected before the match copies anything. A hand-built dynamic block with a single
+1-bit distance code, the one incomplete code set zlib accepts, must decode with and without the table.
+
+The decoder looks Huffman codes up to 10 bits long up in a table. A differential case decodes 900
+seeded random streams (sources, levels, strategies and flushes mixed; some with codes longer than the
+table), each at exact capacity, one byte short, truncated and with flipped bits, and requires status,
+size and bytes equal to the same probe built to decode one bit at a time, and to CPython's zlib except
+where inflate.h decodes past an incomplete code set that zlib rejects. The control is the probe built with
+one wrong table entry, which must differ on some case. tests/startup_inflate_probe.cpp runs the
 decoder; no GPU and no game files are involved.
 """
 from pathlib import Path
 import random
+import struct
 import subprocess
 import sys
 import tempfile
@@ -86,6 +95,34 @@ def fixed_match_block(literals, distance_code, extra_bits, extra_value):
     return bits.to_bytes()
 
 
+def single_distance_block():
+    # Bare deflate data, one final dynamic block whose only distance code is distance 1 with a 1-bit
+    # code: the one incomplete set zlib accepts. Literals A and B, end of block and length 3 have
+    # 2-bit codes 00, 01, 10, 11; eight copies of A plus a length-3 match, then 16 B's.
+    bits = Bits()
+    bits.put(1, 1)
+    bits.put(2, 2)
+    bits.put(258 - 257, 5)  # HLIT: symbols 0..257
+    bits.put(0, 5)  # HDIST: one distance code
+    bits.put(18 - 4, 4)  # HCLEN: code-length codes up to symbol 1 in the transmission order
+    order = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1]
+    for symbol in order:
+        bits.put(2 if symbol in (1, 2, 17, 18) else 0, 3)
+    cl = {1: 0, 2: 1, 17: 2, 18: 3}  # code-length codes, all 2 bits
+    for symbol, extra, count in [(18, 65 - 11, 7), (2, 0, 0), (2, 0, 0), (18, 138 - 11, 7), (18, 51 - 11, 7),
+                                 (2, 0, 0), (2, 0, 0), (1, 0, 0)]:
+        bits.code(cl[symbol], 2)
+        bits.put(extra, count)
+    for _ in range(8):
+        bits.code(0, 2)  # A
+        bits.code(3, 2)  # length 3
+        bits.code(0, 1)  # distance 1
+    for _ in range(16):
+        bits.code(1, 2)  # B
+    bits.code(2, 2)  # end of block
+    return bits.to_bytes(), b"AAAA" * 8 + b"B" * 16
+
+
 def reference(stream, mode):
     return zlib.decompress(stream, 15 if mode == "zlib" else -15)
 
@@ -129,8 +166,156 @@ def expect_rejected(probe, work, name, stream, capacity, mode="zlib", decoded_be
     print("%-22s %6d bytes, capacity %6d, %s" % (name, len(stream), capacity, want))
 
 
-def main(probe):
-    probe = Path(probe).resolve()
+OK, INSUFFICIENT, CORRUPT, BAD_CHECKSUM = range(4)  # x2w_inflate::InflateStatus
+STATUS = ["ok", "insufficient_output", "corrupt_stream", "bad_checksum"]
+
+
+def canonical(lengths):
+    table, code = {}, 0
+    for n in range(1, 16):
+        for symbol, length in enumerate(lengths):
+            if length == n:
+                table[n, code] = symbol
+                code += 1
+        code <<= 1
+    return table
+
+
+def longest_code(stream):
+    # Longest literal/length or distance code of the first block when it is a dynamic one, else 0.
+    value, pos = int.from_bytes(stream[2:], "little"), 0
+
+    def get(n):
+        nonlocal pos
+        pos += n
+        return (value >> (pos - n)) & ((1 << n) - 1)
+
+    get(1)
+    if get(2) != 2:
+        return 0
+    nlen, ndist, ncode = get(5) + 257, get(5) + 1, get(4) + 4
+    order = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+    code_lengths = [0] * 19
+    for i in range(ncode):
+        code_lengths[order[i]] = get(3)
+    table, lengths = canonical(code_lengths), []
+    while len(lengths) < nlen + ndist:
+        n = code = 0
+        while (n, code) not in table:
+            code, n = code << 1 | get(1), n + 1
+        symbol = table[n, code]
+        if symbol < 16:
+            lengths.append(symbol)
+        elif symbol == 16:
+            lengths += [lengths[-1]] * (3 + get(2))
+        else:
+            lengths += [0] * (3 + get(3) if symbol == 17 else 11 + get(7))
+    return max(lengths)
+
+
+def expected_status(stream, capacity):
+    # CPython's zlib run as inflate_zlib_ex classifies: header, deflate data up to capacity + 1 bytes,
+    # end of data, Adler-32. None where zlib rejects a code set as "invalid ... set": inflate.h rejects
+    # over-subscribed sets too but accepts incomplete ones, so it may decode on from there.
+    if len(stream) < 6 or stream[0] & 0x0F != 8 or (stream[0] << 8 | stream[1]) % 31 or stream[1] & 0x20:
+        return CORRUPT, b""
+    decoder = zlib.decompressobj(-15)
+    try:
+        out = decoder.decompress(stream[2:], capacity + 1)
+    except zlib.error as error:
+        return (None if " set" in str(error) else CORRUPT), b""
+    if len(out) > capacity:
+        return INSUFFICIENT, b""
+    if not decoder.eof or len(decoder.unused_data) < 4:
+        return CORRUPT, b""
+    if int.from_bytes(decoder.unused_data[:4], "big") != zlib.adler32(out):
+        return BAD_CHECKSUM, out
+    return OK, out
+
+
+def run_batch(probe, work, name, cases):
+    records, results = work / (name + ".records"), work / (name + ".results")
+    records.write_bytes(b"".join(struct.pack("<II", capacity, len(stream)) + stream for stream, capacity in cases))
+    result = subprocess.run([str(probe), "batch", str(records), str(results)], capture_output=True, text=True,
+                            timeout=60)
+    assert result.returncode == 0, "%s: exit %d: %s%s" % (name, result.returncode, result.stdout, result.stderr)
+    data, at, decoded = results.read_bytes(), 0, []
+    for _ in cases:
+        size = int.from_bytes(data[at + 1:at + 5], "little")
+        decoded.append((data[at], data[at + 5:at + 5 + size]))
+        at += 5 + size
+    assert at == len(data), name + ": trailing result bytes"
+    return decoded
+
+
+def random_cases(rng, streams):
+    # Seeded streams of up to 12 KiB from several sources, levels and strategies, some with a flush
+    # between blocks; each at exact capacity, one byte short, truncated and with one to three bits flipped.
+    strategies = [zlib.Z_DEFAULT_STRATEGY, zlib.Z_FILTERED, zlib.Z_HUFFMAN_ONLY, zlib.Z_RLE, zlib.Z_FIXED]
+    sources = [
+        lambda n: rng.randbytes(n),
+        lambda n: corpus(rng, n),
+        lambda n: words(rng, n),
+        # Geometric byte values: rare symbols get codes longer than the decoder's table.
+        lambda n: bytes(min(255, int(rng.expovariate(rng.choice([0.3, 0.6, 1.2])))) for _ in range(n)),
+    ]
+    cases, long_codes = [], 0
+    for _ in range(streams):
+        data = rng.choice(sources)(rng.choice([rng.randint(0, 300), rng.randint(300, 12288)]))
+        encoder = zlib.compressobj(rng.randint(0, 9), zlib.DEFLATED, 15, 9, rng.choice(strategies))
+        if len(data) > 64 and rng.random() < 0.3:
+            cut = rng.randrange(len(data))
+            stream = encoder.compress(data[:cut]) + encoder.flush(rng.choice([zlib.Z_SYNC_FLUSH, zlib.Z_FULL_FLUSH]))
+            stream += encoder.compress(data[cut:]) + encoder.flush()
+        else:
+            stream = encoder.compress(data) + encoder.flush()
+        long_codes += longest_code(stream) > 10
+        cases.append((stream, len(data)))
+        if data:
+            cases.append((stream, len(data) - 1))
+        cases.append((stream[:rng.randrange(len(stream))], len(data)))
+        damaged = bytearray(stream)
+        for _ in range(rng.randint(1, 3)):
+            damaged[rng.randrange(2, len(damaged))] ^= 1 << rng.randrange(8)
+        cases.append((bytes(damaged), len(data) + rng.choice([0, 0, 64])))
+    return cases, long_codes
+
+
+def expect_differential(probe, bitwise, work, rng):
+    streams = 900
+    cases, long_codes = random_cases(rng, streams)
+    assert long_codes >= 20, "only %d streams have codes longer than 10 bits" % long_codes
+    fast, slow = run_batch(probe, work, "random", cases), run_batch(bitwise, work, "random_bitwise", cases)
+    compared = lenient = 0
+    for index, ((stream, capacity), got, reference) in enumerate(zip(cases, fast, slow)):
+        assert got == reference, "random case %d: %s %d bytes, bit-at-a-time %s %d bytes" % (
+            index, STATUS[got[0]], len(got[1]), STATUS[reference[0]], len(reference[1]))
+        status, out = expected_status(stream, capacity)
+        if status is None:
+            if got[0] != CORRUPT:
+                lenient += 1
+                continue
+            status = CORRUPT
+        assert (got[0], got[1] if got[0] in (OK, BAD_CHECKSUM) else b"") == (status, out), \
+            "random case %d: %s, zlib %s" % (index, STATUS[got[0]], STATUS[status])
+        compared += 1
+    counts = [sum(1 for status, _ in fast if status == s) for s in range(4)]
+    print("%d random streams (%d with codes over 10 bits) as %d cases: equal to bit-at-a-time decoding in all, "
+          "to zlib in %d (%d decoded past an incomplete code set zlib rejects); %s" % (
+              streams, long_codes, len(cases), compared, lenient,
+              ", ".join("%s %d" % (STATUS[s], counts[s]) for s in range(4))))
+    return cases, slow
+
+
+def expect_faulty_caught(faulty, work, cases, reference):
+    got = run_batch(faulty, work, "random_faulty", cases)
+    wrong = sum(1 for a, b in zip(got, reference) if a != b)
+    assert wrong, "the faulty-table control decoded every random case like the reference"
+    print("faulty-table control: %d of %d random cases differ from bit-at-a-time decoding, caught" % (wrong, len(cases)))
+
+
+def main(probe, bitwise, faulty):
+    probe, bitwise, faulty = Path(probe).resolve(), Path(bitwise).resolve(), Path(faulty).resolve()
     rng = random.Random(1149)
     text = corpus(rng, 96 * 1024)
     noise = rng.randbytes(70000)
@@ -174,10 +359,20 @@ def main(probe):
         # before the output and must be rejected with only the four literals decoded.
         expect_decoded(probe, work, "raw_distance_4", fixed_match_block(b"ABCD", 3, 0, 0), b"ABCDABC", 64, "raw")
         expect_rejected(probe, work, "raw_distance_5", fixed_match_block(b"ABCD", 4, 1, 0), 64, "raw", 4)
-    print("inflate.h matches zlib %s in 8 cases and rejects 3 controls" % zlib.ZLIB_RUNTIME_VERSION)
+
+        # A distance code set with a single 1-bit code is incomplete; zlib accepts it, so the table and
+        # the bit-at-a-time loop must both decode it.
+        single, single_data = single_distance_block()
+        expect_decoded(probe, work, "raw_single_distance", single, single_data, 64, "raw")
+        expect_decoded(bitwise, work, "raw_single_distance_bw", single, single_data, 64, "raw")
+
+        cases, reference = expect_differential(probe, bitwise, work, rng)
+        expect_faulty_caught(faulty, work, cases, reference)
+    print("inflate.h matches zlib %s in 10 cases and rejects 3 controls" % zlib.ZLIB_RUNTIME_VERSION)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        sys.exit("usage: startup_inflate_check.py <startup_inflate_probe.exe>")
-    main(sys.argv[1])
+    if len(sys.argv) != 4:
+        sys.exit("usage: startup_inflate_check.py <startup_inflate_probe.exe> <startup_inflate_probe_bitwise.exe> "
+                 "<startup_inflate_probe_faulty.exe>")
+    main(*sys.argv[1:])
