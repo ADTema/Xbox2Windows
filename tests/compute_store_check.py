@@ -1,5 +1,6 @@
 """Check the single-store compute profile with original synthetic kernels."""
 from pathlib import Path
+import math
 import operator
 import os
 import operator
@@ -365,6 +366,7 @@ def controls():
     scalar_alu_controls()
     mbcnt_controls()
     bcnt_exec_controls()
+    cvt_u32_f32_controls()
     ff1_exec_controls()
     writelane_controls()
 
@@ -1862,6 +1864,161 @@ def ff1_exec_draw(directory, compiler, renderer, backend):
     bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
     if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
         raise AssertionError("ff1_exec: mutation escaped detection")
+    return 0
+
+
+CVT_U32_F32 = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "s_mov_b32 s4, 0x40a00000",
+    "v_lshl_add_u32 v3, s10, 5, v0",
+    "v_mul_lo_u32 v1, 0x00800000, v3",
+    "v_add_nc_u32_e32 v1, 0x3f400000, v1",
+    "v_cvt_u32_f32_e32 v4, v1",
+    "v_add_nc_u32_e32 v2, 0x4f7ffff0, v3",
+    "v_cvt_u32_f32_e32 v5, v2",
+    "v_add_nc_u32_e32 v2, 0x7f7ffff0, v3",
+    "v_cvt_u32_f32_e32 v6, v2",
+    "v_add_nc_u32_e32 v2, 0x7ffffff0, v3",
+    "v_cvt_u32_f32_e32 v7, v2",
+    "v_cvt_u32_f32_e32 v8, s4",
+    "v_cvt_u32_f32_e32 v9, 4.0",
+    "v_cvt_u32_f32_e32 v10, 0xff800000",
+    "v_cvt_u32_f32_e32 v11, -1.0",
+    "v_add_nc_u32_e32 v7, v8, v7",
+    "v_add_nc_u32_e32 v7, v9, v7",
+    "v_add_nc_u32_e32 v7, v10, v7",
+    "v_add_nc_u32_e32 v7, v11, v7",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx4 v[4:7], v3, s[12:15], 0 idxen",
+    "s_endpgm",
+]
+CVT_U32_F32_BINDING = dict(table_reg=8, descriptor_offset=0, group_reg=10, stride=16)
+
+
+def cvt_u32_f32_word(bits):
+    """Independent Python model of RDNA2 v_cvt_u32_f32: NaN -> 0, <= 0 -> 0, >= 2^32 -> 0xffffffff, else trunc."""
+    bits &= 0xffffffff
+    if (bits & 0x7fffffff) > 0x7f800000:
+        return 0
+    value = struct.unpack("<f", struct.pack("<I", bits))[0]
+    if math.isnan(value) or value <= 0.0:
+        return 0
+    if value >= 4294967296.0:
+        return 0xffffffff
+    return int(math.trunc(value))
+
+
+def cvt_u32_f32_words(*, convert=cvt_u32_f32_word):
+    """Independent reference for one CVT_U32_F32 group of 32 threads (128 active words, 128..319 sentinel)."""
+    words = [SENTINEL] * 320
+    extra = (convert(0x40a00000) + convert(0x40800000) + convert(0xff800000) + convert(0xbf800000)) & 0xffffffff
+    for flat in range(32):
+        w4 = convert((0x3f400000 + (flat << 23)) & 0xffffffff)
+        w5 = convert((0x4f7ffff0 + flat) & 0xffffffff)
+        w6 = convert((0x7f7ffff0 + flat) & 0xffffffff)
+        w7 = (convert((0x7ffffff0 + flat) & 0xffffffff) + extra) & 0xffffffff
+        words[4 * flat:4 * flat + 4] = [w4, w5, w6, w7]
+    return words
+
+
+def cvt_u32_f32_controls():
+    """v_cvt_u32_f32_e32: exact HLSL, helper gating, and one rejection per unsupported operand or modifier."""
+    source = aot.lower(CVT_U32_F32, 32, **CVT_U32_F32_BINDING)
+    lines = source.splitlines()
+    assert aot.CVT_U32_F32_HELPER.rstrip("\n") in lines, lines
+    assert lines[-2].startswith("    outputData.Store4(tid.x * 16u + 0u, uint4(cvt_u32_f32("), lines
+    # A program without v_cvt_u32_f32_e32 does not emit the helper.
+    assert "uint cvt_u32_f32(" not in aot.lower(READ_F32, 32, **READ_BINDING)
+    # Integer inline 0 and NaN/Inf/denormal constants are accepted.
+    assert "cvt_u32_f32(0x00000000u)" in aot.lower(
+        variant(CVT_U32_F32, ("v_cvt_u32_f32_e32 v11, -1.0", "v_cvt_u32_f32_e32 v11, 0")),
+        32, **CVT_U32_F32_BINDING)
+    assert "cvt_u32_f32(0x7fc00000u)" in aot.lower(
+        variant(CVT_U32_F32, ("v_cvt_u32_f32_e32 v10, 0xff800000", "v_cvt_u32_f32_e32 v10, 0x7fc00000")),
+        32, **CVT_U32_F32_BINDING)
+    assert "cvt_u32_f32(0x00000001u)" in aot.lower(
+        variant(CVT_U32_F32, ("v_cvt_u32_f32_e32 v10, 0xff800000", "v_cvt_u32_f32_e32 v10, 0x00000001")),
+        32, **CVT_U32_F32_BINDING)
+    unsupported, operand, bad_dst = "Unsupported compute instruction: ", "Unverified float operand", "Invalid vector destination"
+    for message, changes in (
+        # Unknown SGPR, pending SGPR, unknown VGPR, unaccepted float literal, out-of-range integer literal.
+        (operand, (("v_cvt_u32_f32_e32 v8, s4", "v_cvt_u32_f32_e32 v8, s30"),)),
+        (operand, (("v_cvt_u32_f32_e32 v8, s4", "v_cvt_u32_f32_e32 v8, s12"),)),
+        (operand, (("v_cvt_u32_f32_e32 v4, v1", "v_cvt_u32_f32_e32 v4, v40"),)),
+        (operand, (("v_cvt_u32_f32_e32 v9, 4.0", "v_cvt_u32_f32_e32 v9, 1.5"),)),
+        (operand, (("v_cvt_u32_f32_e32 v10, 0xff800000", "v_cvt_u32_f32_e32 v10, 0x100000000"),)),
+        # Destination past v255.
+        (bad_dst, (("v_cvt_u32_f32_e32 v8, s4", "v_cvt_u32_f32_e32 v256, s4"),)),
+        # Other spellings, input/output modifiers and register range.
+        (unsupported + "v_cvt_u32_f32_e64", (("v_cvt_u32_f32_e32 v4, v1", "v_cvt_u32_f32_e64 v4, v1"),)),
+        (unsupported + "v_cvt_u32_f32 ", (("v_cvt_u32_f32_e32 v4, v1", "v_cvt_u32_f32 v4, v1"),)),
+        (unsupported + "v_cvt_u32_f32_e32", (("v_cvt_u32_f32_e32 v4, v1", "v_cvt_u32_f32_e32 v4, -v1"),)),
+        (unsupported + "v_cvt_u32_f32_e32", (("v_cvt_u32_f32_e32 v4, v1", "v_cvt_u32_f32_e32 v4, |v1|"),)),
+        (unsupported + "v_cvt_u32_f32_e32", (("v_cvt_u32_f32_e32 v4, v1", "v_cvt_u32_f32_e32 v4, v1 clamp"),)),
+        (unsupported + "v_cvt_u32_f32_e32", (("v_cvt_u32_f32_e32 v4, v1", "v_cvt_u32_f32_e32 v4, v1 mul:2"),)),
+        (unsupported + "v_cvt_u32_f32_e32", (("v_cvt_u32_f32_e32 v4, v1", "v_cvt_u32_f32_e32 v4, v[1:2]"),)),
+    ):
+        rejects(message, aot.lower, variant(CVT_U32_F32, *changes), 32, **CVT_U32_F32_BINDING)
+
+
+def cvt_u32_f32_binary(directory, assembler, objcopy, library):
+    """The assembled CVT_U32_F32 program decodes to its text and lowers to the same translation."""
+    decoded = aot.labelled(disassemble(assemble(directory, assembler, objcopy, CVT_U32_F32), library, offsets=True))
+    assert [line for line in decoded if line.startswith("v_cvt_u32_f32")] == [
+        line for line in CVT_U32_F32 if line.startswith("v_cvt_u32_f32")], decoded
+    assert aot.lower(decoded, 32, **CVT_U32_F32_BINDING) == aot.lower(CVT_U32_F32, 32, **CVT_U32_F32_BINDING)
+
+
+def cvt_u32_f32_draw(directory, compiler, renderer, backend):
+    src, cso, case = [directory / x for x in ("cvt_u32_f32.hlsl", "cvt_u32_f32.cso", "cvt_u32_f32.case")]
+    source = aot.lower(CVT_U32_F32, 32, **CVT_U32_F32_BINDING)
+    src.write_text(source, encoding="ascii")
+    subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+    cmd = [renderer, backend, "--compute-store-case", cso, case]
+    expected = cvt_u32_f32_words()
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+    off = list(expected)
+    off[128] ^= 1
+    def _round_ref(bits):
+        if (bits & 0x7fffffff) > 0x7f800000:
+            return 0
+        v = struct.unpack("<f", struct.pack("<I", bits & 0xffffffff))[0]
+        return 0 if v <= 0.0 else (0xffffffff if v >= 4294967296.0 else int(round(v)))
+    def _wrap_ref(bits):
+        if 0x4f800000 <= (bits & 0xffffffff) < 0x50000000:
+            return int(math.trunc(struct.unpack("<f", struct.pack("<I", bits & 0xffffffff))[0])) & 0xffffffff
+        return cvt_u32_f32_word(bits)
+    def _nan_sat_ref(bits):
+        if (bits & 0x7fffffff) > 0x7f800000:
+            return 0xffffffff
+        return cvt_u32_f32_word(bits)
+    for label, reference, word in (
+            ("round instead of trunc", cvt_u32_f32_words(convert=_round_ref), 0),
+            ("wrap at 2^32", cvt_u32_f32_words(convert=_wrap_ref), 65),
+            ("NaN saturates to 0xffffffff", cvt_u32_f32_words(convert=_nan_sat_ref), 3),
+            ("sentinel past group", off, 128)):
+        assert next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b) == word, label
+        case.write_bytes(struct.pack("<321I", 1, *reference))
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"cvt_u32_f32: reference '{label}' escaped detection\n{bad.stderr}")
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    for label, mutated in (
+            ("2^32 saturation dropped", source.replace("x >= 4294967296.0f ? 0xffffffffu : uint(finite)", "uint(finite)")),
+            ("4.0 replaced by 2.0", source.replace("0x40800000u", "0x40000000u")),
+            ("0.75 replaced by 1.0", source.replace("0x3f400000u", "0x3f800000u"))):
+        if mutated == source:
+            raise AssertionError(f"cvt_u32_f32: mutation '{label}' did not change the source")
+        msrc, mcso = directory / "mutated.hlsl", directory / "mutated.cso"
+        msrc.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", mcso, msrc], check=True)
+        bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"cvt_u32_f32: mutation '{label}' escaped detection")
     return 0
 
 
@@ -4096,6 +4253,7 @@ def binary(directory, assembler, objcopy, library):
     scalar_alu_binary(directory, assembler, objcopy, library)
     mbcnt_binary(directory, assembler, objcopy, library)
     bcnt_exec_binary(directory, assembler, objcopy, library)
+    cvt_u32_f32_binary(directory, assembler, objcopy, library)
     ff1_exec_binary(directory, assembler, objcopy, library)
     writelane_binary(directory, assembler, objcopy, library)
     mubuf_subword_store_controls()
@@ -6849,6 +7007,7 @@ if __name__ == "__main__":
                  "draw-lds-arithmetic": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_ARITHMETIC_CASES),
                  "draw-lds-replacement": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_REPLACEMENT_CASES),
                  "draw-f32": lambda d, *a: draw(d, *a, cases=F32_CASES),
+                 "draw-cvt-u32-f32": cvt_u32_f32_draw,
                  "draw-mbcnt": mbcnt_draw,
                  "draw-bcnt-exec": bcnt_exec_draw,
                  "draw-ff1-exec": ff1_exec_draw,
