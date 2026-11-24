@@ -640,6 +640,7 @@ requests, run `python tools/startup/gfx2hlsl.py --pending <cache-directory>`,
 then start the build again. The new key keeps the former bytecode and manifest
 together under their original name. A 16-dword table load can contain two
 independent image descriptors at offsets 0 and 32 from the load address.
+For a read-only census of cached shader refusals, use `python -B tools/startup/gfx2hlsl.py --refusals <cache-directory> [--json]` with a translator that supports the flag. Earlier versions treat it as `--pending` and write into the directory. See [Startup translator refusal census](experiments.md#startup-translator-refusal-census).
 
 ## Input script
 
