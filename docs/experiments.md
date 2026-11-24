@@ -1645,8 +1645,11 @@ explicit via `--entry-state {defined,canonical}` and exported via
 `lifted_entry_state_profile()` / `lifted_requires_canonical_entry()`: the default `defined`
 profile tracks per-component (`x87`, `sse`, `avx`) initialization from `xrstor`/`xrstor64`
 and `vzeroupper` (`avx`) and rejects any `xsave`/`xsave64` (including entry-only saves and
-partially initialized restore/save paths) that reads uninitialized entry components, while
-the opt-in `canonical` profile permits entry-state `xsave`/`xsave64` provided the native
+partially initialized restore/save paths) that reads uninitialized entry components. `MXCSR`
+is tracked apart from the components: only an `xrstor` whose `RFBM` selects SSE or AVX defines it, so
+`vzeroupper` does not, and a save that stores `MXCSR` (`xsaveopt` with SSE or AVX selected, `xsave`/`xsavec`
+with SSE selected) is rejected when no restore defined it, with an error naming `MXCSR`. The
+opt-in `canonical` profile permits entry-state `xsave`/`xsave64` provided the native
 caller establishes canonical architectural XSAVE state (`FCW=0x037F`, `FSW=0`, `FTW=0`,
 `FOP=0`, `FIP=0`, `FCS=0`, `FDP=0`, `FDS=0`, `MXCSR=0x1F80`, zero `ST`/`XMM`/`YMM_HI`,
 `XINUSE=0`). Transport and ABI glue covers `vmovdqa`/`vmovdqu` (`XMM0`..`5`, `YMM0`..`5`),

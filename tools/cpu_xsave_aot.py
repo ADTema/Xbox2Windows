@@ -12,7 +12,10 @@ Entry-state contract (`--entry-state`):
     state; every xsave/xsave64 must only save components previously initialized
     by a supported xrstor/xrstor64 (or vzeroupper for AVX). Entry-only xsave*
     and partially initialized restore/save paths that observe uninitialized
-    components from entry are rejected.
+    components from entry are rejected. MXCSR is tracked apart from the
+    components: only an xrstor whose RFBM selects SSE or AVX defines it, so
+    vzeroupper alone does not, and a save that stores MXCSR (xsaveopt with SSE
+    or AVX selected, xsave/xsavec with SSE selected) is rejected without it.
   - canonical (opt-in): permits xsave/xsave64 before full component definition
     assuming the native caller establishes canonical architectural XSAVE state
     on entry (FCW=0x037F, FSW=0, FTW=0, FOP=0, FIP=0, FCS=0, FDP=0, FDS=0,
@@ -734,6 +737,8 @@ def lift_code(name, start, raw, *, entry_state="defined"):
     ptr_origins = {"rcx": R.RCX, "rdx": R.RDX, "r8": R.R8}
     const_gpr = {"rcx": None, "rdx": None, "r8": None, "rax": None, "r9": None, "r10": None, "r11": None}
     defined_xcomp = 0
+    # MXCSR is tracked apart from the SSE/AVX components: vzeroupper defines AVX state but never MXCSR.
+    defined_mxcsr = False
     used_canonical_entry = False
     mmx_active = False
     statements = []
@@ -840,11 +845,20 @@ def lift_code(name, start, raw, *, entry_state="defined"):
             else:
                 needed_xcomp = 7
             missing = needed_xcomp & ~defined_xcomp
+            # xsave/xsavec store MXCSR with SSE; xsaveopt also stores it when only AVX is selected.
+            mxcsr_stored = bool(needed_xcomp & (6 if ins.code in XSAVEOPT_CODES else 2))
             if missing != 0:
                 if entry_state != "canonical":
                     missing_names = ", ".join(lbl for bit, lbl in XCOMP_NAMES if missing & bit)
                     raise ValueError(
                         f"xsave observes uninitialized XSAVE component(s) ({missing_names}) before definition; "
+                        f"requires explicit --entry-state canonical at RVA {ins.ip:#x}: {ins}"
+                    )
+                used_canonical_entry = True
+            if mxcsr_stored and not defined_mxcsr:
+                if entry_state != "canonical":
+                    raise ValueError(
+                        f"xsave stores MXCSR before any restore defined it; "
                         f"requires explicit --entry-state canonical at RVA {ins.ip:#x}: {ins}"
                     )
                 used_canonical_entry = True
@@ -859,6 +873,9 @@ def lift_code(name, start, raw, *, entry_state="defined"):
             rdx_val = const_gpr.get("rdx")
             if rdx_val == 0 and rax_val is not None and (rax_val & ~7) == 0:
                 defined_xcomp |= rax_val & 7
+                # xrstor loads MXCSR whenever RFBM selects SSE or AVX.
+                if rax_val & 6:
+                    defined_mxcsr = True
             defined_xmm.update(range(6))
             defined_ymm.update(range(6))
             defined_mm.update(range(8))

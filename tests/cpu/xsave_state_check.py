@@ -1507,6 +1507,7 @@ def check_alt_encodings_and_rejections(original_path: Path, altered_path: Path) 
     mov_eax_1 = Instruction.create_reg_i32(Code.MOV_R32_IMM32, R.EAX, 1)
     mov_eax_2 = Instruction.create_reg_i32(Code.MOV_R32_IMM32, R.EAX, 2)
     mov_eax_3 = Instruction.create_reg_i32(Code.MOV_R32_IMM32, R.EAX, 3)
+    mov_eax_4 = Instruction.create_reg_i32(Code.MOV_R32_IMM32, R.EAX, 4)
     mov_eax_7 = Instruction.create_reg_i32(Code.MOV_R32_IMM32, R.EAX, 7)
     xor_edx = Instruction.create_reg_reg(Code.XOR_R32_RM32, R.EDX, R.EDX)
     ret_ins = Instruction.create(Code.RETNQ)
@@ -1554,11 +1555,27 @@ def check_alt_encodings_and_rejections(original_path: Path, altered_path: Path) 
         Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.RCX)),
         Instruction.create_mem(Code.XSAVEOPT64_MEM, MemoryOperand(R.R8)),
         ret_ins)))
+    # MXCSR is defined by a restore selecting SSE or AVX; an x87-only save stores no MXCSR.
+    alt_accept.append(("xrstor_avx_vzeroupper_xsaveopt64_avx", (
+        mov_eax_4,
+        xor_edx,
+        Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.RCX)),
+        Instruction.create(Code.VEX_VZEROUPPER),
+        Instruction.create_mem(Code.XSAVEOPT64_MEM, MemoryOperand(R.R8)),
+        ret_ins)))
+    alt_accept.append(("xrstor_x87_xsaveopt64_x87", (
+        mov_eax_1,
+        xor_edx,
+        Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.RCX)),
+        Instruction.create_mem(Code.XSAVEOPT64_MEM, MemoryOperand(R.R8)),
+        ret_ins)))
     alt_expected = {
         "xrstor_r9_saved_rdx": "op_xrstor(state, r9, rax, rdx, true);",
         "xrstor3_vzeroupper_xsave7": "op_vzeroupper(state);",
         "xrstor_xsavec64": "op_xsavec(state, r8, rax, rdx, true);",
         "xrstor_xsaveopt64": "op_xsaveopt(state, r8, rax, rdx, true);",
+        "xrstor_avx_vzeroupper_xsaveopt64_avx": "op_xsaveopt(state, r8, rax, rdx, true);",
+        "xrstor_x87_xsaveopt64_x87": "op_xsaveopt(state, r8, rax, rdx, true);",
         "vmovdqa_ymm_roundtrip": "load256(rcx, true)",
         "movdqa_xmm_roundtrip": "store128(r8, get_xmm(state, 3), true);",
         "movq_mm_gpr_roundtrip": "op_emms(state);",
@@ -1617,6 +1634,16 @@ def check_alt_encodings_and_rejections(original_path: Path, altered_path: Path) 
         ("xsaveopt_outside_r8",
          _encode_seq(mov_eax_7, xor_edx, Instruction.create_mem(Code.XSAVEOPT64_MEM, MemoryOperand(R.RCX)), ret_ins),
          "non-r8 store memory operand"),
+        ("vzeroupper_xsaveopt64_avx_mxcsr_undefined",
+         _encode_seq(Instruction.create(Code.VEX_VZEROUPPER), mov_eax_4, xor_edx,
+                     Instruction.create_mem(Code.XSAVEOPT64_MEM, MemoryOperand(R.R8)), ret_ins),
+         "stores MXCSR before any restore defined it"),
+        ("x87_restore_vzeroupper_xsaveopt64_x87_avx_mxcsr_undefined",
+         _encode_seq(mov_eax_1, xor_edx, Instruction.create_mem(Code.XRSTOR64_MEM, MemoryOperand(R.RCX)),
+                     Instruction.create(Code.VEX_VZEROUPPER),
+                     Instruction.create_reg_i32(Code.MOV_R32_IMM32, R.EAX, 5),
+                     Instruction.create_mem(Code.XSAVEOPT64_MEM, MemoryOperand(R.R8)), ret_ins),
+         "MXCSR"),
         ("bare_xsavec_default",
          _encode_seq(mov_eax_7, xor_edx, Instruction.create_mem(Code.XSAVEC64_MEM, MemoryOperand(R.R8)), ret_ins),
          "requires explicit --entry-state canonical"),
