@@ -2671,6 +2671,80 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
     return 0
 
 
+MTBUF_STORE_WORDS = (0x01234567, 0x89abcdef, 0x76543210, 0xfedcba98)
+
+
+def mtbuf_store_cases():
+    for count in range(1, 5):
+        op = "tbuffer_store_format_" + "xyzw"[:count]
+        data = "v10" if count == 1 else f"v[10:{9 + count}]"
+        fmt = f"BUF_FMT_{'32_' * count}UINT"
+        store = f"{op} {data}, v8, s[20:23], 0 format:[{fmt}] idxen offset:4"
+        lines = ["s_mov_b32 s12, s7", "s_mov_b32 s13, 0", "s_load_dwordx4 s[20:23], s[12:13], 0x30",
+                 "v_lshl_add_u32 v8, s11, 5, v0", "s_waitcnt lgkmcnt(0)"]
+        lines += [f"v_xor_b32_e32 v{10 + i}, {word:#x}, v8" for i, word in enumerate(MTBUF_STORE_WORDS[:count])]
+        yield count, [*lines, store, "s_endpgm"], DS_BINDING | {"stride": 4 * (count + 1)}
+
+
+def mtbuf_store_binary(directory, assembler, objcopy, library):
+    src, obj, raw = (directory / f"mtbuf-store.{ext}" for ext in ("s", "o", "bin"))
+    for _, lines, binding in mtbuf_store_cases():
+        src.write_text("\n".join(lines) + "\n", encoding="ascii")
+        subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1030", f"-mattr={DS_FEATURES}",
+                        "-filetype=obj", src, "-o", obj], check=True)
+        subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, raw], check=True)
+        decoded = aot.labelled(disassemble(raw.read_bytes(), library, offsets=True, cpu=b"gfx1030",
+                                          features=DS_FEATURES.encode()))
+        assert decoded[-2] == lines[-2]
+        assert aot.lower(decoded, 32, **binding) == aot.lower(lines, 32, **binding)
+
+
+def mtbuf_store_draw(directory, compiler, renderer, backend):
+    accepted = []
+    src, cso, case = (directory / f"mtbuf-store.{ext}" for ext in ("hlsl", "cso", "case"))
+    compile = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
+    run = [renderer, backend, "--compute-store-case", cso, case]
+    for count, lines, binding in mtbuf_store_cases():
+        store = lines[-2]
+        op = store.split()[0]
+        rejects("Unsupported typed buffer store", aot.lower, lines, 32, **(binding | {"cpu": "gfx1013"}))
+        rejects("Unsupported typed buffer store", aot.lower, variant(lines, ("idxen", "offen")), 32, **binding)
+        wrong_format = "32_32_UINT" if count == 1 else "32_UINT"
+        rejects("Unsupported typed buffer store", aot.lower,
+                variant(lines, (f"{'32_' * count}UINT", wrong_format)), 32, **binding)
+        rejects("Unverified raw UAV store", aot.lower,
+                variant(lines, ("s_waitcnt lgkmcnt(0)", "")), 32, **binding)
+        rejects("Unsupported store address", aot.lower, lines, 32, **(binding | {"stride": 4 * count}))
+        rejects("Overlapping raw UAV stores", aot.lower,
+                variant(lines, (store, store + "\nbuffer_store_dword v10, v8, s[20:23], 0 idxen offset:4")),
+                32, **binding)
+        src.write_text(aot.lower(lines, 32, **binding), encoding="ascii")
+        subprocess.run(compile, check=True)
+        for groups in (1, 2):
+            words = [SENTINEL] * 320
+            for gid in range(groups * 32):
+                start = gid * (count + 1) + 1
+                words[start:start + count] = [word ^ gid for word in MTBUF_STORE_WORDS[:count]]
+            case.write_bytes(struct.pack("<321I", groups, *words))
+            result = subprocess.run(run)
+            if result.returncode:
+                return result.returncode
+        # A legal translation shifted one DWORD early must clobber the record padding.
+        src.write_text(aot.lower(variant(lines, (store, store.removesuffix(" offset:4"))), 32, **binding),
+                       encoding="ascii")
+        subprocess.run(compile, check=True)
+        bad = subprocess.run(run, capture_output=True, text=True)
+        if bad.returncode != 1 or "word=0 expected=" not in bad.stderr:
+            raise AssertionError(f"{op}: incorrect store offset escaped detection\n{bad.stderr}")
+        print(bad.stderr, end="")
+        accepted.append(op)
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(accepted) + "\n", encoding="utf-8")
+    return 0
+
+
 def scalar_alu_binary(directory, assembler, objcopy, library):
     """The assembled scalar chain decodes to the same program as its text."""
     src, obj, raw = [directory / x for x in ("scalar.s", "scalar.o", "scalar.bin")]
@@ -2682,6 +2756,7 @@ def scalar_alu_binary(directory, assembler, objcopy, library):
 
 
 def binary(directory, assembler, objcopy, library):
+    mtbuf_store_binary(directory, assembler, objcopy, library)
     scalar_alu_binary(directory, assembler, objcopy, library)
     ds_controls()
     lds_controls()
@@ -3380,5 +3455,6 @@ if __name__ == "__main__":
                  "draw-lds-packed": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_PACKED_CASES),
                  "draw-lds-arithmetic": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_ARITHMETIC_CASES),
                  "draw-lds-replacement": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_REPLACEMENT_CASES),
+                 "draw-mtbuf-store": mtbuf_store_draw,
                  "draw-guard-read": lambda d, *a: draw(d, *a, cases=GUARD_CASES + READ_CASES + ALU_CASES + SCALAR_CASES)}
         sys.exit(modes[mode](Path(tmp), *args))
