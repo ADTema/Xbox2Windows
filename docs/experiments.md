@@ -6529,15 +6529,29 @@ With SPIRV-Tools and SPIRV-Cross available at configure time, run
 
 ### Ordinary and comparison sampler views in the SPIR-V bridge
 
-The named profile can use one indexed sampler table for ordinary samples and
-depth-reference operations. In mixed modules SPIRV-Cross infers one comparison
-type for that table. The bridge keeps ordinary accesses at set 0, binding 1.
-For each depth-reference use it loads the same descriptor index from set 3,
-binding 1. The host must populate both views from the guest sampler descriptors,
-using ordinary filters in the first and comparison filters and the guest
-comparison function in the second. Both operations retain their texture and
-coordinates. Set 3 must be free. The supported path has a direct access chain,
-sampler load and sampled image. Decorated sampler paths require separate support.
+A module can use an indexed sampler table for ordinary samples and
+depth-reference operations. The table is any uniform-constant variable whose
+type is an array of samplers, fixed or runtime sized, under any ID, in any
+descriptor set except 3, at any binding. In mixed modules SPIRV-Cross infers
+one comparison type for that table. The bridge keeps ordinary accesses where
+the module put them. For each depth-reference use it loads the same descriptor
+index from set 3, at the table's binding. The host must populate both views
+from the guest sampler descriptors, using ordinary filters in the first and
+comparison filters and the guest comparison function in the second. Both
+operations retain their texture and coordinates. Set 3 must be free. The
+supported path has a direct `OpAccessChain` or `OpInBoundsAccessChain` with
+one index, a sampler load and a sampled image. Decorated sampler paths require
+separate support.
+
+Each table is decided on its own. A table gets a set 3 view only if some
+depth-reference sample and some ordinary sample (including a sparse one) both
+reach it; a table used for only one of the two is left alone. The first view
+is `%bridge_cmp` and later ones `%bridge_cmp_table_N`. These are refused with
+a message: a table without exactly one literal `DescriptorSet` and `Binding`
+decoration, a decorated or initialized table, set 3 already in use or a
+`bridge_cmp` ID, two tables whose views would share one set 3 binding, and a
+depth-reference sample whose sampled image, load or chain does not lead to a
+sampler. A variable that is not an array of samplers is not a table.
 
 With SPIRV-Tools and SPIRV-Cross installed, run:
 
@@ -6549,6 +6563,15 @@ ctest --preset dev --no-tests=error -R '^spirv_sampler_views_' -V
 The fixture compiles both shaders at Shader Model 6.0 and dispatches the compute
 shader for readback. The compiled pixel shader uses implicit LOD and the
 compute shader uses explicit LOD. Both compare against a depth reference.
+The same modules are also run with every ID of the table renamed and an
+`OpInBoundsAccessChain`; the readback expects the same four words as the
+original, so a view wired to the wrong table changes a precise word. The
+driver also checks, without a GPU, a runtime-sized table at set 2, binding 7
+(the emitted HLSL has the comparison view at `register(s7, space3)`), two
+split tables at their own bindings with an ordinary-only and a
+comparison-only table left alone, and each refusal above. The renamed GPU run
+has not been executed on a physical adapter by the author; the Windows CI jobs
+`spirv_sampler_views_{hardware,warp}` are the check.
 
 On Windows 10 build 19045.6456, the GTX 1060 (32.0.15.6094) and in-box WARP
 (10.0.19041.5794) matched all four readback words in each of the three sampler
