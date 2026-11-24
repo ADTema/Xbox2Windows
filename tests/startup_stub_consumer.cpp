@@ -1149,7 +1149,7 @@ bool dstorage_checks() {
     // Test: BCPack DirectStorage requests decode into destination memory and malformed streams fail (Refs #1139)
     {
         // 2-block BC7 Mode 6 stream from tests/bc7_mode6_multiblock_check.py (104 bytes)
-        const unsigned char bc7_packed[] = {
+        const unsigned char bc7_mode6_packed[] = {
             0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x05, 0x05, 0x05, 0x05,
             0x05, 0x05, 0x06, 0x06, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x10,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x20, 0x02, 0x02, 0x75, 0x46,
@@ -1162,11 +1162,30 @@ bool dstorage_checks() {
             0xc4, 0xfb, 0x37, 0x25, 0x02, 0x02, 0xbd, 0x19, 0x50, 0x0f, 0x03, 0x41,
             0x41, 0x05, 0x09, 0x34, 0xf4, 0xcb, 0x07, 0x05, 0x02, 0x41, 0x41, 0x11
         };
-        const unsigned char bc7_expected[32] = {
+        const unsigned char bc7_mode6_expected[32] = {
             0x40, 0x31, 0x72, 0x04, 0xa5, 0x68, 0x19, 0xbe,
             0x02, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
             0x40, 0x0a, 0x94, 0x37, 0x77, 0xa3, 0xc8, 0x78,
             0x11, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe
+        };
+
+        // 1-block BC7 Mode 1 stream (172 bytes) exercising 2 subsets, shared p-bit,
+        // dictionary lookup and non-zero endpoint residual delta
+        const unsigned char bc7_mode1_packed[172] = {
+            0x15, 0x13, 0x1a, 0x18, 0x18, 0x1e, 0x10, 0x12, 0x04, 0x03, 0x03, 0x03, 0x04, 0x03, 0x03, 0x03,
+            0x02, 0x09, 0x20, 0x40, 0x10, 0x06, 0x01, 0x73, 0x70, 0x97, 0x1c, 0x30, 0x18, 0xe7, 0x00, 0xc9,
+            0xfe, 0x4f, 0xa1, 0x88, 0x90, 0x6a, 0xeb, 0x89, 0x66, 0xd3, 0x19, 0x74, 0xb2, 0x82, 0x00, 0xc4,
+            0x18, 0x71, 0x19, 0x11, 0x1a, 0x18, 0x13, 0x14, 0x13, 0x1a, 0x18, 0x10, 0x12, 0x03, 0x03, 0x03,
+            0x03, 0x03, 0x03, 0x03, 0x03, 0x0a, 0x27, 0x13, 0x06, 0x14, 0x40, 0x01, 0x57, 0xbd, 0x2c, 0xd5,
+            0xb4, 0x2e, 0x30, 0x00, 0x9d, 0x30, 0xac, 0xc3, 0x21, 0x6b, 0x94, 0xf8, 0x45, 0x56, 0x7f, 0x38,
+            0x11, 0xa8, 0x6b, 0x00, 0x34, 0x03, 0x05, 0x03, 0x19, 0x11, 0x1a, 0x1c, 0x01, 0x8a, 0x18, 0x15,
+            0x03, 0x03, 0x03, 0x7e, 0xe7, 0x8d, 0x03, 0x03, 0x11, 0x27, 0x08, 0x17, 0xee, 0x64, 0x28, 0x99,
+            0x77, 0x2c, 0x07, 0x6c, 0xc5, 0xf1, 0x81, 0xd7, 0x71, 0xcd, 0x99, 0xba, 0x65, 0xfe, 0x78, 0x2c,
+            0x20, 0x18, 0x70, 0x14, 0xa8, 0x90, 0x03, 0x03, 0x40, 0x03, 0x18, 0x15, 0x30, 0x03, 0x03, 0x03,
+            0x90, 0xfd, 0x40, 0x08, 0x6e, 0x59, 0x30, 0xf5, 0x94, 0x38, 0x6b, 0xf4
+        };
+        const unsigned char bc7_mode1_expected[16] = {
+            0xc2, 0x5b, 0x48, 0x7a, 0xea, 0x84, 0xa4, 0x4b, 0xfd, 0xf7, 0x15, 0x87, 0x90, 0xc4, 0x49, 0xac
         };
 
         // 64-block BC1 stream from tools/_bcpack_rans/vectors/synthetic_11.json (515 bytes)
@@ -1247,7 +1266,7 @@ bool dstorage_checks() {
         };
 
         void* status_ptr = nullptr;
-        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 4, "BcpackStatus", nullptr, &status_ptr) != 0 || !status_ptr) {
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 6, "BcpackStatus", nullptr, &status_ptr) != 0 || !status_ptr) {
             return false;
         }
         auto* status = static_cast<Object*>(status_ptr);
@@ -1260,54 +1279,78 @@ bool dstorage_checks() {
         }
         auto* queue = static_cast<Object*>(queue_ptr);
 
-        std::vector<unsigned char> dest_valid(32, 0xAA);
+        std::vector<unsigned char> dest_bc7_mode6(32, 0xAA);
+        std::vector<unsigned char> dest_wrong_size(16, 0xBB);
+        std::vector<unsigned char> dest_bc7_mode1(16, 0xAA);
         std::vector<unsigned char> dest_truncated(32, 0xCC);
         std::vector<unsigned char> dest_bc1_valid(512, 0xEE);
         std::vector<unsigned char> dest_bc1_trailing(512, 0xDD);
 
-        // Request 0: valid BC7 memory request (options = (7 << 1) | 0x400000)
+        // Request 0: valid BC7 Mode 6 memory request (32 bytes destination, 2 blocks)
         unsigned char req0[0x48] = {};
         *reinterpret_cast<u64*>(req0 + 0x00) = (7ull << 1) | 0x400000;
-        *reinterpret_cast<void**>(req0 + 0x08) = dest_valid.data();
+        *reinterpret_cast<void**>(req0 + 0x08) = dest_bc7_mode6.data();
         *reinterpret_cast<u64*>(req0 + 0x10) = 0;
         *reinterpret_cast<unsigned*>(req0 + 0x18) = 32;
-        *reinterpret_cast<const unsigned char**>(req0 + 0x20) = bc7_packed;
+        *reinterpret_cast<const unsigned char**>(req0 + 0x20) = bc7_mode6_packed;
         *reinterpret_cast<u64*>(req0 + 0x28) = 0;
-        *reinterpret_cast<unsigned*>(req0 + 0x30) = sizeof(bc7_packed);
+        *reinterpret_cast<unsigned*>(req0 + 0x30) = sizeof(bc7_mode6_packed);
         *reinterpret_cast<unsigned*>(req0 + 0x38) = 32;
 
-        // Request 1: truncated BC7 memory request (negative control: 32 bytes instead of 104)
+        // Request 1: wrong destination size (negative control: 16 bytes destination for 32-byte stream)
         unsigned char req1[0x48] = {};
         *reinterpret_cast<u64*>(req1 + 0x00) = (7ull << 1) | 0x400000;
-        *reinterpret_cast<void**>(req1 + 0x08) = dest_truncated.data();
+        *reinterpret_cast<void**>(req1 + 0x08) = dest_wrong_size.data();
         *reinterpret_cast<u64*>(req1 + 0x10) = 0;
-        *reinterpret_cast<unsigned*>(req1 + 0x18) = 32;
-        *reinterpret_cast<const unsigned char**>(req1 + 0x20) = bc7_packed;
+        *reinterpret_cast<unsigned*>(req1 + 0x18) = 16;
+        *reinterpret_cast<const unsigned char**>(req1 + 0x20) = bc7_mode6_packed;
         *reinterpret_cast<u64*>(req1 + 0x28) = 0;
-        *reinterpret_cast<unsigned*>(req1 + 0x30) = 32;
-        *reinterpret_cast<unsigned*>(req1 + 0x38) = 32;
+        *reinterpret_cast<unsigned*>(req1 + 0x30) = sizeof(bc7_mode6_packed);
+        *reinterpret_cast<unsigned*>(req1 + 0x38) = 16;
 
-        // Request 2: valid BC1 memory request (options = (1 << 1) | 0x400000)
+        // Request 2: valid BC7 Mode 1 memory request (subsequent valid request after rejection)
         unsigned char req2[0x48] = {};
-        *reinterpret_cast<u64*>(req2 + 0x00) = (1ull << 1) | 0x400000;
-        *reinterpret_cast<void**>(req2 + 0x08) = dest_bc1_valid.data();
+        *reinterpret_cast<u64*>(req2 + 0x00) = (7ull << 1) | 0x400000;
+        *reinterpret_cast<void**>(req2 + 0x08) = dest_bc7_mode1.data();
         *reinterpret_cast<u64*>(req2 + 0x10) = 0;
-        *reinterpret_cast<unsigned*>(req2 + 0x18) = 512;
-        *reinterpret_cast<const unsigned char**>(req2 + 0x20) = bc1_packed;
+        *reinterpret_cast<unsigned*>(req2 + 0x18) = 16;
+        *reinterpret_cast<const unsigned char**>(req2 + 0x20) = bc7_mode1_packed;
         *reinterpret_cast<u64*>(req2 + 0x28) = 0;
-        *reinterpret_cast<unsigned*>(req2 + 0x30) = sizeof(bc1_packed);
-        *reinterpret_cast<unsigned*>(req2 + 0x38) = 512;
+        *reinterpret_cast<unsigned*>(req2 + 0x30) = sizeof(bc7_mode1_packed);
+        *reinterpret_cast<unsigned*>(req2 + 0x38) = 16;
 
-        // Request 3: malformed BC1 memory request with trailing non-zero byte (negative control)
+        // Request 3: truncated BC7 memory request (negative control: 32 bytes instead of 104)
         unsigned char req3[0x48] = {};
-        *reinterpret_cast<u64*>(req3 + 0x00) = (1ull << 1) | 0x400000;
-        *reinterpret_cast<void**>(req3 + 0x08) = dest_bc1_trailing.data();
+        *reinterpret_cast<u64*>(req3 + 0x00) = (7ull << 1) | 0x400000;
+        *reinterpret_cast<void**>(req3 + 0x08) = dest_truncated.data();
         *reinterpret_cast<u64*>(req3 + 0x10) = 0;
-        *reinterpret_cast<unsigned*>(req3 + 0x18) = 512;
-        *reinterpret_cast<const unsigned char**>(req3 + 0x20) = bc1_packed_trailing;
+        *reinterpret_cast<unsigned*>(req3 + 0x18) = 32;
+        *reinterpret_cast<const unsigned char**>(req3 + 0x20) = bc7_mode6_packed;
         *reinterpret_cast<u64*>(req3 + 0x28) = 0;
-        *reinterpret_cast<unsigned*>(req3 + 0x30) = sizeof(bc1_packed_trailing);
-        *reinterpret_cast<unsigned*>(req3 + 0x38) = 512;
+        *reinterpret_cast<unsigned*>(req3 + 0x30) = 32;
+        *reinterpret_cast<unsigned*>(req3 + 0x38) = 32;
+
+        // Request 4: valid BC1 memory request (64 blocks / 512 bytes, subsequent valid request)
+        unsigned char req4[0x48] = {};
+        *reinterpret_cast<u64*>(req4 + 0x00) = (1ull << 1) | 0x400000;
+        *reinterpret_cast<void**>(req4 + 0x08) = dest_bc1_valid.data();
+        *reinterpret_cast<u64*>(req4 + 0x10) = 0;
+        *reinterpret_cast<unsigned*>(req4 + 0x18) = 512;
+        *reinterpret_cast<const unsigned char**>(req4 + 0x20) = bc1_packed;
+        *reinterpret_cast<u64*>(req4 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req4 + 0x30) = sizeof(bc1_packed);
+        *reinterpret_cast<unsigned*>(req4 + 0x38) = 512;
+
+        // Request 5: malformed BC1 memory request with trailing non-zero byte (negative control)
+        unsigned char req5[0x48] = {};
+        *reinterpret_cast<u64*>(req5 + 0x00) = (1ull << 1) | 0x400000;
+        *reinterpret_cast<void**>(req5 + 0x08) = dest_bc1_trailing.data();
+        *reinterpret_cast<u64*>(req5 + 0x10) = 0;
+        *reinterpret_cast<unsigned*>(req5 + 0x18) = 512;
+        *reinterpret_cast<const unsigned char**>(req5 + 0x20) = bc1_packed_trailing;
+        *reinterpret_cast<u64*>(req5 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req5 + 0x30) = sizeof(bc1_packed_trailing);
+        *reinterpret_cast<unsigned*>(req5 + 0x38) = 512;
 
         reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req0);
         reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 0);
@@ -1317,16 +1360,22 @@ bool dstorage_checks() {
         reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 2);
         reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req3);
         reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 3);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req4);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 4);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req5);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 5);
         reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
 
         for (int i = 0; i < 200; ++i) {
-            if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 3)) break;
+            if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 5)) break;
             Sleep(10);
         }
         if (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 0) ||
             !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 1) ||
             !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 2) ||
-            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 3)) {
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 3) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 4) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 5)) {
             return false;
         }
 
@@ -1334,14 +1383,21 @@ bool dstorage_checks() {
         long hr1 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 1);
         long hr2 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 2);
         long hr3 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 3);
+        long hr4 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 4);
+        long hr5 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 5);
 
-        if (hr0 != 0 || std::memcmp(dest_valid.data(), bc7_expected, 32) != 0) return false;
+        if (hr0 != 0 || std::memcmp(dest_bc7_mode6.data(), bc7_mode6_expected, 32) != 0) return false;
         if (hr1 == 0) return false;
+        for (unsigned char b : dest_wrong_size) {
+            if (b != 0xBB) return false;
+        }
+        if (hr2 != 0 || std::memcmp(dest_bc7_mode1.data(), bc7_mode1_expected, 16) != 0) return false;
+        if (hr3 == 0) return false;
         for (unsigned char b : dest_truncated) {
             if (b != 0xCC) return false;
         }
-        if (hr2 != 0 || std::memcmp(dest_bc1_valid.data(), bc1_expected, 512) != 0) return false;
-        if (hr3 == 0) return false;
+        if (hr4 != 0 || std::memcmp(dest_bc1_valid.data(), bc1_expected, 512) != 0) return false;
+        if (hr5 == 0) return false;
         for (unsigned char b : dest_bc1_trailing) {
             if (b != 0xDD) return false;
         }
