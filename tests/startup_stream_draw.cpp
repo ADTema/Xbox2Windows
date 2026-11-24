@@ -224,6 +224,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     invoke(list, 25, arg(pso));
     if (GetEnvironmentVariableW(L"X2W_TEST_LOGICAL_VIEW", nullptr, 0)) {
         if (int result = draw_logical_tables(desktop.Get(), guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_SRV", nullptr, 0)) {
+        extern int draw_address_srvs(ID3D12Device*, void*, void*);
+        if (const int result = draw_address_srvs(desktop.Get(), guest, list)) return result;
     } else {
         if (bc7) invoke(list, 36, 0, binding.table);
         invoke(list, 12, 3, 1);
