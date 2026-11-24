@@ -112,6 +112,11 @@ IMAGE_ATOMIC_OPS = "add|sub|and|or|xor|smin|smax|umin|umax|swap|cmpswap|inc|dec"
 IMAGE_ATOMIC_TYPES = {"R32_UINT": "uint", "R32_SINT": "int"}
 
 
+# LLVM's spellings of a 32-bit immediate: decimal, hex, an inline float (`1.0`, `0.15915494`, `-2.5e-3`) and
+# the non-finite names. An s_setreg_imm32_b32 operand is always a literal, never a register.
+_IMM32_LITERAL = re.compile(r"-?(?:0x[0-9a-fA-F]+|\d+(?:\.\d*)?(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?|nan|inf(?:inity)?)",
+                             re.IGNORECASE)
+
 def checked_group(group):
     """Return (x, y, z) within the D3D12 cs_6_0 numthreads limits."""
     x, y, z = (group, 1, 1) if isinstance(group, int) else tuple(group)
@@ -386,6 +391,14 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         if (guard is not None and guard["at_label"]
                 and not re.fullmatch(r"s_waitcnt_depctr 0x[0-9a-f]+|s_nop \d+|s_or_b32 .*", line)):
             raise ValueError("Lane guard branch does not reach its restore")
+        if m := re.fullmatch(r"s_setreg_imm32_b32 hwreg\(HW_REG_FLAT_SCR_(?:LO|HI)\), (.+)", line):
+            if not _IMM32_LITERAL.fullmatch(m[1]):
+                raise ValueError("Unsupported scratch-base immediate spelling: " + m[1])
+            # A whole-register immediate write of the scratch base. Nothing the lowering accepts can read
+            # either half: a read through s_getreg_b32 and every scratch or flat memory form are themselves
+            # unmodelled and refused, so the write has no observable consumer and lowers to nothing. Its value
+            # is not tracked, which is why only this exact whole-register immediate form is accepted.
+            continue
         if re.fullmatch(r"s_inst_prefetch (?:0x[0-9a-f]+|\d+)|s_nop \d+|s_waitcnt_depctr 0x[0-9a-f]+", line):
             continue
         if m := re.fullmatch(r"s_clause (0x[0-9a-f]+|\d+)", line):
