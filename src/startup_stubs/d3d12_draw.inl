@@ -1054,6 +1054,20 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             : ud.kind == Translation::root_constant ? ((ud.a >= 0 && ud.a < 16 && ud.b >= 0 && ud.b < 8) ? pass.constants[ud.a][ud.b] : 0)
             : ud.kind == Translation::stride && ud.a >= 0 && ud.a < 32 ? strides[ud.a] : 0;
     }
+    // A desktop list with no viewport or scissor draws nothing: cover the first render target unless the title set its own.
+    if (pass.target0 && (!pass.viewport_set || !pass.scissor_set)) {
+        const D3D12_RESOURCE_DESC target = pass.target0->GetDesc();
+        if (!pass.viewport_set) {
+            const D3D12_VIEWPORT full{0.0f, 0.0f, static_cast<float>(target.Width), static_cast<float>(target.Height), 0.0f, 1.0f};
+            list->RSSetViewports(1, &full);
+            pass.viewport_set = true;
+        }
+        if (!pass.scissor_set) {
+            const D3D12_RECT full{0, 0, static_cast<LONG>(target.Width), static_cast<LONG>(target.Height)};
+            list->RSSetScissorRects(1, &full);
+            pass.scissor_set = true;
+        }
+    }
     list->SetPipelineState(pipeline);
     list->SetGraphicsRootSignature(tr->root);
     ID3D12DescriptorHeap* samplers = tr->samplers.heap ? pass.sampler_heap.Get() : nullptr;

@@ -27,6 +27,19 @@ It covers what the draw cannot observe: the logged descriptor offset (4 bytes in
 a byte-for-byte copy of the descriptor, and refusal of a null list or one that is not whole
 records. The control expects the first blend patch to win and must fail.
 
+## Default viewport and scissor
+
+A desktop command list that never sets a viewport or scissor rectangle draws no pixel. A translated
+draw therefore covers the whole first render target (its width and height, depth 0 to 1) when the title
+set no viewport, and the same rectangle as scissor when it set no scissor. Each default applies on its own,
+and a viewport or scissor the title did set is never replaced. A list reset starts without either. A call
+with no viewports or no rectangles changes nothing. A draw with no render target bound, for example
+depth only, gets no default.
+
+Run `ctest --preset dev --no-tests=error -R "^startup_stream_viewport_(hardware|warp)$" -V` after building
+`startup_stream_consumer`. On an 8×4 target the cases draw with neither call, inside a 4×2 rectangle (the
+rest keeps the clear color), and on a reset list that follows the rectangle (all pixels drawn again).
+
 ## Output window and fallback diagnostics
 
 The desktop swap chain has its own top-level window, class `X2WOutputWindow`.

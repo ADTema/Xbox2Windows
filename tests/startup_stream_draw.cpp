@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <fstream>
 #include <iterator>
 #include <vector>
@@ -287,12 +288,33 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         extern int draw_bc_address_srvs(void*, void*);
         if (const int result = draw_bc_address_srvs(guest, list)) return result;
     }
-    invoke(list, 9);
-    invoke(queue, 10, 1, arg(&list));
-    if (FAILED(static_cast<HRESULT>(invoke(queue, 14, arg(fence), 1)))) return 24;
-    const auto deadline = GetTickCount64() + 10000;
-    while (invoke(fence, 8) == 0 && GetTickCount64() < deadline) Sleep(1);
-    if (invoke(fence, 8) != 1) return 25;
+    const auto submit = [&](UINT64 value) {
+        invoke(list, 9);
+        invoke(queue, 10, 1, arg(&list));
+        if (FAILED(static_cast<HRESULT>(invoke(queue, 14, arg(fence), value)))) return 24;
+        const auto deadline = GetTickCount64() + 10000;
+        while (invoke(fence, 8) < value && GetTickCount64() < deadline) Sleep(1);
+        return invoke(fence, 8) == value ? 0 : 25;
+    };
+    // X2W_TEST_VIEWPORT=reset: the list above drew inside a small rectangle. Record a second list on the same
+    // object after Reset that sets neither a viewport nor a scissor; it must not inherit the first rectangle.
+    wchar_t viewport_mode[8] = L"";
+    GetEnvironmentVariableW(L"X2W_TEST_VIEWPORT", viewport_mode, 8);
+    UINT64 last = 1;
+    if (std::wcscmp(viewport_mode, L"reset") == 0) {
+        if (const int rc = submit(1)) return rc;
+        const float clear[] = {0, 0, 1, 1};
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv{static_cast<SIZE_T>(invoke(frame.rtv_heap, 9))};
+        if (FAILED(static_cast<HRESULT>(invoke(frame.allocator, 8))) ||
+            FAILED(static_cast<HRESULT>(invoke(list, 139, arg(frame.allocator))))) return 35;
+        invoke(list, 52, rtv.ptr, arg(clear));
+        invoke(list, 50, 1, arg(&rtv));
+        invoke(list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        invoke(list, 25, arg(pso));
+        invoke(list, 12, 3, 1);
+        last = 2;
+    }
+    if (const int rc = submit(last)) return rc;
 
     return read_stream_target(desktop.Get(), frame, pixels);
 }
