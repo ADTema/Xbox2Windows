@@ -480,6 +480,17 @@ VOP1_OPS = {
     0x43: ("v_movrels_b32_e32", "Vector copy with relative source"),
     0x44: ("v_movrelsd_b32_e32", "Vector copy with relative source and destination"),
     0x48: ("v_movrelsd_2_b32_e32", "Vector copy with relative source and destination (extended form)"),
+    0x50: ("v_cvt_f16_u16_e32", "Convert uint16 to float16"),
+    0x51: ("v_cvt_f16_i16_e32", "Convert int16 to float16"),
+    0x52: ("v_cvt_u16_f16_e32", "Convert float16 to uint16"),
+    0x53: ("v_cvt_i16_f16_e32", "Convert float16 to int16"),
+    0x5b: ("v_floor_f16_e32", "Floor float16"),
+    0x5c: ("v_ceil_f16_e32", "Ceiling float16"),
+    0x5d: ("v_trunc_f16_e32", "Truncate toward zero float16"),
+    0x5e: ("v_rndne_f16_e32", "Round to nearest even float16"),
+    0x5f: ("v_fract_f16_e32", "Fractional part float16"),
+    0x63: ("v_cvt_norm_i16_f16_e32", "Convert float16 to normalized int16"),
+    0x64: ("v_cvt_norm_u16_f16_e32", "Convert float16 to normalized uint16"),
 }
 
 VOPC_OPS = {
@@ -714,10 +725,17 @@ VOP2_OPS = {
     0x2c: ("v_fmamk_f32", "Vector fused multiply-add with literal multiplier"),
     0x2d: ("v_fmaak_f32", "Vector fused multiply-add with literal addend"),
     0x2f: ("v_cvt_pkrtz_f16_f32_e32", "Convert two float32 to packed float16 (round to zero)"),
+    0x32: ("v_add_f16_e32", "Vector add float16"),
+    0x33: ("v_sub_f16_e32", "Vector subtract float16"),
+    0x34: ("v_subrev_f16_e32", "Vector reverse subtract float16"),
+    0x35: ("v_mul_f16_e32", "Vector multiply float16"),
     0x36: ("v_fmac_f16_e32", "Vector fused multiply-accumulate float16"),
     0x37: ("v_fmamk_f16", "Vector fused multiply-add float16 with literal multiplier"),
     0x38: ("v_fmaak_f16", "Vector fused multiply-add float16 with literal addend"),
+    0x39: ("v_max_f16_e32", "Vector maximum float16"),
+    0x3a: ("v_min_f16_e32", "Vector minimum float16"),
     0x3b: ("v_ldexp_f16_e32", "Vector scale float16 by a power of two"),
+    0x3c: ("v_pk_fmac_f16", "Vector packed fused multiply-accumulate float16"),
 }
 
 VOP3_NATIVE_OPS = {
