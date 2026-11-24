@@ -174,6 +174,9 @@ void check_footprint_guards()
     odd.placed[0].Footprint.RowPitch = 256;
     odd.placed[0].Footprint.Depth = 4;
     guard_expect(odd.bytes(0) == 256 * 11 + 17, "bytes: depth slices of rows");
+    odd.rows[0] = UINT_MAX;
+    odd.placed[0].Footprint.Depth = UINT_MAX;
+    guard_expect(odd.bytes(0) == 0, "bytes: reject an overflowing span");
     const SliceFootprints unset(nullptr, image(DXGI_FORMAT_R8_UNORM, 1, 1), 1);
     guard_expect(unset.bytes(0) == 0, "bytes: nothing filled in");
 
@@ -215,6 +218,7 @@ void check_footprint_guards()
         {"16 mips", list, texture, buffer, 16, 2, 1, 2},
         {"zero slices", list, texture, buffer, 3, 0, 0, 2},
         {"slice past the slices", list, texture, buffer, 3, 2, 2, 2},
+        {"overflowing subresource", list, texture, buffer, 3, UINT_MAX, UINT_MAX - 1, 2},
         {"subresource past the plan", list, texture, buffer, 3, 2, 1, 3},
         {"subresource far past the plan", list, texture, buffer, 3, 2, 1, UINT_MAX},
     };
