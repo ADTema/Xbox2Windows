@@ -5,10 +5,12 @@ Scalar registers are also tracked symbolically at translation time so that point
 values (tables, vertex-buffer table, root buffers) turn into HLSL resources instead of arithmetic.
 The output is HLSL for both stages plus a manifest that tells the runtime what to bind where.
 """
+from contextlib import suppress
 import os
 import re
 import struct
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 import disasm_rdna2 as D  # noqa: E402
@@ -2061,6 +2063,13 @@ def find_fxc():
     return shutil.which('fxc.exe')
 
 
+def has_bytecode(path):
+    try:
+        return os.path.isfile(path) and os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+
 def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_formats=(), rtv_request='', vs_fetch=None):
     """Writes <key>.vs.hlsl, <key>.ps.hlsl and <key>.txt (last), or <key>.fail with the reason.
 
@@ -2082,18 +2091,41 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
         message = 'fxc.exe not found (X2W_FXC=%s): set X2W_FXC to its path or install the Windows SDK' % os.environ.get('X2W_FXC', '<unset>')
         open(name + '.fail', 'w').write(message + '\n')
         return message
+    manifest_path = name + '.txt'
+    write_manifest = True
     if fxc:
         import subprocess
-        for stage, profile in (('vs', 'vs_5_1'), ('ps', 'ps_5_1')):
-            r = subprocess.run([fxc, '/nologo', '/T', profile, '/E', 'main', '/Fo', name + '.%s.cso' % stage, name + '.%s.hlsl' % stage],
-                               capture_output=True, text=True)
-            if r.returncode:
-                open(name + '.fail', 'w').write('fxc %s: %s\n' % (stage, r.stderr[-2000:]))
-                return 'fxc %s failed: %s' % (stage, r.stderr.strip().splitlines()[-1] if r.stderr.strip() else '?')
-    temporary = '%s.txt.%d.tmp' % (name, os.getpid())
-    with open(temporary, 'w') as result:
-        result.write(manifest)
-    os.replace(temporary, name + '.txt')
+        # An existing manifest can already point at these paths. Publish only bytecode from a successful pair.
+        with tempfile.TemporaryDirectory(prefix='.fxc-', dir=out_dir) as staging:
+            for stage, profile in (('vs', 'vs_5_1'), ('ps', 'ps_5_1')):
+                bytecode = os.path.join(staging, stage + '.cso')
+                r = subprocess.run([fxc, '/nologo', '/T', profile, '/E', 'main', '/Fo', bytecode, name + '.%s.hlsl' % stage],
+                                   capture_output=True, text=True)
+                if r.returncode or not has_bytecode(bytecode):
+                    detail = r.stderr.strip() or ('?' if r.returncode else 'no bytecode produced')
+                    open(name + '.fail', 'w').write('fxc %s: %s\n' % (stage, detail[-2000:]))
+                    return 'fxc %s failed: %s' % (stage, detail.splitlines()[-1])
+            with suppress(FileNotFoundError, UnicodeError):
+                with open(manifest_path) as existing:
+                    write_manifest = existing.read() != manifest
+            # If the bindings changed, withdraw the old manifest before publishing new bytecode.
+            if write_manifest:
+                with suppress(FileNotFoundError):
+                    os.remove(manifest_path)
+            for stage in ('vs', 'ps'):
+                os.replace(os.path.join(staging, stage + '.cso'), name + '.%s.cso' % stage)
+    if write_manifest:
+        temporary = '%s.%d.tmp' % (manifest_path, os.getpid())
+        try:
+            with open(temporary, 'w') as result:
+                result.write(manifest)
+            os.replace(temporary, manifest_path)
+        finally:
+            with suppress(FileNotFoundError):
+                os.remove(temporary)
+    if fxc:
+        with suppress(FileNotFoundError):
+            os.remove(name + '.fail')
     return 'ok'
 
 
@@ -2359,13 +2391,12 @@ def main():
             for ext, blob in (('.a', a), ('.b', b), ('.root', root)):
                 open(os.path.join(out_dir, 'req_%016x%s' % (key, ext)), 'wb').write(blob)
             print('pso %x -> request %016x' % (w & 0xffffff, key))
-    # translate every request that has no result yet
-    for name in sorted(os.listdir(out_dir)):
-        m = re.fullmatch(r'req_([0-9a-f]{16})\.(?:a|rtv)', name)
-        if not m:
-            continue
-        key = int(m.group(1), 16)
-        if os.path.exists(os.path.join(out_dir, '%016x.txt' % key)):
+    manifest_only = os.environ.get('X2W_FXC') == ''
+    for key in request_keys(out_dir):
+        name = os.path.join(out_dir, '%016x' % key)
+        if os.path.isfile(name + '.txt') and (
+            manifest_only or (has_bytecode(name + '.vs.cso') and has_bytecode(name + '.ps.cso'))
+        ):
             continue
         print('%016x: %s' % (key, translate_request(out_dir, key)))
 
