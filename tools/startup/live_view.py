@@ -13,7 +13,7 @@ import time
 rundir = sys.argv[1]
 # The package root the run uses as its working directory (run.ps1 -DataDir), next to the G:\ mount.
 roots = ["G:\\"] + [os.path.join(os.path.abspath(sys.argv[2]), "")] if len(sys.argv) > 2 else ["G:\\"]
-game_file = re.compile(r"Nt(?:CreateFile|OpenFile) (?:\\\?\?\\)?((?i:" + "|".join(map(re.escape, roots)) + r")[^ ]+)")
+game_file = re.compile(r"Nt(?:CreateFile|OpenFile) (?:\\\?\?\\)?((?i:" + "|".join(map(re.escape, roots)) + r").+)(?= from (?:[^+]*\+)?0x[0-9a-fA-F]+ )")
 os.system("title Xbox2Windows debug log - " + os.path.basename(os.path.abspath(rundir)))
 start = time.time()
 counts = {"modules": 0, "files": 0, "refused": 0, "chunks": 0, "gpu calls first seen": 0}
