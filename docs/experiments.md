@@ -6013,6 +6013,31 @@ SM 6.0 and SM 6.6 compute shaders. All these runs reported zero D3D12 warnings
 and errors. The original SM 6.6 readback on RTX 4060 Laptop and WARP produced
 the same values.
 
+An Intel Arc 140T (8086:7d51, driver 32.0.101.8132, Windows 11 build 26300.9974,
+DXC 1.8.2502.11, SPIRV-Tools 2025.5, debug layer enabled) failed the same
+fixture at the first sampler order: it read `0.25 0.25` for the two ordinary
+samples and `0 0` for the two comparison results, so the second thread repeated
+the first thread's descriptors. The same commit's RTX 5080 Laptop
+(32.0.15.8142) and in-box WARP (10.0.26100.9818) matched all four words in all
+three orders. [Issue #1115](https://github.com/R0Y00/Xbox2Windows/issues/1115)
+has the reports.
+
+Two controls written as direct HLSL on that adapter, compiled with the same DXC
+at `cs_6_0` and run through the same readback path, separate the shader from the
+descriptor layer. With the two bindings written out explicitly — `SamplerState
+ordinary[2] : register(s1)` and `SamplerComparisonState comparison[2] :
+register(s1, space3)`, indexed by `SV_DispatchThreadID` — the adapter read
+`0.25 0.75` and `0 1`, and exchanged only the reversed pair in the other two
+orders, matching the reference. Changing the sampler-array index to
+`SV_GroupID` and nothing else reproduced the failure word for word
+(`0.25 0.25`, `0 0`); the RTX and WARP readback for the same two controls were
+identical to each other and correct. The split shader indexes its samplers with
+`gl_WorkGroupID.x`, so on this adapter the difference follows the index source
+rather than the sampling or the readback. A control that reads one table alone —
+ordinary only, or comparison only — read the correct descriptors, so neither
+table is wrong by itself. Whether the driver folds that index as uniform is not
+established here.
+
 ### Standalone comparison-sampler split in the SPIR-V bridge
 
 When one standalone SPIR-V sampler variable feeds both depth-comparison and ordinary
