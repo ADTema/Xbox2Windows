@@ -4694,6 +4694,30 @@ Measured on `31f9ebb` with this change, Windows 10 build 19045, debug layer enab
 ctest --preset dev --no-tests=error -R '^wave64_emulate_' -V
 ```
 
+### Forced wave size at pipeline creation
+
+`wave_startup_<width>_<adapter>` is a CRT-free EXE (`/ENTRY:fixture_entry /NODEFAULTLIB`) that, from its entry point, enables the debug layer when installed, creates a device, reads `D3D12_OPTIONS1.WaveLaneCountMin/Max` and calls `CreateComputePipelineState` once. Its [shader](../tests/wave_startup.hlsl) compiles as `cs_6_6` with no attribute (`0`), `[WaveSize(4)]` or `[WaveSize(32)]`. The EXE prints the exact HRESULT and every debug-layer message stored by the call. When creation succeeds it dispatches one 64-thread group and reads back `WaveGetLaneCount()` from every invocation. It passes when the outcome matches the reported range, and exits 77 when a forced width lies outside the range and the pipeline is refused. A pipeline created outside the range, or refused inside it, fails. `XBOX2WINDOWS_DEBUG_LAYER=off` repeats the attempt without the layer. The desktop readback of wave operations at native and forced widths is `shader_wave` ([#1132](https://github.com/R0Y00/Xbox2Windows/pull/1132)). This fixture answers only whether creation is refused, with which HRESULT and message.
+
+Measured on Windows 11 build 26200.9974, MSVC 19.44, DXC from Windows SDK 10.0.26100, `dev` and `release`, three CTest runs each with the debug layer and three without:
+
+| Adapter | Lane range | No attribute | `[WaveSize(4)]` | `[WaveSize(32)]` |
+| --- | --- | --- | --- | --- |
+| WARP (in-box, 10.0.26100.9818) | 4..4 | `S_OK`, readback 4 | `S_OK`, readback 4 | `0x80070057` (`E_INVALIDARG`), skip 77 |
+| NVIDIA GeForce RTX 3070 (32.0.16.2101) | 32..32 | `S_OK`, readback 32 | `0x80070057` (`E_INVALIDARG`), skip 77 | `S_OK`, readback 32 |
+
+Every readback had 64 invocations agreeing on one width. The refusals return the same HRESULT without the debug layer. With it, each refusal stores exactly one message, D3D12 error 622, and successful creation and dispatch store none:
+
+```text
+ID3D12Device::CreateComputeShader: Shader wants wave lane count of 32 but maximum wave lane count for device is 4. To check for support, check device caps via the CheckFeatureSupport() API
+ID3D12Device::CreateComputeShader: Shader wants wave lane count of 4 but minimum wave lane count for device is 32. To check for support, check device caps via the CheckFeatureSupport() API
+```
+
+Two local mutations were caught: an EXE expecting width 32 around the unforced shader created a pipeline on WARP that its 4..4 range excludes, and an EXE expecting 32 around the `[WaveSize(4)]` shader was refused on the RTX 3070 inside its 32..32 range. Both exited 1. A forced-wave32 pipeline is therefore refused by the in-box WARP at creation, as a capability limit of its 4..4 range, before any translated code runs. Not tested: AMD or Intel hardware, the app-local WARP or Agility SDK runtimes, `[WaveSize(64)]`, and the pipeline under `pe_map`.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^wave_startup_' -V
+```
+
 ## Mapped DLL draw with a Windows reference
 
 `cpu_native_frame_hardware` and `cpu_native_frame_warp` load the same source-built DLL with `LoadLibraryW` and with `pe_map`. Both paths record TLS before the DLL entry on process attach and detach. The DLL's `guest_draw` export selects the shared two-texture shader fixture and calls the graphics provider through its bound import. The provider calls the host test, which runs the existing offscreen renderer in a child process. The renderer checks every RGBA channel against the CPU reference, and the test compares the two 64×64 captures byte for byte. Withholding the graphics provider must fail mapping before startup or drawing.
