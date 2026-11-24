@@ -1,0 +1,6 @@
+; Import-only fixture for pe_run_package --trap-missing. No build product or test
+; package provides trap_fixture.dll, so both imports stay unresolved.
+LIBRARY trap_fixture
+EXPORTS
+    trap_fixture_alpha
+    trap_fixture_beta

@@ -34,6 +34,12 @@ ordinal, using `pe_map_export_ordinal` on the mapped provider. `cpu_native_start
 
 External providers with process-lifetime workers can use `--pin-shim DLL` alongside `--shim DLL PATH`. This pins the provider immediately before the first guest image loads, and only in execution mode. Run packages in a child process when using pinned providers. The guest must still join its own workers and quiesce any host calls into guest code before returning. `cpu_package_shim_lifetime` verifies that the selected provider remains loaded after the entry returns and the ordinary provider unloads.
 
+`--trap-missing` is a diagnostic execution mode for finding the last startup stage a package reaches. By default the runner refuses any unresolved external before mapping. This mode instead binds each one to a numbered trap and lists them on stderr, in sorted `dll!symbol` order. A trap never returns: it prints `trap N: <importers>: <dll>!<symbol>` and terminates the process with `0xE7A00000 | N`. No DLL is written or loaded under the missing name, and a trap is not a provider. If the entry returns without reaching a trap, the JSON result adds `unhit_traps`. The flag cannot be combined with `--preflight-only`, and `plan(report, allow_external=False)` still refuses the same package. `pe_run_package_trap_missing` checks this with a source-built EXE that imports two functions from a module that nothing provides. The default run is refused. Calling either import ends the process with that import's trap code and name, and calling neither reports both traps as unhit.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^pe_run_package_trap_missing$' -V
+```
+
 ### Scoped content root on Windows
 
 `startup_content_root` creates generated archive bytes in a package directory and different bytes
