@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "startup_stream_draw.h"
+#include "../src/startup_stubs/packed_target_format.h"
 #include "startup_stream_setup.h"
 
 using Microsoft::WRL::ComPtr;
@@ -108,7 +109,7 @@ int draw_logical_tables(ID3D12Device* desktop, void* guest, void* list)
 namespace {
 struct Bc7Binding {
     std::vector<unsigned char> backing, views;
-    UINT64 table = 0;
+    UINT64 table = 0, rtv = 0;
 };
 
 bool populate_tiled_bc7(const StartupBc7Input& input, const D3D12_RESOURCE_DESC& desc,
@@ -132,6 +133,57 @@ bool populate_tiled_bc7(const StartupBc7Input& input, const D3D12_RESOURCE_DESC&
     }
     reinterpret_cast<UINT64(*)(void*)>(table[1])(computer);
     return SUCCEEDED(hr);
+}
+
+// Clear colour of the packed-target case; its 8-, 5- and 4-bit roundings differ (tests/startup_packed_target_draw_check.py).
+const float packed_clear[] = {0.45f, 0.0f, 0.8f, 1.0f};
+
+// 0: the texture, both views and the table exist. Otherwise an exit code that names the step.
+int bind_packed(ID3D12Device* desktop, void* guest, const StartupBc7Input& input, Bc7Binding& binding)
+{
+    unsigned resource_format = 0, flags = 0, view_format = 0;
+    if (std::sscanf(input.packed, "%u:%x:%u", &resource_format, &flags, &view_format) != 3) return 2;
+    D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, input.width, input.height, 1, 1,
+        static_cast<DXGI_FORMAT>(resource_format), {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, static_cast<D3D12_RESOURCE_FLAGS>(flags)};
+    // What the adapter says about the description, and what the helper makes of it.
+    const auto support = [desktop](DXGI_FORMAT format) -> UINT {
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT query{format};
+        return SUCCEEDED(desktop->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &query, sizeof(query))) ? static_cast<UINT>(query.Support1) : 0u;
+    };
+    const DXGI_FORMAT created = x2w_startup::packed_target_stand_in(desc, support);
+    std::printf("packed: resource format %u flags 0x%x support1 0x%x view format %u expected texture format %u\n", resource_format, flags,
+                support(desc.Format), view_format, static_cast<unsigned>(created));
+    std::fflush(stdout);
+    binding.backing.resize(static_cast<std::size_t>(input.width) * input.height * 4 + 0x10000);
+    void* texture = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, arg(binding.backing.data()), arg(&desc),
+        D3D12_RESOURCE_STATE_COMMON, 0, arg(&__uuidof(ID3D12Resource)), arg(&texture)))) || !texture) return 40;
+
+    const UINT increment = desktop->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const UINT entries = (32 + increment - 1) / increment;
+    binding.views.resize(static_cast<std::size_t>(entries) * increment);
+    const struct {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        Word backing, bytes;
+    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, entries, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE},
+                arg(binding.views.data()), binding.views.size()},
+      rtv_heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1}, 0, 0};
+    void* heap = nullptr;
+    void* rtv_heap = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 14, arg(&heap_desc), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&heap)))) ||
+        FAILED(static_cast<HRESULT>(invoke(guest, 14, arg(&rtv_heap_desc), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&rtv_heap)))))
+        return 41;
+    const auto cpu = invoke(heap, 9);
+    if (cpu != arg(binding.views.data())) return 41;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{static_cast<DXGI_FORMAT>(view_format), D3D12_SRV_DIMENSION_TEXTURE2D,
+                                        D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+    srv.Texture2D.MipLevels = 1;
+    const D3D12_RENDER_TARGET_VIEW_DESC rtv{static_cast<DXGI_FORMAT>(view_format), D3D12_RTV_DIMENSION_TEXTURE2D, {}};
+    binding.rtv = invoke(rtv_heap, 9);
+    invoke(guest, 20, arg(texture), arg(&rtv), binding.rtv);
+    invoke(guest, 18, arg(texture), arg(&srv), cpu);
+    binding.table = invoke(heap, 10);
+    return binding.table ? 0 : 41;
 }
 
 bool bind_bc7(ID3D12Device* desktop, void* guest, const StartupBc7Input& input, Bc7Binding& binding)
@@ -195,7 +247,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     ComPtr<ID3D12Device> desktop;
     if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
     Bc7Binding binding;
-    if (bc7 && !bind_bc7(desktop.Get(), guest, *bc7, binding)) return 34;
+    if (bc7 && bc7->packed) {
+        if (const int rc = bind_packed(desktop.Get(), guest, *bc7, binding)) return rc;
+    } else if (bc7 && !bind_bc7(desktop.Get(), guest, *bc7, binding)) return 34;
     StreamTarget frame;
     if (two_targets) frame.count = 2;  // a second RGBA8 target of the same size, written after the first
     if (const int rc = open_stream_target(desktop.Get(), guest, pso, width, height, format,
@@ -216,6 +270,7 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         extern int draw_address_srvs(ID3D12Device*, void*, void*);
         if (const int result = draw_address_srvs(desktop.Get(), guest, list)) return result;
     } else {
+        if (bc7 && bc7->packed) invoke(list, 52, binding.rtv, arg(packed_clear));  // render into the texture, then sample it
         if (bc7) invoke(list, 36, 0, binding.table);
         invoke(list, 12, 3, 1);
     }

@@ -31,6 +31,7 @@
 #include "console_plane_size.h"
 #include "null_binding_cause.h"
 #include "null_texture_view.h"
+#include "packed_target_format.h"
 #include "state_block_blend.h"
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
@@ -662,6 +663,22 @@ D3D12_RESOURCE_DESC sanitized(const D3D12_RESOURCE_DESC& desc)
     }
     if (desc.Alignment != 0 && desc.Alignment != 0x10000 && desc.Alignment != 0x400000) copy.Alignment = 0;
     copy.Format = desktop_format(desc.Format);
+    // A 16-bit packed target the adapter cannot render to or write as a UAV: packed_target_format.h.
+    if (the_device && x2w_startup::packed_target_format(copy.Format)) {
+        ID3D12Device* const device = static_cast<ID3D12Device*>(the_device->own().real);
+        const DXGI_FORMAT stand_in = x2w_startup::packed_target_stand_in(copy, [device](DXGI_FORMAT format) -> UINT {
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
+            return SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)))
+                ? static_cast<UINT>(support.Support1) : 0u;
+        });
+        if (stand_in != copy.Format) {
+            static LONG stand_ins;
+            if (first_calls(stand_ins, 4))
+                log("x2w-d3d12 texture format %d with flags 0x%x: shortcut - not supported for that use here, created as format %d",
+                    copy.Format, copy.Flags, stand_in);
+            copy.Format = stand_in;
+        }
+    }
     return copy;
 }
 
@@ -672,7 +689,9 @@ __declspec(noinline) u64 create_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d, 
     u64 args[8] = {a, b, c, d, e, f, g, h};
     for (int i = 0; i < R; ++i) args[i] = unwrap(args[i]);
     D3D12_RESOURCE_DESC desc_copy{};
+    DXGI_FORMAT requested_format = DXGI_FORMAT_UNKNOWN;
     if (Desc >= 0 && args[Desc]) {
+        requested_format = desktop_format(reinterpret_cast<const D3D12_RESOURCE_DESC*>(args[Desc])->Format);
         desc_copy = sanitized(*reinterpret_cast<const D3D12_RESOURCE_DESC*>(args[Desc]));
         args[Desc] = reinterpret_cast<u64>(&desc_copy);
     }
@@ -684,6 +703,8 @@ __declspec(noinline) u64 create_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d, 
     Kind kind = other_kind;
     if (SUCCEEDED(static_cast<HRESULT>(result)) && iid && out && *out) {
         kind = kind_for(*iid);
+        if (Desc >= 0 && kind == resource_kind && requested_format != DXGI_FORMAT_UNKNOWN)
+            x2w_startup::mark_packed_stand_in(static_cast<ID3D12Resource*>(*out), requested_format);
         Wrapper* child = wrap(static_cast<IUnknown*>(*out), kind);
         if (K == device_kind && kind == list_kind) child->own().list_device = self;
         *out = child;
@@ -2150,7 +2171,20 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
         std::memcpy(desc_copy, reinterpret_cast<const void*>(args[desc_index]), sizeof(desc_copy));
         DXGI_FORMAT format;
         std::memcpy(&format, desc_copy, sizeof(format));
-        const DXGI_FORMAT mapped = desktop_format(format);
+        DXGI_FORMAT mapped = desktop_format(format);
+        if (args[0] && x2w_startup::packed_target_format(mapped)) {
+            // A packed view follows a stand-in texture and is refused on any other texture of another format.
+            auto* const resource = reinterpret_cast<ID3D12Resource*>(args[0]);
+            const auto verdict = x2w_startup::packed_view(mapped, resource->GetDesc().Format, x2w_startup::packed_stand_in_of(resource));
+            if (verdict == x2w_startup::PackedView::refused) {
+                static LONG refused;
+                if (first_calls(refused, 6))
+                    log("x2w-d3d12 Device::slot%d view skipped: packed format %d on a texture of format %d that does not stand in for it",
+                        N, mapped, resource->GetDesc().Format);
+                return 0;
+            }
+            if (verdict == x2w_startup::PackedView::stand_in) mapped = DXGI_FORMAT_R8G8B8A8_UNORM;
+        }
         if (mapped != format) {
             std::memcpy(desc_copy, &mapped, sizeof(mapped));
             args[desc_index] = reinterpret_cast<u64>(desc_copy);
@@ -2366,6 +2400,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
                 FAILED(texture_hr) ? bytes : "");
         }
         if (FAILED(texture_hr)) return texture_hr;
+        x2w_startup::mark_packed_stand_in(created, desktop_format(desc->Format));
         Wrapper* w = wrap(created, resource_kind);
         w->own().title_memory = address;
         note_resource(w, desc, 0);
@@ -2727,6 +2762,7 @@ HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROP
             desc->Width, desc->Height, desc->Format, desc->Flags, state, static_cast<const void*>(clear),
             clear && !cleared ? "(dropped)" : "", session, castable_count, castable, text, static_cast<unsigned long>(hr));
     if (FAILED(hr)) return hr;
+    x2w_startup::mark_packed_stand_in(resource, desktop_format(desc->Format));
     Wrapper* w = wrap(resource, resource_kind);
     w->own().title_memory = title_memory;
     note_resource(w, desc, info.SizeInBytes != ~0ull ? info.SizeInBytes : 0);
