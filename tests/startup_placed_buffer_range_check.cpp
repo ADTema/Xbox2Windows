@@ -19,6 +19,9 @@
 // 7. A reservation committed in two steps.
 // 8. A placeholder split in two, its first piece replaced by committed private memory: a buffer inside
 //    the piece and one ending in the placeholder after it.
+// 8b. Other private allocations: MEM_WRITE_WATCH, MEM_TOP_DOWN, PAGE_EXECUTE_READWRITE, a heap block
+//    (a reservation larger than its committed part), an AWE reservation (MEM_PHYSICAL, nothing
+//    committed) and, when the process may lock pages, MEM_LARGE_PAGES (otherwise reported, not run).
 // 9. Cost: a 512 MiB committed private block with one page touched per 64 KiB, 64 buffers spread over
 //    it. Decisions as above; in addition every placement must be proven without VirtualQuery (a call
 //    count, not a time). The time per placement of the full walk, the bounded walk and the exact
@@ -300,6 +303,59 @@ int main(int argc, char** argv)
             VirtualFree(piece, 0, MEM_RELEASE);
         }
         if (holder) VirtualFree(holder + 4 * page, 0, MEM_RELEASE);
+    }
+
+    // Case 8b: other private allocations.
+    {
+        if (auto* p = static_cast<char*>(VirtualAlloc(nullptr, 16 * page, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE))) {
+            place(p + page, 2 * page, 1, "write-watch allocation: buffer inside");
+            place(p + 15 * page, 2 * page, 0, "write-watch allocation: buffer past the end");
+            VirtualFree(p, 0, MEM_RELEASE);
+        } else {
+            setup_fail("cannot allocate with MEM_WRITE_WATCH", nullptr);
+        }
+        if (auto* p = static_cast<char*>(VirtualAlloc(nullptr, 16 * page, MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN, PAGE_READWRITE))) {
+            place(p + page, 2 * page, 1, "top-down allocation: buffer inside");
+            VirtualFree(p, 0, MEM_RELEASE);
+        } else {
+            setup_fail("cannot allocate with MEM_TOP_DOWN", nullptr);
+        }
+        if (auto* p = static_cast<char*>(VirtualAlloc(nullptr, 16 * page, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE))) {
+            place(p + page, 2 * page, 1, "executable allocation: buffer inside");
+            VirtualFree(p, 0, MEM_RELEASE);
+        } else {
+            setup_fail("cannot allocate executable memory", nullptr);
+        }
+        // A large heap block is its own allocation, reserved beyond its committed part.
+        HANDLE heap = HeapCreate(0, 0, 0);
+        auto* block = heap ? static_cast<char*>(HeapAlloc(heap, 0, 4u << 20)) : nullptr;
+        MEMORY_BASIC_INFORMATION info{};
+        if (!block || !VirtualQuery(block, &info, sizeof(info))) {
+            setup_fail("cannot allocate a 4 MiB heap block", block);
+        } else {
+            auto* base = static_cast<char*>(info.AllocationBase);
+            current = partial;
+            place(base + page, page, 1, "heap block: buffer inside the committed part");
+            place(base + page, 5u << 20, 0, "heap block: buffer ending past the committed part");
+            current = other;
+        }
+        if (heap) HeapDestroy(heap);
+        if (auto* p = static_cast<char*>(VirtualAlloc(nullptr, 16 * page, MEM_RESERVE | MEM_PHYSICAL, PAGE_READWRITE))) {
+            place(p, page, 0, "AWE reservation: nothing committed");
+            VirtualFree(p, 0, MEM_RELEASE);
+        } else {
+            setup_fail("cannot reserve with MEM_PHYSICAL", nullptr);
+        }
+        const SIZE_T large = GetLargePageMinimum();
+        auto* p = large ? static_cast<char*>(VirtualAlloc(nullptr, large, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
+                                                          PAGE_READWRITE)) : nullptr;
+        if (p) {
+            place(p, page, 1, "large-page allocation: buffer at the base");
+            place(p + large - page, 2 * page, 0, "large-page allocation: buffer past the end");
+            VirtualFree(p, 0, MEM_RELEASE);
+        } else {
+            std::printf("large-page allocation not run (error %lu: the process may not lock pages)\n", GetLastError());
+        }
     }
 
     // Case 9: cost on a large committed block with touched pages.
