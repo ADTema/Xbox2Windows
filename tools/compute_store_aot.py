@@ -47,6 +47,28 @@ SALU = {
     "s_xor_b32": "({0} ^ {1})",
     "s_lshr_b32": "({0} >> ({1} & 31u))",
 }
+# The binary32 vector ALU subset: VOP2 src0 is any source, src1 a VGPR. v_sub_f32 is src0 - src1 and v_subrev_f32
+# is src1 - src0. Each operation rounds once to nearest even on the bit pattern of a uint word, so a result is again
+# a word. The helpers keep the one rounding per operation: a multiply followed by an add must not be contracted.
+# Fused multiply-add (v_fma_f32, v_fmac_f32) is not in the subset: DXIL has no binary32 fused form to lower it to.
+# NaN payloads, infinities and denormals are not modelled. A literal that is one is refused; a word read from memory
+# is not known statically, so the caller must keep its operands and results finite and normal.
+FALU = {
+    "v_add_f32_e32": "f32_add({0}, {1})",
+    "v_sub_f32_e32": "f32_sub({0}, {1})",
+    "v_subrev_f32_e32": "f32_sub({1}, {0})",
+    "v_mul_f32_e32": "f32_mul({0}, {1})",
+}
+F32_HELPERS = {
+    name: f"uint f32_{name}(uint a, uint b) {{ precise float r = asfloat(a) {op} asfloat(b); return asuint(r); }}\n"
+    for name, op in (("add", "+"), ("sub", "-"), ("mul", "*"))
+}
+# The inline float constants of the encoding, as LLVM prints them, and the bits they hold.
+FLOAT_INLINE = {
+    "0.5": 0x3f000000, "-0.5": 0xbf000000, "1.0": 0x3f800000, "-1.0": 0xbf800000, "2.0": 0x40000000,
+    "-2.0": 0xc0000000, "4.0": 0x40800000, "-4.0": 0xc0800000, "0.15915494": 0x3e22f983,
+}
+FLOAT_SOURCE = r"(s\d+|v\d+|-?\d+\.\d+|0x[0-9a-f]+|-?\d+)"
 SALU_SOURCE = r"(s\d+|-?\d+|0x[0-9a-f]+)"
 ALU_SOURCE = r"(s\d+|v\d+|-?\d+|0x[0-9a-f]+)"
 # Results are inline HLSL expressions; a longer one is rejected instead of growing without bound.
@@ -113,6 +135,14 @@ def alu_word(token, scalar, vector, pending):
     else:
         value = int(token, 0) & 0xffffffff if -(1 << 31) <= int(token, 0) <= 0xffffffff else None
     return value if is_word(value) else None
+
+
+def float_word(token, scalar, vector, pending):
+    """The known word a binary32 source names, or None: as alu_word, but a constant must be a finite normal value or zero."""
+    word = FLOAT_INLINE.get(token) if "." in token else alu_word(token, scalar, vector, pending)
+    if isinstance(word, int) and ((word >> 23) & 0xff == 0xff or ((word >> 23) & 0xff == 0 and word & 0x7fffff)):
+        return None
+    return word
 
 
 def vector_operands(line):
@@ -953,6 +983,21 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or row_tag[1] == column_tag[1]):
                 raise ValueError("Unverified plane byte offset")
             vector[dst] = ("plane_bytes", row_tag[1], shift, *column_tag[1:])
+        elif ((m := re.fullmatch(r"v_and_b32_e32 v(\d+), (?:0xffff|65535), v(\d+)", line))
+              and isinstance(partial := vector.get(int(m[2])), tuple) and partial[0] == "source_low16"):
+            dst = int(m[1])
+            if dst > 255:
+                raise ValueError("Invalid vector destination")
+            vector[dst] = ("alu", f"(inputData.Load({partial[1]}) & 0xffffu)")
+        elif m := re.fullmatch(rf"(v_(?:add|sub|subrev|mul)_f32_e32) v(\d+), {FLOAT_SOURCE}, (v\d+)", line):
+            op, dst = m[1], int(m[2])
+            words = [float_word(token, scalar, vector, pending) for token in m.groups()[2:]]
+            if dst > 255 or None in words:
+                raise ValueError("Unverified float operand")
+            expression = FALU[op].format(*map(hlsl_word, words))
+            if len(expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            vector[dst] = ("alu", expression)
         elif ((m := re.fullmatch(rf"(v_(?:and_b32|lshrrev_b32|min_u32|max_u32|add_nc_u32|or_b32|xor_b32|lshlrev_b32|ashrrev_i32|sub_nc_u32|subrev_nc_u32)_e32) v(\d+), {ALU_SOURCE}, (v\d+)", line))
               or (m := re.fullmatch(rf"(v_mul_lo_u32) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}", line))
               or (m := re.fullmatch(rf"(v_mad_u32_u24) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}, {ALU_SOURCE}", line))
@@ -981,13 +1026,15 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Unverified row pitch byte offset")
             vector[dst] = ("pitch_bytes", row_tag[1], int(pitch, 0), *column_tag[1:])
         elif m := re.fullmatch(r"(?:buffer_load_(?:dword|(?P<subword>[us](?:byte|short)))"
-                               r"|tbuffer_load_format_(?P<channels>x|xy|xyz|xyzw)) "
+                               r"|tbuffer_load_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
                                r"(?P<dst>v\d+|v\[\d+:\d+\]), (?P<addr>off|v\d+), s\[(?P<base>\d+):(?P<high>\d+)\], 0"
-                               r"(?(channels) format:\[(?P<format>BUF_FMT_(?:32_){1,4}UINT)\])"
+                               r"(?(channels) format:\[(?P<format>BUF_FMT_(?:(?:32_){1,4}|(?:16_){1,4})UINT)\])"
                                r"(?P<idxen> idxen)?(?P<offen> offen)?"
                                r"(?: offset:(?P<offset>\d+))?", line):
             channels = m["channels"]
-            count = len(channels) if channels else 1
+            packed = channels is not None and channels.startswith("d16_")
+            components = len(channels.removeprefix("d16_")) if channels else 1
+            count = (components + 1) // 2 if packed else components
             dst, *last = map(int, re.findall(r"\d+", m["dst"]))
             base, high = int(m["base"]), int(m["high"])
             offset = int(m["offset"] or 0)
@@ -998,7 +1045,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Unsupported subword buffer read target or address mode")
             if channels and (cpu != "gfx1030" or not idxen or offen):
                 raise ValueError("Unsupported typed buffer read target or address mode")
-            if channels and m["format"] != f"BUF_FMT_{'32_' * count}UINT":
+            # The three-component D16 form uses the four-component 16-bit format.
+            format_components = 4 if packed and components == 3 else components
+            if channels and m["format"] != f"BUF_FMT_{('16_' if packed else '32_') * format_components}UINT":
                 raise ValueError("Unsupported typed buffer read format")
             if last != ([] if count == 1 else [dst + count - 1]) or dst + count > 256:
                 raise ValueError("Unverified buffer read destination")
@@ -1031,7 +1080,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Unsupported read address")
             for reg, address in enumerate(addresses, dst):
                 vector.pop(reg, None)
-                word = ("source", address)
+                # Whole-word consumers cannot read the undefined upper half of an odd D16 result.
+                kind = "source_low16" if packed and components % 2 and reg == dst + count - 1 else "source"
+                word = (kind, address)
                 if subword:
                     # The stride and SRV base are DWORD-aligned, so the enclosing word stays in the record.
                     bits, shift = width * 8, (offset % 4) * 8
@@ -1041,14 +1092,20 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                         field = f"(({field} ^ {sign}) - {sign})"
                     word = ("alu", field)
                 loading[reg] = word
-        elif m := re.fullmatch(r"(?:buffer_store_dword(?:x([234]))?|tbuffer_store_format_(?P<channels>x|xy|xyz|xyzw)) "
+        elif m := re.fullmatch(r"(?:buffer_store_dword(?:x([234]))?|"
+                               r"tbuffer_store_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
                                r"(v\d+|v\[\d+:\d+\]), (off|v\d+|v\[\d+:\d+\]), s\[(\d+):(\d+)\], 0"
-                               r"(?(channels) format:\[(?P<format>BUF_FMT_(?:32_){1,4}UINT)\])"
+                               r"(?(channels) format:\[(?P<format>BUF_FMT_(?:(?:32_){1,4}|(?:16_){1,4})UINT)\])"
                                r"(?P<idxen> idxen)?(?P<offen> offen)?(?: offset:(?P<offset>\d+))?", line):
             channels = m["channels"]
-            count = len(channels) if channels else int(m[1] or 1)
+            packed = channels is not None and channels.startswith("d16_")
+            components = len(channels.removeprefix("d16_")) if channels else int(m[1] or 1)
+            partial = packed and components % 2 != 0
+            count = (components + 1) // 2 if packed else components
             idxen, offen = m["idxen"], m["offen"]
-            if channels and (cpu != "gfx1030" or not idxen or offen or m["format"] != f"BUF_FMT_{'32_' * count}UINT"):
+            format_components = 4 if packed and components == 3 else components
+            fmt = f"BUF_FMT_{('16_' if packed else '32_') * format_components}UINT"
+            if channels and (cpu != "gfx1030" or not idxen or offen or m["format"] != fmt):
                 raise ValueError("Unsupported typed buffer store format, target or address mode")
             first, *last = map(int, re.findall(r"\d+", m[3]))
             base, high = int(m[5]), int(m[6])
@@ -1123,7 +1180,13 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             values = [vector.get(reg) for reg in range(first, first + count)]
             if not all(is_word(value) for value in values):
                 raise ValueError("Store data is not a known word")
-            words = ", ".join(map(hlsl_word, values))
+            words = list(map(hlsl_word, values))
+            if partial:
+                # Reserve the entire final DWORD, including the untouched high half. The indexed
+                # layout, aligned stride and overlap checks give that word a single writer.
+                final_address = address if count == 1 else f"{address} + 4u"
+                words[-1] = f"((outputData.Load({final_address}) & 0xffff0000u) | ({words[-1]} & 0xffffu))"
+            words = ", ".join(words)
             arg = words if count == 1 else f"uint{count}({words})"
             stores.append(f"    outputData.Store{count if count > 1 else ''}({address}, {arg});")
         else:
@@ -1154,6 +1217,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
         body = "\n".join([*(step for _, step in ds_steps), body])
         if shared:
             local = ", uint3 local : SV_GroupThreadID"
+    # Helpers are selected from the final body, so a float ALU result used only by a DS step still gets its definition.
+    cbuffer += "".join(text for name, text in F32_HELPERS.items() if f"f32_{name}(" in body)
     return (f"{cbuffer}RWByteAddressBuffer outputData : register(u0);\n[numthreads({dims[0]},{dims[1]},{dims[2]})]\n"
             f"void main(uint3 tid : SV_DispatchThreadID{local}) {{\n{body}\n}}\n")
 

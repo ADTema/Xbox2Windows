@@ -145,7 +145,7 @@ class Stage:
                 return '0x%08xu' % (s[1] & 0xffffffff)
             if s[0] == 'ud':
                 return 'ud%d' % s[1]
-            if s[0] == 'execcopy':
+            if s[0] in ('execcopy', 'fixed_buffer_word'):
                 self.used_s.add(n)
                 return 's%d' % n
             raise Unsupported('numeric use of s%d holding %s' % (n, s[0]))
@@ -199,6 +199,7 @@ class Stage:
         self.lines.append(text)
 
     def set_v(self, n, expr):
+        self.uniform_v.discard(n)
         self.used_v.add(n)
         self.emit('v%d = %s;' % (n, expr) if self.exec_known else 'if (exec & 1) v%d = %s;' % (n, expr))
 
@@ -239,6 +240,21 @@ class Stage:
             return s[1], None
         raise Unsupported('descriptor operand %s holds %s' % (tok, s))
 
+    def heap_sampler(self, tok):
+        """'qh[...]' when the four sampler words of tok came from one run-time sampler heap load."""
+        r = reg_range(tok)
+        if not r or r[2] - r[1] != 3:
+            return None
+        first = self.sym.get(r[1])
+        if not first or first[0] != 'smpheap':
+            return None
+        if any(self.sym.get(r[1] + i) != ('smpheap', first[1], i) for i in range(4)):
+            raise Unsupported('sampler operand %s mixes sampler heap words' % tok)
+        self.pipe.uses_sampler_heap = True
+        # Sampler descriptors are 16 bytes; x2w_sampler_entry() maps the byte offset to its entry and
+        # sends unaligned or out-of-range offsets to the fallback entry.
+        return 'qh[x2w_sampler_entry(s%d)]' % first[1]
+
     def const_words(self, tok):
         r = reg_range(tok)
         words = [self.is_const(n) for n in range(r[1], r[2] + 1)]
@@ -251,6 +267,8 @@ class Stage:
             if name.startswith('s_cbranch') or name == 's_branch':
                 targets.add(int(parse(asm)[1][0].split('_')[1], 16))
         self.blocks = []          # (offset, [lines], terminator)
+        self.uniform_v = set()
+        self.has_branches = bool(targets)
         start = 0
         for off, n, name, asm in self.ins:
             if off in targets and off != start:
@@ -268,7 +286,7 @@ class Stage:
         _, ops, mods = parse(asm)
         base = re.sub(r'_e(32|64)$', '', name)
         if base in ('s_inst_prefetch', 's_waitcnt', 's_nop', 'v_nop', 's_clause', 's_sopp_0f', 's_wqm_b64', 's_wqm_b32',
-                    's_setreg_imm32_b32', 's_code_end'):
+                    's_setreg_imm32_b32', 's_code_end', 's_setprio'):
             return None
         if base == 's_endpgm':
             return ('end',)
@@ -433,8 +451,17 @@ class Stage:
         try:
             off = int(ops[2], 0)
         except ValueError:
+            if p[1] == ('smpheap',) and self.pipe.sampler_heap and count == 4:
+                # A sampler picked at run time from the sampler heap: keep the byte offset in the
+                # first destination register; image() indexes the heap table with it.
+                d = dst[1]
+                self.used_s.add(d)
+                self.emit('s%d = %s;' % (d, self.u(ops[2])))
+                for i in range(count):
+                    self.sym[d + i] = ('smpheap', d, i)
+                return
             if p[1] == ('smpheap',):
-                # A sampler picked at run time from the sampler heap: shortcut, a fixed default sampler.
+                # Shortcut (default unless X2W_SAMPLER_HEAP=1): a fixed default sampler.
                 for i in range(count):
                     self.sym[dst[1] + i] = ('const', 0)
                 self.pipe.notes.add('dynamic sampler index replaced by a default sampler')
@@ -486,6 +513,8 @@ class Stage:
         offset = self.u(ops[2])
         for i in range(count):
             self.set_s(dst[1] + i, '%s.Load(%s + %d)' % (buf, offset, 4 * i))
+            if not mods and re.fullmatch(r'0x[0-9a-f]+|\d+', ops[2]):
+                self.sym[dst[1] + i] = ('fixed_buffer_word',)
 
     def op_s_buffer_load_dwordx2(self, ops, mods):
         self.op_s_buffer_load_dword(ops, mods, 2)
@@ -541,6 +570,7 @@ class Stage:
         table = {'BUF_FMT_8_8_8_8_UNORM': ('ldu({0}, a)', ['U((w & 255) / 255.0)', 'U(((w >> 8) & 255) / 255.0)', 'U(((w >> 16) & 255) / 255.0)', 'U((w >> 24) / 255.0)']),
                  'BUF_FMT_8_8_UNORM': ('ldu({0}, a)', ['U((w & 255) / 255.0)', 'U(((w >> 8) & 255) / 255.0)', '0u', 'U(1.0)']),
                  'BUF_FMT_8_UNORM': ('ldu({0}, a)', ['U((w & 255) / 255.0)', '0u', '0u', 'U(1.0)']),
+                 'BUF_FMT_8_UINT': ('{0}.Load(a & ~3u) >> ((a & 3u) * 8u)', ['w & 255u', '0u', '0u', '1u']),
                  'BUF_FMT_16_16_UNORM': ('ldu({0}, a)', ['U((w & 65535) / 65535.0)', 'U((w >> 16) / 65535.0)', '0u', 'U(1.0)']),
                  'BUF_FMT_16_16_FLOAT': ('ldu({0}, a)', ['U(f16tof32(w))', 'U(f16tof32(w >> 16))', '0u', 'U(1.0)']),
                  'BUF_FMT_32_32_32_32_FLOAT': (None, ['{0}.Load(a)', '{0}.Load(a + 4)', '{0}.Load(a + 8)', '{0}.Load(a + 12)']),
@@ -587,8 +617,9 @@ class Stage:
             else:
                 call = '%s.Load(int3(%s, %s, 0))' % (tex, self.u(cs[0]), self.u(cs[1]))
         else:
-            words = self.const_words(ops[3])
-            smp = self.pipe.sampler(tuple(words) if words else self.descriptor(ops[3]))
+            heap = self.heap_sampler(ops[3])
+            words = None if heap else self.const_words(ops[3])
+            smp = heap or self.pipe.sampler(tuple(words) if words else self.descriptor(ops[3]))
             uv = ('float3(%s, %s, %s)' % (self.f(cs[0]), self.f(cs[1]), self.f(cs[2])) if three
                   else 'float2(%s, %s)' % (self.f(cs[0]), self.f(cs[1])))
             if how == 'lz' or not self.exec_known or self.kind != 'ps' or len(self.blocks) > 0:
@@ -610,6 +641,22 @@ class Stage:
 
     def op_image_load(self, ops, mods):
         self.image(ops, mods, 'load')
+
+    def op_v_cvt_i32_f32(self, ops, mods):
+        if mods:
+            raise Unsupported('v_cvt_i32_f32 with modifiers')
+        dst = reg_range(ops[0])[1]
+        self.set_v(dst, 'uint(int(F(%s)))' % self.u(ops[1]))
+        src = reg_range(ops[1])
+        if self.exec_known and src and src[0] == 's' and self.sym.get(src[1]) == ('fixed_buffer_word',):
+            self.uniform_v.add(dst)
+
+    def op_v_readfirstlane_b32(self, ops, mods):
+        src, dst = reg_range(ops[1]), reg_range(ops[0])
+        if (mods or self.has_branches or not self.exec_known or not dst or dst[0] != 's' or
+                not src or src[0] != 'v' or src[1] not in self.uniform_v):
+            raise Unsupported('v_readfirstlane_b32 requires a proven uniform source')
+        self.set_s(reg_range(ops[0])[1], self.u(ops[1]))
 
     def op_v_mov_b32(self, ops, mods):
         self.set_v(reg_range(ops[0])[1], self.u(ops[1]))
@@ -784,7 +831,7 @@ VEC_U = {
     'v_ashrrev_i32': (2, 'uint(int({1}) >> ({0} & 31))'), 'v_min_u32': (2, 'min({0}, {1})'), 'v_max_u32': (2, 'max({0}, {1})'),
     'v_min_i32': (2, 'uint(min(int({0}), int({1})))'), 'v_max_i32': (2, 'uint(max(int({0}), int({1})))'),
     'v_cvt_f32_u32': (1, 'U(float({0}))'), 'v_cvt_f32_i32': (1, 'U(float(int({0})))'),
-    'v_cvt_u32_f32': (1, 'uint(max(F({0}), 0.0))'), 'v_cvt_i32_f32': (1, 'uint(int(F({0})))'),
+    'v_cvt_u32_f32': (1, 'uint(max(F({0}), 0.0))'),
     'v_cvt_f32_ubyte0': (1, 'U(float({0} & 255))'), 'v_cvt_f32_ubyte1': (1, 'U(float(({0} >> 8) & 255))'),
     'v_cvt_f32_ubyte2': (1, 'U(float(({0} >> 16) & 255))'), 'v_cvt_f32_ubyte3': (1, 'U(float({0} >> 24))'),
     'v_cvt_f32_f16': (1, 'U(f16tof32({0}))'), 'v_cvt_f16_f32': (1, 'f32tof16(F({0}))'),
@@ -841,9 +888,28 @@ def parse_root(blob):
     raise Unsupported('no RTS0 part')
 
 
+# Run-time sampler heap indexing: an s_load from the sampler heap with a register offset becomes a
+# read of a bounded table, SamplerState qh[SAMPLER_HEAP_SIZE] : register(s0, space1), the form a
+# desktop SM 5.1 / 6.0 shader can index at run time. Opt-in with X2W_SAMPLER_HEAP=1 until the
+# stand-in binds that table; otherwise such a load keeps the default-sampler shortcut.
+#
+# Contract at the manifest boundary ('smpheap <count> <space> fallback <entry>'):
+# - entries 0 .. SAMPLER_HEAP_FALLBACK - 1 hold the title's sampler-heap entries, entry n at byte
+#   offset 16 * n;
+# - entry SAMPLER_HEAP_FALLBACK is reserved: the host fills it with a fallback sampler;
+# - the shader computes the entry itself (x2w_sampler_entry): a byte offset that is not a multiple
+#   of 16, or that lies at or past 16 * SAMPLER_HEAP_FALLBACK, reads the fallback entry. The host
+#   cannot check the offset, which is computed in the shader, so the guard is in the shader.
+SAMPLER_HEAP_SIZE = 2048  # D3D12's limit for a shader-visible sampler heap
+SAMPLER_HEAP_SPACE = 1
+SAMPLER_HEAP_FALLBACK = SAMPLER_HEAP_SIZE - 1
+
+
 class Pipeline:
-    def __init__(self, vs_code, ps_code, root_blob):
+    def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None):
         self.root = parse_root(root_blob)
+        self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
+        self.uses_sampler_heap = False
         self.resources = {}   # key -> dict(index, kind)
         self.samplers = {}    # key -> index
         self.uds = []         # entry-constant sources
@@ -887,6 +953,10 @@ class Pipeline:
             out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'tex2d': 'Texture2D<float4>', 'tex3d': 'Texture3D<float4>'}[r['kind']], r['index'], r['index']))
         for key, i in self.samplers.items():
             out.append('SamplerState q%d : register(s%d);' % (i, i))
+        if self.uses_sampler_heap:
+            out.append('SamplerState qh[%d] : register(s0, space%d);' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE))
+            out.append('uint x2w_sampler_entry(uint offset) { return (offset & 15u) != 0 || offset >= %du ? %du : offset >> 4; }'
+                       % (16 * SAMPLER_HEAP_FALLBACK, SAMPLER_HEAP_FALLBACK))
         return out
 
     def interface(self, for_pixel):
@@ -939,6 +1009,8 @@ class Pipeline:
             lines.append('srv %d %s %s' % (r['index'], r['kind'], where))
         for key, i in self.samplers.items():
             lines.append('smp %d %s' % (i, ' '.join('0x%x' % w for w in key)))
+        if self.uses_sampler_heap:
+            lines.append('smpheap %d %d fallback %d' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE, SAMPLER_HEAP_FALLBACK))
         lines.append('params %d' % (max(self.params) + 1 if self.params else 0))
         lines.append('targets %s' % ' '.join(k[3:] for k in sorted(self.ps.exports) if k.startswith('mrt')))
         return '\n'.join(lines) + '\n'
