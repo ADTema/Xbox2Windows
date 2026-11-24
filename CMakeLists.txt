@@ -415,6 +415,23 @@ foreach(adapter IN ITEMS hardware warp)
     add_test(NAME startup_null_views_${adapter} COMMAND startup_null_views_check ${adapter})
 endforeach()
 set_tests_properties(startup_null_views_hardware PROPERTIES SKIP_RETURN_CODE 77)
+# Device slot 15 (GetDescriptorHandleIncrementSize, #870) next to a desktop device on the same adapter.
+add_executable(startup_descriptor_increment tests/startup_descriptor_increment.cpp)
+target_compile_features(startup_descriptor_increment PRIVATE cxx_std_17)
+target_link_libraries(startup_descriptor_increment PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(adapter IN ITEMS hardware warp)
+    add_test(NAME startup_descriptor_increment_${adapter} COMMAND startup_descriptor_increment ${adapter})
+endforeach()
+set_tests_properties(startup_descriptor_increment_hardware PROPERTIES SKIP_RETURN_CODE 77)
+# Which heap type values slot 15 forwards to desktop (src/startup_stubs/descriptor_heap_type.h), without a
+# device. The mutated runs are the negative controls.
+add_executable(startup_descriptor_heap_type_check tests/startup_descriptor_heap_type_check.cpp)
+target_include_directories(startup_descriptor_heap_type_check PRIVATE src)
+target_compile_features(startup_descriptor_heap_type_check PRIVATE cxx_std_17)
+add_test(NAME startup_descriptor_heap_type COMMAND startup_descriptor_heap_type_check)
+add_test(NAME startup_descriptor_heap_type_off_by_one_control COMMAND startup_descriptor_heap_type_check --mutate off-by-one)
+add_test(NAME startup_descriptor_heap_type_signed_control COMMAND startup_descriptor_heap_type_check --mutate signed)
+set_tests_properties(startup_descriptor_heap_type_off_by_one_control startup_descriptor_heap_type_signed_control PROPERTIES WILL_FAIL TRUE)
 # The same header without a GPU (src/startup_stubs/null_texture_view.h): fake adapters that lack
 # or have each use, R8G8B8A8 with one use, only B8G8R8A8, and failed queries. WARP has both uses, so
 # only this check reaches the rewrite on CI. The mutated run is the negative control.
