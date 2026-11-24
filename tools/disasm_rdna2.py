@@ -201,6 +201,10 @@ SOP1_OPS = {
     0x2b: ("s_xnor_saveexec_b64", "Save execution mask and bitwise XNOR with scalar source 64-bit"),
     0x2c: ("s_quadmask_b32", "Compute quad mask scalar 32-bit"),
     0x2d: ("s_quadmask_b64", "Compute quad mask scalar 64-bit"),
+    0x2e: ("s_movrels_b32", "Scalar move 32-bit with relative source index in M0"),
+    0x2f: ("s_movrels_b64", "Scalar move 64-bit with relative source index in M0"),
+    0x30: ("s_movreld_b32", "Scalar move 32-bit with relative destination index in M0"),
+    0x31: ("s_movreld_b64", "Scalar move 64-bit with relative destination index in M0"),
     0x34: ("s_abs_i32", "Scalar absolute value signed 32-bit"),
     0x37: ("s_andn1_saveexec_b64", "Save execution mask and bitwise AND NOT1 with scalar source 64-bit"),
     0x38: ("s_orn1_saveexec_b64", "Save execution mask and bitwise OR NOT1 with scalar source 64-bit"),
@@ -219,6 +223,7 @@ SOP1_OPS = {
     0x45: ("s_orn1_saveexec_b32", "Save execution mask and bitwise OR NOT1 with scalar source 32-bit"),
     0x46: ("s_andn1_wrexec_b32", "Save execution mask and write bitwise AND NOT1 scalar source 32-bit"),
     0x47: ("s_andn2_wrexec_b32", "Save execution mask and write bitwise AND NOT2 scalar source 32-bit"),
+    0x49: ("s_movrelsd_2_b32", "Scalar move 32-bit with relative source and destination indices in M0"),
 }
 
 SOP2_OPS = {

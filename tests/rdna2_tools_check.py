@@ -722,6 +722,30 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertEqual(decode_instruction(bytes.fromhex("0000a6bf"), 0)[:3],
                          (4, "s_sopp_26", "s_sopp_26 0x0"))
 
+    def test_sop1_relative_scalar_moves(self):
+        # Words from `llvm-mc -arch=amdgcn -mcpu=gfx1010 -show-encoding`; M0 supplies the index, so it is not printed.
+        vectors = (
+            ("022e81be", "s_movrels_b32 s1, s2"),
+            ("042f82be", "s_movrels_b64 s[2:3], s[4:5]"),
+            ("023081be", "s_movreld_b32 s1, s2"),
+            ("043182be", "s_movreld_b64 s[2:3], s[4:5]"),
+            ("024981be", "s_movrelsd_2_b32 s1, s2"),
+        )
+        for raw, assembly in vectors:
+            with self.subTest(assembly=assembly):
+                records = disasm_rdna2(bytes.fromhex(raw + "000081bf"))
+                self.assertEqual(
+                    [(r["offset"], r["length"], r["opcode"], r["assembly"]) for r in records],
+                    [(0, 4, assembly.split()[0], assembly), (4, 4, "s_endpgm", "s_endpgm")],
+                )
+                self.assertTrue(is_opcode_recognized(assembly.split()[0]))
+        # The neighbouring SOP1 opcode 0x32 is not one of them and stays an unknown record.
+        self.assertEqual(decode_instruction(bytes.fromhex("023281be"), 0)[:2], (4, "s_sop1_32"))
+        # A literal source consumes the trailing dword.
+        records = disasm_rdna2(bytes.fromhex("ff2e81be78563412000081bf"))
+        self.assertEqual([(r["length"], r["assembly"]) for r in records],
+                         [(8, "s_movrels_b32 s1, 0x12345678"), (4, "s_endpgm")])
+
     def test_hwreg_operands_use_llvm_spelling(self):
         """Issue #938: hwreg operands and s_setreg_imm32_b32 literals print as LLVM 15 prints them for gfx1013.
 

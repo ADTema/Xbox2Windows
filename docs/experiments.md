@@ -7440,6 +7440,21 @@ with backface culling enabled (`D3D12_CULL_MODE_BACK`):
 Not covered by this experiment: geometry or tessellation shader stages preceding the
 input assembler, primitive ID generation in pixel shaders, runtime driver hooking, and title CPU code execution.
 
+## gfx1013 SOP1 relative scalar moves
+
+`tools/disasm_rdna2.py` decodes the five relative scalar moves of the `SOP1` encoding (issue #938):
+`s_movrels_b32` and `s_movrels_b64` (opcodes 0x2e and 0x2f), `s_movreld_b32` and `s_movreld_b64`
+(0x30 and 0x31) and `s_movrelsd_2_b32` (0x49). The index comes from `M0` and is not printed; the
+`_b64` forms print SGPR pairs and a literal source consumes the trailing dword. The opcode values
+match LLVM's gfx10 encodings. `tools/scan_unsupported_shaders.py` recognizes the same mnemonics.
+
+```sh
+python3 -B tests/rdna2_tools_check.py
+```
+
+Scope: decoding and scanner recognition only. The translator does not lower these scalar forms, so
+there is no draw or readback, and no measurement on hardware backs the descriptions.
+
 ## gfx1013 SOPK and SOPP decoding
 
 `tools/disasm_rdna2.py` decodes 29 more scalar forms: the nine `s_cmpk_*` compare-immediate ops
