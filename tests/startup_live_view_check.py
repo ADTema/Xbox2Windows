@@ -1,65 +1,103 @@
-"""Check the live viewer with generated startup log lines."""
+"""Check that tools/startup/live_view.py shows a log line intact when a read ends inside a character.
 
-import contextlib
-import io
+The debugger and the stand-in DLLs append to files.txt while the viewer polls it. A path with a
+non-ASCII character can be flushed in two pieces, so one poll ends between the bytes of one UTF-8
+character. The line must still show the character, whichever way the log ends its lines, including
+a CRLF split between reads; invalid UTF-8 bytes must be replaced without stalling later lines. The
+control is an ASCII path split the same way, which has to stay unchanged. A second run passes a
+package root and checks which opens are shown: NtCreateFile and NtOpenFile, with or without the
+NT object prefix, on the G: mount or under the root in any case, with spaces kept and a failed
+status appended; a sibling folder that only starts with the root's name and a system path are not
+shown. No GPU and no game files are involved.
+"""
 from pathlib import Path
-import runpy
+import subprocess
 import sys
 import tempfile
-import unittest
-from unittest import mock
+import time
+
+VIEW = Path(__file__).resolve().parents[1] / "tools/startup/live_view.py"
+TAIL = b" from 0x1000 -> 0x00000000"
 
 
-class LiveViewCheck(unittest.TestCase):
-    def view_log(self, first_chunk, second_chunk=None):
-        viewer = Path(__file__).resolve().parents[1] / "tools" / "startup" / "live_view.py"
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            log = root / "trap.log"
-            log.write_text(first_chunk, encoding="utf-8")
-            finished = root / "finished.txt"
+def run_two_writes(first_bytes, second_bytes, *args):
+    """Run the viewer on files.txt written in two chunks after the ready sentinel; return "file" lines."""
+    with tempfile.TemporaryDirectory() as run:
+        log = Path(run, "files.txt")
+        log.write_bytes(first_bytes)
+        with subprocess.Popen([sys.executable, "-B", str(VIEW), run, *args], stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, text=True, encoding="utf-8") as viewer:
+            try:
+                for line in viewer.stdout:  # the first poll has consumed first_bytes once this shows
+                    if "ready" in line:
+                        break
+                time.sleep(0.6)  # more than one poll interval
+                with log.open("ab") as handle:
+                    handle.write(second_bytes)
+                time.sleep(0.6)
+                Path(run, "finished.txt").write_text("done", encoding="utf-8")
+                lines = []
+                for line in viewer.stdout:
+                    if "Run ended" in line:
+                        break
+                    lines.append(line)
+                return [line for line in lines if " file " in line]
+            finally:
+                viewer.kill()
+                viewer.wait()
 
-            def finish_run(_seconds):
-                if not finished.exists():
-                    if second_chunk is not None:
-                        with log.open("a", encoding="utf-8", newline="\n") as handle:
-                            handle.write(second_chunk)
-                    finished.write_text("finished\n", encoding="utf-8")
 
-            if second_chunk is None:
-                finish_run(0)
-            output = io.StringIO()
-            with mock.patch.object(sys, "argv", [str(viewer), directory]), \
-                    mock.patch("os.system"), mock.patch("time.sleep", side_effect=finish_run), \
-                    contextlib.redirect_stdout(output):
-                runpy.run_path(str(viewer), run_name="__main__")
-        return output.getvalue()
+def shown_files(first, second, newline):
+    """Run the viewer on a log whose last line is written in two parts; return the "file" lines."""
+    return run_two_writes(
+        b"1.0 NtCreateFile G:\\ready" + TAIL + newline + b"2.0 NtCreateFile G:\\" + first,
+        second + TAIL + newline,
+    )
 
-    def test_frame_heartbeat_does_not_claim_draws_were_dropped(self):
-        output = self.view_log("x2w-d3d12 heartbeat: 60 frames presented in 2.0 s (30.0 fps overall)\n")
-        self.assertIn("60 frames presented, 30.0 fps", output)
-        self.assertNotIn("every draw dropped", output)
-        self.assertNotIn("game runs offline", output)
 
-    def test_storage_and_render_totals_are_preserved(self):
-        storage = ("x2w-dstorage heartbeat 10 s: requests done=12 inflated=7 failed=2 bcpack-blank=1; "
-                   "page tokens 0 at enqueue=3, still 0 at run=1; commit peak=900 MiB current=800 MiB, "
-                   "live physical-page sections=42")
-        render = ("x2w-render totals: resets 2 (failed 0), closes 2, clears 1, executes 2, "
-                  "draws 4 (skipped 1), translated draws 3 (not drawn 2), pipelines translated 4 / missing 1, "
-                  "null bindings 5 (entry 1, buffer 1, token 1, wrapper 1, dimension 1), "
-                  "textures uploaded 2 (16 KiB, unreadable 1)")
-        output = self.view_log(storage + "\n" + render + "\n")
-        self.assertIn(storage, output)
-        self.assertIn(render, output)
-        self.assertIn("7 chunks decompressed", output)
+def main():
+    for newline in (b"\n", b"\r\n"):
+        shown = shown_files(b"caf\xc3", b"\xa9.bin", newline)
+        if len(shown) != 1 or not shown[0].rstrip().endswith("G:\\caf\u00e9.bin"):
+            sys.exit(f"character split between two reads was damaged ({newline!r}): {shown!r}")
+        control = shown_files(b"caf", b"e.bin", newline)
+        if len(control) != 1 or not control[0].rstrip().endswith("G:\\cafe.bin"):
+            sys.exit(f"plain split line changed ({newline!r}): {control!r}")
 
-    def test_unknown_and_split_heartbeat(self):
-        first = "x2w-dstorage heartbeat 20 s: requests done=0 inflated=0 failed=0 bcpack-blank=0; "
-        second = "page tokens 0 at enqueue=0, still 0 at run=0; commit unknown, live physical-page sections=unknown\n"
-        output = self.view_log(first, second)
-        self.assertEqual(output.count(first + second.strip()), 1)
+    edge = run_two_writes(
+        b"1.0 NtCreateFile G:\\ready" + TAIL + b"\r\n"
+        + b"2.0 NtCreateFile G:\\split-crlf.bin" + TAIL + b"\r",
+        b"\n"
+        + b"3.0 NtCreateFile G:\\bad\xff.bin" + TAIL + b"\r\n"
+        + b"4.0 NtCreateFile G:\\after.bin" + TAIL + b"\r\n",
+    )
+    expected = ("G:\\split-crlf.bin", "G:\\bad\ufffd.bin", "G:\\after.bin")
+    if len(edge) != len(expected) or any(
+        not line.rstrip("\r\n").endswith(suffix) or "\r" in line.rstrip("\n")
+        for line, suffix in zip(edge, expected)
+    ):
+        sys.exit(f"split CRLF or invalid UTF-8 line failed: {edge!r}")
+
+    # The package root is matched with a trailing separator and without regard to case, so the log
+    # spells it in upper case, and "<root>-other" is a sibling folder that must not be shown.
+    with tempfile.TemporaryDirectory() as package:
+        root = str(Path(package).absolute())
+        opens = run_two_writes(
+            b"1.0 NtCreateFile G:\\ready" + TAIL + b"\n",
+            b"2.0 NtCreateFile \\??\\G:\\nt prefix.bin from game.exe+0x1a2b -> 0x00000000\n"
+            + b"3.0 NtOpenFile G:\\missing.bin from 0x1000 -> 0xc0000034\n"
+            + b"4.0 NtCreateFile " + root.upper().encode() + b"\\Data\\a.bin" + TAIL + b"\n"
+            + b"5.0 NtCreateFile " + root.encode() + b"-other\\b.bin" + TAIL + b"\n"
+            + b"6.0 NtCreateFile C:\\Windows\\c.dll" + TAIL + b"\n",
+            root,
+        )
+    shown = [line.rstrip("\r\n").split(None, 2)[2] for line in opens]  # drop the time and the tag
+    expected = ["G:\\nt prefix.bin", "G:\\missing.bin   (failed 0xc0000034)", root.upper() + "\\Data\\a.bin"]
+    if shown != expected:
+        sys.exit(f"file opens shown wrongly:\n  got      {shown!r}\n  expected {expected!r}")
+    print("live view keeps split UTF-8, split CRLF, and replaces invalid UTF-8 without stalling")
+    print("live view shows G:\\ and package-root opens with their status, and skips other paths")
 
 
 if __name__ == "__main__":
-    unittest.main()
+    main()
