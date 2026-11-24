@@ -262,17 +262,17 @@ def random_cases(rng, streams):
     return cases, long_codes
 
 
-def compare(name, cases, fast, slow, truncated_stored=False):
+def compare(name, cases, fast, slow, in_stored=frozenset()):
     # Equal to the bit-at-a-time build in every case, and to CPython's zlib where it classifies the code sets.
-    # truncated_stored: inflate.h checks a stored block's length against the input before the output, so a
-    # truncated stored block that would not fit either is corrupt_stream where zlib, copying the bytes it
-    # has, reports insufficient output first.
+    # in_stored: indices of cases truncated inside a stored block's length fields or bytes. inflate.h checks
+    # the block's length against the input before the output, so such a block that would not fit either is
+    # corrupt_stream where zlib, copying the bytes it has, reports insufficient output first.
     compared = lenient = 0
     for index, ((stream, capacity), got, reference) in enumerate(zip(cases, fast, slow)):
         assert got == reference, "%s case %d: %s %d bytes, bit-at-a-time %s %d bytes" % (
             name, index, STATUS[got[0]], len(got[1]), STATUS[reference[0]], len(reference[1]))
         status, out = expected_status(stream, capacity)
-        if truncated_stored and status == INSUFFICIENT and got[0] == CORRUPT and reference_rejects(stream):
+        if index in in_stored and status == INSUFFICIENT and got[0] == CORRUPT:
             lenient += 1
             continue
         if status is None:
@@ -315,6 +315,7 @@ def stored_after_fixed(literals, stored):
     bits.put(0, 1)
     bits.put(0, 2)
     bits.put(0, -bits.count % 8)
+    at = 2 + bits.count // 8  # the stored block's length fields in the zlib stream
     bits.put(len(stored) | (len(stored) ^ 0xFFFF) << 16, 32)
     for byte in stored:
         bits.put(byte, 8)
@@ -324,7 +325,7 @@ def stored_after_fixed(literals, stored):
     bits.code(0, 5)
     bits.code(0, 7)
     data = literals + stored + (literals + stored)[-1:] * 3
-    return zlib_wrap(bits.to_bytes(), data), data
+    return zlib_wrap(bits.to_bytes(), data), data, range(at, at + 4 + len(stored))
 
 
 def boundary_cases(rng):
@@ -346,31 +347,33 @@ def boundary_cases(rng):
                 stream += encoder.compress(data[cut:]) + encoder.flush()
             else:
                 stream = encoder.compress(data) + encoder.flush()
-            streams.append((stream, bytes(data)))
+            streams.append((stream, bytes(data), range(0)))
     for count in range(8):
         # count 9-bit literal codes put the stored block at bit position count + 2 modulo 8.
         for stored in (b"", rng.randbytes(1), rng.randbytes(300)):
             literals = bytes(rng.randrange(144, 256) for _ in range(count))
             literals += bytes(rng.randrange(144) for _ in range(rng.randint(1, 300)))
             streams.append(stored_after_fixed(literals, stored))
-    cases = []
-    for stream, data in streams:
+    cases, in_stored = [], set()
+    for stream, data, stored_bytes in streams:
         assert reference(stream, "zlib") == data
         cases += [(stream, capacity) for capacity in range(len(data) + 2)]
-        cases += [(stream[:cut], capacity) for cut in range(len(stream))
-                  for capacity in (len(data), rng.randrange(len(data) + 1))]
+        for cut in range(len(stream)):
+            if cut in stored_bytes:
+                in_stored |= {len(cases), len(cases) + 1}
+            cases += [(stream[:cut], len(data)), (stream[:cut], rng.randrange(len(data) + 1))]
     big = rng.randbytes(65535)
     stream = zlib_wrap(b"\x01\xff\xff\x00\x00" + big, big)
     assert reference(stream, "zlib") == big
     cases += [(stream, capacity) for capacity in (0, 1, 65534, 65535, 65536)]
     cases += [(stream[:cut], 65535) for cut in range(len(stream) - 12, len(stream))]
-    return cases, len(streams) + 1
+    return cases, len(streams) + 1, in_stored
 
 
 def expect_boundaries(probe, bitwise, work, rng):
-    cases, streams = boundary_cases(rng)
+    cases, streams, in_stored = boundary_cases(rng)
     fast, slow = run_batch(probe, work, "boundary", cases), run_batch(bitwise, work, "boundary_bitwise", cases)
-    compared, lenient, counts = compare("boundary", cases, fast, slow, truncated_stored=True)
+    compared, lenient, counts = compare("boundary", cases, fast, slow, in_stored)
     print("%d boundary streams as %d cases: equal to bit-at-a-time decoding in all, to zlib in %d (%d truncated "
           "in a stored block that does not fit either); %s" % (streams, len(cases), compared, lenient, counts))
     return cases, slow
