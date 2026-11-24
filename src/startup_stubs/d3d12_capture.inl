@@ -43,6 +43,7 @@ struct ResourceInfo {
     u64 bytes;                       // allocation size when known, else 0
     Placement placement{};
     const Wrapper* placement_device{};
+    D3D12_RESOURCE_STATES initial_state{};
 };
 
 SRWLOCK note_lock = SRWLOCK_INIT;
@@ -164,14 +165,13 @@ void retire_placement(Wrapper* w)
     ReleaseSRWLockExclusive(&note_lock);
 }
 
-PlacedVertexView placed_vertex_view(const Wrapper* device, const D3D12_VERTEX_BUFFER_VIEW& view)
+PlacedVertexView placed_buffer_range(const Wrapper* device, u64 start, u64 bytes)
 {
     PlacedVertexView result{};
-    const u64 start = view.BufferLocation;
-    if (!start || !view.SizeInBytes) return result;
-    if (view.SizeInBytes > ~u64{} - start) return {nullptr, nullptr, true};
+    if (!start || !bytes) return result;
+    if (bytes > ~u64{} - start) return {nullptr, nullptr, true};
     AcquireSRWLockShared(&note_lock);
-    const u64 end = start + view.SizeInBytes;
+    const u64 end = start + bytes;
     for (const auto& group : placement_index) {
         if (group.by_start.empty()) continue;
         const u64 earliest = start >= group.max_width ? start - group.max_width + 1 : 0;
@@ -181,7 +181,7 @@ PlacedVertexView placed_vertex_view(const Wrapper* device, const D3D12_VERTEX_BU
             if (info.placement_device != device) continue;
             const u64 base = it->first;
             if (base <= start && start - base >= info.bytes) continue;
-            if (result.owner || start < base || view.SizeInBytes > info.bytes - (start - base)) {
+            if (result.owner || start < base || bytes > info.bytes - (start - base)) {
                 result = {nullptr, nullptr, true}; // Ambiguous or crossing an allocation.
                 break;
             }
