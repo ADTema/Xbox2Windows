@@ -314,7 +314,7 @@ void hex_text(const void* data, std::size_t bytes, char* out, std::size_t size)
     for (std::size_t i = 0; i < bytes && used + 4 < size; ++i) used += std::snprintf(out + used, size - used, "%02x ", p[i]);
 }
 
-bool first_calls(LONG& counter, LONG limit = 3) { return InterlockedIncrement(&counter) <= limit; }
+bool first_calls(LONG& counter, LONG limit = 3) { return x2w_local::first_calls(counter, limit); }
 
 // X2W_D3D12_DEBUG=1: the desktop debug layer's messages are drained into the log after forwarded
 // calls, tagged with the call that preceded them, and a device removal is reported once with its reason.
@@ -1479,7 +1479,7 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
     const LONG count = InterlockedIncrement(&shown_frames);
     std::snprintf(shown_note, sizeof(shown_note), "surface %llux%u format %d, readback %ld, mean level %.2f/255",
                   desc.Width, desc.Height, desc.Format, count, sum / (3.0 * shown_width * shown_height));
-    if (count <= 3 || count % 40 == 0) log("x2w-render presented %s", shown_note);
+    if ((count > 0 && count <= 3) || count % 40 == 0) log("x2w-render presented %s", shown_note);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2338,7 +2338,7 @@ void __stdcall list_draw(Wrapper* self, UINT vertices, UINT instances, UINT firs
     if (list && pass.pipeline_real && pass.targets_bound && pass.topology_ok && pass.topology != 0x11 && (pass.srv_bound & 1)) {
         list->DrawInstanced(vertices, instances, first_vertex, first_instance);
         const LONG n = InterlockedIncrement(&render_draws);
-        if (n <= 3) log("x2w-render DrawInstanced(%u, %u, %u, %u) recorded", vertices, instances, first_vertex, first_instance);
+        if (n > 0 && n <= 3) log("x2w-render DrawInstanced(%u, %u, %u, %u) recorded", vertices, instances, first_vertex, first_instance);
     } else {
         InterlockedIncrement(&render_draws_skipped);
     }
@@ -3105,7 +3105,7 @@ void dump_pipeline(const char* what, int slot, const void* desc, std::size_t byt
         return GetEnvironmentVariableA("X2W_D3D12_DUMP_PSO", value, sizeof(value)) && value[0] == '1';
     }();
     static LONG dumped[512];
-    if (!enabled || !desc || InterlockedIncrement(&dumped[slot & 511]) > 4) return;
+    if (!enabled || !desc || !first_calls(dumped[slot & 511], 4)) return;
     if (!x2w_local::readable(desc, bytes)) return;
     const auto* words = static_cast<const u64*>(desc);
     log("x2w-pso %s slot %d desc %p, %llu bytes", what, slot, desc, static_cast<unsigned long long>(bytes));

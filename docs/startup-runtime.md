@@ -560,10 +560,13 @@ ctest --preset release --no-tests=error -R '^startup_dstorage_destination$' -V
 ## Local switches, logging, and memory probing
 
 `tests/startup_local_log_check.cpp` (device-free ctest `startup_local_log`, with negative
-controls `startup_local_log_guard_drop_control`, `startup_local_log_reopen_control` and
-`startup_local_log_cache_failure_control`) verifies `src/startup_stubs/local_log.h`:
-`env_on` (a leading `1` in values up to three characters, preserving `GetLastError`), atomic
-`first_calls` countdowns, `logf` (stderr and `X2W_TRAP_LOG` output, CRLF and 1533-byte payload
+controls `startup_local_log_guard_drop_control`, `startup_local_log_reopen_control`,
+`startup_local_log_cache_failure_control` and `startup_local_log_wrap_control`) verifies
+`src/startup_stubs/local_log.h`: `env_on` (a leading `1` in values up to three characters,
+preserving `GetLastError`), the atomic `first_calls` gate (true for the first N calls; the
+counter stops at N, so a counter that a consumer polling in a loop drives past 2^31 cannot turn
+negative and let every call log again; the wrap control shows the old counting gate doing that
+from a counter set near the wrap point), `logf` (stderr and `X2W_TRAP_LOG` output, CRLF and 1533-byte payload
 truncation, `MAX_PATH` boundary behavior, and `GetLastError` preservation on file-open failure),
 the shared `x2w_trap::append_log` (one `X2W_TRAP_LOG` open per module: in a child process, 8
 threads write 2,000 lines each, every line must arrive intact and the open count must be 1; the
