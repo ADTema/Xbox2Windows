@@ -147,7 +147,7 @@ def draw(directory, compiler, renderer, backend):
 
     upper = translate(upper_clamp_program())
     cso = compile_ps(compiler, upper, directory, "lod_upper")
-    mode = "--check-pixel-quad-lod"
+    mode = "--check-pixel-get-lod-upper"
     result = compare_draws(renderer, backend, mode, [],
                            [("translated", cso), ("direct", direct_shaders["upper_clamp"])],
                            directory, "upper-clamp")
@@ -159,17 +159,32 @@ def draw(directory, compiler, renderer, backend):
     bad_cso = compile_ps(compiler, mutant, directory, "unclamp_both")
     mutant_readback = directory / "unclamp-both.rgba32f"
     bad = subprocess.run([renderer, backend, mode, bad_cso, mutant_readback], capture_output=True, text=True)
-    # On an adapter with a small raw LOD error, the mutation must still
-    # remove the clamp by a large amount and keep the strict check failing.
     if bad.returncode != 1 or "pixel_mismatch x=0 y=0" not in bad.stderr or not mutant_readback.is_file():
         raise AssertionError(f"Removing the upper mip clamp escaped detection\n{bad.stderr}")
     mutated_clamped = struct.unpack_from("<f", mutant_readback.read_bytes(), 4)[0]
-    if status:
-        if not 1.5 < mutated_clamped <= 2.5:
-            raise AssertionError(f"Upper mutant clamped output is {mutated_clamped}, expected near 2")
-    elif mutated_clamped != 2.0:
-        raise AssertionError(f"Upper mutant clamped output is {mutated_clamped}, expected 2")
+    if not (abs(mutated_clamped - 2.0) <= 1 / 256):
+        raise AssertionError(f"Upper mutant clamped output is {mutated_clamped}, expected within 1/256 of 2")
     print(bad.stderr, end="", flush=True)
+
+    # Check the bound even on adapters whose native raw result is exact.
+    direct = direct_source.read_text(encoding="ascii")
+    expression = "return float4(raw - 2.0,"
+    assert direct.count(expression) == 1
+    for steps, expected_code in ((1, 0), (2, 1)):
+        stem = f"raw_lod_{steps}_steps"
+        control = direct.replace(expression, f"return float4(-{steps}.0 / 256.0,")
+        hlsl, cso = directory / f"{stem}.hlsl", directory / f"{stem}.cso"
+        hlsl.write_text(control, encoding="ascii")
+        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", "upper_clamp", "-Fo", cso, hlsl], check=True)
+        probe = subprocess.run([renderer, backend, mode, cso, directory / f"{stem}.rgba32f"],
+                               capture_output=True, text=True)
+        if probe.returncode != expected_code or (expected_code and
+                ("pixel_mismatch x=0 y=0" not in probe.stderr or
+                 "channel=0 expected=0 actual=-0.0078125" not in probe.stderr)):
+            raise AssertionError(f"Upper raw LOD {steps}-step control did not behave as expected\n{probe.stderr}")
+        print(f"{stem}: {'rejected' if expected_code else 'accepted'}", flush=True)
+        if expected_code:
+            print(probe.stderr, end="", flush=True)
     if status:
         return status
     write_record(os.environ.get("FORM_COVERAGE_RECORD"))

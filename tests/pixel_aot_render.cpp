@@ -146,6 +146,7 @@ struct MipDraw {
     UINT requestedMip = 0;
     bool isTailDraw = false;
     bool partialQuad = false;
+    bool allowUpperRawLodStep = false;
 };
 
 struct Extent {
@@ -474,6 +475,14 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
                                         x, y, c, expected_bits, actual_bits);
                             if (!is_nan_bits(actual_bits)) return false;
                         } else if (expected_bits != actual_bits) {
+                            // Only the rendered raw-LOD channel in the upper-clamp fixture.
+                            if (req.allowUpperRawLodStep && c == 0 && expected_bits == 0) {
+                                constexpr float step = 1.0f / (1u << D3D12_MIP_LOD_FRACTIONAL_BIT_COUNT);
+                                const float error = std::fabs(actual[c]);
+                                if (!(error <= step)) return false;
+                                candidateError = (std::max)(candidateError, error);
+                                continue;
+                            }
                             if (!input.tolerance) return false;
                             const float error = std::fabs(actual[c] - reference[c]);
                             if (!(error <= input.tolerance)) return false;   // NaN fails too
@@ -662,7 +671,8 @@ void check_compute_to_pixel(ID3D12Device* device, const char* compute, const cha
                 stale ? stale.Get() : current.Get());
 }
 
-void check_pixel_quad_lod(ID3D12Device* device, const char* shader, const char* rawReadback)
+void check_pixel_quad_lod(ID3D12Device* device, const char* shader, const char* rawReadback,
+                          bool allowUpperRawLodStep)
 {
     PixelInput top{8, 8, 1, DXGI_FORMAT_R8G8B8A8_UNORM};
     PixelInput next{4, 4, 1, DXGI_FORMAT_R8G8B8A8_UNORM};
@@ -679,6 +689,7 @@ void check_pixel_quad_lod(ID3D12Device* device, const char* shader, const char* 
         next.rows.insert(next.rows.end(), {0, 255, 0, 255});
     MipDraw draw{0, 1};
     draw.partialQuad = true;
+    draw.allowUpperRawLodStep = allowUpperRawLodStep;
     draw_verified(device, shader, {std::move(top), std::move(next)}, {8, 8}, 0, {draw}, nullptr,
                   nullptr, rawReadback);
 }

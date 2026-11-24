@@ -749,6 +749,12 @@ OperationResult run_check_pixel_quad_lod(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_check_pixel_get_lod_upper(const OperationContext& ctx)
+{
+    check_pixel_quad_lod(ctx.device, ctx.argv[3], ctx.argv[4], true);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_check_pixel_mip_clamp(const OperationContext& ctx)
 {
     const std::string_view level = ctx.argv[4];
@@ -1261,6 +1267,7 @@ const OperationSpec kOperations[] = {
     {"--check-pixel-attribute", 5, 5, nullptr, kNoGate, run_check_pixel_attribute},
     {"--check-pixel-attribute-rg", 5, 5, nullptr, kNoGate, run_check_pixel_attribute_rg},
     {"--check-pixel-quad-lod", 4, 5, nullptr, kNoGate, run_check_pixel_quad_lod},
+    {"--check-pixel-get-lod-upper", 5, 5, nullptr, kNoGate, run_check_pixel_get_lod_upper},
     {"--spirv-minlod-quad-lod", 4, 4, nullptr, kGateSm60MinLodSmoke, run_check_pixel_quad_lod},
     // Keep the fractional point-filter fixture on its existing gate (#809).
     {"--check-pixel-mip-clamp", 5, 5, nullptr, kGateSm66MinLod, run_check_pixel_mip_clamp},

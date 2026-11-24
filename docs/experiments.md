@@ -698,9 +698,14 @@ For each draw, the GPU fixture compiles the translated program and an
 with the same texture, sampler, viewport and constants. It compares all
 256 FP32 channels and prints the first pixel's RGBA words and a SHA-256
 of the full readback for each path. The upper-clamp readback is in the
-order `(raw LOD - 2, clamped LOD, 0, 1)`. Both paths also undergo the
-strict CPU-reference check. For driver comparisons, the `release` preset
-runs the same fixtures.
+order `(raw LOD - 2, clamped LOD, 0, 1)`. Both paths also undergo the CPU
+reference check. The only non-bitwise allowance is one LOD step (`1/256`,
+from `D3D12_MIP_LOD_FRACTIONAL_BIT_COUNT`) in the rendered upper-clamp red
+channel: the RTX 4060 Laptop read `-0.00390625` on both paths instead of zero.
+All other channels, the clear region and the signed negative LOD remain
+exact, as does the comparison between the two GPU paths. The fixture also
+injects a one-step and a two-step deviation to check that only the former
+is accepted. For driver comparisons, the `release` preset runs the same fixtures.
 
 ```powershell
 cmake --build --preset dev --target offscreen_check
