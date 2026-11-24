@@ -1,4 +1,4 @@
-"""Conversion operations of tools/startup/gfx2hlsl.py (its VEC_U table).
+"""Conversion operations of tools/startup/gfx2hlsl.py (its integer-input tables).
 
   (no arguments)                       translation controls, pure Python
   binary <llvm-mc>                     reassemble the pixel bodies and compare them with the recorded words
@@ -101,7 +101,8 @@ BODY = {
 FAMILY = {
     'ops': OPS, 'draw': DRAW, 'mutations': MUTATIONS, 'body': BODY,
     'accepted': ['v_cvt_f32_u32 v1, v2', 'v_cvt_f32_i32_e64 v1, s2', 'v_cvt_u32_f32 v1, 0.5',
-                 'v_cvt_f32_ubyte2_e64 v1, v2', 'v_cvt_f16_f32 v1, v2'],
+                 'v_cvt_f32_ubyte2_e64 v1, v2', 'v_cvt_f16_f32 v1, v2',
+                 'v_cvt_f32_f16_e64 v1, v2 mul:2'],
     'refused': ['v_cvt_f32_u32 v1, v2, v3', 'v_cvt_f32_i32 v1', 'v_cvt_u32_f32_e64 v1, v2 clamp',
                 'v_cvt_f32_ubyte0_e64 v1, -v2', 'v_cvt_f32_f16_e64 v1, |v2|', 'v_cvt_f16_f32_e64 v1, v2 mul:2'],
 }
