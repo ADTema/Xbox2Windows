@@ -523,6 +523,21 @@ add_test(NAME startup_storage_page_end_counts_one_bucket_control
          COMMAND startup_storage_page_end_counts "$<TARGET_FILE:xmem_shim>" --mutate one-bucket)
 set_tests_properties(startup_storage_page_end_counts startup_storage_page_end_counts_one_bucket_control PROPERTIES TIMEOUT 60)
 set_tests_properties(startup_storage_page_end_counts_one_bucket_control PROPERTIES WILL_FAIL TRUE)
+# A matched pair of page-destination zlib requests ending at the first page's end (#1198): one completes,
+# one is refused for capacity. Read through XMemMapPhysicalPages views at each fence and after, the refused
+# page keeps its sentinel; the pages are then unmapped and freed and a follow-up of the same shape completes.
+# The accept-refused control takes the refused destination as data and must fail on that check.
+add_executable(startup_storage_consumer_pair tests/startup_storage_consumer_pair.cpp)
+target_compile_features(startup_storage_consumer_pair PRIVATE cxx_std_17)
+add_dependencies(startup_storage_consumer_pair startup_stub_xcrdapi xmem_shim)
+add_test(NAME startup_storage_consumer_pair
+         COMMAND startup_storage_consumer_pair "$<TARGET_FILE:startup_stub_xcrdapi>" "$<TARGET_FILE:xmem_shim>")
+add_test(NAME startup_storage_consumer_pair_accept_refused_control
+         COMMAND startup_storage_consumer_pair "$<TARGET_FILE:startup_stub_xcrdapi>" "$<TARGET_FILE:xmem_shim>"
+                 --mutate accept-refused)
+set_tests_properties(startup_storage_consumer_pair startup_storage_consumer_pair_accept_refused_control PROPERTIES TIMEOUT 60)
+set_tests_properties(startup_storage_consumer_pair_accept_refused_control PROPERTIES PASS_REGULAR_EXPRESSION
+    "FAIL: after both fences: R destination taken as data differs from the stream prefix in 4096 byte\\(s\\), first at 0xf000")
 # A queue whose worker cannot start (both CreateThread attempts fail, or the construction of its work
 # throws std::bad_alloc) completes status entries and fences at Submit, never inside Enqueue (#1199).
 # The test compiles the stand-in's source into itself so it can redirect CreateThread and operator new.
