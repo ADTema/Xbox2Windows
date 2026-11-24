@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 namespace {
@@ -92,41 +93,54 @@ const char* check_script(IGameInput* input)
 
 }  // namespace
 
+int usage_error(const char* reason)
+{
+    std::printf("ERROR: %s\n", reason);
+    return 2;
+}
+
 int main(int argc, char** argv)
 {
-    if (argc < 2) return fail("expected the path to GameInput.dll");
-
-    // The 40 future entries put the immediate press beyond both old limits.
-    // src_startup_stubs_gameinput_MAIN.cpp ignores the entire value because it
-    // exceeds its 512-byte buffer, so the script never sets bit 0x200.
+    // startup_gameinput_script <GameInput.dll> long|entries
+    //   long:    41 entries, 725 characters. Before this change the stand-in read the value into a
+    //            512-byte buffer, which then stayed empty, so no entry ran and bit 0x200 was never set.
+    //   entries: 33 entries, 230 characters. Before this change only the first 32 entries were kept,
+    //            so the last one, the only one due at second 0, was dropped.
+    if (argc < 3) return usage_error("usage: startup_gameinput_script <GameInput.dll> long|entries");
     std::string script;
-    for (int i = 0; i < 40; ++i) script += "00000001@9000.000,";
+    if (std::strcmp(argv[2], "long") == 0) {
+        for (int i = 0; i < 40; ++i) script += "00000001@9000.000,";
+    } else if (std::strcmp(argv[2], "entries") == 0) {
+        for (int i = 0; i < 32; ++i) script += "1@9000,";
+    } else {
+        return usage_error("the mode must be long or entries");
+    }
     script += "200@0";
     if (!SetEnvironmentVariableA("X2W_INPUT_SCRIPT", script.c_str()))
-        return fail("could not set X2W_INPUT_SCRIPT");
+        return usage_error("could not set X2W_INPUT_SCRIPT");
     if (!SetEnvironmentVariableA("X2W_INPUT_PRESS", nullptr) && GetLastError() != ERROR_ENVVAR_NOT_FOUND)
-        return fail("could not clear X2W_INPUT_PRESS");
+        return usage_error("could not clear X2W_INPUT_PRESS");
 
     HMODULE dll = LoadLibraryA(argv[1]);
-    if (!dll) return fail("LoadLibraryA failed");
+    if (!dll) return usage_error("LoadLibraryA failed");
 
     using CreateFn = HRESULT(__stdcall*)(IGameInput**);
     auto create = reinterpret_cast<CreateFn>(GetProcAddress(dll, "GameInputCreate"));
     if (!create) {
         FreeLibrary(dll);
-        return fail("GetProcAddress(GameInputCreate) failed");
+        return usage_error("GetProcAddress(GameInputCreate) failed");
     }
 
     IGameInput* input = nullptr;
     if (FAILED(create(&input)) || !input) {
         FreeLibrary(dll);
-        return fail("GameInputCreate failed");
+        return usage_error("GameInputCreate failed");
     }
 
     const char* error = check_script(input);
     input->Release();
     FreeLibrary(dll);
     if (error) return fail(error);
-    std::printf("PASS\n");
+    std::printf("PASS: startup_gameinput_script %s\n", argv[2]);
     return 0;
 }
