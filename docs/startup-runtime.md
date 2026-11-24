@@ -191,7 +191,11 @@ adds memory dumps to the stop report.
 source-built `tests/startup_launch_probe.cpp`. A finished run reports the child's exit code and saves
 its stdout, stderr and trap log; a child that outlives `--timeout` is terminated; `--memory-gib` and
 `--max-processes` stop an over-limit allocation and a helper process, and the same requests succeed
-under larger limits; a missing executable is reported instead of looking like a finished run. No GPU
+under larger limits; a missing executable is reported instead of looking like a finished run. When
+`X2W_STORAGE_PATH` is unset and `S:\` does not exist, `launch.py` creates `<logdir>\storage` as a
+per-run fallback (preserving `X2W_STORAGE_PATH` when set); it warns without deleting when
+`X2W_SHADER_CACHE` points to a non-empty directory, and prints a fast-fail diagnostic line pointing
+to `trap.log`, `X2W_STORAGE_PATH` and `X2W_SHADER_CACHE` on a sub-second non-zero exit. No GPU
 and no game files are needed, and the `pr` preset builds the probe and runs the test:
 
 ```powershell
