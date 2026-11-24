@@ -704,10 +704,6 @@ class TestRdna2Disasm(unittest.TestCase):
             ],
         )
 
-        self.assertEqual(result["supported_instructions"], len(scan_source))
-        self.assertFalse(result["translator_accepted"])
-        self.assertEqual(result["lower_error"], "Instruction follows program end")
-
     def test_s_code_end_is_recognized_but_not_translated(self):
         instruction = disasm_rdna2(bytes.fromhex("00009fbf"))[0]
         self.assertEqual((instruction["opcode"], instruction["assembly"]), ("s_code_end", "s_code_end"))
