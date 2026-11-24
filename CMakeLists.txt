@@ -311,6 +311,9 @@ add_test(NAME startup_draw_bmp COMMAND startup_draw_bmp_check)
 # alive so the launch tool's job limits have to stop it.
 add_executable(startup_launch_probe tests/startup_launch_probe.cpp)
 target_compile_features(startup_launch_probe PRIVATE cxx_std_17)
+# Input for the startup debugger's diagnostics check (tests/startup_debug_check.py).
+add_executable(startup_debug_probe tests/startup_debug_probe.cpp)
+target_compile_features(startup_debug_probe PRIVATE cxx_std_17)
 
 add_executable(startup_dump_fence_check tests/startup_dump_fence.cpp tests/desktop_gpu.cpp)
 add_executable(startup_overlay_window tests/startup_overlay_window.cpp)
@@ -1157,6 +1160,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_launch COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_launch_check.py" "$<TARGET_FILE:startup_launch_probe>")
     set_tests_properties(startup_launch PROPERTIES TIMEOUT 120)
+    add_test(NAME startup_debug COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_debug_check.py" "$<TARGET_FILE:startup_debug_probe>")
+    set_tests_properties(startup_debug PROPERTIES TIMEOUT 300)
 
     add_test(NAME startup_stream_request_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
         "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_check.py" "$<TARGET_FILE:startup_stream_consumer>")
