@@ -959,6 +959,25 @@ class Stage:
         self.set_v(reg_range(ops[0])[1], 'f32tof16(%s) | (f32tof16(%s) << 16)' % (self.f(ops[1]), self.f(ops[2])))
 
     def compare(self, base, ops):
+        # v_cmp_class_f32 / v_cmpx_class_f32 test the binary32 class of SRC1 against the mask in SRC0.
+        # The mask is an integer operand (often the inline -1), the value is read as float.
+        if base in ('v_cmp_class_f32', 'v_cmpx_class_f32'):
+            if len(ops) != 3:
+                raise Unsupported('%s with %d operands' % (base, len(ops)))
+            dst, mask, value = ops
+            cond = '(class32(%s) & %s) != 0u' % (self.f(value), self.u(mask))
+            predicate = '((%s) ? 1u : 0u)' % cond
+            if base == 'v_cmpx_class_f32' or dst in ('exec', 'exec_lo'):
+                self.exec_known = False
+                self.emit('exec = %s;' % predicate)
+            elif dst in ('vcc', 'vcc_lo'):
+                self.emit('vcc = %s;' % predicate)
+            else:
+                d = reg_range(dst)[1]
+                self.set_s(d, predicate)
+                self.masks.add(d)
+            return None
+
         m = re.fullmatch(r'v_cmp(x?)_(\w+?)_(f32|u32|i32)(_sdwa)?', base)
         if not m or m.group(4):
             raise Unsupported(base)
@@ -1270,6 +1289,14 @@ class Pipeline:
         out = ['#define F(x) asfloat(x)', '#define U(x) asuint(x)',
                'float mul_legacy(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }',
                'float med3(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }',
+               # The ten binary32 classes v_cmp_class_f32 tests, from the raw encoding (#1795).
+               'uint class32(float value) { uint bits = asuint(value), magnitude = bits & 0x7fffffffu;'
+               ' bool negative = bits >= 0x80000000u;'
+               ' if (magnitude > 0x7f800000u) return (bits & 0x00400000u) != 0u ? 0x2u : 0x1u;'
+               ' if (magnitude == 0x7f800000u) return negative ? 0x4u : 0x200u;'
+               ' if (magnitude >= 0x00800000u) return negative ? 0x8u : 0x100u;'
+               ' if (magnitude != 0u) return negative ? 0x10u : 0x80u;'
+               ' return negative ? 0x20u : 0x40u; }',
                'uint ldu(ByteAddressBuffer b, uint a) { uint k = (a & 3) * 8, lo = b.Load(a & ~3u); if (k == 0) return lo; '
                'return (lo >> k) | (b.Load((a & ~3u) + 4) << (32 - k)); }',
                'cbuffer entry : register(b0) { %s };' % ' '.join('uint ud%d;' % i for i in range(len(self.uds)))]
