@@ -183,7 +183,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
         scalar[reg] = ("group", axis)
     vector = {axis: ("local", axis) for axis in range(3) if axis == 0 or dims[axis] > 1}
     pending = set()
-    # VGPRs a buffer_load_dword still writes, with the word they receive (None when unknown);
+    # VGPRs a buffer read still writes, with the word they receive (None when unknown);
     # they enter vector only at s_waitcnt vmcnt(0).
     loading = {}
     stores = []
@@ -980,29 +980,34 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or row_tag[1] == column_tag[1]):
                 raise ValueError("Unverified row pitch byte offset")
             vector[dst] = ("pitch_bytes", row_tag[1], int(pitch, 0), *column_tag[1:])
-        elif m := re.fullmatch(r"buffer_load_dword v(\d+), (off|v\d+), s\[(\d+):(\d+)\], 0( idxen)?( offen)?"
-                               r"(?: offset:(\d+))?", line):
-            dst, base, high = int(m[1]), int(m[3]), int(m[4])
-            offset = int(m[7] or 0)
+        elif m := re.fullmatch(r"(?:buffer_load_dword|(?P<typed>tbuffer_load_format_x)) "
+                               r"v(?P<dst>\d+), (?P<addr>off|v\d+), s\[(?P<base>\d+):(?P<high>\d+)\], 0"
+                               r"(?(typed) format:\[BUF_FMT_32_UINT\])(?P<idxen> idxen)?(?P<offen> offen)?"
+                               r"(?: offset:(?P<offset>\d+))?", line):
+            dst, base, high = int(m["dst"]), int(m["base"]), int(m["high"])
+            offset = int(m["offset"] or 0)
+            addr, idxen, offen = m["addr"], m["idxen"], m["offen"]
+            if m["typed"] and (cpu != "gfx1030" or not idxen or offen):
+                raise ValueError("Unsupported typed buffer read target or address mode")
             if (dst > 255 or high != base + 3 or base % 4 or high > 105
                     or pending.intersection(range(base, high + 1))):
                 raise ValueError("Unverified buffer read descriptor")
-            kinds = {scalar.get(base + i) for i in range(4)}
-            if kinds == {("uav", i) for i in range(4)}:
+            kinds = tuple(scalar.get(base + i) for i in range(4))
+            if kinds == tuple(("uav", i) for i in range(4)):
                 # The store target would need ordering against other invocations' stores.
                 raise ValueError("Reads from the stored UAV are not supported")
-            if kinds != {("srv", i) for i in range(4)}:
+            if kinds != tuple(("srv", i) for i in range(4)):
                 raise ValueError("Unverified buffer read descriptor")
             if offset % 4 or offset > 4095:
                 raise ValueError("Unverified read offset")
-            tag = vector.get(int(m[2][1:])) if m[2] != "off" else None
-            if m[2] == "off" and not m[5] and not m[6]:
+            tag = vector.get(int(addr[1:])) if addr != "off" else None
+            if addr == "off" and not idxen and not offen:
                 address = f"{offset}u"
-            elif (m[6] and not m[5] and isinstance(tag, tuple) and tag[0] == "thread_bytes"
+            elif (offen and not idxen and isinstance(tag, tuple) and tag[0] == "thread_bytes"
                   and 2 <= tag[2] < 32):
                 # A shift below 2 gives unaligned byte offsets, which ByteAddressBuffer.Load cannot express.
                 address = f"(tid.{AXES[tag[1]]} << {tag[2]}u) + {offset}u"
-            elif (m[5] and not m[6] and source_stride is not None and isinstance(tag, tuple)
+            elif (idxen and not offen and source_stride is not None and isinstance(tag, tuple)
                   and tag[0] == "thread"):
                 # idxen: index * stride + instruction offset, inside one source element.
                 if offset + 4 > source_stride:

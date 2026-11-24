@@ -2681,6 +2681,33 @@ python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLV
 
 Build the emitted source with `dxc -T cs_6_0 -E main`. The Windows fixture reads back all 320 words, including gaps between records and the untouched tail, after one and three indexed groups. A wrong stored word and a wrong guard word must both fail. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_'`.
 
+### Indexed gfx1030 typed-buffer reads
+
+The `gfx1030` compute store profile lowers `tbuffer_load_format_x` with
+instruction format `BUF_FMT_32_UINT` to one 32-bit `ByteAddressBuffer.Load`
+from `t0`. The format describes an unsigned 32-bit X component, so it
+requires no numeric conversion. The accepted address is `idxen` with a
+verified dispatch-thread index, zero scalar offset, and a DWORD-aligned
+instruction offset inside an explicit `--source-stride`. Both descriptor
+and vector load waits must complete before the corresponding registers are
+used. Other formats, address modes, and modifiers are not accepted.
+
+The binding assumes a valid, unswizzled native descriptor and stable,
+in-range source bytes disjoint from the output. It does not emulate native
+descriptor bounds checks or unbound descriptors. The source-built wave32
+fixture reads byte 4 of each 12-byte source record and copies it to byte 4
+of each 8-byte output record. A CPU reference compares all 320 output words,
+including the gaps and tail, for one and three groups. With the source
+stride deliberately changed to 8, word 3 must mismatch on both backends.
+The LLVM 15 binary check also verifies the decoded instruction and the
+CLI's generated HLSL. These are desktop DXIL executions, not native runs
+of the assembled gfx1030 program.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mtbuf_load_(warp|hardware)$' -V
+```
+
 ### Bounded gfx1030 DS lane routing
 
 The `gfx1030` compute profile lowers `ds_bpermute_b32` (gather) and
