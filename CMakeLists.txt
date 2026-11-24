@@ -774,6 +774,14 @@ target_compile_features(startup_plane_size_check PRIVATE cxx_std_17)
 add_test(NAME startup_plane_size COMMAND startup_plane_size_check)
 add_test(NAME startup_plane_size_packed_control COMMAND startup_plane_size_check --mutate packed)
 set_tests_properties(startup_plane_size_packed_control PROPERTIES WILL_FAIL TRUE)
+# GameInput stand-in timestamps: a performance-counter reading in microseconds without a product
+# that wraps (src/startup_stubs/qpc_microseconds.h); the mutated run is the negative control.
+add_executable(startup_qpc_microseconds_check tests/startup_qpc_microseconds_check.cpp)
+target_include_directories(startup_qpc_microseconds_check PRIVATE src)
+target_compile_features(startup_qpc_microseconds_check PRIVATE cxx_std_17)
+add_test(NAME startup_qpc_microseconds COMMAND startup_qpc_microseconds_check)
+add_test(NAME startup_qpc_microseconds_product_control COMMAND startup_qpc_microseconds_check --mutate product)
+set_tests_properties(startup_qpc_microseconds_product_control PROPERTIES WILL_FAIL TRUE)
 # The blend patch a slot 55 derivation applies (src/startup_stubs/derived_blend.h): the last part-2
 # record, its descriptor offset and bytes, and lists that are not whole records. The mutated run is
 # the negative control.
