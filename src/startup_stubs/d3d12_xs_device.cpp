@@ -3479,18 +3479,28 @@ void draw_overlay(LONG frame, double seconds)
 
 #include "startup_stubs/d3d12_present.inl"
 
-// Render mode: a coarse signature of the presented picture every X2W_PRESENT_SIGNATURE_EVERY presents
-// (default 4, 0 = off) for input-script waits (present_signature.h, present_signature_sampler.h).
+// Render mode: a coarse signature of the presented picture for input-script waits (present_signature.h,
+// present_signature_sampler.h). The block always counts presents; samples are taken every 4 presents
+// only while a script with a picture wait has asked for them (request_sampling). X2W_PRESENT_SIGNATURE_EVERY=<n>
+// samples every n presents from the start without a request, and 0 turns the signature off.
 // 18 one-texel rows are copied on the presenting queue and read back on a later present; nothing waits.
 void present_signature(Wrapper* queue, Wrapper* surface, LONG frame)
 {
-    static const int every = [] {
+    static const int explicit_every = [] {
         char value[16]{};
-        return GetEnvironmentVariableA("X2W_PRESENT_SIGNATURE_EVERY", value, sizeof(value)) ? std::atoi(value) : 4;
+        return GetEnvironmentVariableA("X2W_PRESENT_SIGNATURE_EVERY", value, sizeof(value)) ? std::atoi(value) : -1;
     }();
-    if (every <= 0) return;
-    static x2w_present_signature::Block* const block = x2w_present_signature::create_block(GetCurrentProcessId(), static_cast<std::uint32_t>(every));
-    static auto* const sampler = new x2w_present_signature::Sampler(every);  // kept until the process ends
+    if (explicit_every == 0) return;
+    static const int every = explicit_every > 0 ? explicit_every : 4;
+    static x2w_present_signature::Block* const block = [] {
+        auto* created = x2w_present_signature::create_block(GetCurrentProcessId(), static_cast<std::uint32_t>(every));
+        log("x2w-present picture signature: Local\\x2w_present_signature_%lu, every %d presents %s",
+            static_cast<unsigned long>(GetCurrentProcessId()), every,
+            explicit_every > 0 ? "from the start (X2W_PRESENT_SIGNATURE_EVERY)" : "once a script wait asks for it");
+        return created;
+    }();
+    // Kept until the process ends, so a copy in flight never loses the objects it uses.
+    static auto* const sampler = new x2w_present_signature::Sampler(every, explicit_every > 0);
     ID3D12Resource* real = surface && surface->own().kind == resource_kind ? static_cast<ID3D12Resource*>(surface->own().real) : nullptr;
     const bool published = sampler->present(device_of(the_device), static_cast<ID3D12CommandQueue*>(queue->own().real), real, frame, block);
     static LONG first, refused, failed;
@@ -3499,7 +3509,9 @@ void present_signature(Wrapper* queue, Wrapper* surface, LONG frame)
             frame, static_cast<unsigned long>(GetCurrentProcessId()), every);
     if (sampler->unsupported_format() != DXGI_FORMAT_UNKNOWN && first_calls(refused, 1))
         log("x2w-present picture signature: surface format %d is not sampled", sampler->unsupported_format());
-    if (sampler->failed() && first_calls(failed, 1)) log("x2w-present picture signature: setup failed, no samples");
+    if (sampler->failed() && first_calls(failed, 1))
+        log(sampler->stranded() ? "x2w-present picture signature: Signal failed after a copy was submitted; sampling stopped, its surface stays referenced"
+                                : "x2w-present picture signature: setup failed, no samples");
 }
 
 // Queue slot 32 (Xbox order): (plane count, plane parameters*, present parameters*) -> HRESULT, the

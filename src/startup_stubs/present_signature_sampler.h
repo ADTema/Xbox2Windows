@@ -5,6 +5,16 @@
 // each, never the whole surface), and the 72 rows of the fine grid while a reader asks for it, into
 // a small readback buffer on the presenting queue and signals a fence. It never waits: a later call publishes the rows once the fence has passed, and no new
 // copy starts while one is in flight. The surface rests in COMMON before and after.
+//
+// Lifetime: command lists do not hold the resources they reference, and the caller may release the
+// presented surface right after the present. The sampler therefore holds its own reference to the
+// surface from submission until the copy's fence has passed. If Signal fails after the list was
+// submitted, nothing can tell when the copy ends: the sampler stops sampling and keeps the surface,
+// allocator, list and readback buffer referenced for the rest of the process ("stranded").
+//
+// Sampling is opt-in: a sampler made with always = false records copies only while the block's
+// sampling_wanted is set (a script with a picture wait asks for it); otherwise it creates no GPU
+// objects and submits nothing, and only counts presents.
 #pragma once
 
 #include "startup_stubs/present_signature.h"
@@ -33,7 +43,7 @@ inline bool layout_of(DXGI_FORMAT format, Layout& layout)
 
 class Sampler {
 public:
-    explicit Sampler(int every) : every_(every) {}
+    explicit Sampler(int every, bool always = true) : every_(every), always_(always) {}
 
     // Called once per present with the presented surface. Returns true when this call published a sample.
     bool present(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Resource* surface, LONG64 present_number, Block* block)
@@ -41,6 +51,7 @@ public:
         bool published = false;
         if (in_flight_ && fence_->GetCompletedValue() >= fence_value_) {
             in_flight_ = false;
+            retire_source();
             void* mapped = nullptr;
             const D3D12_RANGE range{0, static_cast<SIZE_T>(row_stride_ * rows_)};
             if (SUCCEEDED(readback_->Map(0, &range, &mapped))) {
@@ -58,6 +69,7 @@ public:
         }
         if (block) note_present(block, present_number);
         if (every_ <= 0 || failed_ || !device || !queue || !surface) return published;
+        if (!always_ && !(block && block->sampling_wanted)) return published;
         if ((counter_++ % every_) != 0 || in_flight_) return published;
         const D3D12_RESOURCE_DESC desc = surface->GetDesc();
         Layout layout;
@@ -95,9 +107,12 @@ public:
             return published;
         }
         ID3D12CommandList* lists[] = {list_};
+        surface->AddRef();  // held until the copy's fence has passed (retire_source)
+        source_ = surface;
         queue->ExecuteCommandLists(1, lists);
         if (FAILED(queue->Signal(fence_, ++fence_value_))) {
-            failed_ = true;
+            // Submitted, but no fence will tell when the copy ends: keep everything it uses.
+            stranded_ = failed_ = true;
             return published;
         }
         in_flight_ = true;
@@ -110,18 +125,35 @@ public:
     }
 
     bool failed() const { return failed_; }
+    bool stranded() const { return stranded_; }
+    bool holds_source() const { return source_ != nullptr; }
+    bool set_up() const { return allocator_ != nullptr; }
     DXGI_FORMAT unsupported_format() const { return unsupported_; }
     bool in_flight() const { return in_flight_; }
     int rows_in_flight() const { return in_flight_ ? rows_ : 0; }
 
+    // Waits (at most 10 s) for a copy in flight; if it cannot be seen to end, or the sampler is
+    // stranded, the objects the copy uses stay referenced instead of being released under the GPU.
     ~Sampler()
     {
+        if (in_flight_ && !stranded_ && fence_->GetCompletedValue() < fence_value_) {
+            HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (event && SUCCEEDED(fence_->SetEventOnCompletion(fence_value_, event))) WaitForSingleObject(event, 10000);
+            if (event) CloseHandle(event);
+        }
+        if (stranded_ || (in_flight_ && fence_->GetCompletedValue() < fence_value_)) return;
+        retire_source();
         for (IUnknown* object : {static_cast<IUnknown*>(readback_), static_cast<IUnknown*>(fence_),
                                  static_cast<IUnknown*>(list_), static_cast<IUnknown*>(allocator_)})
             if (object) object->Release();
     }
 
 private:
+    void retire_source()
+    {
+        if (source_) source_->Release();
+        source_ = nullptr;
+    }
     bool setup(ID3D12Device* device, UINT64 bytes)
     {
         HRESULT hr = S_OK;
@@ -164,18 +196,20 @@ private:
     }
 
     int every_;
+    bool always_;
     LONG64 counter_ = 0, copied_present_ = 0;
     ID3D12CommandAllocator* allocator_ = nullptr;
     ID3D12GraphicsCommandList* list_ = nullptr;
     ID3D12Fence* fence_ = nullptr;
     ID3D12Resource* readback_ = nullptr;
+    ID3D12Resource* source_ = nullptr;  // the surface of the copy in flight
     UINT64 readback_bytes_ = 0, fence_value_ = 0, row_stride_ = 0;
     UINT width_ = 0;
     int rows_ = cells_y;
     std::uint8_t fine_[fine_cells] = {};
     Layout layout_ = Layout::rgba8;
     DXGI_FORMAT unsupported_ = DXGI_FORMAT_UNKNOWN;
-    bool in_flight_ = false, failed_ = false;
+    bool in_flight_ = false, failed_ = false, stranded_ = false;
 };
 
 }  // namespace x2w_present_signature

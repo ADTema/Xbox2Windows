@@ -846,8 +846,10 @@ int case_wait(const char* dll)
     std::memset(b, 200, sizeof(b));
     x2w_present_signature::publish(block, a, 8);
     x2w_present_signature::note_present(block, 10);
+    check(block->sampling_wanted == 0, "no sampling request before the script is read");
     Child child;
     if (!open_child(dll, "wait=1/20,80@+2,mark=menu@+0,4@+0.5", child)) return 2;
+    check(block->sampling_wanted == 1, "a script with a wait asks the presenter to sample");
     const std::uint64_t z = 1000;  // first poll: the wait begins at 0 s on the first-poll base
     for (std::uint64_t ms = z; ms <= z + 8000; ms += 100) {
         if (ms == z + 2000) x2w_present_signature::publish(block, b, 40);
@@ -864,12 +866,36 @@ int case_wait(const char* dll)
     check(child.count("x2w-input script: 3 entries accepted, 0 rejected, time base first-poll") == 0, "summary counts entries only");
     check(child.count("x2w-input script: 2 entries accepted, 0 rejected, time base first-poll") == 1, "wait summary line");
     check(child.count("x2w-input script: 1 waits, 1 marks; picture signal from Local\\x2w_present_signature_") == 1, "wait and mark count line");
+    check(child.count("x2w-input script: picture signature requested") == 1, "sampling request line");
     check(child.count("x2w-input script wait item 1 begun at 0.000 s\r\n") == 1, "wait begun line");
     check(child.count("x2w-input script wait item 1: picture changed at 2.000 s, 2.000 s after the wait began") == 1, "picture changed line");
     check(child.count("x2w-input script wait item 1 done at 3.000 s after 3.000 s") == 1, "wait done line");
     check(child.count("timed out") == 0, "no timeout line");
     check(child.count("x2w-input script mark menu at 5.000 s (item 3, present 322)") == 1, "mark line with the present number");
     check(child.count("x2w-input script time passed its last entry (2 entries, ended at 5.800 s") == 1, "last-entry line after the wait");
+    return 0;
+}
+
+// Negative control for the sampling request: a script with marks but no wait plays and logs present
+// numbers, but never asks the presenter to sample, so an ordinary render run records no copies.
+int case_marks_only(const char* dll)
+{
+    x2w_present_signature::Block* block = x2w_present_signature::create_block(GetCurrentProcessId(), 4);
+    if (!block) {
+        std::printf("FAIL: create_block\n");
+        return 2;
+    }
+    std::uint8_t picture[x2w_present_signature::cells];
+    std::memset(picture, 90, sizeof(picture));
+    x2w_present_signature::publish(block, picture, 5);
+    x2w_present_signature::note_present(block, 7);
+    Child child;
+    if (!open_child(dll, "mark=start@0,4@0.5", child)) return 2;
+    for (std::uint64_t ms = 1000; ms <= 2500; ms += 100) child.at(ms);
+    check(block->sampling_wanted == 0, "a script without a wait does not ask for samples");
+    check(block->fine_wanted == 0, "nor for the fine grid");
+    check(child.count("picture signature requested") == 0, "no sampling request line");
+    check(child.count("x2w-input script mark start at 0.000 s (item 1, present 7)") == 1, "the mark still reads the present number");
     return 0;
 }
 
@@ -981,7 +1007,7 @@ const NamedCase cases[] = {
     {"base_poll", case_base_poll}, {"malformed", case_malformed},
     {"too_long", case_too_long}, {"over_limit", case_over_limit},
     {"wait", case_wait},         {"wait_without_presenter", case_wait_without_presenter},
-    {"fine_group", case_fine_group},
+    {"fine_group", case_fine_group}, {"marks_only", case_marks_only},
 };
 
 bool xinput_pad_connected()

@@ -612,7 +612,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` and forwards [single-record indirect Dispatch](experiments.md#gpu-written-indirect-dispatch-arguments), [DrawIndexed](experiments.md#gpu-written-indirect-indexed-draw-arguments), [Draw](experiments.md#gpu-written-indirect-draw-arguments), and [DispatchMesh](experiments.md#gpu-written-indirect-mesh-dispatch-arguments) for supported desktop pipelines and tracked placed buffers |
 | `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}` and, when needed, RTV variants `req_<key>.rtv`. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running. Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` and no manifest; `X2W_FXC=` (empty) skips compilation and publishes the manifest alone. |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
-| `X2W_PRESENT_SIGNATURE_EVERY=<n>` | in render mode, publishes a coarse signature of the presented picture every `n` presents (default 4, `0` off) for input-script waits: see [Waiting for the presented picture](#waiting-for-the-presented-picture) |
+| `X2W_PRESENT_SIGNATURE_EVERY=<n>` | in render mode, samples a coarse signature of the presented picture every `n` presents from the start, without a script request (`0` off). Unset, sampling starts, every 4 presents, only once a script with a `wait` asks for it: see [Waiting for the presented picture](#waiting-for-the-presented-picture) |
 | `X2W_D3D12_DUMP_SURFACE=<bmp>` | writes the last presented surface |
 | `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. At most 48 copies are pending or written; a copy whose fence reports device removal (`UINT64_MAX`) is released unwritten and frees its slot (`src/startup_stubs/draw_dump_tracking.h`, `ctest --preset dev --no-tests=error -R '^startup_dump_fence_(removed_control_)?warp$' -V`; the control must fail). |
 | `X2W_AUDIO_PERMISSIVE=1` | enables the audio stand-ins. Without a DSP provider, `XDspActivate` clears valid outputs and reports unavailable resources, and failed `XDspSubmitCommand` calls leave the sequence unchanged. |
@@ -719,10 +719,18 @@ wait,80@+2,4@+0.5,mark=menu1@+0,wait,80@+2,4@+0.5,mark=menu2@+0
 ```
 
 The picture signal comes from the D3D12 stand-in in render mode (`X2W_D3D12_RENDER=1`,
-`run.ps1 -Render`). Every `X2W_PRESENT_SIGNATURE_EVERY` presents (default 4; `0` turns it off) it
+`run.ps1 -Render`). Sampling is opt-in: it starts only after a script with at least one `wait` has
+asked for it (the GameInput stand-in sets a request field in the signature block and logs
+`x2w-input script: picture signature requested`), so ordinary render runs record no extra GPU work.
+`X2W_PRESENT_SIGNATURE_EVERY=<n>` samples every `n` presents from the start without a request, and
+`0` turns the signature off. While sampling, every fourth present (or every `n`) it
 copies 18 evenly spaced single rows of the presented surface into a small readback buffer on the
 presenting queue, never the whole surface and never waiting for the copy, and on a later present
-reduces them to 32 x 18 cells of mean luma. It publishes them in a named block,
+reduces them to 32 x 18 cells of mean luma. Command lists do not hold the resources they use, so the
+sampler holds its own reference to the presented surface until the copy's fence has passed; a title
+may release the surface right after the present. If `Signal` fails after the copy was submitted,
+sampling stops and the surface, command list and readback buffer stay referenced for the rest of the
+process. It publishes them in a named block,
 `Local\x2w_present_signature_<process id>`, so other tools can read it too
 (`src/startup_stubs/present_signature.h` describes the layout). The 8-bit and 10:10:10:2 colour
 formats are read; for others it logs
@@ -734,12 +742,15 @@ Log lines, each once per item:
 
 ```text
 x2w-input script: <n> waits, <m> marks; picture signal from Local\x2w_present_signature_<pid>
+x2w-input script: picture signature requested
+x2w-present picture signature: Local\x2w_present_signature_<pid>, every <k> presents once a script wait asks for it|from the start (X2W_PRESENT_SIGNATURE_EVERY)
 x2w-input script wait item <i> begun at <s> s[ (no presenter signal yet)]
 x2w-input script wait item <i>: picture changed at <s> s, <e> s after the wait began
 x2w-input script wait item <i> done at <s> s after <e> s
 x2w-input script wait item <i> timed out at <s> s after <e> s[ (no presenter signal)]; the script goes on|stops
 x2w-input script mark <label> at <s> s (item <i>, present <n>|no presenter signal)
 x2w-present picture signature: first sample published at present <n> in Local\x2w_present_signature_<pid> (every <k> presents)
+x2w-present picture signature: Signal failed after a copy was submitted; sampling stopped, its surface stays referenced
 ```
 
 Times are seconds on the script's time base. The rejection reasons of waits and marks are `bad wait option`,
@@ -804,10 +815,15 @@ The timeline is in `src/startup_stubs/input_script.h` and the sampler in
 `src/startup_stubs/present_signature_sampler.h`. The timeline cases run with a controllable clock
 and picture signal; two cases run through the stand-in with the check process publishing the
 pictures. The WARP check presents two different pictures and repeated identical ones, and compares
-the published cells with a CPU reduction of the same rows:
+the published cells with a CPU reduction of the same rows. The held-source check runs under the
+D3D12 debug layer: it stalls the queue on a fence, lets the sampler record its copy, releases the
+caller's only reference to the surface, then releases the queue, and requires the correct signature
+and no debug-layer error; it also makes `Signal` fail after submission and requires the sampler to
+keep the surface. Its control repeats the stall with a copy that does not hold its source and passes
+only when the debug layer reports the released surface:
 
 ```powershell
-ctest --preset dev --no-tests=error -R '^startup_(gameinput_script_syntax|present_signature_warp)$' -V
+ctest --preset dev --no-tests=error -R '^startup_(gameinput_script_syntax|present_signature_(warp|held_source_warp|unheld_source_control_warp))$' -V
 ```
 
 ## Game saves

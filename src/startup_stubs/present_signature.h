@@ -11,8 +11,10 @@
 //   +0x268 i32 fine wanted: set to 1 by a reader (request_fine) to ask for the fine grid as well
 //   +0x26C u32 fine_x (64), u32 fine_y (72), i32 fine valid: the published sample has the fine grid
 //   +0x278 u8 fine[72][64]: the same reduction over 72 rows and 64 columns
-// A reader copies the cells between two reads of an even, unchanged sequence. The fine grid costs
-// 72 more one-texel rows per sample, so the presenter copies it only after a reader asked for it.
+//   +0x1478 i32 sampling wanted: set to 1 by a reader (request_sampling) to ask for samples at all
+// A reader copies the cells between two reads of an even, unchanged sequence. Sampling records GPU
+// copies, so the presenter samples only after a reader asked for it (or X2W_PRESENT_SIGNATURE_EVERY
+// is set); the fine grid costs 72 more one-texel rows per sample and is copied only while asked for.
 #pragma once
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -44,8 +46,10 @@ struct Block {
     std::uint32_t fine_x, fine_y;
     volatile LONG fine_valid;
     std::uint8_t fine[fine_cells];
+    volatile LONG sampling_wanted;
 };
-static_assert(offsetof(Block, luma) == 0x28 && offsetof(Block, fine_wanted) == 0x268 && offsetof(Block, fine) == 0x278,
+static_assert(offsetof(Block, luma) == 0x28 && offsetof(Block, fine_wanted) == 0x268 && offsetof(Block, fine) == 0x278 &&
+                  offsetof(Block, sampling_wanted) == 0x1478,
               "signature block layout");
 
 struct Snapshot {
@@ -95,9 +99,9 @@ inline const Block* open_block(DWORD process)
     return block;
 }
 
-// Reader side: asks the presenter of `process` for the fine grid. Creates the block if no presenter
-// has yet (the presenter's create_block then keeps the request). False if the block cannot be made.
-inline bool request_fine(DWORD process)
+// Reader side: sets one request flag in the block of `process`. Creates the block if no presenter has
+// yet (the presenter's create_block then keeps the request). False if the block cannot be made.
+inline bool request(DWORD process, volatile LONG Block::*flag)
 {
     wchar_t name[64];
     block_name(name, process);
@@ -105,9 +109,13 @@ inline bool request_fine(DWORD process)
     if (!mapping) return false;
     auto* block = static_cast<Block*>(MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, sizeof(Block)));
     if (!block) return false;
-    InterlockedExchange(&block->fine_wanted, 1);
+    InterlockedExchange(&(block->*flag), 1);
     return true;
 }
+// Asks the presenter to sample at all (a script with a picture wait).
+inline bool request_sampling(DWORD process) { return request(process, &Block::sampling_wanted); }
+// Asks the presenter for the fine grid as well.
+inline bool request_fine(DWORD process) { return request(process, &Block::fine_wanted); }
 
 // `fine` may be null: the sample then has no fine grid.
 inline void publish(Block* block, const std::uint8_t (&luma)[cells], LONG64 present, const std::uint8_t* fine = nullptr)

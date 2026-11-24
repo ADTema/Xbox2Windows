@@ -3,9 +3,19 @@
 // reduction of those rows, and the published signal changes once for two different pictures and
 // never for repeated identical pictures (negative control). Also checks the sampling interval, that a
 // bar of about 1 % of the frame between two base rows is missed by the 32 x 18 grid and caught by the
-// fine 64 x 72 grid, and prints the CPU-side cost per sampled present at 3840 x 2160.
+// fine 64 x 72 grid, prints the CPU-side cost per sampled present at 3840 x 2160, and checks that a
+// sampler made with always = false records nothing until the block asks for samples.
 //
-// usage: startup_present_signature   (exit 77 when no WARP adapter can be created)
+// With "held_source" it runs the lifetime check under the D3D12 debug layer: the queue is stalled on
+// a fence, the sampler records its copy, the caller releases its only reference to the surface,
+// then the queue is released. The signature must still equal the picture, the sampler must drop its
+// reference once the copy's fence has passed, and the debug layer must report no error. A queue whose
+// Signal fails after submission must leave the sampler stranded, still holding the surface.
+// With "unheld_control" it runs the same stall with a plain copy of its own that does not hold the
+// surface (the defect the sampler avoids); it passes only if the debug layer reports that.
+//
+// usage: startup_present_signature [held_source | unheld_control]
+//        (exit 77 when no WARP adapter, or for the two modes no debug layer, is available)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -18,6 +28,7 @@
 #include "startup_stubs/present_signature_sampler.h"
 
 #include <d3d12.h>
+#include <d3d12sdklayers.h>
 #include <dxgi1_4.h>
 
 #include <cstdint>
@@ -172,6 +183,178 @@ std::vector<x2w_present_signature::Snapshot> present_all(Gpu& gpu, x2w_present_s
     return published;
 }
 
+// Forwards every call to a real queue, except that Signal fails once `fail_signal` is set: the
+// "submitted, but no fence" case the sampler has to survive.
+class SignalFailingQueue : public ID3D12CommandQueue {
+public:
+    explicit SignalFailingQueue(ID3D12CommandQueue* real) : real_(real) {}
+    bool fail_signal = false;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override { return real_->QueryInterface(riid, out); }
+    ULONG STDMETHODCALLTYPE AddRef() override { return 2; }
+    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID g, UINT* n, void* d) override { return real_->GetPrivateData(g, n, d); }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID g, UINT n, const void* d) override { return real_->SetPrivateData(g, n, d); }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID g, const IUnknown* d) override { return real_->SetPrivateDataInterface(g, d); }
+    HRESULT STDMETHODCALLTYPE SetName(LPCWSTR name) override { return real_->SetName(name); }
+    HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void** out) override { return real_->GetDevice(riid, out); }
+    void STDMETHODCALLTYPE UpdateTileMappings(ID3D12Resource* r, UINT n, const D3D12_TILED_RESOURCE_COORDINATE* c,
+                                              const D3D12_TILE_REGION_SIZE* s, ID3D12Heap* h, UINT rn, const D3D12_TILE_RANGE_FLAGS* f,
+                                              const UINT* o, const UINT* cnt, D3D12_TILE_MAPPING_FLAGS fl) override
+    {
+        real_->UpdateTileMappings(r, n, c, s, h, rn, f, o, cnt, fl);
+    }
+    void STDMETHODCALLTYPE CopyTileMappings(ID3D12Resource* d, const D3D12_TILED_RESOURCE_COORDINATE* dc, ID3D12Resource* s,
+                                            const D3D12_TILED_RESOURCE_COORDINATE* sc, const D3D12_TILE_REGION_SIZE* rs,
+                                            D3D12_TILE_MAPPING_FLAGS f) override
+    {
+        real_->CopyTileMappings(d, dc, s, sc, rs, f);
+    }
+    void STDMETHODCALLTYPE ExecuteCommandLists(UINT n, ID3D12CommandList* const* lists) override { real_->ExecuteCommandLists(n, lists); }
+    void STDMETHODCALLTYPE SetMarker(UINT m, const void* d, UINT n) override { real_->SetMarker(m, d, n); }
+    void STDMETHODCALLTYPE BeginEvent(UINT m, const void* d, UINT n) override { real_->BeginEvent(m, d, n); }
+    void STDMETHODCALLTYPE EndEvent() override { real_->EndEvent(); }
+    HRESULT STDMETHODCALLTYPE Signal(ID3D12Fence* fence, UINT64 value) override { return fail_signal ? E_FAIL : real_->Signal(fence, value); }
+    HRESULT STDMETHODCALLTYPE Wait(ID3D12Fence* fence, UINT64 value) override { return real_->Wait(fence, value); }
+    HRESULT STDMETHODCALLTYPE GetTimestampFrequency(UINT64* f) override { return real_->GetTimestampFrequency(f); }
+    HRESULT STDMETHODCALLTYPE GetClockCalibration(UINT64* g, UINT64* c) override { return real_->GetClockCalibration(g, c); }
+#if defined(_MSC_VER) || !defined(_WIN32)
+    D3D12_COMMAND_QUEUE_DESC STDMETHODCALLTYPE GetDesc() override { return real_->GetDesc(); }
+#else
+    D3D12_COMMAND_QUEUE_DESC* STDMETHODCALLTYPE GetDesc(D3D12_COMMAND_QUEUE_DESC* out) override { return real_->GetDesc(out); }
+#endif
+
+private:
+    ID3D12CommandQueue* real_;
+};
+
+// Error and corruption messages the debug layer has stored since the last call; prints each one.
+// `deleted_in_use` is set when one of them reports an object released while the GPU still used it.
+int debug_errors(ID3D12InfoQueue* info, bool* deleted_in_use = nullptr)
+{
+    int errors = 0;
+    const UINT64 stored = info->GetNumStoredMessages();
+    for (UINT64 i = 0; i < stored; ++i) {
+        SIZE_T bytes = 0;
+        info->GetMessage(i, nullptr, &bytes);
+        std::vector<unsigned char> storage(bytes);
+        auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+        if (FAILED(info->GetMessage(i, message, &bytes))) continue;
+        if (message->Severity != D3D12_MESSAGE_SEVERITY_ERROR && message->Severity != D3D12_MESSAGE_SEVERITY_CORRUPTION) continue;
+        ++errors;
+        if (deleted_in_use && message->ID == D3D12_MESSAGE_ID_OBJECT_DELETED_WHILE_STILL_IN_USE) *deleted_in_use = true;
+        std::printf("debug layer: %.*s\n", static_cast<int>(message->DescriptionByteLength), message->pDescription);
+    }
+    info->ClearStoredMessages();
+    return errors;
+}
+
+// Builds a stall: the queue waits on `gate` (not yet signalled) before anything submitted after it.
+ID3D12Fence* stall(Gpu& gpu)
+{
+    ID3D12Fence* gate = nullptr;
+    gpu.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate));
+    gpu.queue->Wait(gate, 1);
+    return gate;
+}
+
+int lifetime(Gpu& gpu, ID3D12InfoQueue* info, x2w_present_signature::Block* block, bool control)
+{
+    const Picture picture = gradient(false);
+    std::uint8_t want[x2w_present_signature::cells];
+    expected_grid(picture, x2w_present_signature::Layout::rgba8, want);
+    debug_errors(info);  // setup noise, if any, is not part of the check
+    if (control) {
+        // The defect: a copy whose source nobody holds. The test records it itself, releases its only
+        // reference while the queue is stalled, then lets the queue run.
+        ID3D12Resource* source = surface(gpu, DXGI_FORMAT_R8G8B8A8_UNORM, picture);
+        ID3D12Fence* gate = stall(gpu);
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC buffer{};
+        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width = 1024;
+        buffer.Height = 1;
+        buffer.DepthOrArraySize = 1;
+        buffer.MipLevels = 1;
+        buffer.SampleDesc.Count = 1;
+        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ID3D12Resource* readback = nullptr;
+        ID3D12CommandAllocator* allocator = nullptr;
+        ID3D12GraphicsCommandList* list = nullptr;
+        gpu.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback));
+        gpu.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator));
+        gpu.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr, IID_PPV_ARGS(&list));
+        D3D12_TEXTURE_COPY_LOCATION from{}, to{};
+        from.pResource = source;
+        from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        to.pResource = readback;
+        to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        to.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, width, 1, 1, 1024};
+        const D3D12_BOX row{0, 0, 0, width, 1, 1};
+        list->CopyTextureRegion(&to, 0, 0, 0, &from, &row);
+        list->Close();
+        ID3D12CommandList* lists[] = {list};
+        gpu.queue->ExecuteCommandLists(1, lists);
+        source->Release();  // nobody holds the source of the stalled copy now
+        gate->Signal(1);
+        gpu.idle();
+        bool deleted_in_use = false;
+        const int errors = debug_errors(info, &deleted_in_use);
+        std::printf("control: %d debug-layer errors, released while in use %s\n", errors, deleted_in_use ? "reported" : "not reported");
+        check(deleted_in_use, "the debug layer reports a stalled copy whose source was released (the check can fail)");
+        list->Release();
+        allocator->Release();
+        readback->Release();
+        gate->Release();
+        return 0;
+    }
+
+    // The sampler: its copy is stalled, the caller drops its reference, then the queue runs.
+    {
+        ID3D12Resource* presented = surface(gpu, DXGI_FORMAT_R8G8B8A8_UNORM, picture);
+        x2w_present_signature::Sampler sampler(1);
+        ID3D12Fence* gate = stall(gpu);
+        const LONG64 before = block->sequence / 2;
+        sampler.present(gpu.device, gpu.queue, presented, 1, block);
+        check(sampler.in_flight() && sampler.holds_source(), "the stalled copy is in flight and the sampler holds its surface");
+        const ULONG left = presented->Release();  // the caller's only reference, right after the present
+        check(left == 1, "after the caller's release, only the sampler's reference is left");
+        sampler.present(gpu.device, gpu.queue, nullptr, 2, block);
+        check(block->sequence / 2 == before && sampler.holds_source(), "nothing is published and the surface is kept while the queue is stalled");
+        gate->Signal(1);
+        gpu.idle();
+        sampler.present(gpu.device, gpu.queue, nullptr, 3, block);
+        x2w_present_signature::Snapshot snapshot{};
+        check(block->sequence / 2 == before + 1 && x2w_present_signature::read(block, snapshot) && snapshot.sample_present == 1 &&
+                  std::memcmp(snapshot.luma, want, sizeof(want)) == 0,
+              "after the stall the published signature equals the released surface's picture");
+        check(!sampler.holds_source() && !sampler.in_flight(), "the sampler drops the surface once the copy's fence has passed");
+        gate->Release();
+    }
+    // Signal fails after the list was submitted: the sampler stops and keeps everything the copy uses.
+    {
+        ID3D12Resource* presented = surface(gpu, DXGI_FORMAT_R8G8B8A8_UNORM, picture);
+        SignalFailingQueue failing(gpu.queue);
+        failing.fail_signal = true;
+        ID3D12Fence* gate = stall(gpu);
+        auto* sampler = new x2w_present_signature::Sampler(1);
+        sampler->present(gpu.device, &failing, presented, 1, block);
+        check(sampler->failed() && sampler->stranded() && sampler->holds_source(), "a failed Signal strands the sampler with the surface held");
+        const ULONG left = presented->Release();
+        check(left == 1, "the stranded sampler still holds the surface after the caller's release");
+        gate->Signal(1);
+        gpu.idle();
+        sampler->present(gpu.device, &failing, presented, 2, block);
+        check(sampler->stranded() && !sampler->in_flight() && sampler->holds_source(), "a stranded sampler records nothing more and keeps the surface");
+        delete sampler;  // a stranded sampler releases nothing it may still be using
+        gate->Release();
+    }
+    const int errors = debug_errors(info);
+    std::printf("held source: %d debug-layer errors\n", errors);
+    check(errors == 0, "the debug layer reports no error for the sampler's stalled copy");
+    return 0;
+}
+
 int changes(const std::vector<x2w_present_signature::Snapshot>& grids)
 {
     int n = 0;
@@ -182,8 +365,23 @@ int changes(const std::vector<x2w_present_signature::Snapshot>& grids)
 
 }  // namespace
 
-int main()
+int main(int argc, char** argv)
 {
+    const bool held = argc > 1 && std::strcmp(argv[1], "held_source") == 0;
+    const bool control = argc > 1 && std::strcmp(argv[1], "unheld_control") == 0;
+    if (argc > 1 && !held && !control) {
+        std::printf("unknown mode %s\n", argv[1]);
+        return 2;
+    }
+    if (held || control) {
+        ID3D12Debug* debug = nullptr;
+        if (FAILED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
+            std::printf("SKIP: no D3D12 debug layer\n");
+            return 77;
+        }
+        debug->EnableDebugLayer();
+        debug->Release();
+    }
     IDXGIFactory4* factory = nullptr;
     IDXGIAdapter* warp = nullptr;
     Gpu gpu;
@@ -201,6 +399,18 @@ int main()
     x2w_present_signature::Block* block = x2w_present_signature::create_block(GetCurrentProcessId() | 0x80000000u, 1);
     check(block != nullptr, "create the signature block");
     if (!block) return 1;
+
+    if (held || control) {
+        ID3D12InfoQueue* info = nullptr;
+        if (FAILED(gpu.device->QueryInterface(IID_PPV_ARGS(&info)))) {
+            std::printf("SKIP: the debug layer gave no info queue\n");
+            return 77;
+        }
+        lifetime(gpu, info, block, control);
+        info->Release();
+        std::printf("%s\n", failures ? "FAIL" : "pass");
+        return failures ? 1 : 0;
+    }
 
     const Picture a = gradient(false), b = gradient(true);
     for (DXGI_FORMAT format : {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_TYPELESS}) {
@@ -230,6 +440,29 @@ int main()
         for (ID3D12Resource* r : {a1, a2, b1, b2}) r->Release();
     }
 
+    // Opt-in: a sampler made with always = false creates no GPU objects and records no copy until the
+    // block asks for samples; then it samples as usual.
+    {
+        ID3D12Resource* s = surface(gpu, DXGI_FORMAT_R8G8B8A8_UNORM, a);
+        x2w_present_signature::Sampler sampler(1, false);
+        InterlockedExchange(&block->sampling_wanted, 0);
+        const LONG64 before = block->sequence / 2;
+        for (LONG64 present = 1; present <= 4; ++present) {
+            sampler.present(gpu.device, gpu.queue, s, present, block);
+            gpu.idle();
+        }
+        check(!sampler.set_up() && !sampler.in_flight() && block->sequence / 2 == before && block->presents == 4,
+              "without a request: no GPU objects, no copies, presents still counted");
+        InterlockedExchange(&block->sampling_wanted, 1);
+        sampler.present(gpu.device, gpu.queue, s, 5, block);
+        gpu.idle();
+        sampler.present(gpu.device, gpu.queue, nullptr, 6, block);
+        x2w_present_signature::Snapshot last{};
+        check(sampler.set_up() && block->sequence / 2 == before + 1 && x2w_present_signature::read(block, last) && last.sample_present == 5,
+              "after the request: the next present is sampled");
+        InterlockedExchange(&block->sampling_wanted, 0);
+        s->Release();
+    }
     // Interval: with every = 4, eight presents publish two samples (presents 1 and 5).
     {
         ID3D12Resource* s = surface(gpu, DXGI_FORMAT_R8G8B8A8_UNORM, a);

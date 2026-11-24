@@ -165,6 +165,10 @@ const x2w_input_script::Script& input_script()
             x2w_local::logf("x2w-input script: %zu waits, %zu marks; picture signal from Local\\x2w_present_signature_%lu",
                             parsed.waits.size(), parsed.marks.size(), static_cast<unsigned long>(GetCurrentProcessId()));
         if (!parsed.groups.empty()) x2w_local::logf("x2w-input script: %zu groups", parsed.groups.size());
+        // The presenter samples the picture only for scripts that wait on it.
+        if (!parsed.waits.empty())
+            x2w_local::logf("x2w-input script: picture signature %s",
+                            x2w_present_signature::request_sampling(GetCurrentProcessId()) ? "requested" : "could not be requested");
         // A wait with ;fine reads the 64 x 72 grid; the presenter copies it only while asked.
         if (parsed.wants_fine())
             x2w_local::logf("x2w-input script: fine picture signature (64 x 72) %s",
