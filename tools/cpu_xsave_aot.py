@@ -183,6 +183,12 @@ extern "C" __declspec(dllexport) std::uint64_t host_xcr0() {
     return _xgetbv(0);
 }
 
+extern "C" __declspec(dllexport) std::uint32_t host_xsave_area_size() {
+    int features[4]{};
+    __cpuidex(features, 0xD, 0);
+    return static_cast<std::uint32_t>(features[1]);
+}
+
 extern "C" __declspec(dllexport) std::uint32_t host_deprecates_fpu_cs_ds() {
     int info0[4]{};
     __cpuid(info0, 0);

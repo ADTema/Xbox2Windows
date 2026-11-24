@@ -72,7 +72,7 @@ def _encode_seq(*instructions) -> bytes:
     return enc.take_buffer()
 
 
-def clean_entry_bytes(mxcsr_mask: int = 0xFFFF, size: int = 4096) -> bytes:
+def clean_entry_bytes(mxcsr_mask: int, size: int) -> bytes:
     buf = bytearray(size)
     struct.pack_into("<HHBBH", buf, 0, 0x037F, 0, 0, 0, 0)
     struct.pack_into("<II", buf, 24, 0x1F80, mxcsr_mask)
@@ -82,7 +82,11 @@ def clean_entry_bytes(mxcsr_mask: int = 0xFFFF, size: int = 4096) -> bytes:
 class NativeHarness:
     """VirtualAlloc x64 caller harness preserving caller XMM6..15, YMM6..15, x87/MMX and MXCSR."""
 
-    def __init__(self):
+    def __init__(self, area_size: int, mxcsr_mask: int):
+        if area_size < 832:
+            raise ValueError(f"Host XSAVE area is too small: {area_size}")
+        # The trampoline saves every enabled host component. Guest encodings remain bounded to 832 bytes.
+        self.area_size = area_size
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         k32.VirtualAlloc.argtypes = [wintypes.LPVOID, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD]
         k32.VirtualAlloc.restype = ctypes.c_void_p
@@ -174,8 +178,8 @@ class NativeHarness:
         self.rstor32_fn = ctypes.CFUNCTYPE(None, ctypes.c_uint64)(mem + rstor32_off)
         self.call_fn = ctypes.CFUNCTYPE(None, ctypes.c_uint64, ctypes.c_uint64)(mem + call_off)
 
-        self._save_buf, self._save_ptr, _, _, _ = alloc_aligned_buffer(b"\x00" * 4096, align=64)
-        self._clean_buf, self._clean_ptr, _, _, _ = alloc_aligned_buffer(clean_entry_bytes(), align=64)
+        self._save_buf, self._save_ptr, _, _, _ = alloc_aligned_buffer(bytes(area_size), align=64)
+        self._clean_buf, self._clean_ptr, _, _, _ = alloc_aligned_buffer(clean_entry_bytes(mxcsr_mask, area_size), align=64)
         self._args = (ctypes.c_uint64 * 5)()
 
     def close(self):
@@ -223,15 +227,15 @@ class NativeHarness:
                         seed=1,
                         poison_reserved=False,
                     )
-                    in_buf, in_ptr, _, _, _ = alloc_aligned_buffer(img)
-                    out_buf, out_ptr, _, out_off, out_post = alloc_aligned_buffer(b"\x00" * BUF_LEN)
+                    in_buf, in_ptr, _, _, _ = alloc_aligned_buffer(img.ljust(self.area_size, b"\x00"))
+                    out_buf, out_ptr, out_pre, out_off, out_post = alloc_aligned_buffer(bytes(self.area_size))
                     self.save_fn(self._save_ptr)
                     try:
                         (self.rstor_fn if rstor64 else self.rstor32_fn)(in_ptr)
                         (self.save_fn if save64 else self.save32_fn)(out_ptr)
                     finally:
                         self.rstor_fn(self._save_ptr)
-                    raw = out_buf.raw[out_off:out_post]
+                    raw = check_guards_and_read(out_buf, out_pre, out_off, out_post, "host FIP/FDP probe")
                     _ = in_buf
                     got_fop = raw[6:8]
                     got_fip = raw[8 : 8 + width]
@@ -793,10 +797,10 @@ def check_lifted_preserves_host_state(harness: NativeHarness, lifted_fns, mxcsr_
     host_img = make_xsave_image(mxcsr_mask, xstate_bv=7, mxcsr=0x3F80, seed=333)
     guest_img = make_xsave_image(mxcsr_mask, xstate_bv=7, mxcsr=0x5F80, seed=444)
 
-    buf_host, ptr_host, _, _, _ = alloc_aligned_buffer(host_img)
+    buf_host, ptr_host, _, _, _ = alloc_aligned_buffer(host_img.ljust(harness.area_size, b"\x00"))
     buf_guest, ptr_guest, _, _, _ = alloc_aligned_buffer(guest_img)
-    buf_before, ptr_before, b_pre, b_off, b_post = alloc_aligned_buffer(b"\x00" * 4096)
-    buf_after, ptr_after, a_pre, a_off, a_post = alloc_aligned_buffer(b"\x00" * 4096)
+    buf_before, ptr_before, b_pre, b_off, b_post = alloc_aligned_buffer(bytes(harness.area_size))
+    buf_after, ptr_after, a_pre, a_off, a_post = alloc_aligned_buffer(bytes(harness.area_size))
     buf_out, ptr_out, _, _, _ = alloc_aligned_buffer(FILL)
 
     harness.save_fn(harness._save_ptr)
@@ -848,7 +852,7 @@ def check_entry_state_contracts(
 
     # 1) Non-default incoming SSE state on entry-only XSAVE/XSAVE64 exports:
     #    SSE in use (XSTATE_BV=2), MXCSR=0x3F80, low XMM0 lane=0x3F800000.
-    nondefault_sse = bytearray(clean_entry_bytes(mxcsr_mask))
+    nondefault_sse = bytearray(clean_entry_bytes(mxcsr_mask, harness.area_size))
     struct.pack_into("<Q", nondefault_sse, 512, 2)
     struct.pack_into("<I", nondefault_sse, 24, 0x3F80 & mxcsr_mask)
     struct.pack_into("<I", nondefault_sse, 160, 0x3F800000)
@@ -868,7 +872,7 @@ def check_entry_state_contracts(
 
     # 2) Non-default incoming x87+AVX state on partially initialized restore/save:
     #    x87 in use (FCW=0x027F, ST0!=0) and AVX in use (YMM0_hi!=0), XSTATE_BV=1|4.
-    nondefault_partial = bytearray(clean_entry_bytes(mxcsr_mask))
+    nondefault_partial = bytearray(clean_entry_bytes(mxcsr_mask, harness.area_size))
     struct.pack_into("<H", nondefault_partial, 0, 0x027F)
     nondefault_partial[32] = 0x11
     struct.pack_into("<I", nondefault_partial, 576, 0x11223344)
@@ -916,6 +920,11 @@ def check_differential(
         print("Host CPU lacks XSAVE/OSXSAVE/AVX (XCR0 & 7 == 7); skipping native differential check.")
         raise SystemExit(77)
 
+    lifted_lib.host_xsave_area_size.argtypes = []
+    lifted_lib.host_xsave_area_size.restype = ctypes.c_uint32
+    host_area_size = int(lifted_lib.host_xsave_area_size())
+    print(f"Host XSAVE area (CPUID.0D.0:EBX): {host_area_size} bytes", flush=True)
+
     lifted_lib.host_deprecates_fpu_cs_ds.argtypes = []
     lifted_lib.host_deprecates_fpu_cs_ds.restype = ctypes.c_uint32
     lifted_lib.host_fp_err_cpuid_info.argtypes = []
@@ -935,7 +944,7 @@ def check_differential(
         canonical_altered_path, "lifted_", ALTERED_CANONICAL_EXPORTS
     )
 
-    harness = NativeHarness()
+    harness = NativeHarness(host_area_size, mxcsr_mask)
     try:
         fp_caps = harness.probe_xsave_err_ptrs(mxcsr_mask)
         check_entry_state_contracts(
