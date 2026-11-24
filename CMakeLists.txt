@@ -1141,6 +1141,12 @@ if(EXISTS "${INTAKE_PYTHON}")
             target_link_libraries(${BIND_NAME} PRIVATE ${BIND_SECOND_PROVIDER})
         endif()
     endfunction()
+    cpu_asm_fixture(cpu_clzero counted_clzero)
+    cpu_translation(cpu_clzero cpu_switch_aot counted,loop_dx,loop_r8,loop_r9,loop_r10)
+    add_test(NAME cpu_counted_clzero COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/counted_clzero.py" "$<TARGET_FILE:cpu_clzero>" "$<TARGET_FILE:cpu_clzero_lifted>"
+        "${CMAKE_SOURCE_DIR}/tools/cpu_switch_aot.py" "${CMAKE_CURRENT_BINARY_DIR}")
+
     foreach(variant IN ITEMS original inverted)
         cpu_asm_fixture(cpu_leaf_${variant} branch)
         cpu_translation(cpu_leaf_${variant} cpu_leaf_aot branch_value)
