@@ -614,10 +614,11 @@ B8G8R8A8/B8G8R8X8 (87-93) families. Both allocation-info entries (slots 25 and 1
 answer for them.
 
 Verification status: the device-independent reference sizes in `tests/startup_plane_size_check.cpp`
-(`startup_plane_size`) cover R24G8 and the added colour families. The R24G8 and added MSAA colour
-formats have not yet been verified through the Windows device wrapper
-(`startup_plane_size_device_`, reproduced with the second command below); only the fixture result
-is established for them.
+(`startup_plane_size`) cover R24G8 and the added colour families. `startup_plane_size_device_`
+checks that the wrapper answers the helper's result for the adapter's own desktop answer; it passed
+on Windows Server 2025 (WARP and the hardware case) in Debug and Release. It does not show that the
+console layout fits the answered size for these formats; no console reference sizes are listed for
+R24G8 or the added colour families.
 
 - `ctest --preset release --no-tests=error -R '^startup_plane_size(_packed_control)?$' -V` checks
   the rule without a device, including the shapes it refuses.
