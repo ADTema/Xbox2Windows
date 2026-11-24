@@ -302,11 +302,9 @@ constexpr u64 save_provider_handle = 0x58325753'00000001ull, save_container_hand
               save_update_handle = 0x58325755'50000001ull;
 // Container and update handles keep their fixed base; the low bits count from 1 and index these tables.
 // Reopening a container name returns the same handle, so the table stays small.
-constexpr std::size_t max_save_handles = 64;
+constexpr std::size_t max_save_handles = x2w_save::ContainerTable::capacity;
 constexpr u64 e_invalidarg = 0x80070057, e_outofmemory = 0x8007000E, e_fail = 0x80004005;
-std::string save_containers[max_save_handles];
-std::size_t save_container_count;
-int save_updates[max_save_handles];  // container index + 1 of an open update, 0 = free
+x2w_save::ContainerTable save_table;  // guarded by save_lock; closed containers give their entry back
 SRWLOCK save_lock = SRWLOCK_INIT;
 x2w_save::Store save_store() { return x2w_save::Store(std::filesystem::path(storage_path()) / "x2w-gamesave"); }
 // A NUL-terminated name of at most x2w_save::max_name_bytes in readable memory.
@@ -334,13 +332,10 @@ u64 open_container(const std::string& name, u64* handle)
     const x2w_save::Status status = save_store().create_container(name);
     if (status != x2w_save::Status::ok) return save_status(status);
     AcquireSRWLockExclusive(&save_lock);
-    std::size_t index = 0;
-    while (index < save_container_count && save_containers[index] != name) ++index;
-    const bool full = index == save_container_count && save_container_count == max_save_handles;
-    if (index == save_container_count && !full) save_containers[save_container_count++] = name;
+    const long index = save_table.open(name);
     ReleaseSRWLockExclusive(&save_lock);
-    if (full) return e_outofmemory;
-    *handle = save_container_handle + index;
+    if (index < 0) return e_outofmemory;
+    *handle = save_container_handle + static_cast<u64>(index);
     return 0;
 }
 // The container name behind an update handle, or empty when it is not an open update.
@@ -348,8 +343,7 @@ std::string update_container(u64 update)
 {
     std::string name;
     AcquireSRWLockShared(&save_lock);
-    const u64 index = update - save_update_handle;
-    if (update >= save_update_handle && index < max_save_handles && save_updates[index]) name = save_containers[save_updates[index] - 1];
+    if (update >= save_update_handle) name = save_table.update_container(static_cast<std::size_t>(update - save_update_handle));
     ReleaseSRWLockShared(&save_lock);
     return name;
 }
@@ -377,12 +371,21 @@ bool save_call(int slot, u64* args, u64* result)
     case 5:  // XGameSaveInitializeProviderResult(async, &provider)
         if (out(args[1], 8)) *reinterpret_cast<u64*>(args[1]) = save_provider_handle;
         return true;
-    case 6: case 17:  // close provider / container
+    case 6:  // close provider
+        return true;
+    case 17:  // XGameSaveCloseContainer(container): the table entry is reused once nothing needs it
+        if (args[0] >= save_container_handle && args[0] - save_container_handle < max_save_handles) {
+            AcquireSRWLockExclusive(&save_lock);
+            save_table.close(static_cast<std::size_t>(args[0] - save_container_handle));
+            ReleaseSRWLockExclusive(&save_lock);
+        }
         return true;
     case 24:  // XGameSaveCloseUpdate(update)
-        AcquireSRWLockExclusive(&save_lock);
-        if (args[0] >= save_update_handle && args[0] - save_update_handle < max_save_handles) save_updates[args[0] - save_update_handle] = 0;
-        ReleaseSRWLockExclusive(&save_lock);
+        if (args[0] >= save_update_handle && args[0] - save_update_handle < max_save_handles) {
+            AcquireSRWLockExclusive(&save_lock);
+            save_table.end_update(static_cast<std::size_t>(args[0] - save_update_handle));
+            ReleaseSRWLockExclusive(&save_lock);
+        }
         return true;
     case 7:  // XGameSaveGetRemainingQuota(provider, &bytes)
         if (out(args[1], 8)) *reinterpret_cast<std::int64_t*>(args[1]) = 256ll << 20;
@@ -419,16 +422,13 @@ bool save_call(int slot, u64* args, u64* result)
         *result = blob_not_found;
         return true;
     case 23: {  // XGameSaveCreateUpdate(container, display name, &update)
-        const u64 container = args[0] - save_container_handle;
         u64 handle = 0;
-        AcquireSRWLockExclusive(&save_lock);
-        if (args[0] >= save_container_handle && container < save_container_count)
-            for (std::size_t i = 0; i < max_save_handles && !handle; ++i)
-                if (!save_updates[i]) {
-                    save_updates[i] = static_cast<int>(container) + 1;
-                    handle = save_update_handle + i;
-                }
-        ReleaseSRWLockExclusive(&save_lock);
+        if (args[0] >= save_container_handle && args[0] - save_container_handle < max_save_handles) {
+            AcquireSRWLockExclusive(&save_lock);
+            const long update = save_table.begin_update(static_cast<std::size_t>(args[0] - save_container_handle));
+            ReleaseSRWLockExclusive(&save_lock);
+            if (update >= 0) handle = save_update_handle + static_cast<u64>(update);
+        }
         if (!handle) *result = e_outofmemory;
         else if (out(args[2], 8)) *reinterpret_cast<u64*>(args[2]) = handle;
         return true;

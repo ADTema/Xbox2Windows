@@ -9,6 +9,7 @@
 #include <cstring>
 #include <ctime>
 #include <string>
+#include <thread>
 
 namespace fs = std::filesystem;
 using x2w_save::Status;
@@ -118,6 +119,69 @@ int main(int argc, char** argv)
     expect(run_reader(self, root / "store", 2) == exit_missing, "second process no longer finds the deleted blob");
     expect(store.delete_container("slot-a") == Status::ok && !fs::exists(root / "store" / "slot-a"), "delete container removes its directory");
     expect(fs::exists(root / "store"), "the store root itself stays");
+
+    // A link left at the old guessable staging name is never opened: the outside file stays intact
+    // and the blob ends up a regular file.
+    {
+        const fs::path outside = root / "outside.bin";
+        std::ofstream(outside, std::ios::binary) << "untouched";
+        expect(store.create_container("slot-l") == Status::ok, "create link container");
+        std::error_code link_error;
+        fs::create_symlink(outside, root / "store" / "slot-l" / "profile.dat.x2w-part", link_error);
+        if (link_error) std::puts("note: symlink creation not permitted here, link control skipped");
+        else {
+            expect(store.write_blob("slot-l", "profile.dat", first.data(), first.size()) == Status::ok, "write beside a planted link");
+            std::ifstream check(outside, std::ios::binary);
+            std::string seen((std::istreambuf_iterator<char>(check)), std::istreambuf_iterator<char>());
+            expect(seen == "untouched", "a link at the old staging name is not followed");
+            expect(fs::is_regular_file(fs::symlink_status(root / "store" / "slot-l" / "profile.dat")), "the blob is a regular file");
+        }
+    }
+
+    // Two writers on the same blob never share a staging file: both succeed and the blob holds one
+    // whole payload.
+    {
+        const std::vector<unsigned char> one = payload(5, 1 << 20), two = payload(6, 1 << 20);
+        bool fail_one = false, fail_two = false;
+        for (int round = 0; round < 20; ++round) {
+            std::thread a([&] { fail_one |= store.write_blob("slot-c", "shared.dat", one.data(), one.size()) != Status::ok; });
+            std::thread b([&] { fail_two |= store.write_blob("slot-c", "shared.dat", two.data(), two.size()) != Status::ok; });
+            a.join();
+            b.join();
+        }
+        expect(!fail_one && !fail_two, "concurrent writes to one blob both succeed");
+        expect(store.read_blob("slot-c", "shared.dat", bytes) == Status::ok && (bytes == one || bytes == two), "the blob holds one whole payload");
+        std::size_t left = 0;
+        for (const auto& item : fs::directory_iterator(root / "store" / "slot-c", ec)) { (void)item; ++left; }
+        expect(left == 1, "no staging file is left after concurrent writes");
+    }
+
+    // The staging suffix is reserved whatever the case (the same file on a case-insensitive disk).
+    expect(!x2w_save::valid_name("profile.X2W-PART") && !x2w_save::valid_name("a.x2W-Part"), "staging suffix is reserved case-insensitively");
+    expect(x2w_save::valid_name("profile.x2w-par"), "a near miss of the suffix is a valid name");
+
+    // Closed containers give their table entry back: far more than 64 distinct names, one at a time.
+    {
+        x2w_save::ContainerTable table;
+        bool all = true;
+        for (int i = 0; i < 300; ++i) {
+            const long c = table.open("rot-" + std::to_string(i));
+            const long u = c < 0 ? -1 : table.begin_update(static_cast<std::size_t>(c));
+            all &= c >= 0 && u >= 0 && table.update_container(static_cast<std::size_t>(u)) == "rot-" + std::to_string(i);
+            if (u >= 0) table.end_update(static_cast<std::size_t>(u));
+            if (c >= 0) table.close(static_cast<std::size_t>(c));
+        }
+        expect(all && table.in_use() == 0, "300 open/close rounds of distinct containers never exhaust the table");
+        // Negative control: containers kept open do exhaust it, and an open update keeps its entry.
+        long last = 0;
+        for (std::size_t i = 0; i < x2w_save::ContainerTable::capacity; ++i) last = table.open("held-" + std::to_string(i));
+        expect(last >= 0 && table.open("one-too-many") == -1, "a full table of open containers refuses another");
+        const long u = table.begin_update(0);
+        table.close(0);
+        expect(u >= 0 && table.update_container(static_cast<std::size_t>(u)) == "held-0", "an open update keeps its container entry after close");
+        table.end_update(static_cast<std::size_t>(u));
+        expect(table.open("now-free") >= 0, "the entry is reclaimed once the update ends");
+    }
 
     fs::remove_all(root, ec);
     if (failures) return 1;
