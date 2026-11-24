@@ -92,7 +92,7 @@ def on_shim(line):
         m = re.search(r"heartbeat: (\d+) frames presented in ([\d.]+) s \(([\d.]+) fps", line)
         if m:
             frames = m.group(1)
-            say("frames", f"{m.group(1)} frames presented, {m.group(3)} fps (every draw dropped: no GPU translation yet)")
+            say("frames", f"{m.group(1)} frames presented, {m.group(3)} fps")
     elif "title main state" in line:
         m = re.search(r"state (-?\d+) -> (-?\d+)", line)
         if m:
@@ -157,7 +157,8 @@ while True:
     time.sleep(0.25)
 print("-" * 110)
 try:
-    print(open(finished, encoding="utf-8", errors="replace").read().strip())
+    with open(finished, encoding="utf-8", errors="replace") as handle:
+        print(handle.read().strip())
 except OSError:
     pass
 print("\nRun ended. Full logs are in " + os.path.abspath(rundir) + " (events.txt, files.txt, trap.log).")
