@@ -655,6 +655,11 @@ endforeach()
 add_test(NAME startup_present_view_srgb_control COMMAND startup_present_view_check warp --mutate srgb)
 set_tests_properties(startup_present_view_identity_control startup_present_view_srgb_control PROPERTIES WILL_FAIL TRUE)
 set_tests_properties(startup_present_view_hardware PROPERTIES SKIP_RETURN_CODE 77)
+# Buffer and raytracing acceleration-structure memory SRV validation (src/startup_stubs/memory_srv_buffer.h).
+add_executable(startup_memory_srv_buffer_check tests/startup_memory_srv_buffer_check.cpp)
+target_include_directories(startup_memory_srv_buffer_check PRIVATE src)
+target_compile_features(startup_memory_srv_buffer_check PRIVATE cxx_std_17)
+add_test(NAME startup_memory_srv_buffer COMMAND startup_memory_srv_buffer_check)
 # Console allocation sizes for depth-with-stencil and multisampled textures
 # (src/startup_stubs/console_plane_size.h); the mutated run is the negative control.
 add_executable(startup_plane_size_check tests/startup_plane_size_check.cpp)
@@ -1467,6 +1472,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_address_srv_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_address_srv_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_address_buffer_srv_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_address_buffer_srv_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
+        set_tests_properties(startup_address_buffer_srv_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
         add_test(NAME startup_placed_vertex_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_placed_vertex_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")

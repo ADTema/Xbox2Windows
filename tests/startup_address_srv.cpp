@@ -243,3 +243,102 @@ void release_placed_vertices(bool done)
         p.resource[0] = nullptr;
     }
 }
+
+int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
+{
+    alignas(65536) static std::array<std::uint32_t, 64> buf0{};
+    alignas(65536) static std::array<std::uint32_t, 64> buf1{};
+    buf0.fill(0);
+    buf1.fill(0);
+    buf0[0] = 17;
+    buf0[1] = 99;
+    buf0[4] = 63;
+    buf1[4] = 141;
+
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = 256;
+    desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    void* placed[2]{};
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(buf0.data()), ptr(&desc), D3D12_RESOURCE_STATE_COMMON,
+                                           0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed[0]))))) return 47;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(buf1.data()), ptr(&desc), D3D12_RESOURCE_STATE_COMMON,
+                                           0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed[1]))))) return 47;
+
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+
+    const auto draw = [&](LONG x) {
+        const D3D12_RECT strip{x, 0, x + 1, 4};
+        invoke(list, 22, 1, ptr(&strip));
+        invoke(list, 12, 3, 1);
+    };
+
+    ViewAt raw{};
+    raw.view.Format = DXGI_FORMAT_R32_TYPELESS;
+    raw.view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    raw.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    raw.view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    raw.view.Buffer.NumElements = 4;
+
+    raw.address = ptr(buf0.data());
+    invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
+    draw(0);
+
+    raw.address = ptr(buf0.data() + 4);
+    invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
+    draw(1);
+
+    raw.address = ptr(buf1.data());
+    raw.view.Buffer.FirstElement = 4;
+    invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
+    draw(2);
+
+    // Unaligned interior address for a raw buffer must be refused and keep the previous descriptor.
+    raw.view.Buffer.FirstElement = 0;
+    raw.address = ptr(buf0.data() + 1);
+    invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
+    draw(3);
+
+    ViewAt structured{};
+    structured.view.Format = DXGI_FORMAT_UNKNOWN;
+    structured.view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    structured.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    structured.view.Buffer.FirstElement = 1;
+    structured.view.Buffer.NumElements = 1;
+    structured.view.Buffer.StructureByteStride = 4;
+    structured.address = ptr(buf0.data());
+    invoke(guest, 70, ptr(&desc), ptr(&structured), cpu);
+    draw(4);
+
+    // Exercise RT acceleration-structure memory SRV when the adapter supports raytracing.
+    D3D12_FEATURE_DATA_D3D12_OPTIONS5 opts5{};
+    if (SUCCEEDED(desktop->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &opts5, sizeof(opts5))) &&
+        opts5.RaytracingTier != D3D12_RAYTRACING_TIER_NOT_SUPPORTED) {
+        alignas(65536) static std::array<std::uint8_t, 512> as_mem{};
+        D3D12_RESOURCE_DESC as_desc = desc;
+        as_desc.Width = as_mem.size();
+        as_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        void* as_res = nullptr;
+        if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(as_mem.data()), ptr(&as_desc),
+                                               D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, 0,
+                                               ptr(&__uuidof(ID3D12Resource)), ptr(&as_res))))) return 48;
+        ViewAt as_view{};
+        as_view.view.Format = DXGI_FORMAT_UNKNOWN;
+        as_view.view.ViewDimension = static_cast<D3D12_SRV_DIMENSION>(11);
+        as_view.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        as_view.address = ptr(as_mem.data());
+        invoke(guest, 70, ptr(&as_desc), ptr(&as_view), cpu);
+        if (FAILED(desktop->GetDeviceRemovedReason())) return 49;
+    }
+
+    raw.address = ptr(buf0.data());
+    raw.view.Buffer.FirstElement = 0;
+    invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
+    draw(5);
+    draw(6);
+    draw(7);
+    return 0;
+}
