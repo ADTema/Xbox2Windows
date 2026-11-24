@@ -48,8 +48,10 @@ ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const char* sample
 }
 }  // namespace
 
+// array: the same eight texels as two slices of a 2D array (dim:SQ_RSRC_IMG_2D_ARRAY); the default
+// view of a two-slice texture is a Texture2DArray over both.
 void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
-                            float color[4], const char* sampler_line)
+                            float color[4], const char* sampler_line, bool array)
 {
     const auto vs = read_blob(vertex_path);
     const auto ps = read_blob(pixel_path);
@@ -72,7 +74,7 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     check(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pipeline)), "Create image 3D PSO");
 
     D3D12_RESOURCE_DESC td{};
-    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    td.Dimension = array ? D3D12_RESOURCE_DIMENSION_TEXTURE2D : D3D12_RESOURCE_DIMENSION_TEXTURE3D;
     td.Width = side;
     td.Height = side;
     td.DepthOrArraySize = side;
@@ -80,21 +82,24 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     td.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
     td.SampleDesc.Count = 1;
     const auto texture = resource(device, td, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    // A volume is one subresource of two slices; an array is two subresources of one slice each.
+    const UINT subresources = array ? side : 1;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[side]{};
     UINT64 upload_size = 0;
-    device->GetCopyableFootprints(&td, 0, 1, 0, &footprint, nullptr, nullptr, &upload_size);
+    device->GetCopyableFootprints(&td, 0, subresources, 0, footprints, nullptr, nullptr, &upload_size);
+    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint = footprints[0];
     const auto upload = make_buffer(device, upload_size, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     void* mapped = nullptr;
     const D3D12_RANGE none{0, 0};
     check(upload->Map(0, &none, &mapped), "Map image 3D texels");
-    auto* base = static_cast<std::uint8_t*>(mapped) + footprint.Offset;
+    auto* const start = static_cast<std::uint8_t*>(mapped);
     const UINT slice_pitch = footprint.Footprint.RowPitch * footprint.Footprint.Height;
     for (UINT tz = 0; tz < side; ++tz)
         for (UINT ty = 0; ty < side; ++ty)
             for (UINT tx = 0; tx < side; ++tx) {
                 const float texel[4] = {(1.0f + tx + 2.0f * ty + 4.0f * tz) / 8.0f, float(tx), float(ty), float(tz)};
-                std::memcpy(base + tz * slice_pitch + ty * footprint.Footprint.RowPitch + tx * sizeof(texel), texel,
-                            sizeof(texel));
+                auto* const slice = array ? start + footprints[tz].Offset : start + footprint.Offset + tz * slice_pitch;
+                std::memcpy(slice + ty * footprint.Footprint.RowPitch + tx * sizeof(texel), texel, sizeof(texel));
             }
     upload->Unmap(0, nullptr);
 
@@ -125,10 +130,13 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
 
     ComputeCommands commands(device, pipeline.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
     auto* list = commands.list.Get();
-    D3D12_TEXTURE_COPY_LOCATION to{texture.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-    D3D12_TEXTURE_COPY_LOCATION from{upload.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-    from.PlacedFootprint = footprint;
-    list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    for (UINT i = 0; i < subresources; ++i) {
+        D3D12_TEXTURE_COPY_LOCATION to{texture.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        to.SubresourceIndex = i;
+        D3D12_TEXTURE_COPY_LOCATION from{upload.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+        from.PlacedFootprint = footprints[i];
+        list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    }
     transition(list, texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     list->ClearRenderTargetView(rtv, clear.Color, 0, nullptr);
     list->SetGraphicsRootSignature(root.Get());
@@ -158,5 +166,5 @@ void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const
     check(readback->Map(0, &read, &mapped), "Map image 3D readback");
     std::memcpy(color, static_cast<std::uint8_t*>(mapped) + target_footprint.Offset, 4 * sizeof(float));
     readback->Unmap(0, &none);
-    std::printf("startup_image_3d z=%g color=(%g, %g, %g, %g)\n", z, color[0], color[1], color[2], color[3]);
+    std::printf("startup_image_%s z=%g color=(%g, %g, %g, %g)\n", array ? "2d_array" : "3d", z, color[0], color[1], color[2], color[3]);
 }
