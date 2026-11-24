@@ -39,7 +39,8 @@ void table()
     expect("bgrx8", DXGI_FORMAT_B8G8R8X8_TYPELESS, DXGI_FORMAT_B8G8R8X8_UNORM);
     expect("rgb10a2", DXGI_FORMAT_R10G10B10A2_TYPELESS, DXGI_FORMAT_R10G10B10A2_UNORM);
     for (DXGI_FORMAT typed : {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
-                              DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_BC1_UNORM})
+                              DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_BC1_UNORM,
+                              static_cast<DXGI_FORMAT>(191) /* DXGI_FORMAT_A4B4G4R4_UNORM */})
         expect("typed passes", typed, typed);
     for (DXGI_FORMAT ambiguous : {DXGI_FORMAT_R32G32B32A32_TYPELESS, DXGI_FORMAT_R32G32B32_TYPELESS, DXGI_FORMAT_R16G16B16A16_TYPELESS,
                                   DXGI_FORMAT_R32G32_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_R16G16_TYPELESS,
@@ -49,7 +50,6 @@ void table()
                                   DXGI_FORMAT_BC7_TYPELESS})
         expect("ambiguous refused", ambiguous, none);
     expect("unknown refused", DXGI_FORMAT_UNKNOWN, none);
-    expect("out of range refused", static_cast<DXGI_FORMAT>(0x7fff), none);
 }
 
 void check(HRESULT hr, const char* what)
@@ -175,7 +175,7 @@ bool readback(ID3D12Device* device, const Case& item)
     for (int i = 0; i < 16 && bad < 3; ++i)
         for (int c = 0; c < 4; ++c) {
             const float expected = item.decode(item.texel[i], c);
-            if (std::fabs(words[i * 4 + c] - expected) > 1e-4f) {
+            if (!(std::fabs(words[i * 4 + c] - expected) <= 1e-4f)) {
                 std::printf("FAIL %s texel %d channel %d: read %f, expected %f\n", item.name, i, c, words[i * 4 + c], expected);
                 ++bad;
                 break;

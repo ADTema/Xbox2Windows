@@ -14,7 +14,6 @@
 namespace x2w_startup {
 inline DXGI_FORMAT present_view_format(DXGI_FORMAT format)
 {
-    constexpr unsigned last_format = 132;  // DXGI_FORMAT_V408; larger values are not formats a surface has
     switch (format) {
     case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
     case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -39,7 +38,7 @@ inline DXGI_FORMAT present_view_format(DXGI_FORMAT format)
     case DXGI_FORMAT_BC6H_TYPELESS:
     case DXGI_FORMAT_BC7_TYPELESS:
     case DXGI_FORMAT_UNKNOWN: return DXGI_FORMAT_UNKNOWN;
-    default: return static_cast<unsigned>(format) <= last_format ? format : DXGI_FORMAT_UNKNOWN;
+    default: return format;
     }
 }
 }  // namespace x2w_startup
