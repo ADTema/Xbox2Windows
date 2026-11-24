@@ -108,6 +108,34 @@ A maintainer outside this project measured one compile at 3.51 s without the cac
 including ordinal-only (`NONAME`) DLL exports and forwarder chains ending in an
 ordinal, using `pe_map_export_ordinal` on the mapped provider. `cpu_native_startup` checks the same two-DLL fixture under this runner and the Windows loader.
 
+**Windows system commit preflight (optional).** When mapping a large source-built
+package, use `--min-commit-mib N` with `pe_run_package.py` to read the system
+commit budget through `GetPerformanceInfo` **before** the package is inspected
+or any external provider is loaded. It refuses an insufficient budget with a
+plain-language error instead of reaching an out-of-commit mapper failure.
+The check uses `CommitLimit - CommitTotal` times the Windows page size, *not*
+physical free RAM; system commit includes paging-file backing. `N=0` requests
+an informational snapshot only. The JSON result adds `host_commit` with the
+limit, used, available and requested MiB only when the option is present.
+No default minimum is imposed because the amount a package needs is unknown.
+The snapshot reserves no memory: another process can consume the headroom
+before or during startup, so a successful check is not a startup guarantee.
+
+```powershell
+python -B tools/pe_run_package.py pe_map.dll out/source-built-package app.exe --min-commit-mib 4096 --preflight-only
+python -B tests/host_commit_check.py -v
+```
+
+This is independently written from public Windows PSAPI behavior and the
+reported Windows commit-limit failure mode in
+[VIctory's README at `ffe310e`](https://github.com/Marvisak/VIctory/blob/ffe310eb2098e52169f4c44db5ffdabf43a72622/README.md).
+No VIctory (GPL-3.0-or-later) source code is copied into this MIT project.
+The source-built Linux tests mock the Windows API and check limits, underflow,
+API errors, low-commit failure **before** package inspection, and preservation
+of the prior JSON output when the option is absent. The native Windows test
+uses the real `GetPerformanceInfo` API; it validates the live response but
+requires no title files or allocations.
+
 External providers with process-lifetime workers can use `--pin-shim DLL` alongside `--shim DLL PATH`. This pins the provider immediately before the first guest image loads, and only in execution mode. Run packages in a child process when using pinned providers. The guest must still join its own workers and quiesce any host calls into guest code before returning. `cpu_package_shim_lifetime` verifies that the selected provider remains loaded after the entry returns and the ordinary provider unloads.
 
 `--trap-callable DLL!SYMBOL` (or `DLL!#ORDINAL`, repeatable) is a diagnostic execution mode for finding the last startup stage a package reaches. By default the runner refuses any unresolved external before mapping. An import table entry names a symbol, but it does not say whether the caller calls it or reads it as data, so this mode binds only the unresolved externals the caller lists as callable. Each listed name gets a numbered trap, and the traps are listed on stderr in sorted `dll!symbol` order. Any unlisted unresolved external is still refused before mapping, and so is a listed name that is not an unresolved external. A trap never returns: it prints `trap N: <importers>: <dll>!<symbol>` and terminates the process with `0xE7A00000 | N`. The report is best effort, and termination does not depend on it. No DLL is written or loaded under the missing name, and a trap is not a provider. If the entry returns without reaching a trap, the JSON result adds `unhit_traps`. The option cannot be combined with `--preflight-only`, and `plan(report, allow_external=False)` still refuses the same package.

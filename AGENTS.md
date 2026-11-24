@@ -121,6 +121,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/layout_chunks_check.py
 ./out/pe-env/bin/python -B tests/dependency_paths_check.py
 ./out/pe-env/bin/python -B tests/pe_package_preflight_check.py
+./out/pe-env/bin/python -B tests/host_commit_check.py
 ./out/pe-env/bin/python -B tests/pe_package_ordinal_plan_check.py
 ./out/pe-env/bin/python -B tests/compat_report_check.py
 ./out/pe-env/bin/python -B tests/intake/paths_check.py
