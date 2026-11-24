@@ -534,7 +534,7 @@ These are measured on one executable; treat them as hypotheses for others.
 - **2D array depth comparison.** `image_sample_c_lz` and `image_sample_c` (sampler MAX_LOD 0) with
   `dim:SQ_RSRC_IMG_2D_ARRAY` take the reference, u, v and the slice as four address registers and lower to
   `Texture2DArray.SampleCmpLevelZero(smp, float3(u, v, slice), reference)` on the same constant comparison
-  sampler as the 2D form. Before, they were refused with `image_sample_c on SQ_RSRC_IMG_2D_ARRAY`.
+  sampler as the 2D form. Before, they were refused with `image_sample_c[_lz] on SQ_RSRC_IMG_2D_ARRAY`.
   `python -B tests/startup_image_sample_c_check.py` translates the fixtures (words checked against `llvm-mc`) and
   fails seven edited array lowerings. No draw runs this form yet, so the compare result on WARP or hardware is
   not measured; `image_sample_c_l` stays refused (shader model 6.7).
