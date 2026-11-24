@@ -1480,6 +1480,8 @@ Seven native-only exports move on the caller's flags. `fcmovb` and `fcmove` move
 
 `cpu_aot_x87_examine` checks `ftst`, `fxam`, `ficom` and `ficomp` with an m16 or m32 integer, `fnop`, `fnclex` and `fclex` in the same way, with 4 exports and 782 cases. `ftst` compares ST(0) with +0.0 and `ficom` with the integer, converted exactly as for `fild`; both set C0, C2 and C3 like `fcom`, and `ficomp` pops. `fxam` writes C3, C2 and C0 from the 80-bit encoding: unsupported, NaN, normal, infinity, zero, empty and denormal, where a pseudo-denormal is a denormal, as the native run confirms. An empty ST(0) is known at translation time. C1, which `fxam` sets to the sign, stays unknown, as for every instruction in the profile except `fprem` and `fprem1` in the checked entry. `fnop` and `fnclex` change nothing the profile models, and `fclex` decodes as `wait` and `fnclex`; like every other x87 instruction they leave C0, C2 and C3 undefined. The inputs cover every class, both signs, the integer bounds and values on either side of an integer. Three mutated controls, which report a denormal as normal, convert the integer as unsigned, and compare `ftst` with 1.0, gave 5, 136 and 7 mismatches. Translation rejects `ftst` and `ficomp` on an empty stack, and a reader of C0 after `fnop` or `fnclex`. The rejection cases that used these instructions in the earlier x87 tests now use instructions that stay outside the profile. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_x87_examine$' -V`.
 
+The profile also accepts the 8087/287 controls `fneni`, `fndisi` and `fnsetpm`, which the 80387 and later execute as `fnop`; `feni` and `fdisi` decode as `wait` and the no-wait form, and ML64 assembles `fsetpm` as `fnsetpm` without a `wait` and has no `fnsetpm` spelling. A fifth export, `legacy_controls`, runs `feni`, `fneni`, `fdisi`, `fndisi` and `fsetpm` between a load and a store, so the check now has 5 exports and 816 cases. On Windows 10 build 19045 the native run stored the loaded value unchanged and returned with control word 0x027F and an empty stack in every case, as the translation does. A fourth control, which flips the sign of ST(0) at `fnsetpm`, gave 34 mismatches, one per `legacy_controls` case, and translation rejects a reader of C0 after `fneni` or `fnsetpm`.
+
 `lower(..., x87=x87_lower.Checked(reject))` is the checked entry of the profile. It also accepts `fldcw m16`, and keeps the control word in a local of the lowered function, `fninit` and `finit`, which load `0x037F`, clear C0 to C3 and empty every register, `fbld` (`cpu_aot_x87_bcd`), and `fprem` and `fprem1` (`cpu_aot_x87_fprem`). The arithmetic, `fsqrt`, `fscale`, `frndint`, `fist` and `fistp`, the m32 and m64 stores, `fnstcw` and the five inexact constant loads all follow that word. The precision control applies only to the arithmetic and `fsqrt`. `fldcw` accepts a word with all six exceptions masked and precision control 00, 10 or 11 (24, 53 or 64 bits). It keeps the word as `fnstcw` reads it back: bit 6 reads as 1, bits 7 and 13 to 15 as 0, and bit 12 is kept. The lowered function leaves through the caller's `reject` statement with a status in these cases:
 
 - status 1, at an `fldcw` whose word unmasks an exception;
@@ -3419,6 +3421,47 @@ ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_d16_' -V
 python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```
 
+### Indexed gfx1030 formatted UINT buffer reads
+
+The compute store profile lowers `buffer_load_format_x`,
+`buffer_load_format_xy`, `buffer_load_format_xyz`, and `buffer_load_format_xyzw`
+for `--source-format BUF_FMT_32_32_32_32_UINT`. The formatted MUBUF opcodes use
+format and channel selectors from the resource descriptor
+([AMD RDNA 2 Shader ISA](https://gpuopen.com/download/rdna2-shader-instruction-set-architecture.pdf), §8.1.4).
+The option declares this format and identity XYZW selectors for the table
+slot named by `--source-descriptor`. The caller checks those fields, disables
+swizzle and add-thread-ID, and binds the same bytes as an aligned raw SRV at
+`t0`. The lowering copies the requested prefix of the four 32-bit words in
+channel order. Each word retains its full UINT representation.
+
+The verified address uses `idxen` with a dispatch-thread index, zero scalar
+offset and an immediate aligned to 16 bytes. A full 16-byte texel must fit
+within the caller's 16-byte-aligned source stride. The source must remain
+stable, in range and disjoint from the output. The descriptor must be ready
+after `lgkmcnt(0)` and all result words become available at `vmcnt(0)`. The
+index may alias a destination. Other formats, channel mappings, native
+bounds, status returns and D16 forms are outside the supported subset.
+
+The wave32 fixtures reuse the first destination as the input index and copy
+one to four distinguishable channels per record. An independent CPU
+reference checks all 320 words, including inter-record gaps and the
+untouched tail, for one and two groups on both backends. Reading Y instead
+of X, or swapping the first and last channels, must mismatch at word 0.
+Rejection controls cover missing and unsupported format declarations,
+address modes, partial records, invalid operand ranges and missing waits.
+LLVM 15 assembles and decodes the four source-built fixtures and compares
+synthetic compute-container CLI HLSL to direct lowering. The GPU tests
+execute the translated desktop DXIL.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_format_' -V
+```
+
+```sh
+python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
 ### Per-lane guards around compute stores
 
 A per-lane bound such as `if (gid < n) store` compiles under LLVM 15 to one exit, with no early `s_endpgm`. A `v_cmp` sets `vcc_lo`, `s_and_saveexec_b32` saves `exec_lo` and masks it, and an optional `s_cbranch_execz` skips the masked block when no lane passes. `s_or_b32 exec_lo, exec_lo, sN` then restores the mask, or the program exits with the mask still applied. The store profile lowers this form as control flow: the stores issued under the mask go inside an HLSL `if`, and stores after the restore stay outside it.
@@ -3958,6 +4001,27 @@ the CLI and pins the lowered line, and changing that one instruction word to
 another compare must change the line. On a Linux host only the LLVM part and the
 reference pictures were run; no WARP or GPU readback of these four forms exists yet.
 
+The program may also apply the one-source binary32 forms `v_rcp_f32_e32`,
+`v_rsq_f32_e32`, `v_sqrt_f32_e32`, `v_floor_f32_e32`, `v_trunc_f32_e32` and
+`v_rndne_f32_e32` (VGPR destination; constant, scalar word or VGPR source). They
+lower to `1.0f / x`, `rsqrt`, `sqrt`, `floor`, `trunc` and `round` (half to
+even). Source modifiers, `clamp`, output modifiers, a second source and the e64
+encodings reject translation. The precision of reciprocal, reciprocal square root
+and square root is not claimed, since D3D allows each an error, and a zero or
+negative operand of the last two, NaN, infinity, denormals and signed zero are not
+exercised. `depth_mask_unary_draw_*` (`unary` mode) therefore feeds the three
+approximate forms an input whose exact result is an integer (1/8, 1/4 and 9), through
+a zero the compiler cannot prove (`v7 - v7`) so the opcode really runs on WARP, rounds
+the result (add 0.5, floor) and scales v7 by it. Floor, truncation and round-to-even
+are compared exactly on `4 * (v7 - 0.5)`, an odd multiple of 1/16 that is never a tie
+or an integer, with thresholds where each sibling gives different pixels. The CPU
+reference is written with Python arithmetic, and every other form's reference must
+fail on exactly the pixels where the two differ. LLVM CI also assembles each form,
+translates it through the CLI, pins the lowered line, and changing that one
+instruction word to each of the other five forms must change the line. On a Linux
+host only the LLVM part (LLVM 19; LLVM 15 was not run) and the reference pictures
+were run; no WARP readback of these six forms exists yet.
+
 The Windows fixture binds distinct seeds and thresholds, changes each separately,
 then exchanges the two root CBV addresses. It checks all 1,024 D32_FLOAT
 pixels and requires comparison against the old reference to fail after the
@@ -3966,7 +4030,7 @@ synthetic container through the CLI.
 
 ```text
 python3 -B tests/depth_mask_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
-ctest --preset dev --no-tests=error -R "^depth_mask_(ops_|cmpx_)?draw_" -V
+ctest --preset dev --no-tests=error -R "^depth_mask_(ops_|cmpx_|unary_)?draw_" -V
 ```
 
 In a local inventory based on main `933cbad`, 354 of 12,101 PS records
@@ -5298,6 +5362,14 @@ Run `ctest --preset dev --no-tests=error -R '^vm_copy_queue_' -V`.
 `vm_page_provenance_warp` and `vm_page_provenance_hardware` test the source side independently. Two pagefile sections hold distinct data and are mapped into adjacent CPU addresses in reverse creation order. D3D12 reopens those same sections as heaps. The test copies a 4 KiB span centered on the page boundary into a GPU buffer using the logical page order, then compares its readback with the two expected token patterns. It writes new data through the CPU aliases and reads the GPU buffer again before uploading, which must still return the old data. A second upload must produce all the updated words. The tests skip (77) if the requested adapter or section-backed D3D12 buffers are unavailable. [Opening a D3D12 heap from a file mapping](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device3-openexistingheapfromfilemapping)
 
 Run `ctest --preset dev --no-tests=error -R '^vm_page_provenance_' -V`.
+
+`vm_raw_srv_warp` and `vm_raw_srv_hardware` select 1024 words straddling a 64 KiB boundary using a GPU byte address and a separate first element. A compute shader reads the native raw buffer SRV through a descriptor table. Readback checks the intended span and a second valid descriptor shifted by four elements. The second span has to match its own expected contents and differ from every word of the first span. The view builder rejects misaligned addresses and views outside the declared buffer.
+
+Run `cmake --build --preset dev --target vm_copy_queue_check` and `ctest --preset dev --no-tests=error -R '^vm_raw_srv_' -V`.
+
+`vm_raw_uav_warp` and `vm_raw_uav_hardware` store through two logical address windows. Each window maps a 2040-byte range that starts 256 or 512 bytes into its own 4 KiB buffer, and each buffer holds distinct sentinel words. `resolve_raw_uav_store` (`src/raw_buffer_uav.h`) maps a logical address to the window that contains it and returns a raw UAV covering exactly that window, plus the store's byte offset. It requires the declared alignment (4 bytes for a scalar DWORD store, 16 bytes for a four-DWORD store) and the whole store inside one window. Seven requests are refused before any descriptor is created: a 16-byte-aligned vector that runs 8 bytes past its window, the first byte after a window, a 4-byte-aligned vector, a misaligned scalar, an address between the windows, an address just before a window, and an undeclared 8-byte width. Four metadata controls also reject a shader offset beyond 32 bits, a misaligned logical base, an address range that wraps and an ambiguous overlapping window. The descriptor result is unchanged on refusal. A compute shader then performs the accepted scalar store in the last DWORD of window 0 and the accepted vector store 24 bytes before the end of window 1. Readback matches both full buffers against the five positions fixed by the fixture, independently of the resolved offsets. A second pass reloads the sentinels and swaps the two window bindings. The stores then land at the matching offsets of the other buffer, and the five intended words keep their sentinels.
+
+Run `cmake --build --preset dev --target vm_copy_queue_check` and `ctest --preset dev --no-tests=error -R '^vm_raw_uav_' -V`.
 
 #### Xbox frame events and token wait semantics (#874)
 
@@ -7687,10 +7759,13 @@ explicitly.
 - Clamp 1 checked against mip 2, and clamp 1.25 checked against the 1.5 blend,
   must fail at pixel (0, 0).
 
-`spirv_minlod_fractional_*` retains the `ps_6_6` capability gate. It checks
-nearest-mip selection at 1.4375, 1.5625 and 3.75. At the 1.5 tie, either
-neighbor is accepted when both shader sources select the same mip. The
-stale-reference check at 1.5625 must reject mip 1 at pixel (0, 0).
+`spirv_minlod_fractional_*` retains the `ps_6_6` capability gate. It requires
+mip 1 at 1.4375 and mip 3 at 3.75. At 1.5 and 1.5625 it checks for exact
+readback of mip 1 or 2, then requires the translated and direct HLSL shaders
+to agree and reports the selected mip. The wrong-mip control at 1.5625
+must reject mip 0 at pixel (0, 0) under either rounding rule. To test
+nearest-mip selection away from the tie, append `--strict-rounding` to
+the normal arguments to `tests/spirv_window/minlod_fractional.py`.
 [Issue #809](https://github.com/R0Y00/Xbox2Windows/issues/809) records why the
 fractional point cases run separately.
 

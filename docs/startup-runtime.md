@@ -182,6 +182,12 @@ These are measured on one executable; treat them as hypotheses for others.
 - **DirectStorage file ranges.** A nonempty file request checks its byte offset and length against
   the current file size before allocating the staging buffer. A range ending at EOF is valid.
   An overrun or short read fails the queue request and preserves the destination.
+  The `startup_storage_directory_batch` fixture submits ten requests across two synthetic RDS5/ETPF
+  files on one queue. In each file, moving the first absolute source offset by 896 KiB selects a
+  different valid 28-byte zlib stream. Both return success and produce 4096 bytes. Comparing the
+  entire page detects the wrong stream. Moving the second request by the same distance reaches
+  EOF and leaves the destination untouched. A subsequent request using its directory offset succeeds.
+  Reproduce with `ctest --preset release --no-tests=error -R '^startup_storage_directory_batch$' -V`.
 
 ## Shortcuts that are known to be wrong
 
