@@ -1280,6 +1280,9 @@ DPP_CVT = {
 DPP_INT32 = {
     "not_b32": (1, "(~{0})", None),
     "bfrev_b32": (1, "reversebits({0})", None),
+    # Each signed halfword clamped to [0, 255] into bits 7:0 and 15:8, as the e32 form (INTEGER).
+    "sat_pk_u8_i16": (1, "(uint(clamp(asint({0} << 16) >> 16, 0, 255)) | "
+                         "(uint(clamp(asint({0}) >> 16, 0, 255)) << 8))", None),
     "ffbl_b32": (1, "firstbitlow({0})", None),
     "ffbh_u32": (1, "dpp_ffbh_u32({0})", "dpp_ffbh_u32"),
     "ffbh_i32": (1, "dpp_ffbh_i32({0})", "dpp_ffbh_i32"),
