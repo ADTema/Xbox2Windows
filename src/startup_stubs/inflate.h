@@ -242,9 +242,13 @@ inline bool stored(Stream& s) noexcept
         s.overflow = true;
         return false;
     }
-    if (length) std::memcpy(s.out + s.out_pos, s.in + s.in_pos, length);  // out may be null when length is 0
-    s.out_pos += length;
-    s.in_pos += length;
+    if (fast_bits > 0 && length) {  // out may be null when length is 0
+        std::memcpy(s.out + s.out_pos, s.in + s.in_pos, length);
+        s.out_pos += length;
+        s.in_pos += length;
+    } else {
+        for (unsigned i = 0; i < length; ++i) s.out[s.out_pos++] = s.in[s.in_pos++];
+    }
     return true;
 }
 

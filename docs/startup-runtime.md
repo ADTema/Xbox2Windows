@@ -355,7 +355,8 @@ symbols from a 64-bit bit buffer that one 8-byte load refills, with no per-symbo
 leaves anything else (end of block, codes longer than 10 bits, invalid symbols and distances) to the
 bit-at-a-time loop, and gives back the whole bytes it loaded but did not use, so that loop, stored
 blocks and the Adler-32 trailer start at the same bit position as before. The bit-at-a-time build
-does not have this loop. Its negative control is the probe built with `X2W_INFLATE_FAULTY_MARGIN`,
+has neither this loop nor the 8-byte match copy and the one-memcpy stored block; it copies a byte at
+a time. Its negative control is the probe built with `X2W_INFLATE_FAULTY_MARGIN`,
 which enters the loop one output byte short of the longest match; it writes past a destination in
 the boundary case. No GPU and no game files are needed:
 
