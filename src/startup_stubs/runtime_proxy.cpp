@@ -6,7 +6,8 @@
 // so that the lookup of "QueryApiImpl" returns a wrapper. The wrapper hands out proxy objects whose
 // methods log their first calls ("x2w-runtime") and forward to the real object.
 //
-// X2W_FAKE_USER=1 additionally answers the user API for one local user (see fake_user below).
+// X2W_FAKE_USER=1 additionally answers the user API for one local user (see fake_user below)
+// and, while the proxy is on, XStoreCreateContext for that user (see area_call).
 #include "startup_stubs/api_trace.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/save_blob_pack.h"
@@ -48,6 +49,9 @@ QueryApi real_query;
 constexpr unsigned long user_provider_data1 = 0x01acd177;
 constexpr u64 local_user_handle = 0x58325755'00000001ull;  // not a pointer the runtime knows
 constexpr u64 local_user_id = 0x0009000012345678ull;
+// XStoreImpl. Method 3 is XStoreCreateContext; the handle below is the offline context it writes.
+constexpr unsigned long store_provider_data1 = 0x0dd112ac;
+constexpr u64 store_context_handle = 0x58325753'00000001ull;  // not a pointer the runtime knows
 bool fake_user() noexcept { return x2w_local::env_on("X2W_FAKE_USER"); }
 int user_provider = -1, save_provider = -1;
 // The user provider also hands out a second interface (iid cef4fac0...) whose slot 3 is
@@ -882,7 +886,54 @@ bool area_call(unsigned long provider, int slot, u64* args, u64* result)
         *result = 0;
         return true;
     }
+    if (provider == store_provider_data1 && slot == 3) {
+        // XStoreCreateContext(user, &context). Vtable slot 3 of XStoreImpl
+        // (0dd112ac-7c24-448c-b92b-3960fb5bd30c): QueryInterface, AddRef, Release, then this.
+        // The public GDK takes the console user and writes an XStoreContextHandle. The VIctory
+        // runtime notes (github.com/Marvisak/VIctory, facts only) answer it offline by writing one
+        // context and returning success; catalog, licence and purchase methods stay unanswered.
+        // Only the local user is answered. A buffer that cannot be written is E_INVALIDARG.
+        if (args[0] != local_user_handle) return false;
+        if (!out(args[1], 8)) {
+            *result = 0x80070057;
+            return true;
+        }
+        *reinterpret_cast<u64*>(args[1]) = store_context_handle;
+        *result = 0;
+        return true;
+    }
     return false;
+}
+
+// Source-built check (tests/startup_stub_consumer.cpp). Both switches are required, as they are
+// for a title: the proxy is installed only for X2W_RUNTIME_PROXY, and this answer only for the
+// fake user. Returns 0 when the local user receives the context and a mutated provider still
+// fails with E_FAIL without writing.
+int store_method3_check()
+{
+    if (!x2w_local::env_on("X2W_RUNTIME_PROXY") || !fake_user()) return 2;
+    if (provider_count >= max_providers) return 3;
+    const int index = provider_count++;
+    provider_ids[index] = {};
+    provider_ids[index].Data1 = store_provider_data1;
+    Proxy proxy{nullptr, nullptr, index};
+
+    u64 context = 0;
+    const u64 answered = forward<3>(&proxy, local_user_handle, reinterpret_cast<u64>(&context), 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    if (answered != 0 || context != store_context_handle) return 4;
+
+    u64 untouched = 0x1111111111111111ull;
+    provider_ids[index].Data1 = store_provider_data1 ^ 1u;  // not the store provider
+    const u64 refused = forward<3>(&proxy, local_user_handle, reinterpret_cast<u64>(&untouched), 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    if (refused != 0x80004005 || untouched != 0x1111111111111111ull) return 5;
+    provider_ids[index].Data1 = store_provider_data1;
+
+    const u64 missing = forward<3>(&proxy, local_user_handle, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    if (missing != 0x80070057) return 6;
+
+    std::printf("store context %016llx\n", static_cast<unsigned long long>(context));
+    std::printf("store refused %08llx\n", static_cast<unsigned long long>(refused & 0xffffffffu));
+    return 0;
 }
 
 // Persistent local storage: the root of a drive (X2W_STORAGE_PATH, e.g. "S:\\", mapped by the run
@@ -948,6 +999,8 @@ void* storage_object()
     return &object;
 }
 }  // namespace
+
+int x2w_store_method3_check() { return store_method3_check(); }
 
 BOOL WINAPI DllMain(HINSTANCE, DWORD reason, void*)
 {
