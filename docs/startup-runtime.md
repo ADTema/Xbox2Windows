@@ -88,7 +88,7 @@ adds memory dumps to the stop report.
 | `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses (0x4 = A); keyboard and XInput pad 0 also work |
 | `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into `SamplerState qh[2048] : register(s0, space1)` and writes `smpheap 2048 1 fallback 2047`. The stand-in uses entries 0 to 2046 for the bound heap and reserves entry 2047 for unaligned or out-of-range offsets. It also accepts the original `smpheap 2048 1` manifest with all 2,048 entries available. [#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143) |
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
-| `X2W_XG_BC7_4K_S_LAYOUT=1` | enables the BC7 tiled layout and diagnostic copy when `X2W_D3D12_PERMISSIVE=1` |
+| `X2W_XG_BC7_4K_S_LAYOUT=1` | enables the BC7 tiled layout, copy and draw upload when `X2W_D3D12_PERMISSIVE=1` |
 | `X2W_TRAP_CONTINUE=<exports>` | lets listed trap exports return 0 instead of ending the process |
 
 ## Findings
@@ -124,9 +124,11 @@ These are measured on one executable; treat them as hypotheses for others.
   `BC7_UNORM` 2D texture with an unknown layout, default alignment, and no resource flags.
   The diagnostic selects the profile explicitly. Native XG selector values still need
   independent evidence. `CopyIntoSubresource` writes the visible BC7 blocks from pitched source rows
-  and preserves tile padding. With `X2W_D3D12_RENDER=1`, it returns `E_NOTIMPL` pending a detiler for
-  the upload path. The reported pitch describes the padded block-row extent of the surface.
-  The synthetic copy check runs with `ctest --preset dev --no-tests=error -R '^startup_xg_bc7_layout$' -V`.
+  and preserves tile padding. In render mode, a successful copy marks the backing so the D3D12
+  stand-in can detile BC7 blocks into the desktop upload footprint. The companion D3D12
+  stand-in must be loaded for render-mode copies. The reported pitch describes the padded
+  block-row extent of the surface. Synthetic copy and draw checks run with
+  `ctest --preset dev --no-tests=error -R '^startup_xg_bc7_' -V`.
 - The default translator uses a static default sampler for a dynamically indexed sampler-heap load.
   With the sampler-heap opt-in, translated draws snapshot the bound heap's 16-byte sampler entries and
   bind a private desktop table beside the static samplers. Missing, out-of-range, or unreadable entries
