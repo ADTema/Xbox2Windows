@@ -141,6 +141,16 @@ adapter whose handles are addresses.
 How the executable arrives at the damaged handle is not known; only the handle and the fault were
 observed.
 
+## Copies of title memory within a frame
+
+A translated draw that reads title memory by address (a constant buffer, a vertex or index range, a root pointer)
+gets a copy in the upload ring. Within one frame the copy is found again by address and size, but only while the
+title's memory still holds the bytes it was made from: each entry keeps them, and a draw that finds different bytes
+makes a new copy and logs one `frame copy of ... refreshed` line (the first four). Without that, a title that rewrites
+one address between two draws of a frame, such as a dynamic constant buffer, gave the second draw the first draw's
+data. The comparison uses the kept bytes because the ring is write-combined memory that is slow to read.
+`startup_frame_copy_{warp,hardware}` rewrites a constant buffer between two draws and checks both halves.
+
 ## Null bindings in translated draws
 
 The `x2w-render totals` line reports `null bindings N`, then the same count split by cause as

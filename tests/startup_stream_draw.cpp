@@ -282,6 +282,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_BUFFER_SRV", nullptr, 0)) {
         extern int draw_address_buffer_srvs(ID3D12Device*, void*, void*);
         if (const int result = draw_address_buffer_srvs(desktop.Get(), guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_FRAME_COPY", nullptr, 0)) {
+        extern int draw_frame_copies(ID3D12Device*, void*, void*, UINT, UINT);
+        if (const int result = draw_frame_copies(desktop.Get(), guest, list, width, height)) return result;
     } else {
         if (bc7 && bc7->packed) invoke(list, 52, binding.rtv, arg(packed_clear));  // render into the texture, then sample it
         if (bc7) invoke(list, 36, 0, binding.table);
