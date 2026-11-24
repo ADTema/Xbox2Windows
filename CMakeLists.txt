@@ -643,6 +643,11 @@ add_custom_command(OUTPUT "${descriptor_window_cs}" COMMAND "${DXC_EXECUTABLE}" 
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/descriptor_window_submissions.hlsl"
     DEPENDS tests/descriptor_window_submissions.hlsl VERBATIM)
 target_sources(offscreen_check PRIVATE tests/descriptor_window_submissions.cpp "${descriptor_window_cs}")
+set(cpu_srv_cs "${CMAKE_CURRENT_BINARY_DIR}/cpu_srv_refresh_cs.h")
+add_custom_command(OUTPUT "${cpu_srv_cs}" COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E main
+    -Vn cpu_srv_refresh_cs -Fh "${cpu_srv_cs}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu_srv_refresh.hlsl"
+    DEPENDS tests/cpu_srv_refresh.hlsl VERBATIM)
+target_sources(offscreen_check PRIVATE "${cpu_srv_cs}")
 set(startup_sampler_x_cs "${CMAKE_CURRENT_BINARY_DIR}/startup_sampler_x_cs.h")
 add_custom_command(OUTPUT "${startup_sampler_x_cs}" COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E main
     -Vn startup_sampler_x_cs -Fh "${startup_sampler_x_cs}"
@@ -1176,6 +1181,10 @@ foreach(adapter IN ITEMS hardware warp)
     add_test(NAME stream_root_srv_${adapter} COMMAND offscreen_check ${adapter} --stream-root-srv)
     set_tests_properties(stream_root_srv_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     add_test(NAME descriptor_window_submissions_${adapter} COMMAND offscreen_check ${adapter} --descriptor-window-submissions)
+    foreach(mode IN ITEMS refresh stale)
+        add_test(NAME cpu_srv_${mode}_${adapter} COMMAND offscreen_check ${adapter} --cpu-srv-${mode})
+        set_tests_properties(cpu_srv_${mode}_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    endforeach()
     add_test(NAME descriptor_window_stale_${adapter} COMMAND offscreen_check ${adapter} --descriptor-window-stale)
     set_tests_properties(descriptor_window_submissions_${adapter} descriptor_window_stale_${adapter}
         PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)

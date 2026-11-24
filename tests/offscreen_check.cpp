@@ -653,6 +653,12 @@ OperationResult run_descriptor_window_submissions(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_cpu_srv_refresh(const OperationContext& ctx)
+{
+    check_cpu_srv_refresh(ctx.device, std::string_view(ctx.argv[2]) == "--cpu-srv-stale");
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_descriptor_window_stale(const OperationContext& ctx)
 {
     check_descriptor_window_submissions(ctx.device, DescriptorWindowCase::stale_window);
@@ -1271,6 +1277,8 @@ const OperationSpec kOperations[] = {
     {"--dual-uav", 3, 3, nullptr, kNoGate, run_dual_uav},
     {"--stream-root-srv", 3, 3, nullptr, kGateSm60BufferOps, run_stream_root_srv},
     {"--descriptor-window-submissions", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_window_submissions},
+    {"--cpu-srv-refresh", 3, 3, nullptr, kGateSm60BufferOps, run_cpu_srv_refresh},
+    {"--cpu-srv-stale", 3, 3, nullptr, kGateSm60BufferOps, run_cpu_srv_refresh},
     {"--descriptor-window-stale", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_window_stale},
     {"--descriptor-record-copy", 4, 4, validate_descriptor_record_args, kGateSm60BufferOps, run_descriptor_record_copy},
     {"--texture-mips", 3, 3, nullptr, kNoGate, run_texture_mips},
