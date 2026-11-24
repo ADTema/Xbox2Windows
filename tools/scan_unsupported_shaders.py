@@ -287,6 +287,8 @@ KNOWN_RDNA2_BASE_OPCODES = {
     "s_quadmask_b32", "s_quadmask_b64", "s_abs_i32",
     "s_andn1_saveexec_b64", "s_orn1_saveexec_b64", "s_andn1_wrexec_b64", "s_andn2_wrexec_b64",
     "s_bitreplicate_b64_b32",
+    # Relative scalar moves: decoded by tools/disasm_rdna2.py, recognition only, no lowering.
+    "s_movrels_b32", "s_movrels_b64", "s_movreld_b32", "s_movreld_b64", "s_movrelsd_2_b32",
     # SOP2
     "s_add_u32", "s_sub_u32", "s_add_i32", "s_sub_i32", "s_absdiff_i32", "s_addc_u32", "s_subb_u32",
     "s_min_i32", "s_min_u32", "s_max_i32", "s_max_u32", "s_cselect_b32", "s_cselect_b64",
