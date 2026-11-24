@@ -13,3 +13,9 @@ EXPORTS
     neg_jcc
     setcc_mix
     cmovcc_mix
+    min_ss
+    max_ss
+    min_sd
+    max_sd
+    root_ss
+    root_sd

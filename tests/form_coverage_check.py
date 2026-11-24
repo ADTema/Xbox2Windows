@@ -158,9 +158,9 @@ def check_scalar_float():
         groups.setdefault(group, set()).add(form)
     assert not [form for form in forms if not fc.x64_forms({form}, reference)]
     assert groups["SSE"] == {"movss", "movaps", "addss", "subss", "mulss", "divss", "cvtsi2ss", "cvttss2si",
-                             "ucomiss", "comiss", "xorps"}, sorted(groups["SSE"])
+                             "ucomiss", "comiss", "xorps", "minss", "maxss", "sqrtss"}, sorted(groups["SSE"])
     assert groups["SSE2"] == {"addsd", "subsd", "mulsd", "divsd", "cvtsi2sd", "cvttsd2si", "cvtss2sd", "cvtsd2ss",
-                              "ucomisd", "comisd", "xorpd"}, sorted(groups["SSE2"])
+                              "ucomisd", "comisd", "xorpd", "minsd", "maxsd", "sqrtsd"}, sorted(groups["SSE2"])
     # The reference files a mnemonic under its oldest encoding, so these three sit outside both groups.
     assert groups["MMX"] == {"movd", "movq", "pxor"} and "movsd" in groups["Integer"]
     with tempfile.TemporaryDirectory() as tmp:
@@ -177,7 +177,7 @@ def check_scalar_float():
     # In the real repository the fixture is classified and counts with its own test only.
     real = fc.measure({"cpu_aot_scalar_float": "pass"})
     assert real["fixtures"]["scalar_float.asm"] == "pass" and "scalar_float.asm" not in real["unclassified"]
-    assert [real["x64_zen2"]["groups"][group]["covered"] for group in ("SSE", "SSE2")] == [11, 11]
+    assert [real["x64_zen2"]["groups"][group]["covered"] for group in ("SSE", "SSE2")] == [14, 14]
     assert fc.measure({"cpu_aot_jump_tables": "pass"})["x64_zen2"]["groups"]["SSE"]["covered"] == 0
 
 

@@ -5,6 +5,9 @@ letter is `f` (float), `d` (double) or `q` (a 64-bit integer or pointer). Slot N
 XMM0-XMM3 when it is floating point and in RCX, RDX, R8 or R9 otherwise; the result leaves in
 XMM0 or RAX. Control flow and the integer instructions are those of cpu_switch_aot.
 
+Scalar SQRT, MIN and MAX are lifted too. The generated code runs under the host MXCSR: a guest MXCSR write is not
+lifted, so the rounding mode, DAZ and FTZ are the host's and the exception flags are not observed.
+
 Only the low quadword of an XMM register is modelled. Every supported instruction computes
 that quadword from low quadwords alone, so the upper half never reaches a result. The two
 dwords of the low quadword are tracked separately as defined or undefined: a float argument
@@ -36,8 +39,12 @@ FROM_INTEGER = {M.CVTSI2SS: 4, M.CVTSI2SD: 8}
 TRUNCATIONS = {M.CVTTSS2SI: 4, M.CVTTSD2SI: 8}
 RESIZES = {M.CVTSS2SD: 4, M.CVTSD2SS: 8}
 COMPARES = {M.UCOMISS: 4, M.COMISS: 4, M.UCOMISD: 8, M.COMISD: 8}
+ROOTS = {M.SQRTSS: 4, M.SQRTSD: 8}
+# MIN and MAX with the comparison that keeps the destination operand.
+EXTREMA = {M.MINSS: ("<", 4), M.MAXSS: (">", 4), M.MINSD: ("<", 8), M.MAXSD: (">", 8)}
 ZEROING = {M.XORPS, M.XORPD, M.PXOR}
-SCALAR = {*MOVES, *COPIES, *ARITHMETIC, *FROM_INTEGER, *TRUNCATIONS, *RESIZES, *COMPARES, *ZEROING, M.MOVD, M.MOVQ}
+SCALAR = {*MOVES, *COPIES, *ARITHMETIC, *ROOTS, *EXTREMA, *FROM_INTEGER, *TRUNCATIONS, *RESIZES, *COMPARES, *ZEROING,
+          M.MOVD, M.MOVQ}
 # fc holds ZF, PF and CF of the last compare as bits 2, 1 and 0. An unordered compare sets all three.
 CONDITIONS = {CC.E: "(fc & 4u) != 0", CC.NE: "(fc & 4u) == 0", CC.B: "(fc & 1u) != 0", CC.AE: "(fc & 1u) == 0",
               CC.BE: "(fc & 5u) != 0", CC.A: "(fc & 5u) == 0", CC.P: "(fc & 2u) != 0", CC.NP: "(fc & 2u) == 0"}
@@ -182,6 +189,18 @@ class ScalarLifter(Lifter):
             a = name if width == 8 else f"static_cast<std::uint32_t>({name})"
             b = self.source(ins, 1, width, reads)
             return self.assign(destination, width, f"arith<{TYPES[width]}>({a}, {b}, '{operator}')"), reads, writes
+        if mnemonic in ROOTS:
+            # The source alone is read. The destination keeps every bit above the result.
+            width = ROOTS[mnemonic]
+            bits = self.source(ins, 1, width, reads)
+            writes.update(parts(destination, width))
+            return self.assign(destination, width, f"root<{TYPES[width]}>({bits})"), reads, writes
+        if mnemonic in EXTREMA:
+            operator, width = EXTREMA[mnemonic]
+            reads.update(parts(destination, width))
+            a = name if width == 8 else f"static_cast<std::uint32_t>({name})"
+            b = self.source(ins, 1, width, reads)
+            return self.assign(destination, width, f"extreme<{TYPES[width]}>({a}, {b}, '{operator}')"), reads, writes
         if mnemonic in FROM_INTEGER:
             width = FROM_INTEGER[mnemonic]
             if ins.op1_kind == OpKind.REGISTER:
@@ -338,7 +357,8 @@ def lift(pe, name, result, slots):
     return "\n".join(source), function
 
 
-FLOAT_PRELUDE = PRELUDE + """#include <limits>
+FLOAT_PRELUDE = PRELUDE + """#include <cmath>
+#include <limits>
 // One host instruction per guest operation: no fused multiply-add.
 #if defined(_MSC_VER) && !defined(__clang__)
 #pragma fp_contract(off)
@@ -365,6 +385,22 @@ template <class Float, class Bits> static Bits arith(Bits a, Bits b, char op) {
     if (y != y) return b | quiet;
     const Float r = op == '+' ? x + y : op == '-' ? x - y : op == '*' ? x * y : x / y;
     return r != r ? static_cast<Bits>(~(quiet - 1)) : cast<Bits>(r);
+}
+// SQRTSS and SQRTSD with exceptions masked. A NaN operand is returned quieted with its payload, a negative
+// operand other than -0 gives the default NaN, whose sign is set, and -0 gives -0. The host function is
+// kept out of those cases because its NaN sign and its errno handling are not the processor's.
+template <class Float, class Bits> static Bits root(Bits b) {
+    const Bits quiet = static_cast<Bits>(1) << (std::numeric_limits<Float>::digits - 2);
+    const Float y = cast<Float>(b);
+    if (y != y) return b | quiet;
+    if (y < 0) return static_cast<Bits>(~(quiet - 1));
+    return cast<Bits>(static_cast<Float>(std::sqrt(y)));
+}
+// MINSS, MAXSS, MINSD and MAXSD return the destination only when the comparison is true. Equal values
+// (so zeros of either sign) and any NaN, which compares false, give the source operand unchanged.
+template <class Float, class Bits> static Bits extreme(Bits a, Bits b, char op) {
+    const Float x = cast<Float>(a), y = cast<Float>(b);
+    return (op == '<' ? x < y : x > y) ? a : b;
 }
 // CVTTSS2SI and CVTTSD2SI: a NaN or a value outside the destination range gives the integer
 // indefinite, which is the sign bit alone.
