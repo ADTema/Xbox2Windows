@@ -255,6 +255,7 @@ class F32(float):
 
 # Host models of the HLSL intrinsics the unary lowering emits, on exact inputs only. round is half-even.
 HLSL_MATH = {
+    "rcp": lambda x: F32(1 / x),
     "sqrt": lambda x: F32(math.sqrt(x)),
     "rsqrt": lambda x: F32(1 / math.sqrt(x)),
     "floor": lambda x: F32(math.floor(x)),
@@ -264,8 +265,16 @@ HLSL_MATH = {
 }
 
 
-def evaluate_depth(text, inputs):
-    # Evaluate the emitted float chain in binary32 and return position component z of vertex 0.
+def evaluate_depth(text, inputs, error=0.0):
+    # Evaluate the emitted float chain in binary32 and return position component z of vertex 0. A nonzero relative
+    # error scales the reciprocal, reciprocal square root and square root results, as an approximate one would.
+    math_ops = {
+        name: (lambda x, fn=fn: F32(float(fn(x)) * (1 + error)))
+        for name, fn in HLSL_MATH.items()
+        if name in ("rcp", "rsqrt", "sqrt")
+    }
+    math_ops = {**HLSL_MATH, **math_ops}
+
     def word(m):
         return repr(F32(struct.unpack("<f", struct.pack("<I", int(m[1], 16)))[0]))
 
@@ -281,10 +290,11 @@ def evaluate_depth(text, inputs):
             expr,
         )
         expr = re.sub(r"(?<!\w)float\(0x([0-9a-f]+)u\)", lambda m: repr(F32(int(m[1], 16))), expr)
+        expr = re.sub(r"^\(1\.0f / (.*)\)$", r"rcp(\1)", expr)
         expr = re.sub(r"asfloat\(0x([0-9a-f]+)u\)", word, expr)
         expr = re.sub(r"(point|matrix)Data\[(\d+)\]\.([xyzw])", buffer, expr)
         expr = re.sub(r"(?<![\w.])(-?\d+\.\d+(?:e[+-]?\d+)?)f?", r"F32(\1)", expr)
-        return eval(expr, {"F32": F32, **HLSL_MATH}, names)
+        return eval(expr, {"F32": F32, **math_ops}, names)
 
     names = {}
     for name, expr in re.findall(r"precise float (f\d+) = (.*);", text):
@@ -557,25 +567,30 @@ def cvt_minmax_binary(tmp, tools):
         raise AssertionError(line)
 
 
-# One-source binary32 math. Every input has an exact result, and the sibling opcode gives a different one: a
-# reciprocal and a reciprocal square root of different powers of two, floor and truncation of negative fractions,
-# a tie rounded to even (3.5 and -0.5; floor of -0.5 is -1, round half away is -1 too), and a fractional part.
+# One-source binary32 math. The inputs reach each opcode through a register that holds an added zero the compiler
+# cannot prove, so the compiler's own constant folding is not what the draw checks. Reciprocal, reciprocal square
+# root and square root are approximate in D3D, so each result is rounded to the nearest integer (add 0.5, floor)
+# before it counts: it is an integer for any result within 0.5 of the exact one, and the sibling opcode gives a
+# different integer. The rounding opcodes are exact and are compared directly: floor and truncation of negative
+# fractions, a tie rounded to even (-2.5 and -0.5; floor and round half away give -3 and -1), a fractional part.
 UNARY_CASES = [
-    ("v_rcp_f32_e32", 4.0, "v_rsq_f32_e32"),
-    ("v_rsq_f32_e32", 16.0, "v_rcp_f32_e32"),
-    ("v_sqrt_f32_e32", 2.25, "v_rsq_f32_e32"),
+    ("v_rcp_f32_e32", 0.25, "v_rsq_f32_e32"),
+    ("v_rsq_f32_e32", 0.0625, "v_rcp_f32_e32"),
+    ("v_sqrt_f32_e32", 16.0, "v_rsq_f32_e32"),
     ("v_floor_f32_e32", -2.5, "v_trunc_f32_e32"),
     ("v_trunc_f32_e32", -2.5, "v_floor_f32_e32"),
-    ("v_rndne_f32_e32", 3.5, "v_floor_f32_e32"),
+    ("v_rndne_f32_e32", -2.5, "v_floor_f32_e32"),
     ("v_fract_f32_e32", -2.75, "v_floor_f32_e32"),
     ("v_rcp_f32_e64", 0.125, "v_rsq_f32_e64"),
-    ("v_rsq_f32_e64", 0.0625, "v_rcp_f32_e64"),
-    ("v_sqrt_f32_e64", 0.5625, "v_rsq_f32_e64"),
+    ("v_rsq_f32_e64", 0.25, "v_rcp_f32_e64"),
+    ("v_sqrt_f32_e64", 9.0, "v_rsq_f32_e64"),
     ("v_floor_f32_e64", -7.75, "v_trunc_f32_e64"),
     ("v_trunc_f32_e64", -6.75, "v_floor_f32_e64"),
     ("v_rndne_f32_e64", -0.5, "v_floor_f32_e64"),
     ("v_fract_f32_e64", 5.125, "v_floor_f32_e64"),
 ]
+APPROXIMATE = ("v_rcp", "v_rsq", "v_sqrt")
+UNARY_BIAS = -4.25  # brings the sum of the rounded results to a depth inside the clip range
 
 
 def fword(x):
@@ -583,17 +598,18 @@ def fword(x):
 
 
 def unary_program(swap=None, line=None):
-    # The e32 forms read a literal; the e64 forms read a register. A swap replaces one case's opcode with its sibling.
+    # v5 is zero, but not a zero the compiler can see. A swap replaces one case's opcode with its sibling.
     program = PROGRAM.copy()
-    body = []
+    body = ["v_sub_f32_e32 v5, v3, v3"]
     for i, (op, x, sibling) in enumerate(UNARY_CASES):
+        approximate = op.startswith(APPROXIMATE)
         op = sibling if op == swap else op
         out = f"v{20 + i}"
-        if op.endswith("_e32"):
-            body.append(f"{op} {out}, 0x{fword(x):08x}")
-        else:
-            body += [f"v_mov_b32_e32 v{40 + i}, 0x{fword(x):08x}", f"{op} {out}, v{40 + i}"]
+        body += [f"v_add_f32_e32 v{40 + i}, 0x{fword(x):08x}, v5", f"{op} {out}, v{40 + i}"]
+        if approximate:
+            body += [f"v_add_f32_e32 {out}, 0x3f000000, {out}", f"v_floor_f32_e32 {out}, {out}"]
         body.append(f"v_add_f32_e32 v3, {out}, v3")
+    body.append(f"v_add_f32_e32 v3, 0x{fword(UNARY_BIAS):08x}, v3")
     program[-2:-2] = body
     if line:
         program.insert(-2, line)
@@ -602,11 +618,11 @@ def unary_program(swap=None, line=None):
 
 def unary_reference():
     # Independent of the lowering: Python arithmetic on exact values, in the order the program runs. Python rounds
-    # a tie to even, which is what v_rndne_f32 does.
+    # a tie to even, which is what v_rndne_f32 does. An approximate result counts as its nearest integer.
     exact = {
-        "v_rcp": lambda x: 1 / x,
-        "v_rsq": lambda x: 1 / math.sqrt(x),
-        "v_sqrt": math.sqrt,
+        "v_rcp": lambda x: math.floor(1 / x + 0.5),
+        "v_rsq": lambda x: math.floor(1 / math.sqrt(x) + 0.5),
+        "v_sqrt": lambda x: math.floor(math.sqrt(x) + 0.5),
         "v_floor": math.floor,
         "v_trunc": math.trunc,
         "v_rndne": round,
@@ -615,6 +631,7 @@ def unary_reference():
     z = 0.125 + 0.375  # pointData y plus the matrix value
     for op, x, _ in UNARY_CASES:
         z += exact[op.rsplit("_f32", 1)[0]](x)
+    z += UNARY_BIAS
     # The draw keeps depth clipping on, so a final depth outside [0, 1] would clip the whole triangle.
     assert 0.0 <= z <= 1.0, z
     return z
@@ -645,6 +662,9 @@ def unary_binary(tmp, tools):
     inputs, reference = triangle_inputs(), unary_reference()
     text = binary(tmp, *tools, program=unary_program(), words=[4099])
     assert evaluate_depth(text, inputs) == reference, text
+    # The three approximate operations may be off by a thousandth either way without moving the depth.
+    for error in (-2**-10, 2**-10):
+        assert evaluate_depth(text, inputs, error) == reference, (error, text)
     # Each lowering is present, and each sibling opcode changes the depth.
     for hlsl in ("(1.0f / ", "rsqrt(", "sqrt(", "floor(", "trunc(", "round(", "frac("):
         assert hlsl in text, hlsl

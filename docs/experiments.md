@@ -2674,21 +2674,31 @@ The translator also lowers the one-source binary32 math and rounding forms
 `v_rndne_f32` and `v_fract_f32` (`_e32` and `_e64`) to `1.0f / x`,
 `rsqrt`, `sqrt`, `floor`, `trunc`, `round` (half to even) and `frac`. Source
 modifiers, `clamp`, output modifiers and a second source are refused. The
-precision of reciprocal, reciprocal square root and square root is not claimed:
-the test program uses only inputs whose results are exact in binary32 (powers
-of two and 2.25, 0.5625 for the square root), and the draw compares the exported
-depth word bit for bit. Floor, truncation, a tie rounded to even and a negative
-fractional part use inputs where the sibling opcode gives a different value. One
-program applies all fourteen encodings and adds the results; the binary mode
+precision of reciprocal, reciprocal square root and square root is not
+claimed, because D3D allows each of them an error. The test program does not
+depend on it: each of the six results is rounded to the nearest integer (add 0.5,
+then floor) before it is summed, and the inputs are chosen so that the exact
+result is an integer (reciprocals of 0.25 and 0.125 give 4 and 8, reciprocal
+square roots of 0.0625 and 0.25 give 4 and 2, square roots of 16 and 9 give 4
+and 3), so any result within 0.5 of the exact one gives the same
+depth. The binary mode checks that scaling those three results by plus or minus
+one part in 1024 leaves the depth unchanged. Floor, truncation, a tie rounded to
+even (-2.5 and -0.5) and a negative fractional part are exact and are compared
+directly, with inputs where the sibling opcode gives a different value. Each
+input reaches its opcode through a register holding a zero that the compiler
+cannot prove (the point and matrix value minus itself), so the shader compiler
+does not fold the operation away. One program applies all fourteen encodings,
+adds the results and a fixed bias of -4.25 that keeps the final depth (0.625)
+inside the clip range; the binary mode
 evaluates the emitted expressions in binary32 and compares the depth with an
 independent Python calculation, and each opcode swapped for its sibling must give
 a different depth. The draw `mesh_entry_unary_draw_*` (`draw-unary`) compares
 the exported position words with that reference; a depth one unit in the last
 place off in the last vertex, or any of the fourteen opcodes swapped for its
 sibling, must report `Mesh export trace mismatch`. The draw is written for
-Windows and has not been run on Linux. NaN, infinity, denormals, a zero or
-negative operand of reciprocal square root or square root, and signed zero
-results are not exercised.
+Windows and has not been run there since this program changed. NaN, infinity,
+denormals, a zero or negative operand of reciprocal square root or square root,
+and signed zero results are not exercised.
 
 A local scan based on main `933cbad` selected the shortest validated native
 stream among 9,282 MS records (832 bytes, 153 instructions). For the tested
