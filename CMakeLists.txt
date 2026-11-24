@@ -2959,6 +2959,10 @@ if(EXISTS "${INTAKE_PYTHON}")
         DEPENDS cpu_integer_flags_original tests/cpu/integer_flags_check.py tools/ffx_version_query.py
             tools/x87_lower.py tools/cpu_leaf_aot.py tools/cpu_ranges.py VERBATIM)
     add_library(cpu_integer_flags_controls SHARED "${cpu_integer_flags_controls_cpp}")
+# Reserved/hint NOP forms in the shared lowering (#1476): each accepted encoding must lower to a no-op,
+# and the neighbours that decode as another mnemonic (ENDBR64/32, CLDEMOTE, RDSSPD) must stay refused.
+add_test(NAME cpu_hint_nop COMMAND "${INTAKE_PYTHON}" -B
+    "${CMAKE_SOURCE_DIR}/tests/cpu/hint_nop_check.py")
     add_test(NAME cpu_aot_integer_flags COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/integer_flags_check.py" check
         "$<TARGET_FILE:cpu_integer_flags_original>"

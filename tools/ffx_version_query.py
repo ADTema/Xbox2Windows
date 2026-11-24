@@ -3066,7 +3066,13 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
             suffix, host = {1: ("8", "char"), 2: ("16", "short"), 4: ("", "long"), 8: ("64", "__int64")}[size]
             stmt = write_register(register, f"_InterlockedExchange{suffix}(reinterpret_cast<{host} volatile*>({address()}), "
                                             f"static_cast<{host}>({operand(n)}))")
-        elif op == M.NOP or (op == M.XCHG and i.op0_register == i.op1_register == R.AX):
+        elif op in (M.NOP, M.RESERVEDNOP) or (op == M.XCHG and i.op0_register == i.op1_register == R.AX):
+            # The reserved/hint NOP space: iced decodes the 0F 19 /r, 0F 1D /r, 0F 1E /r (unprefixed) and
+            # 0F 1F /r forms as RESERVEDNOP on this target. The AMD APM documents them as reserved hint NOPs
+            # that take a ModRM but access no memory, so the operand is not evaluated: no address
+            # computation, no load and no fault. Forms iced decodes as another mnemonic never reach this
+            # branch and stay refused - CLDEMOTE (0F 1C /0), RDSSPD/RDSSPQ (F3 0F 1E /1), ENDBR64/ENDBR32
+            # (F3 0F 1E FA/FB), the 0F 18 prefetches and the MPX forms.
             stmt = ";"
         elif (op in (M.SETE, M.SETNE, M.SETA, M.SETAE, M.SETB, M.SETBE) or
               (x87_depth is None and op in (M.SETL, M.SETGE, M.SETLE, M.SETG, M.SETS, M.SETNS, M.SETO, M.SETNO))):
