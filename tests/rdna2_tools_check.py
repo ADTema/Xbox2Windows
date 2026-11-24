@@ -5649,7 +5649,9 @@ class TestRdna2Scanner(unittest.TestCase):
         for opcode in ("v_cvt_pk_u16_u32", "v_cvt_pk_i16_i32"):
             self.assertTrue(is_opcode_recognized(opcode), opcode)
         for line in (
+            "v_sad_u8 v1, v2, v3, v4",
             "v_sad_hi_u8 v1, v2, v3, v4",
+            "v_sad_u16 v1, s2, v3, 64",
             "v_sad_u32 v1, s2, v3, 64",
             "v_sad_u32_e64 v1, v2, v3, v4",
             "v_msad_u8 v1, v2, 0x7f00ff01, s4",
@@ -5660,13 +5662,15 @@ class TestRdna2Scanner(unittest.TestCase):
             "v_sad_u32 v1, v2, v3",
             "v_msad_u8 v1, v2, v3, v4, v5",
             "v_msad_u8 v1, v2, v3, v4 clamp",
-            "v_sad_u8 v1, v2, v3, v4",
-            "v_sad_u16 v1, v2, v3, v4",
+            "v_sad_u8_e32 v1, v2, v3, v4",
+            "v_sad_u8 v1, v2, v3, v4 clamp",
+            "v_sad_u16 v1, v2, v3",
+            "v_sad_u16 v1, v2, v3, v4 clamp",
             "v_mqsad_pk_u16_u8 v[1:2], v[3:4], v5, v[6:7]",
             "v_mqsad_u32_u8 v[1:4], v[5:6], v7, v[8:11]",
         ):
             self.assertFalse(is_instruction_supported(line), line)
-        for opcode in ("v_sad_hi_u8", "v_sad_u32", "v_msad_u8"):
+        for opcode in ("v_sad_u8", "v_sad_hi_u8", "v_sad_u16", "v_sad_u32", "v_msad_u8"):
             self.assertTrue(is_opcode_recognized(opcode), opcode)
         for line in (
             "v_add3_u32 v1, v2, v3, v4",

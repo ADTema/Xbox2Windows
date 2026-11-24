@@ -6729,7 +6729,7 @@ def check_int16_ternary_controls():
     # The two-operand forms keep their operand count; the neighbours that stay unsupported are still refused.
     refuse("v_add_nc_u16 v24, v18, v19, v20", "Wrong 16-bit integer operand count for v_add_nc_u16")
     for line in ("v_mad_u32_u16 v24, v18, v19, v20", "v_mad_i32_i16 v24, v18, v19, v20",
-                 "v_sad_u16 v24, v18, v19, v20", "v_med3_f16 v24, v18, v19, v20", "v_mad_f16 v24, v18, v19, v20"):
+                 "v_med3_f16 v24, v18, v19, v20", "v_mad_f16 v24, v18, v19, v20"):
         refuse(line, "Unsupported instruction")
     sample = next(i for i, line in enumerate(with_constants([])) if line.startswith("image_sample"))
     overlap = with_constants([])
@@ -10367,16 +10367,21 @@ CARRY_IN_WRONG = {
         (3, 3, lambda a, b, c, d: _SET, "borrow-out of the unreversed subtract"),
     ),
 }
-# Sums of absolute differences (v_sad_hi_u8, v_sad_u32, v_msad_u8). Bodies for uncompressed_export(): s44 = A,
-# s45 = B and s46 = C from the constants, v18 = B, and each channel v12..v15 holds its own result. The second
-# source is the reference of v_msad_u8, here once a register and once a literal whose byte 2 is zero. No
-# instruction uses more than two scalar registers and literals, the gfx10 constant bus limit LLVM 15 enforces.
+# Sums of absolute differences (v_sad_u8, v_sad_hi_u8, v_sad_u16, v_sad_u32, v_msad_u8). Bodies for
+# uncompressed_export(): s44 = A, s45 = B and s46 = C from the constants, v18 = B, and each channel v12..v15 holds
+# its own result. The second source is the reference of v_msad_u8, here once a register and once a literal whose
+# byte 2 is zero. The lanes group gives v_sad_u8 a literal accumulator that is not an inline constant, so its
+# result stays a normal binary32. No instruction uses more than two scalar registers and literals, the gfx10
+# constant bus limit LLVM 15 enforces.
 SAD_LITERAL = 0x7f00ff01
+SAD_ACCUMULATOR = 0x3f800010
 SAD_BODIES = {
     "bytes": ["v_sad_hi_u8 v12, s44, v18, s46", "v_sad_hi_u8 v13, v18, s44, 0",
               "v_msad_u8 v14, s44, v18, s46", "v_msad_u8 v15, v18, s44, s46"],
     "dword": ["v_sad_u32 v12, s44, v18, s46", "v_sad_u32 v13, v18, s44, 64",
               f"v_msad_u8 v14, s44, {SAD_LITERAL:#x}, v18", "v_sad_hi_u8 v15, s45, s44, v18"],
+    "lanes": ["v_sad_u8 v12, s44, v18, s46", f"v_sad_u8 v13, v18, s44, {SAD_ACCUMULATOR:#x}",
+              "v_sad_u16 v14, s44, v18, s46", "v_sad_u16 v15, v18, s44, v18"],
 }
 SAD_OPS = tuple(sorted({line.split()[0] for body in SAD_BODIES.values() for line in body}))
 
@@ -10389,6 +10394,14 @@ def _sad4(a, b, masked=False, lanes=4, signed=False):
     return sum(abs(lane(a, k) - lane(b, k)) for k in range(lanes) if not masked or _byte(b, k))
 
 
+def _sad2(a, b, lanes=2, signed=False):
+    """Sum of |a.half[k] - b.half[k]| over the low halfword lanes."""
+    def lane(word, k):
+        value = (word >> (16 * k)) & 0xffff
+        return value - 0x10000 if signed and value >= 0x8000 else value
+    return sum(abs(lane(a, k) - lane(b, k)) for k in range(lanes))
+
+
 def _signed_absdiff32(a, b):
     return abs((a - (1 << 32) if a & 0x80000000 else a) - (b - (1 << 32) if b & 0x80000000 else b))
 
@@ -10397,6 +10410,7 @@ def _signed_absdiff32(a, b):
 SAD_RESULTS = {
     "bytes": lambda a, b, c: ((_sad4(a, b) << 16) + c, _sad4(b, a) << 16, _sad4(a, b, True) + c, _sad4(b, a, True) + c),
     "dword": lambda a, b, c: (abs(a - b) + c, abs(b - a) + 64, _sad4(a, SAD_LITERAL, True) + b, (_sad4(b, a) << 16) + b),
+    "lanes": lambda a, b, c: (_sad4(a, b) + c, _sad4(b, a) + SAD_ACCUMULATOR, _sad2(a, b) + c, _sad2(b, a) + b),
 }
 # Negative controls by group: (channel, word a wrong lowering would give, what went wrong). Each is drawn on
 # the first row of the group and must report a mismatch.
@@ -10423,6 +10437,19 @@ SAD_WRONG = {
         (2, lambda a, b, c: _sad4(a, SAD_LITERAL, True) + c, "s46 read for the register accumulator"),
         (3, lambda a, b, c: (_sad4(b, a) << 16) + c, "wrong accumulator register"),
     ),
+    "lanes": (
+        (0, lambda a, b, c: (_sad4(a, b) << 16) + c, "v_sad_u8 moved to the high half like v_sad_hi_u8"),
+        (0, lambda a, b, c: _sad4(a, b, True) + c, "v_sad_u8 masked like v_msad_u8"),
+        (0, lambda a, b, c: _sad4(a, b, signed=True) + c, "signed byte lanes"),
+        (0, lambda a, b, c: _sad4(a, b, lanes=3) + c, "top byte lane dropped"),
+        (0, lambda a, b, c: _sad4(a, b), "accumulator dropped"),
+        (1, lambda a, b, c: _sad4(b, a) + c, "s46 read for the literal accumulator"),
+        (2, lambda a, b, c: _sad4(a, b) + c, "byte lanes for the halfword sum"),
+        (2, lambda a, b, c: _sad2(a, b, signed=True) + c, "signed halfword lanes"),
+        (2, lambda a, b, c: _sad2(a, b, lanes=1) + c, "high halfword lane dropped"),
+        (2, lambda a, b, c: abs(a - b) + c, "dword difference for the halfword sum"),
+        (3, lambda a, b, c: _sad2(b, a) + c, "s46 read for the VGPR accumulator"),
+    ),
 }
 # (A, B, C) as binary32 words; the inputs and every right result are normal numbers or zero (asserted at the
 # draw). In the first bytes row A and B each have one zero byte in a different lane and lanes on both sides of
@@ -10430,6 +10457,8 @@ SAD_WRONG = {
 SAD_ROWS = {
     "bytes": ((0xC1007F90, 0x40C30011, 0x3F80FFFF), (0x3E0027FF, 0xBF62FF00, 0x40000000)),
     "dword": ((0xC1700000, 0x3F800024, 0x7F000000), (0x40000023, 0x4C003A00, 0x3F800000)),
+    # The bytes rows again: A and B also have halfword lanes on both sides of 0x8000 (0xC100 and 0x40C3).
+    "lanes": ((0xC1007F90, 0x40C30011, 0x3F80FFFF), (0x3E0027FF, 0xBF62FF00, 0x40000000)),
 }
 
 
@@ -11588,7 +11617,7 @@ def check_carry_in_lowering():
 
 
 def check_sad_lowering():
-    """Static checks for v_sad_hi_u8, v_sad_u32 and v_msad_u8 in the programs of sad_group()."""
+    """Static checks for v_sad_u8, v_sad_hi_u8, v_sad_u16, v_sad_u32 and v_msad_u8 in the programs of sad_group()."""
     # v18 is written by the mov at index 20 and the four group instructions follow at 21..24.
     a, b, c, v = "params[0].w", "params[1].x", "params[1].y", "asuint(alu20)"
     expected = {
@@ -11596,6 +11625,8 @@ def check_sad_lowering():
                   f"sad4_u8({a}, {v}, true) + {c}", f"sad4_u8({v}, {a}, true) + {c}"),
         "dword": (f"(max({a}, {v}) - min({a}, {v})) + {c}", f"(max({v}, {a}) - min({v}, {a})) + 64u",
                   f"sad4_u8({a}, {SAD_LITERAL}u, true) + {v}", f"(sad4_u8({b}, {a}, false) << 16u) + {v}"),
+        "lanes": (f"sad4_u8({a}, {v}, false) + {c}", f"sad4_u8({v}, {a}, false) + {SAD_ACCUMULATOR}u",
+                  f"sad2_u16({a}, {v}) + {c}", f"sad2_u16({v}, {a}) + {v}"),
     }
     assert expected.keys() == SAD_BODIES.keys() == SAD_RESULTS.keys() == SAD_WRONG.keys() == SAD_ROWS.keys()
     for group, expressions in expected.items():
@@ -11605,16 +11636,21 @@ def check_sad_lowering():
         for offset, expression in enumerate(expressions, start=21):
             statement = f"    precise float alu{offset} = asfloat({expression});"
             assert statement in source.splitlines(), (group, statement)
-        # The byte-lane helper is emitted once, and only for a program that uses it.
+        # The byte-lane helper is emitted once, and only for a program that uses it; so is the halfword one.
         assert source.count("uint sad4_u8(uint a, uint b, bool masked)") == 1, group
+        assert source.count("uint sad2_u16(uint a, uint b)") == (1 if group == "lanes" else 0), group
     only_dword = translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", "v_sad_u32 v12, s44, v18, s46"]))
-    assert "sad4_u8" not in only_dword
+    assert "sad4_u8" not in only_dword and "sad2_u16" not in only_dword
+    only_halves = translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", "v_sad_u16 v12, s44, v18, s46"]))
+    assert "sad4_u8" not in only_halves and only_halves.count("uint sad2_u16(uint a, uint b)") == 1
     assert set(SAD_OPS) <= ACCEPTED, set(SAD_OPS) - ACCEPTED
-    assert SAD_OPS == ("v_msad_u8", "v_sad_hi_u8", "v_sad_u32")
+    assert SAD_OPS == ("v_msad_u8", "v_sad_hi_u8", "v_sad_u16", "v_sad_u32", "v_sad_u8")
     # The Python references agree with the worked values of the first rows.
     assert _sad4(0xC1007F90, 0x40C30011) == 0x242 and _sad4(0xC1007F90, 0x40C30011, True) == 0x1C3
     assert _sad4(0x40C30011, 0xC1007F90, True) == 0x17F
     assert SAD_RESULTS["dword"](*SAD_ROWS["dword"][0])[0] & 0xffffffff == 0x00EFFFDC
+    # |0xC100 - 0x40C3| + |0x7F90 - 0x0011| = 0x803D + 0x7F7F; read as signed halfwords the high lane would be 0x7FC3.
+    assert _sad2(0xC1007F90, 0x40C30011) == 0xFFBC and _sad2(0xC1007F90, 0x40C30011, signed=True) == 0xFF42
     # Three sources in the VOP3 encoding and nothing else: no e32 spelling, no clamp (LLVM 15 assembles the
     # bit, but the ISA text gives it no meaning for an integer result), no float modifier, an in-range
     # destination, written registers and 32-bit literals only.
@@ -11634,13 +11670,18 @@ def check_sad_lowering():
         "v_msad_u8 v256, s44, v18, s46",
         "v_msad_u8 v12, s44, 0x100000000, s46",
         "v_msad_u8 v12, s44, v106, s46",
+        "v_sad_u8_e32 v12, s44, v18, s46",
+        "v_sad_u8 v12, s44, v18, s46 clamp",
+        "v_sad_u8 v12, s44, v18",
+        "v_sad_u16_e32 v12, s44, v18, s46",
+        "v_sad_u16 v12, s44, v18, s46 clamp",
+        "v_sad_u16 v12, s44, -v18, s46",
+        "v_sad_u16 v12, s44, v106, s46",
     ):
         translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", good]))
         must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
-    # The neighbours stay unsupported: the 8- and 16-bit lane sums without a shift, and the wide packed forms.
+    # The neighbours stay unsupported: the wide packed forms.
     for neighbour in (
-        "v_sad_u8 v12, s44, v18, s46",
-        "v_sad_u16 v12, s44, v18, s46",
         "v_qsad_pk_u16_u8 v[12:13], v[18:19], s44, v[20:21]",
         "v_mqsad_pk_u16_u8 v[12:13], v[18:19], s44, v[20:21]",
         "v_mqsad_u32_u8 v[12:15], v[18:19], s44, v[20:23]",
@@ -17997,7 +18038,8 @@ def check_carry_in_draws(directory, compiler, renderer, backend):
 
 
 def check_sad_draws(directory, compiler, renderer, backend):
-    """Draw v_sad_hi_u8, v_sad_u32 and v_msad_u8 through the integer readback target and compare the words.
+    """Draw v_sad_u8, v_sad_hi_u8, v_sad_u16, v_sad_u32 and v_msad_u8 through the integer readback target and compare
+    the words.
 
     Each group of SAD_BODIES is compiled once and drawn in one renderer batch: every row of SAD_ROWS with the
     right words, and the first row once per SAD_WRONG entry with one channel replaced by the word a wrong
