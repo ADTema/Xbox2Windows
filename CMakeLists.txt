@@ -1117,7 +1117,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Registered unconditionally: without the tools the wrapper reports a skip (77) rather than the
     # tests silently disappearing. Hosted CI sets X2W_REQUIRE_SPIRV_TOOLS=1 to turn skips into failures.
     foreach(adapter IN ITEMS hardware warp)
-        foreach(bridge IN ITEMS address_window:draw address_window_atomic:atomic address_window_qword:qword
+        foreach(bridge IN ITEMS address_window:draw address_window_atomic:atomic address_window_signed:address_signed
+                                address_window_qword:qword
                                 sampler_views:sampler ballot_extract:ballot
                                 compaction:compaction compare_sampler:compare_sampler minlod:minlod
                                 minlod_exact:minlod_exact minlod_levels:minlod_levels
