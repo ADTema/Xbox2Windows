@@ -669,6 +669,11 @@ foreach(mutation IN ITEMS stand-in array b565 view)
     add_test(NAME startup_packed_target_${mutation}_control COMMAND startup_packed_target_check --mutate ${mutation})
     set_tests_properties(startup_packed_target_${mutation}_control PROPERTIES WILL_FAIL TRUE)
 endforeach()
+# Static samplers built from smp and smpc manifest lines (src/startup_stubs/translated_sampler_bindings.h).
+add_executable(startup_sampler_comparison_check tests/startup_sampler_comparison_check.cpp)
+target_include_directories(startup_sampler_comparison_check PRIVATE src)
+target_compile_features(startup_sampler_comparison_check PRIVATE cxx_std_17)
+add_test(NAME startup_sampler_comparison COMMAND startup_sampler_comparison_check)
 # Diagnostic line for a refused device slot 70 call (src/startup_stubs/memory_srv_report.h).
 add_executable(startup_memory_srv_report_check tests/startup_memory_srv_report_check.cpp)
 target_include_directories(startup_memory_srv_report_check PRIVATE src)
@@ -1407,6 +1412,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_uniform_lane_check.py")
     add_test(NAME startup_image_sample_l COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_image_sample_l_check.py")
+    add_test(NAME startup_image_sample_c COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_image_sample_c_check.py")
     # Rewrites for instructions the host processor lacks (tools/startup/host_cpu.py), run on the host.
     add_test(NAME startup_host_cpu COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_host_cpu_check.py")
