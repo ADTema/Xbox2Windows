@@ -290,6 +290,11 @@ def controls():
     assert "    outputData.Store3(20u, uint3(0xffff8000u, 0x00000017u, 0xfffffffeu));" in (
         aot.lower(movk_boundary, 1, **FIXED_BINDING).splitlines())
     must_reject(lambda: aot.lower(FIXED, 1, **dict(FIXED_BINDING, constant_descriptor=8)))
+    # Positive coverage, so the raw and binary modes exercise the accepted form as well as the Windows draw
+    # mode: every accepted spelling lowers to exactly the untouched kernel, both scratch halves included.
+    untouched = aot.lower(INDEXED, 32, **INDEX_BINDING)
+    for lines in [SCRATCH_BASE_WRITE_LINES] + [[spelling] + INDEXED for spelling in SCRATCH_BASE_WRITE_SPELLINGS]:
+        assert aot.lower(lines, 32, **INDEX_BINDING) == untouched, lines[0]
 
     # Overlapping store spans in one invocation are rejected.
     must_reject(lambda: aot.lower(
@@ -5853,7 +5858,7 @@ def draw_mul_lo(cmd, case):
 
 
 def draw_scratch_base_write(directory, compiler, renderer, backend):
-    """The scratch-base write must leave the generated HLSL byte for byte identical to the untouched kernel,"
+    """The scratch-base write must leave the generated HLSL byte for byte identical to the untouched kernel,
     then run on the GPU so the readback and the untouched guards are checked as for the original case."""
     control = aot.lower(INDEXED, 32, **INDEX_BINDING)
     for name, lines, width, binding in SCRATCH_BASE_WRITE_CASES:
