@@ -250,12 +250,15 @@ def run(renderer, adapter, tmp, mesh, data):
     return result
 
 
-def expect(result, code, mismatches, trace_byte, label):
+def expect(result, adapter, code, mismatches, trace_byte, label):
     out = result.stdout
+    lines = out.splitlines()
+    # The runner prints the debug-layer summary only when the layer is available.
+    debug = f"backend={adapter} debug_layer=enabled" in lines
     ok = (
         result.returncode == code
         and f"pixels=1024 mismatches={mismatches}\n" in out
-        and "debug_errors=0 debug_warnings=0" in out
+        and (not debug or "debug_errors=0 debug_warnings=0" in lines)
         and (trace_byte is None) == ("first_mesh_export_mismatch_byte" not in out)
         and (trace_byte is None or f"first_mesh_export_mismatch_byte={trace_byte}\n" in out)
     )
@@ -279,7 +282,7 @@ def draw(dxc, renderer, adapter, tmp):
             if result.returncode == 77:
                 return 77
             covered = len(raster(vertices(case), primitives(case)))
-            expect(result, 0, 0, None, f"{case} traced={int(traced)} covered={covered}")
+            expect(result, adapter, 0, 0, None, f"{case} traced={int(traced)} covered={covered}")
         mesh = tmp / "mesh_traced.dxil"
         good = fixture(case)
         triangles = primitives(case)
@@ -300,13 +303,14 @@ def draw(dxc, renderer, adapter, tmp):
             if not want and not trace_bytes:
                 raise AssertionError(f"{case} {label}: the control changes nothing")
             result = run(renderer, adapter, tmp, mesh, bad)
-            expect(result, 1, want, first_difference(bad, good) if trace_bytes else None, f"{case} {label}")
+            expect(result, adapter, 1, want, first_difference(bad, good) if trace_bytes else None,
+                   f"{case} {label}")
         # A translated program whose primitive keeps its vertices but swaps two indices draws the
         # same pixels; only the export trace sees it.
         rotated = lower(pcs(mutate("s_mov_b32 s41, 0x200400", "s_mov_b32 s41, 0x100800")), [word(case)], LIMITS)
         compile_shaders(dxc, tmp, rotated)
         result = run(renderer, adapter, tmp, mesh, good)
-        expect(result, 1, 0, 16 + 16 * CASES[case][0] + 4, f"{case} swapped winding")
+        expect(result, adapter, 1, 0, 16 + 16 * CASES[case][0] + 4, f"{case} swapped winding")
     return 0
 
 
