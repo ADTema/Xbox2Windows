@@ -396,6 +396,17 @@ BOOL free_pages(ULONG_PTR count, PULONG_PTR pages)
 }
 }  // namespace
 
+// Experimental export: one snapshot of the physical-page accounting for the startup heartbeat
+// (#1199). A page gets its 64 KiB section on first use, by a mapping or by a page-token write, and
+// loses it when the grant is released; the count is reported so runs can be compared.
+extern "C" BOOL WINAPI x2w_xmem_page_stats(ULONGLONG* live_sections)
+{
+    if (!live_sections) return FALSE;
+    const std::lock_guard guard(memory.mutex);
+    *live_sections = static_cast<ULONGLONG>(memory.backings.size());
+    return TRUE;
+}
+
 // Experimental export: writes bytes into physical pages named by the title's
 // page tokens (page number << 4, as XMemMapPhysicalPages takes them), starting offset bytes into the
 // first page. DirectStorage requests can name such pages as their destination.

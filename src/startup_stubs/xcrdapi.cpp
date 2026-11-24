@@ -11,6 +11,8 @@
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/inflate.h"
 
+#include <psapi.h>
+
 #include <condition_variable>
 #include <deque>
 #include <exception>
@@ -769,6 +771,34 @@ void** make_table(unsigned kind)
     return table;
 }
 
+// What the heartbeat reports about memory (#1199): this process's commit charge and the live
+// physical-page sections of the xmem stand-in, read through its probe export. The flags keep the
+// line's shape when a reading is unavailable.
+struct MemorySample {
+    ULONGLONG peak_commit = 0, commit = 0, sections = 0;
+    bool commit_known = false, sections_known = false;
+};
+
+MemorySample memory_sample() noexcept
+{
+    MemorySample sample;
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    counters.cb = sizeof(counters);
+    if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                             sizeof(counters))) {
+        sample.commit = counters.PagefileUsage;
+        sample.peak_commit = counters.PeakPagefileUsage;
+        sample.commit_known = true;
+    }
+    using PageStats = BOOL(WINAPI*)(ULONGLONG*);
+    static const PageStats page_stats = [] {
+        const HMODULE xmem = GetModuleHandleW(L"xmem.dll");
+        return xmem ? reinterpret_cast<PageStats>(GetProcAddress(xmem, "x2w_xmem_page_stats")) : nullptr;
+    }();
+    sample.sections_known = page_stats && page_stats(&sample.sections);
+    return sample;
+}
+
 }  // namespace
 
 extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
@@ -778,18 +808,40 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
     log("x2w-dstorage DStorageGetFactory riid=%s", id);
     if (!out) return E_POINTER;
     // Heartbeat: the request counters every 10 s, so a run shows whether loading still progresses
-    // after the per-call logs have gone quiet.
+    // after the per-call logs have gone quiet. Peak commit and the live physical-page sections show
+    // what the run spends (#1199), including while requests are stalled.
     static HANDLE heartbeat = CreateThread(nullptr, 0, [](void*) -> DWORD {
         LONG last = -1;
+        ULONGLONG last_peak_mib = 0, last_sections = 0;
         for (int second = 10;; second += 10) {
             Sleep(10000);
             const LONG total = requests_done + requests_compressed + requests_failed;
             const LONG total2 = total + requests_bcpack_blank;
-            if (total2 != last)
+            const MemorySample sample = memory_sample();
+            const ULONGLONG peak_mib = sample.peak_commit >> 20;
+            const ULONGLONG sections = sample.sections_known ? sample.sections : 0;
+            if (total2 != last || peak_mib != last_peak_mib || sections != last_sections) {
+                char memory[96];
+                if (sample.commit_known)
+                    std::snprintf(memory, sizeof(memory), "commit peak=%llu MiB current=%llu MiB",
+                                  static_cast<unsigned long long>(peak_mib),
+                                  static_cast<unsigned long long>(sample.commit >> 20));
+                else
+                    std::snprintf(memory, sizeof(memory), "commit unknown");
+                char section_text[24];
+                if (sample.sections_known)
+                    std::snprintf(section_text, sizeof(section_text), "%llu",
+                                  static_cast<unsigned long long>(sample.sections));
+                else
+                    std::snprintf(section_text, sizeof(section_text), "unknown");
                 log("x2w-dstorage heartbeat %d s: requests done=%ld inflated=%ld failed=%ld bcpack-blank=%ld; page tokens 0 at enqueue=%ld, "
-                    "still 0 at run=%ld", second, requests_done, requests_compressed, requests_failed, requests_bcpack_blank,
-                    zero_tokens_at_enqueue, zero_tokens_at_run);
-            last = total2;
+                    "still 0 at run=%ld; %s, live physical-page sections=%s", second, requests_done, requests_compressed,
+                    requests_failed, requests_bcpack_blank, zero_tokens_at_enqueue, zero_tokens_at_run, memory,
+                    section_text);
+                last = total2;
+                last_peak_mib = peak_mib;
+                last_sections = sections;
+            }
         }
     }, nullptr, 0, nullptr);
     (void)heartbeat;
