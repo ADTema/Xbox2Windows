@@ -85,7 +85,10 @@ for the entry block: the straight-line code from the call to the first branch or
 defined when it is v0, a fetched register, or written in the entry block before the read by an instruction that
 runs with the entry exec mask. A write after exec was changed, or in any block after the entry block, does not
 count, even when it would run on every path. A read of any other register is refused. Programs whose later
-blocks only read registers defined this way still translate.
+blocks only read registers defined this way still translate. After the call, any exec write ends the
+unconditional region, whatever instruction makes it. `s_wqm` of exec into itself only adds lanes and stays a
+no-op. Other `s_wqm` forms, writes to exec_hi, and exec writes by an instruction the translator does not model are
+refused.
 
 Before this change the call was cut off with the header and every input read as zero. The draw then had zero area
 and wrote no pixel. Programs without the call translate as before.
@@ -100,11 +103,13 @@ out of the fetch index also fails it. A shader without its layout is refused and
 
 The translator cases need no device: `python -B tests/startup_stream_fetch_check.py`, or
 `ctest --preset release --no-tests=error -R "^startup_stream_fetch_translate$"`. They check the generated loads and
-manifest entries for both slots. They also check these refusals:
+manifest entries for both slots, and that a fetch behind `s_wqm_b64 exec, exec` still translates. They also check
+these refusals:
 - no layout;
 - an export of v12 that nothing defines;
 - v12 written only after exec was set to 0;
 - v12 written only in code a branch jumps over;
+- v12 written after `s_wqm_b32 exec_lo, 0`, or after a write to exec_hi;
 - a z-only record whose count stops below z (a count of 3 translates);
 - an element in slot 8, a per-instance element, or an element of format 10;
 - a record of kind 7, or one that reaches past v255;

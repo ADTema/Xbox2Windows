@@ -477,6 +477,16 @@ class Stage:
     def one(self, name, asm):
         _, ops, mods = parse(asm)
         base = re.sub(r'_e(32|64)$', '', name)
+        if self.fetched:
+            # Behind a fetch call the definite-assignment guard relies on exec_known: every exec write must clear it.
+            # s_wqm of exec into itself only adds lanes, so it stays a no-op; other s_wqm forms (a no-op here) and
+            # exec writes outside the handlers that clear exec_known are refused. Other programs keep their handling.
+            if base in ('s_wqm_b32', 's_wqm_b64') and not (ops[0] in ('exec', 'exec_lo') and ops[1:] == ops[:1]):
+                raise Unsupported('%s %s after a fetch call' % (base, ', '.join(ops)))
+            if ops and ops[0] in ('exec', 'exec_lo', 'exec_hi') and not base.startswith('s_wqm') and (
+                    ops[0] == 'exec_hi' or not (base in SCA or base.startswith('v_cmp') or
+                                                (base in ('s_cselect_b32', 's_cselect_b64') and ops[0] == 'exec'))):
+                raise Unsupported('%s into %s after a fetch call' % (base, ops[0]))
         if base in ('s_inst_prefetch', 's_waitcnt', 's_nop', 'v_nop', 's_clause', 's_sopp_0f', 's_wqm_b64', 's_wqm_b32',
                     's_setreg_imm32_b32', 's_code_end', 's_setprio'):
             return None

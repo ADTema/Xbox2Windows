@@ -198,6 +198,7 @@ def check(directory, consumer, backend):
 NO_LAYOUT = "vertex stage calls a fetch routine and the pipeline declares no input layout"
 UNDEFINED = "vertex stage reads v12, which neither the fetch nor an unconditional write before the first branch defines"
 EXEC_LO_0, EXEC_LO_ALL, BRANCH_OVER_ONE = 0xbefe0380, 0xbefe03c1, 0xbf820001  # s_mov_b32 exec_lo, 0 / -1; s_branch +1
+WQM_EXEC_LO_0, WQM_EXEC_EXEC, EXEC_HI_0 = 0xbefe0980, 0xbefe0a7e, 0xbeff0380  # s_wqm_b32 exec_lo, 0; s_wqm_b64 exec, exec; s_mov_b32 exec_hi, 0
 V7_ONE, V12_ONE = vop1(1, 7, 242), vop1(1, 12, 242)                         # v_mov_b32 v7 / v12, 1.0
 EXPORTS_V12 = [0xf80008cf, 0x07060504, 0xf800020f, 0x070c0c0c, ENDPGM]      # pos0 v4-v7; param0 v12, v12, v12, v7
 EMPTY_ROOT = (b"DXBC" + bytes(16) + struct.pack("<4I", 1, 68, 1, 36) + b"RTS0" + struct.pack("<I", 24)
@@ -251,11 +252,21 @@ def translate_cases(directory):
             ("masked write", [SWAPPC, PREFETCH, V7_ONE, EXEC_LO_0, V12_ONE, EXEC_LO_ALL, WAIT_VM] + EXPORTS_V12,
              LAYOUT_TEXT, UNDEFINED),
             ("bypassed write", [SWAPPC, PREFETCH, V7_ONE, BRANCH_OVER_ONE, V12_ONE, WAIT_VM] + EXPORTS_V12,
-             LAYOUT_TEXT, UNDEFINED)):
+             LAYOUT_TEXT, UNDEFINED),
+            # Whole-quad mode into exec from another source, and a write to exec_hi: refused, not a no-op.
+            ("s_wqm into exec", [SWAPPC, PREFETCH, V7_ONE, WQM_EXEC_LO_0, V12_ONE, EXEC_LO_ALL, WAIT_VM] + EXPORTS_V12,
+             LAYOUT_TEXT, "s_wqm_b32 exec_lo, 0 after a fetch call"),
+            ("exec_hi write", [SWAPPC, PREFETCH, V7_ONE, EXEC_HI_0, V12_ONE, WAIT_VM] + EXPORTS_V12,
+             LAYOUT_TEXT, "s_mov_b32 into exec_hi after a fetch call")):
         vs = vertex() if words is None else fetch_container(words, RECORDS)
         status, _, _ = translate(directory / label.replace(" ", "_"), vs, layout)
         assert status == "unsupported: " + want, (label, status)
         print(f"translate: {label} refused")
+    # s_wqm of exec into itself only adds lanes: it stays a no-op and the fetch still translates.
+    words = [SWAPPC, PREFETCH, WQM_EXEC_EXEC, V7_ONE, WAIT_VM, 0xf80008cf, 0x07060504, 0xf800020f, 0x070a0908, ENDPGM]
+    status, _, _ = translate(directory / "wqm_exec_exec", fetch_container(words, RECORDS), LAYOUT_TEXT)
+    assert status == "ok", status
+    print("translate: s_wqm_b64 exec, exec translates")
 
     # z only: the count reaches the highest component read; a mask above the count is refused.
     for count, want in ((3, "ok"), (2, "unsupported: unverified vertex fetch record 0600040401")):
