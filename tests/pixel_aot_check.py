@@ -35,6 +35,17 @@ SOP2_LSHL_ADD_OPS = (
 SOP2_ABSDIFF_OPS = (
     "s_absdiff_i32",
 )
+SCALAR_ALU_SOP1_OPS = (
+    "s_bcnt0_i32_b32", "s_bcnt0_i32_b64", "s_bcnt1_i32_b32", "s_bcnt1_i32_b64",
+    "s_ff0_i32_b32", "s_ff0_i32_b64", "s_ff1_i32_b32", "s_ff1_i32_b64",
+    "s_flbit_i32", "s_flbit_i32_b32", "s_flbit_i32_b64", "s_flbit_i32_i64",
+    "s_sext_i32_i8", "s_sext_i32_i16", "s_abs_i32",
+)
+SCALAR_ALU_SOP2_OPS = (
+    "s_pack_ll_b32_b16", "s_pack_lh_b32_b16", "s_pack_hh_b32_b16",
+    "s_mul_hi_i32", "s_mul_hi_u32",
+)
+SCALAR_ALU_OPS = SCALAR_ALU_SOP1_OPS + SCALAR_ALU_SOP2_OPS
 VOP2_INT_OPS = (
     "v_lshrrev_b32_e32", "v_ashrrev_i32_e32", "v_lshlrev_b32_e32",
     "v_and_b32_e32", "v_or_b32_e32", "v_xor_b32_e32",
@@ -12532,6 +12543,37 @@ def check_controls(directory):
         "s_absdiff_i32 v12, s44, s45",
     ):
         must_reject(translate, with_constants([bad_absdiff]))
+    for halves in PACK_HALVES:
+        translate(scalar_pack_values(halves))
+    for width in (32, 64):
+        translate(scalar_bit_count_values(width))
+        translate(scalar_first_bit_values(width))
+        translate(scalar_leading_bit_values(width))
+    translate(scalar_mul_hi_values("i32"))
+    translate(scalar_mul_hi_values("u32"))
+    translate(sext_values())
+    translate_int(sop1_scalar_ops())
+    assert set(SCALAR_ALU_OPS) <= ACCEPTED
+    for bad_scalar_alu in (
+        "s_bcnt0_i32_b32 s62, v12",
+        "s_bcnt0_i32_b32 s62, s[44:45]",
+        "s_bcnt0_i32_b64 s62, s44",
+        "s_bcnt0_i32_b64 s62, s[45:46]",
+        "s_bcnt0_i32_b64 s62, v[12:13]",
+        "s_ff0_i32_b32 s62, v12",
+        "s_ff0_i32_b32 s62, s[44:45]",
+        "s_ff0_i32_b64 s62, s44",
+        "s_ff0_i32_b64 s62, s[45:46]",
+        "s_flbit_i32 s62, v12",
+        "s_flbit_i32_b32 s62, v12",
+        "s_flbit_i32_b64 s62, s44",
+        "s_flbit_i32_i64 s62, s[45:46]",
+        "s_sext_i32_i8 s62, v12",
+        "s_sext_i32_i16 s62, s[44:45]",
+        "s_pack_ll_b32_b16 s62, v12, s45",
+        "s_mul_hi_i32 s62, v12, s45",
+    ):
+        must_reject(translate, with_constants([bad_scalar_alu]))
     rgb = rgb_sample()
     translate(rgb)
     rga = translate([line.replace("dmask:0x7", "dmask:0xb") for line in rgb])
