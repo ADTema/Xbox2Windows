@@ -248,14 +248,14 @@ bool dstorage_checks() {
         }
     }
 
-    // Negative control: chunk request with out-of-bounds offset must fail and leave destination untouched
+    // Negative control: chunk request with out-of-bounds or wrapping offset must fail and leave destination untouched
     {
         const size_t total_plain_size = 128 * 1024;
         std::vector<unsigned char> test_plain(total_plain_size, 0x55);
         const auto test_comp = make_stored_zlib(test_plain.data(), total_plain_size);
 
         void* status_ptr = nullptr;
-        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 2, "ChunkNegStatus", nullptr, &status_ptr) != 0 || !status_ptr)
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 3, "ChunkNegStatus", nullptr, &status_ptr) != 0 || !status_ptr)
             return false;
         auto* status = static_cast<Object*>(status_ptr);
 
@@ -268,6 +268,7 @@ bool dstorage_checks() {
 
         std::vector<unsigned char> dest0(64 * 1024, 0);
         std::vector<unsigned char> dest1(64 * 1024, 0xEE); // sentinel
+        std::vector<unsigned char> dest2(64 * 1024, 0xDD); // sentinel for wrap test
 
         // Piece 0
         unsigned char req0[0x48] = {};
@@ -289,21 +290,38 @@ bool dstorage_checks() {
         *reinterpret_cast<unsigned*>(req1 + 0x30) = static_cast<unsigned>(test_comp.size());
         *reinterpret_cast<unsigned*>(req1 + 0x38) = static_cast<unsigned>(total_plain_size);
 
+        // Piece 2 with near-wrapping offset (UINT64_MAX - 0x10000)
+        unsigned char req2[0x48] = {};
+        *reinterpret_cast<u64*>(req2 + 0x00) = 1 | 0x400000;
+        *reinterpret_cast<void**>(req2 + 0x08) = dest2.data();
+        *reinterpret_cast<unsigned*>(req2 + 0x18) = 64 * 1024;
+        *reinterpret_cast<const unsigned char**>(req2 + 0x20) = test_comp.data();
+        *reinterpret_cast<u64*>(req2 + 0x28) = 0xFFFFFFFFFFFF0000ull;
+        *reinterpret_cast<unsigned*>(req2 + 0x30) = static_cast<unsigned>(test_comp.size());
+        *reinterpret_cast<unsigned*>(req2 + 0x38) = static_cast<unsigned>(total_plain_size);
+
         reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req0);
         reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 0);
         reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req1);
         reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 1);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req2);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 2);
         reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
 
         for (int i = 0; i < 200; ++i) {
-            if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 1)) break;
+            if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 2)) break;
             Sleep(10);
         }
-        if (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 1)) return false;
+        if (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 1) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 2)) return false;
         long hr1 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 1);
-        if (hr1 == 0) return false;
+        long hr2 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 2);
+        if (hr1 == 0 || hr2 == 0) return false;
         for (unsigned char b : dest1) {
             if (b != 0xEE) return false;
+        }
+        for (unsigned char b : dest2) {
+            if (b != 0xDD) return false;
         }
     }
 

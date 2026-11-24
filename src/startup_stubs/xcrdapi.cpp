@@ -102,7 +102,7 @@ struct StreamCache {
             if (it->source == source && it->compressed_size == compressed_size) {
                 if (offset >= it->base_offset) {
                     const u64 delta = offset - it->base_offset;
-                    if (delta + need_bytes <= it->data.size()) {
+                    if (delta <= it->data.size() && need_bytes <= it->data.size() - delta) {
                         out_slice.assign(it->data.begin() + delta, it->data.begin() + delta + need_bytes);
                         return true;
                     }
@@ -125,7 +125,8 @@ bool has_following_chunk(Object* self, u64 source, u64 offset, unsigned source_s
         const u64 e_source = *reinterpret_cast<const u64*>(e.bytes + 0x20);
         const u64 e_offset = *reinterpret_cast<const u64*>(e.bytes + 0x28);
         const unsigned e_source_size = *reinterpret_cast<const unsigned*>(e.bytes + 0x30);
-        return e_source == source && e_source_size == source_size && e_offset == offset + destination_size;
+        return e_source == source && e_source_size == source_size && e_offset > offset &&
+               e_offset - offset == destination_size;
     };
     for (const auto& e : work.submitted) {
         if (check(e)) return true;
