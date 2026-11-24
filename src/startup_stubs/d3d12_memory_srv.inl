@@ -41,6 +41,7 @@ bool supports_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOUR
                v.Texture2D.MipLevels <= r.MipLevels - v.Texture2D.MostDetailedMip &&
                !v.Texture2D.PlaneSlice && v.Texture2D.ResourceMinLODClamp == 0;
     }
+    if (x2w_startup::supports_single_element_srv(r, v)) return true;
     return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && r.Width && r.Height &&
            r.DepthOrArraySize == 1 && r.MipLevels == 1 && r.SampleDesc.Count == 1 && r.SampleDesc.Quality == 0 &&
            (r.Format == DXGI_FORMAT_R8_UNORM || tiled_bc_srv(r)) && v.Format == r.Format && !(r.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) &&
@@ -135,7 +136,8 @@ std::unordered_multimap<u64, Wrapper*> tiled_srv_addresses;
 
 Wrapper* publish_tiled_texture(Wrapper* device, u64 address, const D3D12_RESOURCE_DESC& desc)
 {
-    const auto bytes = x2w_startup::bc64::supports(desc) ? x2w_startup::bc64::Chain(desc).bytes() : x2w_startup::Bc16Surface(desc).size();
+    const UINT element = x2w_startup::single_element_bytes(desc);
+    const auto bytes = element ? u64{element} : x2w_startup::bc64::supports(desc) ? x2w_startup::bc64::Chain(desc).bytes() : x2w_startup::Bc16Surface(desc).size();
     // The transient upload ring accepts individual copies up to 64 MiB.
     if (bytes > (64ull << 20) || !x2w_local::readable(reinterpret_cast<const void*>(address), bytes)) return nullptr;
     std::lock_guard lock(tiled_srv_mutex);
@@ -211,6 +213,14 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     static LONG refused;
     if (const char* reason = memory_srv_refusal(resource, input, destination)) {
         if (first_calls(refused, 8)) log_refused_memory_srv("unsupported memory SRV arguments", reason, resource, input, destination);
+        return;
+    }
+    // A single-element texture is published by address like a tiled view: its texel is read at offset 0.
+    if (x2w_startup::supports_single_element_srv(*resource, input->view)) {
+        if (Wrapper* texture = publish_tiled_texture(self, input->address, *resource))
+            view_slot<18, 2>(self, reinterpret_cast<u64>(texture), reinterpret_cast<u64>(&input->view), destination, 0);
+        else if (first_calls(refused, 8))
+            log_refused_memory_srv("unavailable texture at the supplied base and layout", "texture_unavailable", resource, input, destination);
         return;
     }
     if (resource->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {

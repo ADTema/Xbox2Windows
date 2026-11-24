@@ -11006,6 +11006,17 @@ The fixture checks the XG layout, tile spans, block offsets, copy in and out, an
 ctest --preset release --no-tests=error --output-on-failure -R '^startup_xg_bc_chain_'
 ```
 
+### Single-element 2D and 3D textures published by address
+
+Device slot 70 publishes a 1×1 2D or 1×1×1 3D texture by address, without a resource object. It must have one mip and one sample, and a plain colour format whose element is one texel of 1 to 16 bytes. R8_UNORM keeps its placed-texture path. The view must name the whole texture with the default mapping. The only element is read from offset 0 of the guest memory. That holds for layout UNKNOWN, linear (`0x100`) and the swizzle modes without pipe/bank XOR (`0x101`–`0x10B`). A swizzle address is a block offset plus a bit pattern of the coordinates, both zero at the origin. AMD addrlib places a single mip at offset 0 (`Gfx10Lib::ComputeSurfaceInfoMacroTiled` at the pinned [revision](https://gitlab.freedesktop.org/mesa/mesa/-/tree/5c142e46f3f6e752ed745fd48912ebb8fad67145/src/amd/addrlib)). XOR modes (`0x110` and up) can move the origin and stay refused, as do larger shapes, mip chains, arrays, multisampling, block-compressed formats and render-target, depth or UAV flags. The translated draw uploads the texel through the footprint path. It re-reads the texel when the view is published again and once per frame, like the other address-only views.
+
+`startup_single_element_srv` checks the accepted and refused descriptions without a device; its `xor_control` expects layout `0x115` to be accepted and must fail. `startup_address_single_element_{warp,hardware}` draws eight columns per dimension from a translated shader that loads texel zero. The columns are RGBA8 at layouts 0 and `0x105`, the first texel rewritten and published again, B8G8R8A8 and R16G16B16A16_FLOAT. Ten refused descriptions and a zero address must leave the previous view in place. On Windows 11 build 26300 with the debug layer off, RTX 5090 (32.0.16.2135) and WARP (10.0.26100.10068) matched all 32 RGBA pixels per dimension. With the runtime change reverted, column 0 reads zero. An upload that skips the texel after its first copy fails column 2, which then reads the old texel.
+
+```powershell
+cmake --build --preset release --target startup_stream_consumer startup_single_element_srv_check d3d12_xs_shim
+ctest --preset release --no-tests=error --output-on-failure -R '^startup_(single_element_srv|address_single_element_)'
+```
+
 ### Placed vertex buffers consumed by a translated draw
 
 `startup_placed_vertex_{hardware,warp}` opens two real slot-133 buffers on CPU-visible allocations with bases separated by 1 TiB. Slot 48 supplies the full guest address and byte length to a translated vertex-stream binding. The shader can read from the registered GPU buffer directly when the resource aliases the guest memory, the length covers whole DWORDs and the start is aligned to 16 bytes. Views crossing a registered boundary or overlapping multiple live placements on the list's device produce a null descriptor before staging. Final wrapper release removes the placement from binding lookup.
