@@ -2478,6 +2478,8 @@ Run `ctest --preset dev --no-tests=error -R '^cpu_aot_fuzz_smoke$' -V`. `CPU_FUZ
 
 `cpu_aot_fuzz_switches` (`--area switches`) covers the jump-table switch lowering of the [translator](../tools/cpu_switch_aot.py) from its own seed, so the areas above are unchanged. Each of 48 exports takes a selector in RCX and writes to the R8 output buffer. It checks the selector against an unsigned limit, dispatches through a table of 2 to 24 entries, and runs an arm that rewrites RDX with one or two operations, from 32-bit or 64-bit forms of ADD, SUB, XOR, IMUL, shifts, ROL, NEG, NOT and LEA. Every arm also writes a marker word of its own, so a wrong target shows even when two arms compute the same value. The tail stores RDX at the start of the output and returns the selector plus RDX. The 48 exports are the 48 combinations, in a seeded order, of two table layouts (MSVC image-relative entries through `__ImageBase`, and LLVM signed offsets from the table), four bound branches (`JA` and `JAE` to the default, and the inverted `JBE` and `JB` into the dispatch block with a `JMP` to the default in front of it) and six ways to get the index from RCX: the 32-bit register, the 64-bit register, `AND` with a mask, `MOVZX` of CL or CX, and a signed clamp to zero with `TEST` and `CMOVS`. Each table is one of three kinds: every entry its own arm in order, runs of entries sharing an arm in order, or shared arms with entries and layout shuffled. An arm may end with a `JMP` to the common tail, with its own store and `RET`, or fall into the next arm, and the default arm sits after the arms or before the check. The `__ImageBase` address is sometimes loaded before the check. The check run adds selectors 0 to 39, so every arm of the largest table and the default are reached, and the same selectors with bit 32 or bit 31 set or with the upper word all ones, which a 32-bit compare ignores and a 64-bit compare does not. Four negative controls in the same DLL are translated one at a time, and the test fails unless each is refused for its own reason: no bound check (`unbounded jump-table index`), a signed `JG` bound (`jump-table bound is not an unsigned upper limit`), a 32-bit compare followed by an index that is not zero-extended (`is not the bounded value`), and a table base that is not a RIP-relative address (`is not a RIP-relative address`). The planted translator fault, `--mutant`, makes the translator read every table entry one slot late, so each selector runs the arm of the next entry; the test fails unless that build differs from native. At the default seed `0x5717`, the 48 exports hold 393 table entries, 32 tables with a shared arm, 18 tables that are not in order, 79 arms that fall into the next arm (in 33 exports), 38 arms with their own `RET`, 21 exports with 64-bit arms and 11 with the default before the check. `CPU_FUZZ_SWITCHES_SEED` and `CPU_FUZZ_SWITCHES_FUNCTIONS` select a longer run. Without MSVC, this was run on Linux with `llvm-ml-19` and `lld-link-19` (their assembler has no `IMAGEREL` or `LABEL`, and encodes `LEA` of a label as an absolute address, so a small text rewrite to `@IMGREL`, plain labels and `[rip+label]` was applied to the generated MASM first), the translator, a MinGW build of the translation at `-O0` and `-O2` and a small loader under Wine. At the default seed, 15,024 native against translated comparisons per build (48 exports, 313 inputs) had no mismatch. Seeds `0x1`, `0x2` and `0xBEEF` at 96 exports each made 30,048 comparisons per build with no refusal and no mismatch. The four controls were refused with the messages above. The planted fault differed in 4,028 of 15,024 calls, in all 48 exports. The `ctest` run on Windows with MSVC and ML64 is not yet recorded here. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_fuzz_switches$' -V`. The generator does not use tables above 24 entries, a table index that is not derived from RCX, or a switch inside a frame or after a call.
 
+`cpu_aot_fuzz_scalar_fp` (`--area scalar_fp`) covers the scalar SSE and SSE2 lifter [`cpu_sse_aot`](../tools/cpu_sse_aot.py) from its own seed, so the areas above are unchanged (their `emit` output is byte-identical to the previous revision). Every export is fn(x, y, out) and carries the descriptor that `cpu_sse_aot` takes, `<name>=<ret>:<slots>`, which the generator writes as `Function.signature` (for example `d:fdq`). The first two slots are a float (`f`), a double (`d`) or a 64-bit integer (`q`), passed in XMM0 and XMM1 or in RCX and RDX by slot number, and the third is the output buffer in R8. The result is a float or double in XMM0 or an integer in RAX. The check passes a float or double slot as a `ctypes` double with the whole 64 bits set to the value (a float takes the low 32 bits and a fixed pattern above them, which the function must ignore) and reads a float result as the low 32 bits of the returned double. A float or double result is compared bit for bit, including every NaN payload and the sign of zero, together with the 256-byte output buffer: the translator models those bits (it quiets a signalling NaN, returns the destination NaN before the source one, and gives the default NaN for an invalid operation), the fixtures in `tests/cpu/scalar_float.asm` compare them, and nothing is masked. The 60 default exports cycle through six profiles (float arithmetic, double arithmetic, MIN and MAX, compares with jumps, conversions, and a mixture) and use ADDSS, SUBSS, MULSS, DIVSS, SQRTSS, MINSS, MAXSS and the SD forms; UCOMISS, UCOMISD, COMISS and COMISD followed by one conditional jump (`JE`, `JNE`, `JB`, `JAE`, `JBE`, `JA`, `JP`, `JNP`) or by a parity jump and then an ordered one, with an arm for each outcome and a join; CVTSS2SD, CVTSD2SS, CVTSI2SS and CVTSI2SD from a 32- or 64-bit register or memory, CVTTSS2SI and CVTTSD2SI to a 32- or 64-bit register; MOVAPS, MOVSS, MOVSD, MOVQ and MOVD between registers, from and to the output buffer, and to and from a general register; and the zeroing XORPS, XORPD and PXOR. Memory operands are always in the output buffer, which each function first fills with its arguments, and the function writes every live register back to it before it returns. The generator tracks which low dword or quadword of each XMM register and which general registers are defined, and reads only what the translator accepts; the upper dword of a float argument is never read. The check inputs for each export are the 17 x 17 combinations of 17 edge values of the kind of each slot (zeros of both signs, one, 1.5, the smallest and largest denormals, the smallest normal, the largest finite value, both infinities, quiet NaNs, a NaN with a payload, a signalling NaN, and the values at 2^31 and 2^63) and 24 pairs of further edges (just inside and outside the 32- and 64-bit integer conversion limits) and random bits. SETcc and CMOVcc after a float compare are not generated, because `cpu_sse_aot` refuses them (the flags of a float compare feed jumps only). Four negative controls in the same DLL are translated one at a time, and the test fails unless each is refused for its own reason: SETcc after UCOMISS (`unsupported flag producer`), `JLE` after UCOMISS (`unsupported condition after a float compare`), a read of an XMM register that was never written (`undefined register xmm2`) and an ADDSD on a float argument (`undefined register xmm0[63:32]`). MOVQ between a general register and an XMM register, CVTSS2SI and CVTSD2SI (which round by MXCSR), packed and VEX forms and any write to MXCSR are not generated. The planted translator fault, `--mutant` (`minmax_swap`), makes MINSS and MINSD keep the larger operand and MAXSS and MAXSD the smaller, in the translator's table; the test fails unless that build differs from native. Without MSVC, this was run on Linux with `llvm-ml-19` and `lld-link-19` (no rewrite of the MASM was needed), the real `cpu_sse_aot` translation, a MinGW build of it at `-O0` and `-O2` and a small loader under Wine that calls each export and prints its result bits and a hash of the buffer. At the default seed `0xF10A` (60 exports, 313 inputs each) the 18,780 calls per build had no mismatch at `-O0` or `-O2`; the 60 exports have 39 compares in 23 functions, 51 conditional jumps (17 of them in a parity pair), 75 truncations to an integer, 26 conversions from an integer, 54 float and double resizes, 149 arithmetic, 64 MIN and MAX and 38 SQRT operations. Seeds `0x1`, `0x2` and `0xBEEF` at 120 exports (37,560 calls per build) and `0xC0DE` at 100 exports (31,300) also had no refusal and no mismatch. The four controls were refused with the messages above. The planted fault differed in 3,742 of 18,780 calls (18 of 60 exports) at the default seed, and in 9,371, 8,388, 6,441 and 8,246 calls at the other four runs. The Python `check` command was run against native-code stand-ins built from the translation on Linux (the same 60 exports, 37,560 comparisons, controls refused, and the same 3,742 mutant mismatches), not against MSVC and ML64 output. The `ctest` run on Windows with MSVC and ML64 is not yet recorded here. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_fuzz_scalar_fp$' -V`. `CPU_FUZZ_SCALAR_FP_SEED` and `CPU_FUZZ_SCALAR_FP_FUNCTIONS` select a longer run. The generator does not use stack slots (the leaf profile rejects stack operations), RIP-relative constants, MXCSR modes other than the host default, or nested compares.
+
 ## Mesh draw fallback
 
 The bounded mesh translator can emit `cs_6_0` entry `main` and `vs_6_0` entry
@@ -7454,6 +7456,17 @@ independently of the desktop device's wave size. On RTX 4060 Laptop and WARP, bo
 readbacks matched 128 output words and 192 guards. Exchanging expected positions
 31 and 32 produced exactly two mismatches on each adapter.
 
+The same lowering handles `OpGroupNonUniformBallotFindLSB %uint %scope %ballot`, which SPIRV-Cross
+rejects for HLSL (the 2021.01.15 package stops with "Cannot trivially implement BallotFindLSB in
+HLSL"). Each of the four ballot words goes through GLSL `FindILsb`, offset by 0, 32,
+64 and 96. An empty word stays all ones, and the smallest candidate wins, so an empty ballot gives
+`0xffffffff`. The scope must be a Subgroup constant, the result type `%uint`, and an existing
+`GLSL.std.450` import is reused. The readback fixture gives each of 128 threads a one-bit ballot at its
+own index, plus a two-bit ballot (empty on every eighth thread) in a second output range, and compares
+all words with a bit-scan reference. Four faulty lowerings (wrong offset, swapped words, highest instead
+of lowest bit, no empty-word fill) must each be caught at their first differing word. The ballot
+operand is built from the thread index, so the result does not depend on the adapter's wave width.
+
 With SPIRV-Tools and SPIRV-Cross available at configure time, run
 `ctest --preset dev --no-tests=error -R spirv_ballot_extract -V`.
 
@@ -7475,7 +7488,10 @@ separate support.
 
 Each table is decided on its own. A table gets a set 3 view only if some
 depth-reference sample and some ordinary sample (including a sparse one) both
-reach it; a table used for only one of the two is left alone. The first view
+reach it; a table used for only one of the two is left alone. An `OpImageQueryLod` on a
+sampled image counts as an ordinary use, because HLSL `CalculateLevelOfDetail` takes a `SamplerState`: before
+this, a table used only for a level-of-detail query and a depth-reference sample was returned unchanged and
+SPIRV-Cross wrote the query against a `SamplerComparisonState`. The first view
 is `%bridge_cmp` and later ones `%bridge_cmp_table_N`. These are refused with
 a message: a table without exactly one literal `DescriptorSet` and `Binding`
 decoration, a decorated or initialized table, set 3 already in use or a
@@ -7499,7 +7515,9 @@ original, so a view wired to the wrong table changes a precise word. The
 driver also checks, without a GPU, a runtime-sized table at set 2, binding 7
 (the emitted HLSL has the comparison view at `register(s7, space3)`), two
 split tables at their own bindings with an ordinary-only and a
-comparison-only table left alone, `;` comments after any declaration, and each refusal above. The renamed GPU run
+comparison-only table left alone, a fragment `OpImageQueryLod` plus a depth-reference sample (the query
+uses the `SamplerState` table, the sample the set 3 view; DXC compiles it as `ps_6_0` only on Windows, and no
+readback of the LOD value is drawn), `;` comments after any declaration, and each refusal above. The renamed GPU run
 has not been executed on a physical adapter by the author; the Windows CI jobs
 `spirv_sampler_views_{hardware,warp}` are the check.
 
@@ -8710,8 +8728,8 @@ A lane with a NaN source is resolved in software (the first source operand when 
 second, made quiet), so a compiler that swaps the operands of an addition cannot change a payload; `minps`
 and `maxps` use the host instruction unchanged, which returns the second source operand for equal values
 (signed zeros included) and for any NaN. A guest `ldmxcsr` is not lifted and exception flags are not observed.
-The packed double forms (`addpd`, `sqrtpd`, `minpd` and the others), the scalar forms, `rcpps` and
-`rsqrtps` stay rejected.
+The packed double arithmetic forms are described in the next subsection; the other packed double forms
+(compares, logic, conversions), the scalar forms, `rcpps` and `rsqrtps` stay rejected.
 
 The translator explicitly rejects VEX/EVEX encodings, `cmpps`/`cmpss` predicates
 `imm8 >= 8`, nonvolatile vector registers (`xmm6`..`xmm15`), nonvolatile or non-argument
@@ -8782,7 +8800,7 @@ division by zero, zero and `min` ordering, ignored rounding mode, DAZ or FTZ, an
 disagree with the processor on some call; a call under a different control word must leave the next default-mode call
 unchanged. The translator also rejects, with the message each time checked, VEX and EVEX forms, unaligned
 displacements, nonvolatile or undefined registers, non-argument and indexed memory bases and the unsupported packed
-double, scalar, `rcpps` and `rsqrtps` forms.
+double (other than the arithmetic forms below), scalar, `rcpps` and `rsqrtps` forms.
 
 Measured on Linux x86-64 on 24 November 2026 (a QEMU virtual x86-64 processor, not the Windows CI machine): the
 fixture was assembled with `llvm-ml-19` and linked with `lld-link-19`, the native code was run through a Windows-ABI
@@ -8795,10 +8813,56 @@ each built and run: the first six fail on a named word of a named export, for ex
 host because the host instruction already returns the architectural NaN, so that rule is defensive and not shown here to matter. The MSVC
 build and `ctest` run of `cpu_aot_sse_fp` are left to CI.
 
-Not covered by this experiment: unmasked exceptions and exception flags, the packed double and scalar arithmetic
+Not covered by this experiment: unmasked exceptions and exception flags, the scalar arithmetic
 forms, `rcpps` and `rsqrtps`, non-default MXCSR modes for the compares and moves,
 non-temporal cache-bypass hints on `movntps`, control flow, nonvolatile `xmm6`..`xmm15`
 prologues, and title CPU code execution.
+
+#### Packed double arithmetic
+
+The same translator also lifts the seven legacy SSE2 packed double forms `addpd`, `subpd`, `mulpd`, `divpd`,
+`minpd`, `maxpd` and `sqrtpd`, with an `xmm` source or a 16-byte aligned `m128` source (a displacement that is
+not a multiple of 16 is rejected at translation time, so no code that could fault on a misaligned address is
+generated; the leaf contract already requires 16-byte aligned argument pointers). Each form runs the matching
+`emmintrin.h` instruction on a run-time operand, so rounding mode, DAZ and FTZ are the host's, nothing is folded
+at translation time, and the C library square root is never used (it can differ from the hardware on a denormal
+operand under DAZ). A lane with a NaN source is resolved in software as for the single forms (the first source
+operand when it is a NaN, else the second, made quiet); `minpd` and `maxpd` use the host instruction unchanged
+(second source operand for equal values and for any NaN); `sqrtpd` returns a NaN source quiet with its payload
+and only writes its destination. A guest `ldmxcsr` is still not lifted and exception flags are not observed.
+VEX and EVEX forms, scalar forms (`F2`/`F3` prefixes with the same opcodes are `addsd`, `addss`, `sqrtsd`,
+`sqrtss`), `cmppd`, `andpd`, `cvtps2pd` and the other packed double forms stay rejected. These forms add no
+store: the results leave through the `movaps` stores the fixture already used.
+
+[The fixture](../tests/cpu/sse_fp_pd.asm) has four exports per operation (register source, `m128` at `[rdx]`, `m128`
+at `[rdx+16]`, same register as both operands) and a chained `op_pd_pipeline`. [The check](../tests/cpu/sse_fp_pd_check.py)
+compares native code, translated code and an [independent exact-rational reference](../tests/cpu/sse_fp_pd_ref.py)
+(no host floating point, no translator) bit for bit on 412 inputs per export: every ordered pair of 28 edge values
+(signed zeros, infinities, quiet and signaling NaNs with payloads, denormals, ties, overflow and underflow
+boundaries) plus 20 random vectors with biased exponents. It then repeats all 29 exports under the 16 control words
+(four rounding modes, each with neither, DAZ, FTZ or both) through the native-only `op_call_with_mxcsr` driver
+of the packed single check. Lanes the reference cannot decide (FTZ at the smallest normal number, `minpd`/`maxpd`
+under DAZ with a denormal result) are compared native against translated only.
+
+Negative controls: the `ALTER_IMM` build (add and subtract, multiply and divide, minimum and maximum, `sqrtpd` as
+`addpd`, the other displacement, a second register, a division in the chain) must match its own reference and differ
+from the original on every export; each non-default control word must change a result; fifteen wrong reference
+rules (NaN order, no quieting, mixed-sign zero, division by zero, zero and `min` order, ignored rounding, DAZ or FTZ,
+two `sqrtpd` rules) must each disagree with the processor; 48 translator rejection controls (VEX and EVEX, out-of-scope
+packed double and scalar forms, wrong-prefix scalar bytes, misaligned displacements, nonvolatile or undefined
+registers, non-argument, indexed, `rip`, `rsp` and 32-bit bases, segment prefix, missing `ret`) and 9 of them patched
+into a copy of the linked DLL.
+
+Measured on Linux x86-64 on 24 November 2026 (a QEMU virtual x86-64 processor, not the Windows CI machine): the
+fixture was assembled with `llvm-ml-19` and linked with `lld-link-19`, the native code was run through a Windows-ABI
+caller, and the translation was built with `clang++-19` at `-O0`, `-O2` and `-O3` (and compiled warning-free with
+MinGW `g++`). All three passed: 11,948 default-mode cases over 29 exports, 191,168 runs in 16 control words agreeing
+on 755,105 lanes (9,567 left undecided by the reference), 48 rejection controls and 9 PE-patched controls. The translator from
+`origin/main` fails on the same fixture with `unsupported instruction at RVA 0x1006: addpd xmm0,xmm1`. Eleven translator
+mutants (add as subtract, subtract with swapped operands, multiply as divide, divide as multiply, minimum as maximum,
+swapped `minpd` and `maxpd` operands, `sqrtpd` or the NaN rule not quieting, the NaN rule picking the second operand,
+`sqrtpd` as a doubling) each fail on a named word of a named export, for example `lifted op_addpd case 1`. The MSVC
+build and `ctest` run of `cpu_aot_sse_fp_pd` are left to CI. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_sse_fp_pd$' -V`.
 
 ## Legacy SSE/MMX conversion, shuffle, and masked/non-temporal stores
 

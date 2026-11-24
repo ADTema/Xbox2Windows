@@ -3,6 +3,10 @@ project(Xbox2Windows LANGUAGES CXX)
 
 enable_testing()
 
+# Defined before the first Python-driven test so a fresh configure registers all of them.
+set(INTAKE_PYTHON "${CMAKE_SOURCE_DIR}/out/pe-env/Scripts/python.exe" CACHE FILEPATH
+    "Native x64 Python with pefile for static intake tests")
+
 set(DSTORAGE_SDK_ROOT "" CACHE PATH "Extracted Microsoft.Direct3D.DirectStorage NuGet package")
 if(DSTORAGE_SDK_ROOT)
     find_package(ZLIB 1.2.9 REQUIRED)
@@ -859,7 +863,7 @@ endforeach()
 # D3D12XboxCreateDevice device-slot inventory and source-built creation fixture (#XCL-08).
 set(d3d12x_pso_header "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_pso_cs.h")
 add_custom_command(OUTPUT "${d3d12x_pso_header}"
-    COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E CSMain -Qstrip_rootsignature -Vn d3d12x_pso_cs
+    COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E CSMain -Vn d3d12x_pso_cs
             -Fh "${d3d12x_pso_header}" -Fo "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_pso_cs.cso"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/d3d12x_pso.hlsl"
     DEPENDS tests/d3d12x_pso.hlsl
@@ -1174,8 +1178,6 @@ if(EXISTS "${SIMPLE_TRIANGLE_DIR}/VertexShader.hlsl")
     endforeach()
 endif()
 
-set(INTAKE_PYTHON "${CMAKE_SOURCE_DIR}/out/pe-env/Scripts/python.exe" CACHE FILEPATH
-    "Native x64 Python with pefile for static intake tests")
 target_sources(offscreen_check PRIVATE tests/ffx_device_init.cpp tests/ffx_backend_slots.cpp tests/ffx_recurrent.cpp tests/ffx_provider_loop.cpp)
 set(FFX_UPSCALER_IMAGE "" CACHE FILEPATH "Local Xbox upscaler DLL for offline backend translation")
 set(FFX_DISPATCH_SHADER_DIR "" CACHE PATH "Directory containing locally translated FSR4 shaders and scratch_reference.h")
@@ -1749,6 +1751,47 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_fuzz_switches>" "$<TARGET_FILE:cpu_fuzz_switches_lifted>" "${cpu_fuzz_switches_o2}"
         --area switches --mutant "$<TARGET_FILE:cpu_fuzz_switches_mutant>")
     set_tests_properties(cpu_aot_fuzz_switches PROPERTIES TIMEOUT 60)
+
+    # Scalar float and double arithmetic, compares, conversions and moves through cpu_sse_aot, with MIN and MAX swapped planted.
+    set(CPU_FUZZ_SCALAR_FP_SEED "0xF10A" CACHE STRING "Seed for the CPU differential fuzz scalar float test")
+    set(CPU_FUZZ_SCALAR_FP_FUNCTIONS "60" CACHE STRING "Number of exported scalar float functions in the CPU differential fuzz scalar float test")
+    set(cpu_fuzz_scalar_fp_asm "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_scalar_fp.asm")
+    set(cpu_fuzz_scalar_fp_def "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_scalar_fp.def")
+    add_custom_command(OUTPUT "${cpu_fuzz_scalar_fp_asm}" "${cpu_fuzz_scalar_fp_def}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" emit
+            "${CPU_FUZZ_SCALAR_FP_SEED}" "${CPU_FUZZ_SCALAR_FP_FUNCTIONS}" "${cpu_fuzz_scalar_fp_asm}"
+            "${cpu_fuzz_scalar_fp_def}" --area scalar_fp
+        DEPENDS tools/fuzz_cpu.py VERBATIM)
+    add_library(cpu_fuzz_scalar_fp SHARED "${cpu_fuzz_scalar_fp_asm}" "${cpu_fuzz_scalar_fp_def}")
+    set_target_properties(cpu_fuzz_scalar_fp PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_fuzz_scalar_fp PRIVATE /NOENTRY /NODEFAULTLIB /INCREMENTAL:NO /OPT:NOICF)
+    set(cpu_fuzz_scalar_fp_lifted "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_scalar_fp_lifted.cpp")
+    set(cpu_fuzz_scalar_fp_mutant "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_scalar_fp_mutant.cpp")
+    foreach(variant lifted mutant)
+        set(mutant_flag "")
+        if(variant STREQUAL "mutant")
+            set(mutant_flag "--mutant")
+        endif()
+        add_custom_command(OUTPUT "${cpu_fuzz_scalar_fp_${variant}}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" translate
+                "${CPU_FUZZ_SCALAR_FP_SEED}" "${CPU_FUZZ_SCALAR_FP_FUNCTIONS}" "$<TARGET_FILE:cpu_fuzz_scalar_fp>"
+                "${cpu_fuzz_scalar_fp_${variant}}" --area scalar_fp ${mutant_flag}
+            DEPENDS cpu_fuzz_scalar_fp tools/fuzz_cpu.py tools/cpu_sse_aot.py tools/cpu_switch_aot.py tools/cpu_leaf_aot.py
+                tools/cpu_call_aot.py tools/cpu_ranges.py VERBATIM)
+        add_library(cpu_fuzz_scalar_fp_${variant} SHARED "${cpu_fuzz_scalar_fp_${variant}}")
+        target_compile_features(cpu_fuzz_scalar_fp_${variant} PRIVATE cxx_std_20)
+    endforeach()
+    set(cpu_fuzz_scalar_fp_o2 "${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_scalar_fp_lifted_o2.dll")
+    add_custom_command(OUTPUT "${cpu_fuzz_scalar_fp_o2}"
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /O2 /W4 /LD "${cpu_fuzz_scalar_fp_lifted}"
+            "/Fo${CMAKE_CURRENT_BINARY_DIR}/cpu_fuzz_scalar_fp_lifted_o2.obj" "/Fe${cpu_fuzz_scalar_fp_o2}"
+        DEPENDS "${cpu_fuzz_scalar_fp_lifted}" VERBATIM)
+    add_custom_target(cpu_fuzz_scalar_fp_lifted_o2 ALL DEPENDS "${cpu_fuzz_scalar_fp_o2}")
+    add_test(NAME cpu_aot_fuzz_scalar_fp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" check "${CPU_FUZZ_SCALAR_FP_SEED}" "${CPU_FUZZ_SCALAR_FP_FUNCTIONS}"
+        "$<TARGET_FILE:cpu_fuzz_scalar_fp>" "$<TARGET_FILE:cpu_fuzz_scalar_fp_lifted>" "${cpu_fuzz_scalar_fp_o2}"
+        --area scalar_fp --mutant "$<TARGET_FILE:cpu_fuzz_scalar_fp_mutant>")
+    set_tests_properties(cpu_aot_fuzz_scalar_fp PROPERTIES TIMEOUT 60)
     cpu_asm_fixture(cpu_switch_addr32 switch_addr32)
     cpu_asm_fixture(cpu_switch_strings switch_strings)
     cpu_asm_fixture(cpu_string_probe string_probe)
@@ -2259,6 +2302,27 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_sse_fp_original>"
         "$<TARGET_FILE:cpu_sse_fp_original_lifted>"
         "$<TARGET_FILE:cpu_sse_fp_altered_lifted>"
+        "$<TARGET_FILE:cpu_sse_fp_harness>")
+    set(cpu_sse_fp_pd_exports
+        "op_addpd,op_addpd_mem,op_addpd_mem_disp,op_addpd_self,"
+        "op_subpd,op_subpd_mem,op_subpd_mem_disp,op_subpd_self,"
+        "op_mulpd,op_mulpd_mem,op_mulpd_mem_disp,op_mulpd_self,"
+        "op_divpd,op_divpd_mem,op_divpd_mem_disp,op_divpd_self,"
+        "op_minpd,op_minpd_mem,op_minpd_mem_disp,op_minpd_self,"
+        "op_maxpd,op_maxpd_mem,op_maxpd_mem_disp,op_maxpd_self,"
+        "op_sqrtpd,op_sqrtpd_mem,op_sqrtpd_mem_disp,op_sqrtpd_self,"
+        "op_pd_pipeline")
+    string(CONCAT cpu_sse_fp_pd_exports ${cpu_sse_fp_pd_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_sse_fp_pd_${variant} sse_fp_pd)
+        cpu_translation(cpu_sse_fp_pd_${variant} cpu_sse_fp_aot "${cpu_sse_fp_pd_exports}")
+    endforeach()
+    target_compile_definitions(cpu_sse_fp_pd_altered PRIVATE ALTER_IMM)
+    add_test(NAME cpu_aot_sse_fp_pd COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/sse_fp_pd_check.py"
+        "$<TARGET_FILE:cpu_sse_fp_pd_original>"
+        "$<TARGET_FILE:cpu_sse_fp_pd_original_lifted>"
+        "$<TARGET_FILE:cpu_sse_fp_pd_altered_lifted>"
         "$<TARGET_FILE:cpu_sse_fp_harness>")
     set(cpu_avx_fp_move_exports
         "op_vmovq_xmm_xmm,op_vmovq_xmm_m64,op_vmovq_m64_xmm,op_vmovq_xmm_r64,op_vmovq_r64_xmm,"
