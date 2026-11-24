@@ -6606,14 +6606,44 @@ provider.
 `XUserAddAsync` and `XGameSaveInitializeProviderAsync` remain explicit stubs.
 Their completion contract requires the public `XAsyncBlock`, `XUserAddResult`,
 and `XGameSaveInitializeProviderResult` queue/callback/result semantics, which
-this repository does not model without GDK headers. `xgameruntime_contracts`
-exercises the synchronous subset and checks that no XUser/XGameSave call logs
+this repository does not model without GDK headers.
+
+The same fixture adds the smallest documented synchronous persistent local
+storage and package subset. `XPersistentLocalStorageGetPathSize`,
+`XPersistentLocalStorageGetPath`, and `XPersistentLocalStorageGetSpaceInfo`
+report one deterministic synthetic app path under the process temporary
+directory, `%TEMP%\xbox-recomp-pls\x2w-synthetic-title-0001`. The shim creates
+that directory but writes no title data; `xgameruntime_pls_xpackage` writes and
+removes a small test-owned marker to prove the reported path is usable on disk.
+Space information is fixed at 32 MiB available, 48 MiB total free, and 64 MiB
+total, so a second call reports the same values. `XPersistentLocalStorageGetPath`
+returns `E_INVALIDARG` for a buffer smaller than the reported size and
+`E_POINTER` for a null path or null size output.
+
+`XPackageMount` (documented synchronous, deprecated in favor of
+`XPackageMountWithUiAsync`) maps a validated synthetic package identifier to
+`%TEMP%\xbox-recomp-packages\<identifier>` and returns an in-process mount
+handle. `XPackageGetMountPathSize` and `XPackageGetMountPath` report that path,
+and `XPackageCloseMountHandle` invalidates the handle; later path queries return
+`E_HANDLE`. The mapping is shim-only and does not read or verify a real package
+manifest. `XPackageMountWithUiAsync` remains an explicit stub, as do
+`XUserAddAsync` and `XGameSaveInitializeProviderAsync`, because the
+`XAsyncBlock` completion contract is not modeled without GDK headers.
+
+`xgameruntime_pls_xpackage` calls every implemented PLS and XPackage function,
+checks repeated path and space values, writes and removes a PLS marker, verifies
+the package mount directory, checks the unmounted `E_HANDLE` status, and asserts
+that no implemented call logged `E_NOTIMPL`. Its negative controls are
+`XPackageMountWithUiAsync` and `XSystemGetConsoleId`, which must both log
+`E_NOTIMPL`. `xgameruntime_contracts` exercises the synchronous subset and
+checks that no XUser/XGameSave call logs
 `E_NOTIMPL`; it then calls XPackage and XGame stubs as negative controls. The
 DLL remains under `out/build/dev/fixture-shims/` and is loaded by explicit path.
 
 ```powershell
-cmake --build --preset dev --target xgameruntime_shim xgameruntime_shim_check xgameruntime_contracts_check
+cmake --build --preset dev --target xgameruntime_shim xgameruntime_shim_check xgameruntime_contracts_check xgameruntime_pls_xpackage_check
 ctest --preset dev --no-tests=error -R '^xgameruntime_' -V
+python -B tests/xgameruntime_table_check.py
 ```
 
 ## Offline package PE import closure
