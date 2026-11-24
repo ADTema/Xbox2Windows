@@ -347,6 +347,12 @@ add_dependencies(startup_acphal_apu_free startup_stub_acphal)
 add_test(NAME startup_acphal_apu_free COMMAND startup_acphal_apu_free "$<TARGET_FILE:startup_stub_acphal>")
 set_tests_properties(startup_acphal_apu_free PROPERTIES TIMEOUT 60)
 
+add_executable(startup_xapu_queue_check tests/startup_xapu_queue_check.cpp)
+target_compile_features(startup_xapu_queue_check PRIVATE cxx_std_17)
+add_dependencies(startup_xapu_queue_check startup_stub_xapu)
+add_test(NAME startup_xapu_queue COMMAND startup_xapu_queue_check "$<TARGET_FILE:startup_stub_xapu>")
+set_tests_properties(startup_xapu_queue PROPERTIES TIMEOUT 60)
+
 add_executable(startup_draw_bmp_check tests/startup_draw_bmp.cpp)
 add_test(NAME startup_draw_bmp COMMAND startup_draw_bmp_check)
 # Game-save stand-in storage (src/startup_stubs/save_store.h): a blob written by one process is read by a second.

@@ -498,6 +498,14 @@ timer resolution for the mix worker's short refill waits. The last disconnect
 releases the request. This affects scheduling and preserves the existing audio
 routing and sample format.
 
+With `X2W_AUDIO_PERMISSIVE=1`, `xapu.dll` tracks active handles across `XApuConnect`
+and `XApuDisconnect`, refuses null outputs (`E_POINTER`) and unknown or disconnected
+handles (`E_HANDLE`), and queues one completion entry per `XApuEnqueueCommand` call so
+`XApuGetResultCount` and `XApuDequeueResult` retire commands cleanly (zeroing the
+`0x58`-byte result buffer without fabricating unmeasured fields, and returning `E_FAIL`
+when the queue is empty). Default non-permissive mode still traps on every export
+(`ctest --preset dev --no-tests=error -R '^startup_xapu_queue$' -V`).
+
 `src/startup_stubs/audio_sink.{h,cpp}` is a desktop WASAPI shared-mode render sink. It opens the
 default render endpoint, takes the mix format from `GetMixFormat` (32-bit float or 16-bit PCM only),
 converts each submitted block (format, frame count, bytes) to it, and writes it through
