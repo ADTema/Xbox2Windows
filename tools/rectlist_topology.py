@@ -4,7 +4,7 @@ AMD GCN/RDNA hardware architecture specifies VGT_PRIMITIVE_TYPE_RECTLIST = 0x11
 (17 decimal). Three vertices define a rectangle:
   v0: primary origin corner
   v1: adjacent corner sharing an edge with v0
-  v2: diagonal corner opposite to v1 (sharing an edge with v1)
+  v2: corner opposite v0, sharing an edge with v1
 
 The fourth corner is automatically synthesized by the hardware as:
   v3 = v0 + v2 - v1
@@ -12,7 +12,7 @@ The fourth corner is automatically synthesized by the hardware as:
 Corner Order and Winding Specification:
   - Input Precondition: The input vertices must be supplied in defined sequence
     (v0, v1, v2) where v0 and v1 are adjacent corners, and v2 is diagonally
-    opposite to v1.
+    opposite to v0 and adjacent to v1.
   - Winding Preservation: Lowering expands the rectangle into two triangles:
       Triangle 0: (v0, v1, v2)
       Triangle 1: (v0, v2, v3) = (v0, v2, v0 + v2 - v1)

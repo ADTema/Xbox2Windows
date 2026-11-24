@@ -4,6 +4,8 @@ Refs #870.
 """
 
 from pathlib import Path
+import struct
+import subprocess
 import sys
 import unittest
 
@@ -179,5 +181,18 @@ class RectlistTopologyTests(unittest.TestCase):
         self.assertNotEqual(baseline, mutant)
 
 
+def run_draw(renderer: str, backend: str) -> int:
+    corners = (
+        (-0.5, -0.5, 0.0, 1.0, 0.2, 0.1, 0.5, 1.0),
+        (0.5, -0.5, 0.0, 1.0, 0.8, 0.1, 0.5, 1.0),
+        (0.5, 0.5, 0.0, 1.0, 0.8, 0.9, 0.5, 1.0),
+    )
+    triangles = expand_rectangles(corners, validate_winding=True)
+    vertices = b"".join(struct.pack("<8f", *vertex) for vertex in triangles)
+    return subprocess.run([renderer, backend], input=vertices, timeout=45).returncode
+
+
 if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[1] == "--draw":
+        sys.exit(run_draw(*sys.argv[2:]))
     unittest.main()

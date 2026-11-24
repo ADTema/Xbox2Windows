@@ -1,6 +1,8 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
+#include <fcntl.h>
+#include <io.h>
 #include <cstdio>
 #include <cmath>
 #include <vector>
@@ -306,29 +308,21 @@ int main(int argc, char* argv[])
     check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "Create fence");
     UINT64 fence_val = 0;
 
-    // 5. Rectangle Geometry:
-    // Input 3 corners (canonical CCW: bottom-left v0, bottom-right v1, top-right v2)
-    // with distinct interpolated vertex attributes (RGBA).
-    const Vertex v0{{-0.5f, -0.5f, 0.0f, 1.0f}, {0.2f, 0.1f, 0.5f, 1.0f}};
-    const Vertex v1{{ 0.5f, -0.5f, 0.0f, 1.0f}, {0.8f, 0.1f, 0.5f, 1.0f}};
-    const Vertex v2{{ 0.5f,  0.5f, 0.0f, 1.0f}, {0.8f, 0.9f, 0.5f, 1.0f}};
-
-    // Derived fourth corner: v3 = v0 + v2 - v1
-    Vertex v3{};
-    for (int i = 0; i < 4; ++i) {
-        v3.pos[i] = v0.pos[i] + v2.pos[i] - v1.pos[i];
-        v3.col[i] = v0.col[i] + v2.col[i] - v1.col[i];
-    }
-    // Verify derived position is exactly (-0.5, 0.5, 0.0, 1.0)
-    if (std::abs(v3.pos[0] - (-0.5f)) > 1e-6f || std::abs(v3.pos[1] - 0.5f) > 1e-6f) {
-        std::fputs("Corner derivation algebraic mismatch\n", stderr);
+    // The Python runner feeds the output of expand_rectangles through stdin.
+    Vertex positive_triangles[6]{};
+    static_assert(sizeof(Vertex) == 8 * sizeof(float));
+    if (_setmode(_fileno(stdin), _O_BINARY) == -1 ||
+        std::fread(positive_triangles, sizeof(Vertex), 6, stdin) != 6 ||
+        std::fgetc(stdin) != EOF || std::ferror(stdin)) {
+        std::fputs("Expected six packed output vertices from the rectlist lowerer\n", stderr);
         return 1;
     }
-
+    const auto& v0 = positive_triangles[0];
+    const auto& v1 = positive_triangles[1];
+    const auto& v2 = positive_triangles[2];
+    const auto& v3 = positive_triangles[5];
     std::vector<uint32_t> pixels;
 
-    // --- POSITIVE RUN: Lowered CCW Triangle List (v0, v1, v2) and (v0, v2, v3) ---
-    const Vertex positive_triangles[6] = {v0, v1, v2, v0, v2, v3};
     execute_draw(device.Get(), queue.Get(), allocator.Get(), list.Get(), pipeline.Get(), root.Get(),
                  target.Get(), readback.Get(), upload_vb.Get(), rtv_handle, footprint, fence.Get(), fence_val,
                  positive_triangles, 6, pixels);
