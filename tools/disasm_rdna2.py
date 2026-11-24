@@ -2184,6 +2184,51 @@ def _decode_interp_f16(op: int, w0: int, w1: int) -> tuple[int, str, str, str]:
     return (8, name, asm, comment)
 
 
+# VOP3 32-bit interpolation (issue #938). gfx10/gfx1013 encodes v_interp_p1_f32_e64,
+# v_interp_p2_f32_e64 and v_interp_mov_f32_e64 at 0x200, 0x201 and 0x202
+# (LLVM 15 llvm/lib/Target/AMDGPU/VOP3Instructions.td:1045-1047), not at the gfx8/gfx9 opcodes
+# 0x270-0x272 that the VI branch below still handles. The VOP3_INTERP / VOP3_INTERP_MOV operand
+# profiles (VOP3Instructions.td:55-105) print
+# "$vdst, $src0_modifiers, $attr$attrchan$clamp$omod" (the mov form prints its InterpSlot
+# instead of a register), and VOP3Interp_gfx10 (llvm/lib/Target/AMDGPU/VOPInstructions.td:296-312)
+# places attr in SRC0[5:0], attrchan in SRC0[7:6], the data VGPR in SRC1, and fixes SRC0[8] (the
+# f16-only high bit), the SRC2 field and every abs/neg bit except index 1 to zero. The vectors
+# this layout was derived from are VOP3_INTERP_F32_E64_VECTORS in tests/rdna2_tools_check.py.
+INTERP_F32_E64_OPS = {
+    0x200: ("v_interp_p1_f32_e64", "Interpolate f32 attribute, P1 stage (VOP3A)"),
+    0x201: ("v_interp_p2_f32_e64", "Interpolate f32 attribute, P2 stage (VOP3A)"),
+}
+
+
+def _decode_interp_f32_e64(op: int, w0: int, w1: int) -> tuple[int, str, str, str]:
+    """Decode the gfx10/gfx1013 VOP3 spelling of v_interp_p1_f32 or v_interp_p2_f32.
+
+    SRC0 is the attribute operand, so the data source keeps the abs/neg bits of index 1 (w0[9]
+    and w1[30]); the modifier bits of index 0 (the attribute) and index 2 (the operand this
+    profile does not have), the f16-only high bit and the SRC2 field are fixed zero and are
+    reported as an unsupported encoding when set, because LLVM's TableGen decoder only matches
+    the zeroes. The data source in SRC1 is a VGPR_32 (VOPInterp_gfx10 fixes it to a VGPR, unlike
+    the VRegSrc_32 of _decode_interp_f16), so only source codes 256..511 are legal there.
+    """
+    name, comment = INTERP_F32_E64_OPS[op]
+    attr, attrchan = w1 & 0x3f, (w1 >> 6) & 0x3
+    source_code = (w1 >> 9) & 0x1ff
+    abs_bits, neg_bits = (w0 >> 8) & 0x7, (w1 >> 29) & 0x7
+    # SRC1 is a VGPR_32 field, so codes 0..255 -- SGPRs, inline constants, literals, and every code
+    # in INTERP_F16_REFUSED_SOURCES -- are not a legal data operand. LLVM's gfx1013 disassembler
+    # marks them as an invalid register instead of printing an operand, so refuse them.
+    if abs_bits & 0x5 or neg_bits & 0x5 or w1 & 0x100 or (w1 >> 18) & 0x1ff \
+            or not 256 <= source_code <= 511:
+        return (8, f"{name}_unsupported", f"{name} <unsupported VOP3 encoding>",
+                f"LLVM 15 refuses this {name} encoding for gfx1013")
+
+    is_abs, is_neg = (abs_bits >> 1) & 1, (neg_bits >> 1) & 1
+    source = _format_operand_modifiers(decode_v_reg(source_code), is_abs, is_neg)
+    asm = f"{name} v{w0 & 0xff}, {source}, attr{attr}.{'xyzw'[attrchan]}"
+    asm += _vop3_output_modifiers((w0 >> 15) & 1, (w1 >> 27) & 0x3)
+    return (8, name, asm, comment)
+
+
 def _packed_addr_regs(count: int) -> int:
     """Registers LLVM 15 prints for a packed (non-NSA) MIMG address of count dwords.
 
@@ -2641,12 +2686,20 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             mods.append("slc")
         if r128:
             mods.append("r128")
-        if (w0 >> 14) & 1:
-            mods.append("lwe")
         if (w0 >> 7) & 1:
             mods.append("dlc")
+        if (w0 >> 16) & 1:
+            mods.append("tfe")
+        if (w0 >> 17) & 1:
+            mods.append("lwe")
+        if (w1 >> 30) & 1:
+            mods.append("a16")
         if d16:
             mods.append("d16")
+        # Word 0 bits 6 and 14 and word 1 bits 29:26 are reserved on gfx10: LLVM assembles none of them and
+        # ignores them when disassembling, so a set bit is surfaced instead of vanishing from the listing.
+        if (w0 & 0x4040) or (w1 >> 26) & 0xf:
+            mods.append("reserved")
         asm = f"{op_name} {', '.join(operands)} {' '.join(mods)}"
         comment = "Image memory load/store/sample operation"
         return (length, op_name, asm, comment)
@@ -2874,7 +2927,20 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
                 else:
                     dst_width = 1
                     src_widths = (1,)
+        elif 0x200 <= op < 0x203:
+            # gfx10/gfx1013 VOP3 interpolation (see INTERP_F32_E64_OPS). The p1/p2 forms are
+            # decoded here; the mov form keeps its table-driven, restricted-modifier decode
+            # below, whose second operand is an InterpSlot (p10/p20/p0), not a register.
+            if op == 0x202:
+                op_name, comment, arity, is_vop3b, dst_width, src_widths = VOP3_NATIVE_OPS[op]
+            else:
+                return _decode_interp_f32_e64(op, w0, w1)
         elif 0x270 <= op < 0x274:
+            # gfx8/gfx9 (VI) range, not gfx1013: LLVM 15 defines these three as
+            # VOP3Interp_Real_vi at 0x270-0x272 under AssemblerPredicate = isGFX8GFX9
+            # (VOP3Instructions.td:1365-1367). No gfx10 instruction uses them (gfx1013 puts the
+            # same three forms at 0x200-0x202 above), so the branch is kept only so gfx8/gfx9
+            # words still render the way LLVM's VI tests show.
             vintrp_names = {0: "v_interp_p1_f32_e64", 1: "v_interp_p2_f32_e64", 2: "v_interp_mov_f32_e64"}
             vop_int = op - 0x270
             op_name = vintrp_names.get(vop_int, f"v_interp_{vop_int}_e64")

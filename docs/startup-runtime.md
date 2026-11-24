@@ -8,6 +8,15 @@ This is not a port and not an emulator. No executable is playable. Every stand-i
 most answers are shortcuts that are logged as such. The open problems are tracked in the issues
 whose titles start with `startup-runtime:`.
 
+## Output window and fallback diagnostics
+
+The desktop swap chain has its own top-level window, class `X2WOutputWindow`.
+When a present cannot show its surface, the GDI fallback selects a visible,
+unowned guest window in the same process. If only the presenter is visible,
+the fallback leaves it alone. To exercise both z-orders with source-built
+windows, build `startup_overlay_window` and run
+`ctest --preset release --no-tests=error -R '^startup_overlay_window$' -V`.
+
 ## Null Texture2D descriptors
 
 When the adapter lacks typed UAV support for B5G5R5A1_UNORM or render-target support for
@@ -69,6 +78,19 @@ socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do no
 `tools/startup/live_view.py` follows a run in a second console. `X2W_TRAP_DUMP="exe+RVA:len,reg+off:len"`
 adds memory dumps to the stop report.
 
+## Launcher check
+
+`tests/startup_launch_check.py` (ctest `startup_launch`) drives `tools/startup/launch.py` on the
+source-built `tests/startup_launch_probe.cpp`. A finished run reports the child's exit code and saves
+its stdout, stderr and trap log; a child that outlives `--timeout` is terminated; `--memory-gib` and
+`--max-processes` stop an over-limit allocation and a helper process, and the same requests succeed
+under larger limits; a missing executable is reported instead of looking like a finished run. No GPU
+and no game files are needed, and the `pr` preset builds the probe and runs the test:
+
+```powershell
+ctest --preset release --no-tests=error -R '^startup_launch$' -V
+```
+
 ## Switches
 
 | Variable | Effect |
@@ -107,6 +129,12 @@ These are measured on one executable; treat them as hypotheses for others.
 - **DirectStorage ordering.** Requests must run after `Submit`, in order with status and fence
   entries. Titles fill destination page-array entries after `EnqueueRequest`; an entry that is 0
   at enqueue is read again when the request runs.
+- **Sub-dword addressing (SDWA).** The translator lowers the byte and word selects of the 32-bit
+  integer VOP1/VOP2 SDWA forms: a source selection is zero-extended, or sign-extended under `sext()`,
+  and the low bits of the result are placed in the destination field, with `UNUSED_PAD` zeroing the
+  others and `UNUSED_PRESERVE` keeping them. The selection helpers match `tools/pixel_aot.py`, which
+  already lowers the same forms. Float SDWA forms and a `dst_unused:UNUSED_SEXT` destination still
+  stop translation rather than translating to something inexact. [#1141](https://github.com/R0Y00/Xbox2Windows/issues/1141)
 - **Soft asserts.** Retail code keeps `int3` instructions followed by a continuation. Without a
   debugger the title's handler steps over them; under the startup debugger use
   `-ContinueAsserts N`. One of them fires about ten times a second in the texture-streaming path
@@ -115,9 +143,30 @@ These are measured on one executable; treat them as hypotheses for others.
   the one on the calling thread's stack is the return buffer.
 - **Inline samplers.** Pixel shaders build sampler descriptors from constants (`s_movk_i32`,
   `s_bfm_b32`, 64-bit moves); the translator folds those into static samplers.
+- **3D images.** `image_sample` with `dim:SQ_RSRC_IMG_3D` becomes a `Texture3D<float4>` sampled with
+  a `float3` of the three address registers in order; 1D images are refused. A source-built pixel
+  stage draws one texel of a 2x2x2 texture on WARP and hardware with DXC and FXC
+  (`ctest --preset release --no-tests=error -R "^startup_image_3d_"`).
+- **Stream-cache identity.** A cached zlib stream is served only to the exact queued
+  continuation entries in the same DirectStorage queue. The lookup checks the enqueued request
+  id, the source, the compressed size and the destination chunk size. A later independent
+  request at a matching offset still decodes its own bytes or fails without touching its
+  destination.
 
 ## Shortcuts that are known to be wrong
 
+- A shader-visible CBV/SRV/UAV heap larger than the adapter accepts is created at the limit the
+  adapter does take (measured once, then bisected) and the title's full-size memory stays the heap's
+  CPU side. Desktop descriptor writes and copies use a CPU-only heap for the remainder. Translated
+  graphics draws resolve their root tables against the bound logical heap and publish the requested
+  records into the draw's private shader-visible heap. Changing the bound heap invalidates its
+  tables, and a record extending beyond the logical end supplies a null view. This covers translated
+  graphics draws; other consumers need their own binding path. Drivers refuse the request
+  with different codes for the same condition (`E_INVALIDARG` on a GTX 1660 SUPER, `E_OUTOFMEMORY` on
+  an RTX 3060), so any failure of an oversized shader-visible view heap takes this path. The measured
+  limits so far are 1,000,000 descriptors on both adapters. Reproduce with
+  `ctest --preset release --no-tests=error -R '^startup_(view_heap|logical_view)_' -V`, which skips (77) on an
+  adapter that accepts the full request.
 - BCPack requests are completed with zero-filled destinations (blank textures).
 - The XG stand-in normally uses desktop copyable footprints. Its opt-in BC7 diagnostic
   reports standard GFX10 4 KiB tiled geometry for a single-slice, single-mip, non-MSAA
@@ -137,6 +186,10 @@ These are measured on one executable; treat them as hypotheses for others.
   Wrapped sampler heaps keep the 16-byte title stride separate from the desktop descriptor increment
   for CPU handles and descriptor copies.
   The source-built readback uses `ctest --preset dev --no-tests=error -R '^startup_sampler_heap_' -V`.
+- The startup shader translator lowers `image_sample_l` (explicit level, 2D and 3D, any `dmask`) to
+  `SampleLevel(sampler, uv, level)`, taking the level from the last address register. Offset, compare,
+  gather, clamp, cube, array, 1D and `unorm` forms are refused. Only the translation is checked
+  (`python -B tests/startup_image_sample_l_check.py`); a WARP readback of distinct mip levels is still open.
 - Slot 86 graphics streams can submit VS/PS requests to the offline cache. The fixture sends
   complete shader containers and a wrapped root through WARP, runs `gfx2hlsl.py --pending`, and
   reloads the compiled stages. A second fixture draws a clipped triangle through the translated
@@ -151,7 +204,34 @@ These are measured on one executable; treat them as hypotheses for others.
   support, MIN/MAX with factors other than ONE). Its draws match a CPU model of the register fields
   (`ctest --preset release --no-tests=error -R "^startup_cb_blend"`). Where those registers sit in the
   state block is not measured yet, so the draw path doesn't call it.
-- Audio produces no output.
+- Audio produces no output from the console audio path. A separate desktop render sink exists
+  (see "Audio output"); nothing connects the console path to it yet.
+
+## Audio output
+
+`src/startup_stubs/audio_sink.{h,cpp}` is a desktop WASAPI shared-mode render sink. It opens the
+default render endpoint, takes the mix format from `GetMixFormat` (32-bit float or 16-bit PCM only),
+converts each submitted block (format, frame count, bytes) to it, and writes it through
+`IAudioRenderClient`. Consumed frames are the submitted frames minus `GetCurrentPadding`; the
+`IAudioClock` position is reported next to them. It records the first accepted block, the
+submitted format, per-block frame counts and peak amplitude, the drained interval (queue empty
+while the producer withholds data) and the recovery (resume until consumption advances). The
+render API reports no discontinuity flag, so the glitch count is "not available" and is kept
+apart from both intervals.
+
+```powershell
+cmake --build --preset release --target startup_audio_output
+ctest --preset release --no-tests=error -R '^startup_audio_output$' -V
+```
+
+The fixture runs three cases: no submission (nothing accepted or consumed); a stream of eight
+generated 40 ms tone blocks with distinct amplitudes, one of them all zeros (accepted, counted,
+peak 0); and starvation (drain to padding 0, hold 300 ms, resume, consumption recovers). Exit
+code 77 means no usable render endpoint (or an unsupported mix format). It prints the endpoint,
+format and Windows build. A skip is neither a pass nor a failure. Every wait is bounded.
+
+Not established: the layout of the console audio command queue (`xapu.cpp` is not decoded
+here), what is audible (no capture-path check), and any hardware or driver glitch count.
 
 ## Uniform first-lane reads
 

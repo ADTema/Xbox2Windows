@@ -25,6 +25,87 @@ Word invoke(void* object, unsigned index, Word a = 0, Word b = 0, Word c = 0, Wo
     return reinterpret_cast<Slot>((*static_cast<void***>(object))[index])(object, a, b, c, d, e, f, g, h);
 }
 
+int draw_logical_tables(ID3D12Device* desktop, void* guest, void* list)
+{
+    constexpr UINT count = 1245184;
+    auto accepts = [&](UINT n) {
+        const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, n,
+                                             D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
+        ComPtr<ID3D12DescriptorHeap> probe;
+        return SUCCEEDED(desktop->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&probe)));
+    };
+    if (accepts(count)) return 77;
+    UINT boundary = 0, upper = 1048577;
+    while (upper - boundary > 1) {
+        const UINT n = boundary + (upper - boundary) / 2;
+        if (accepts(n)) boundary = n; else upper = n;
+    }
+    if (!boundary) return 34;
+    std::printf("logical views: physical capacity %u, logical count %u\n", boundary, count);
+    const UINT stride = static_cast<UINT>(invoke(guest, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
+    if (stride < 32) return 34;
+    struct Extended {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        Word cpu, bytes;
+    } info{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, count, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+    void* heaps[2]{};
+    Word handles[2]{};
+    Extended staging_info{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2}, 0, 0};
+    void* staging = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 14, arg(&staging_info), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&staging))))) return 34;
+    const Word staging_cpu = invoke(staging, 9);
+    D3D12_SHADER_RESOURCE_VIEW_DESC null_srv{};
+    null_srv.Format = DXGI_FORMAT_R32_TYPELESS;
+    null_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    null_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    null_srv.Buffer.NumElements = 1;
+    null_srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    alignas(256) static std::array<std::array<UINT, 64>, 6> words{};
+    for (UINT h = 0; h < 2; ++h) {
+        if (FAILED(static_cast<HRESULT>(invoke(guest, 14, arg(&info), arg(&__uuidof(ID3D12DescriptorHeap)), arg(&heaps[h]))))) return 34;
+        const Word cpu = invoke(heaps[h], 9);
+        handles[h] = invoke(heaps[h], 10);
+        if (!cpu || !handles[h]) return 34;
+        const UINT slots[] = {boundary - 1, boundary, count - 1};
+        for (UINT i = 0; i < 3; ++i) {
+            auto& data = words[3 * h + i];
+            data[0] = 16 + 96 * h + 16 * i;
+            const D3D12_CONSTANT_BUFFER_VIEW_DESC cb{arg(data.data()), static_cast<UINT>(sizeof(data))};
+            // Initialize a real native descriptor as well as the fixture's guest view token.
+            const Word destination = i < 2 ? staging_cpu + Word{i} * stride : cpu + Word{slots[i]} * stride;
+            invoke(guest, 18, 0, arg(&null_srv), destination);
+            invoke(guest, 17, arg(&cb), destination);
+        }
+        const Word destination = cpu + Word{boundary - 1} * stride;
+        const UINT two = 2;
+        if (h == 0) {
+            invoke(guest, 24, two, destination, staging_cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        } else {
+            invoke(guest, 23, 1, arg(&destination), arg(&two), 1, arg(&staging_cpu), arg(&two), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        }
+        // Reject the complete copy: even its first entry must leave the final sentinel intact.
+        invoke(guest, 24, two, cpu + Word{count - 1} * stride, staging_cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    }
+    const auto bind = [&](UINT h) { invoke(list, 32, 1, arg(&heaps[h])); };
+    const auto table = [&](UINT h, UINT i) { invoke(list, 36, 0, handles[h] + Word{i} * stride); };
+    const auto draw = [&](LONG x) {
+        const D3D12_RECT strip{x, 0, x + 1, 4};
+        invoke(list, 22, 1, arg(&strip));
+        invoke(list, 12, 3, 1);
+    };
+    bind(0);
+    table(0, boundary - 1); draw(0);
+    table(0, boundary); draw(1);
+    table(0, count - 1); draw(2);
+    table(0, count); draw(3);
+    bind(1);
+    table(1, boundary); draw(4);
+    bind(0); draw(5);                   // Changing heaps invalidates its previous table.
+    table(1, boundary); draw(6);        // A handle belonging to the other heap.
+    table(0, boundary); draw(7);
+    return 0;
+}
+
 namespace {
 struct Bc7Binding {
     std::vector<unsigned char> backing, views;
@@ -141,8 +222,12 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     invoke(list, 22, 1, arg(&rect));
     invoke(list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     invoke(list, 25, arg(pso));
-    if (bc7) invoke(list, 36, 0, binding.table);
-    invoke(list, 12, 3, 1);
+    if (GetEnvironmentVariableW(L"X2W_TEST_LOGICAL_VIEW", nullptr, 0)) {
+        if (int result = draw_logical_tables(desktop.Get(), guest, list)) return result;
+    } else {
+        if (bc7) invoke(list, 36, 0, binding.table);
+        invoke(list, 12, 3, 1);
+    }
     invoke(list, 9);
     invoke(queue, 10, 1, arg(&list));
     if (FAILED(static_cast<HRESULT>(invoke(queue, 14, arg(fence), 1)))) return 24;

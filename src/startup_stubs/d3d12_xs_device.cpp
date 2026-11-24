@@ -14,6 +14,8 @@
 #define X2W_TRAP_MODULE_ID 7
 #include "startup_stubs/trap.h"
 #include "startup_stubs/local_log.h"
+#include "startup_stubs/logical_view_table.h"
+#include "startup_stubs/overlay_window.h"
 #include "startup_stubs/draw_bmp.h"
 #include "startup_stubs/draw_dump_tracking.h"
 #include "startup_stubs/translated_sampler_bindings.h"
@@ -104,21 +106,108 @@ struct DescriptorRange {
     std::uint64_t desktop;
     UINT title_stride;
     UINT desktop_stride;
+    // How many title descriptors the desktop heap covers. Normally the whole heap; shorter only when
+    // the console heap was larger than the driver accepts and the stand-in emulated the remainder.
+    std::uint64_t desktop_descriptors;
+    std::uint64_t tail_cpu; // CPU-only heap for view records outside the shader-visible prefix.
 };
 SRWLOCK descriptor_lock = SRWLOCK_INIT;
 std::vector<DescriptorRange> descriptor_ranges;
 
-std::uint64_t desktop_cpu_handle(std::uint64_t handle)
+// Desktop rejects a shader-visible CBV/SRV/UAV heap above a driver-specific descriptor count: the
+// API documents 1,048,576, but a driver may accept fewer (1,000,000 on the GTX 1660 SUPER here), so
+// the accepted maximum is measured once and cached rather than assumed.
+constexpr std::uint64_t view_heap_probe_floor = 65536;
+
+void log(const char* format, ...);
+bool first_calls(LONG& counter, LONG limit);
+std::uint64_t accepted_view_heap_descriptors(ID3D12Device* device, UINT node_mask);
+
+std::uint64_t desktop_cpu_handle(std::uint64_t handle, UINT* contiguous = nullptr, UINT* available = nullptr)
 {
-    AcquireSRWLockShared(&descriptor_lock);
     std::uint64_t result = handle;
+    UINT room = UINT_MAX, remaining = UINT_MAX;
+    bool past_end = false;
+    AcquireSRWLockShared(&descriptor_lock);
     for (const auto& r : descriptor_ranges) {
-        if (handle < r.title || handle - r.title >= r.bytes) continue;
-        const auto offset = handle - r.title;
-        result = r.desktop + offset / r.title_stride * r.desktop_stride + offset % r.title_stride;
+        if (handle < r.title) continue;
+        const u64 offset = handle - r.title;
+        if (offset == r.bytes && r.tail_cpu) past_end = true;
+        if (offset >= r.bytes) continue;
+        const u64 index = offset / r.title_stride;
+        const u64 limit = r.bytes / r.title_stride;
+        remaining = static_cast<UINT>(limit - index);
+        if (r.tail_cpu && offset % r.title_stride) {
+            result = 0;
+            room = 0;
+        } else if (index >= r.desktop_descriptors) {
+            result = r.tail_cpu + (index - r.desktop_descriptors) * r.desktop_stride;
+            room = static_cast<UINT>(limit - index);
+        } else {
+            result = r.desktop + index * r.desktop_stride + offset % r.title_stride;
+            room = static_cast<UINT>(r.desktop_descriptors - index);
+        }
+        past_end = false;
+        break;
     }
     ReleaseSRWLockShared(&descriptor_lock);
+    if (past_end) { result = 0; room = 0; }
+    if (contiguous) *contiguous = room;
+    if (available) *available = result ? remaining : 0;
     return result;
+}
+
+// Measure, once per process, the largest shader-visible CBV/SRV/UAV heap this driver creates. The
+// documented ceiling is 1,048,576 descriptors, but drivers may accept fewer, so halve from the
+// ceiling until a create succeeds and then bisect upward. Each probe heap is released before the next
+// one, so at most one probe holds memory at a time.
+std::uint64_t accepted_view_heap_descriptors(ID3D12Device* device, UINT node_mask)
+{
+    static std::uint64_t cached;
+    static LONG state;  // 0 none, 1 measuring, 2 measured
+    if (InterlockedCompareExchange(&state, 0, 0) == 2) return cached;
+    if (InterlockedCompareExchange(&state, 1, 0) != 0) {
+        // Another thread is measuring; wait for it rather than create a second set of probe heaps.
+        for (int spin = 0; spin < 2000 && InterlockedCompareExchange(&state, 0, 0) != 2; ++spin) Sleep(1);
+        return InterlockedCompareExchange(&state, 0, 0) == 2 ? cached : 0;
+    }
+
+    const auto probe = [device, node_mask](std::uint64_t count) {
+        D3D12_DESCRIPTOR_HEAP_DESC desc{};
+        desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        desc.NumDescriptors = static_cast<UINT>(count);
+        desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        desc.NodeMask = node_mask;
+        ID3D12DescriptorHeap* heap = nullptr;
+        const bool ok = SUCCEEDED(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&heap))) && heap;
+        if (heap) heap->Release();
+        return ok;
+    };
+
+    // Halve from the documented ceiling, testing the floor too: a driver whose maximum is below the
+    // floor must not be recorded as accepting it, or the retry would ask for a size it rejects again.
+    std::uint64_t accepted = 0;
+    for (std::uint64_t size = 1048576; size >= view_heap_probe_floor; size /= 2) {
+        if (probe(size)) {
+            accepted = size;
+            break;
+        }
+    }
+    if (!accepted) {
+        InterlockedExchange(&state, 2);
+        log("x2w-d3d12 no probe size at or above %llu was accepted; the view heap shortcut is declined",
+            view_heap_probe_floor);
+        return 0;
+    }
+    std::uint64_t low = accepted, high = accepted * 2;
+    while (low + 1 < high && high <= 1048576) {
+        const std::uint64_t mid = low + (high - low) / 2;
+        if (probe(mid)) low = mid; else high = mid;
+    }
+    cached = low;
+    InterlockedExchange(&state, 2);
+    log("x2w-d3d12 measured the shader-visible view heap limit: %llu descriptors", cached);
+    return cached;
 }
 
 UINT title_descriptor_stride(u64 handle, UINT desktop_stride)
@@ -1328,7 +1417,8 @@ struct Pass {
     // What the title bound, kept for draws through translated pipelines:
     Wrapper* pipeline = nullptr;
     UINT topology = 0;
-    u64 table_address[16] = {};      // title descriptor memory of each bound table
+    x2w_startup::ViewTable view_tables[16]{};
+    u64 source_view_heap = 0;
     u64 root_address[16] = {};       // title address of each root descriptor
     std::uint32_t constants[16][8] = {};
     D3D12_VERTEX_BUFFER_VIEW vb[8] = {};
@@ -1732,8 +1822,31 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
     *out = nullptr;
     const auto* extra = reinterpret_cast<const std::uint64_t*>(desc + 1);
     ID3D12DescriptorHeap* heap = nullptr;
-    const HRESULT hr = kind_for(*iid) == descriptor_heap_kind
+    HRESULT hr = kind_for(*iid) == descriptor_heap_kind
         ? device_of(self)->CreateDescriptorHeap(desc, IID_PPV_ARGS(&heap)) : E_NOINTERFACE;
+    // A console view heap can be larger than the driver accepts. Measure the accepted maximum, create
+    // the desktop heap at it, and keep the title's full-size descriptor memory. Desktop view writes
+    // and copies past the physical prefix use a companion CPU-only heap.
+    // The refusal code differs between drivers (E_INVALIDARG on a GTX 1660 SUPER, E_OUTOFMEMORY on an
+    // RTX 3060). Preserve errors unrelated to capacity, including unsupported interface IDs.
+    D3D12_DESCRIPTOR_HEAP_DESC clamped = *desc;
+    bool did_clamp = false;
+    if ((hr == E_INVALIDARG || hr == E_OUTOFMEMORY) && (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
+        && desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
+        && desc->NumDescriptors > view_heap_probe_floor) {
+        const std::uint64_t limit = accepted_view_heap_descriptors(device_of(self), desc->NodeMask);
+        if (limit && limit < desc->NumDescriptors) {
+            clamped.NumDescriptors = static_cast<UINT>(limit);
+            did_clamp = true;
+            hr = device_of(self)->CreateDescriptorHeap(&clamped, IID_PPV_ARGS(&heap));
+            static LONG shortcuts;
+            if (SUCCEEDED(hr) && first_calls(shortcuts, 1))
+                log("x2w-d3d12 Device::CreateDescriptorHeap: shortcut - title asked for %u shader-visible "
+                    "view descriptors, this driver accepts %u; the rest stay in title memory",
+                    desc->NumDescriptors, clamped.NumDescriptors);
+        }
+    }
+    const D3D12_DESCRIPTOR_HEAP_DESC* request = did_clamp ? &clamped : desc;
     const std::uint64_t desktop = heap ? heap->GetCPUDescriptorHandleForHeapStart().ptr : 0;
     static LONG calls;
     if (first_calls(calls, 16))
@@ -1741,7 +1854,17 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
             "-> 0x%08lx desktop=0x%llx", desc->Type, desc->NumDescriptors, desc->Flags, desc->NodeMask, extra[0], extra[1],
             text, static_cast<unsigned long>(hr), desktop);
     if (FAILED(hr)) return hr;
-    Wrapper* w = wrap(heap, descriptor_heap_kind);
+    x2w_startup::ComPtr<ID3D12DescriptorHeap> tail;
+    if (did_clamp) {
+        D3D12_DESCRIPTOR_HEAP_DESC tail_desc = *desc;
+        tail_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+        tail_desc.NumDescriptors -= clamped.NumDescriptors;
+        hr = device_of(self)->CreateDescriptorHeap(&tail_desc, IID_PPV_ARGS(&tail));
+        // Retain the physical CPU tail for the lifetime of the original desktop heap.
+        static constexpr GUID tail_lifetime{0x1aa68383,0xf1e9,0x4264,{0xa7,0x05,0x1f,0xf9,0x69,0xa8,0x03,0xac}};
+        if (SUCCEEDED(hr)) hr = heap->SetPrivateDataInterface(tail_lifetime, tail.Get());
+        if (FAILED(hr)) { heap->Release(); return hr; }
+    }
     const UINT desktop_stride = device_of(self)->GetDescriptorHandleIncrementSize(desc->Type);
     const bool raw_samplers = desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER &&
         extra[1] == u64{desc->NumDescriptors} * x2w_startup::title_sampler_stride;
@@ -1755,14 +1878,18 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
     // there (note_view) travel with those copies; the desktop heap behind it is still filled.
     if (!title_memory && desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && bytes)
         title_memory = reinterpret_cast<std::uint64_t>(VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (did_clamp && !title_memory) { heap->Release(); return E_OUTOFMEMORY; }
+    Wrapper* w = wrap(heap, descriptor_heap_kind);
     if (title_memory) {
         w->own().title_cpu = title_memory;
         AcquireSRWLockExclusive(&descriptor_lock);
-        descriptor_ranges.push_back({title_memory, bytes, desktop, title_stride, desktop_stride});
+        descriptor_ranges.push_back({title_memory, bytes, desktop, title_stride, desktop_stride,
+                                     static_cast<std::uint64_t>(request->NumDescriptors),
+                                     tail ? tail->GetCPUDescriptorHandleForHeapStart().ptr : 0});
         ReleaseSRWLockExclusive(&descriptor_lock);
     }
     const u64 sampler_cpu = raw_samplers ? title_memory : 0;
-    note_heap(w, desc->Type, desc->NumDescriptors, desktop_stride,
+    note_heap(w, desc->Type, request->NumDescriptors, desc->NumDescriptors, desktop_stride,
               title_memory, desktop,
               (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) ? heap->GetGPUDescriptorHandleForHeapStart().ptr : 0,
               sampler_cpu);
@@ -1783,6 +1910,7 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
     u64 args[4] = {unwrap(a), unwrap(b), unwrap(c), unwrap(d)};
     const u64 title_dest = args[D];
     args[D] = desktop_cpu_handle(args[D]);
+    if (!args[D]) return 0;
     {
         const u64 raw[4] = {a, b, c, d};
         const int described = N == 19 ? 2 : (N == 17 || N == 22) ? 0 : 1;
@@ -1841,13 +1969,32 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
     return result;
 }
 
+// Copy through actual desktop heaps. A logical range may straddle the last
+// shader-visible descriptor and the first CPU-only descriptor.
+void copy_descriptor_run(Wrapper* self, UINT count, u64 dest, u64 src, D3D12_DESCRIPTOR_HEAP_TYPE type)
+{
+    const UINT increment = device_of(self)->GetDescriptorHandleIncrementSize(type);
+    const UINT dest_stride = title_descriptor_stride(dest, increment);
+    const UINT src_stride = title_descriptor_stride(src, increment);
+    while (count) {
+        UINT dest_room, src_room, dest_total, src_total;
+        const auto d = desktop_cpu_handle(dest, &dest_room, &dest_total);
+        const auto s = desktop_cpu_handle(src, &src_room, &src_total);
+        if (count > dest_total || count > src_total || !d || !s) return;
+        const UINT chunk = (std::min)(count, (std::min)(dest_room, src_room));
+        device_of(self)->CopyDescriptorsSimple(chunk, {static_cast<SIZE_T>(d)}, {static_cast<SIZE_T>(s)}, type);
+        note_copy(dest, src, d, s, chunk, increment);
+        dest += u64{chunk} * dest_stride;
+        src += u64{chunk} * src_stride;
+        count -= chunk;
+    }
+}
+
 // Device slot 24, desktop CopyDescriptorsSimple(count, dest, src, type).
 void __stdcall device_copy_descriptors_simple(Wrapper* self, UINT count, u64 dest, u64 src, D3D12_DESCRIPTOR_HEAP_TYPE type)
 {
     Timed timed(time_copy);
-    device_of(self)->CopyDescriptorsSimple(count, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(desktop_cpu_handle(dest))},
-                                           D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(desktop_cpu_handle(src))}, type);
-    note_copy(dest, src, desktop_cpu_handle(dest), desktop_cpu_handle(src), count, device_of(self)->GetDescriptorHandleIncrementSize(type));
+    copy_descriptor_run(self, count, dest, src, type);
     check_device("Device CopyDescriptorsSimple", 24);
     static LONG calls;
     if (first_calls(calls)) log("x2w-d3d12 Device::CopyDescriptorsSimple count=%u dest=0x%llx src=0x%llx type=%d", count, dest, src, type);
@@ -1858,24 +2005,31 @@ void __stdcall device_copy_descriptors(Wrapper* self, UINT dest_count, const D3D
                                        const UINT* dest_sizes, UINT src_count, const D3D12_CPU_DESCRIPTOR_HANDLE* src_starts,
                                        const UINT* src_sizes, D3D12_DESCRIPTOR_HEAP_TYPE type)
 {
-    std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> dest(dest_count), src(src_count);
-    for (UINT i = 0; i < dest_count; ++i) dest[i].ptr = static_cast<SIZE_T>(desktop_cpu_handle(dest_starts[i].ptr));
-    for (UINT i = 0; i < src_count; ++i) src[i].ptr = static_cast<SIZE_T>(desktop_cpu_handle(src_starts[i].ptr));
-    device_of(self)->CopyDescriptors(dest_count, dest.data(), dest_sizes, src_count, src.data(), src_sizes, type);
-    {
-        // Same pairing rule as the desktop call: ranges are consumed in order; null sizes mean 1 each.
-        const UINT increment = device_of(self)->GetDescriptorHandleIncrementSize(type);
-        UINT di = 0, doff = 0, si = 0, soff = 0;
-        while (di < dest_count && si < src_count) {
-            const UINT dsize = dest_sizes ? dest_sizes[di] : 1, ssize = src_sizes ? src_sizes[si] : 1;
-            const UINT run = (dsize - doff) < (ssize - soff) ? (dsize - doff) : (ssize - soff);
-            if (run) note_copy(dest_starts[di].ptr + u64{doff} * title_descriptor_stride(dest_starts[di].ptr, increment),
-                               src_starts[si].ptr + u64{soff} * title_descriptor_stride(src_starts[si].ptr, increment),
-                               dest[di].ptr + u64{doff} * increment, src[si].ptr + u64{soff} * increment, run, increment);
-            doff += run; soff += run;
-            if (doff >= dsize) { ++di; doff = 0; }
-            if (soff >= ssize) { ++si; soff = 0; }
+    // Validate each complete logical range before the first desktop copy.
+    const auto valid = [](UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* starts, const UINT* sizes, u64& total) {
+        for (UINT i = 0; i < count; ++i) {
+            const UINT size = sizes ? sizes[i] : 1;
+            UINT available;
+            desktop_cpu_handle(starts[i].ptr, nullptr, &available);
+            if (size > available) return false;
+            total += size;
         }
+        return true;
+    };
+    u64 dest_total = 0, src_total = 0;
+    if (!valid(dest_count, dest_starts, dest_sizes, dest_total) ||
+        !valid(src_count, src_starts, src_sizes, src_total) || dest_total != src_total) return;
+    const UINT increment = device_of(self)->GetDescriptorHandleIncrementSize(type);
+    UINT di = 0, doff = 0, si = 0, soff = 0;
+    while (di < dest_count && si < src_count) {
+        const UINT dsize = dest_sizes ? dest_sizes[di] : 1, ssize = src_sizes ? src_sizes[si] : 1;
+        const UINT run = (std::min)(dsize - doff, ssize - soff);
+        if (run) copy_descriptor_run(self, run,
+            dest_starts[di].ptr + u64{doff} * title_descriptor_stride(dest_starts[di].ptr, increment),
+            src_starts[si].ptr + u64{soff} * title_descriptor_stride(src_starts[si].ptr, increment), type);
+        doff += run; soff += run;
+        if (doff == dsize) { ++di; doff = 0; }
+        if (soff == ssize) { ++si; soff = 0; }
     }
     check_device("Device CopyDescriptors", 23);
     static LONG calls;
@@ -2391,26 +2545,9 @@ HRESULT __stdcall device_wait_frame_event(Wrapper*, UINT type, UINT timeout, voi
 // Diagnostic overlay: while nothing is rendered, the title window would stay blank. Every few
 // presents a status text is drawn into it with GDI so the state is visible. This is not game output.
 LONG draw_calls_seen;
-HWND title_window()
-{
-    static HWND window = nullptr;
-    if (window && IsWindow(window)) return window;
-    window = nullptr;
-    EnumWindows([](HWND candidate, LPARAM out) -> BOOL {
-        DWORD process = 0;
-        GetWindowThreadProcessId(candidate, &process);
-        if (process == GetCurrentProcessId() && IsWindowVisible(candidate) && !GetWindow(candidate, GW_OWNER)) {
-            *reinterpret_cast<HWND*>(out) = candidate;
-            return FALSE;
-        }
-        return TRUE;
-    }, reinterpret_cast<LPARAM>(&window));
-    return window;
-}
-
 void draw_overlay(LONG frame, double seconds)
 {
-    HWND window = title_window();
+    HWND window = x2w_startup::overlay_window();
     if (!window) return;
     HDC dc = GetDC(window);
     if (!dc) return;

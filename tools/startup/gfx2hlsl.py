@@ -20,6 +20,38 @@ class Unsupported(Exception):
 
 PREFETCH = bytes.fromhex('0300a0bf')
 
+# SDWA (sub-dword addressing) selections, with the same meaning as tools/pixel_aot.py: a source
+# selection is zero-extended, or sign-extended under sext(); a destination selection writes the low
+# bits of the result into that field, UNUSED_PAD zeroes the others and UNUSED_PRESERVE keeps them.
+SDWA_SEL = {'BYTE_0': (0, 8), 'BYTE_1': (8, 8), 'BYTE_2': (16, 8), 'BYTE_3': (24, 8),
+            'WORD_0': (0, 16), 'WORD_1': (16, 16), 'DWORD': (0, 32)}
+
+
+def sdwa_source(word, sel, sext):
+    """The uint expression a source selection reads out of a 32-bit register."""
+    offset, width = SDWA_SEL[sel]
+    if width == 32:
+        return word
+    if sext:
+        return 'asuint(asint(%s << %du) >> %du)' % (word, 32 - offset - width, 32 - width)
+    return '((%s >> %du) & %#xu)' % (word, offset, (1 << width) - 1)
+
+
+def sdwa_dest(result, sel, unused, old):
+    """The uint expression a destination selection writes back into a 32-bit register."""
+    offset, width = SDWA_SEL[sel]
+    if width == 32:
+        return result
+    if unused == 'UNUSED_SEXT':
+        raise Unsupported('SDWA UNUSED_SEXT')
+    field = '((%s & %#xu) << %du)' % (result, (1 << width) - 1, offset)
+    if unused == 'UNUSED_PAD':
+        return field
+    if unused != 'UNUSED_PRESERVE':
+        raise Unsupported('SDWA dst_unused %s' % unused)
+    keep = ~(((1 << width) - 1) << offset) & 0xffffffff
+    return '((asuint(%s) & %#xu) | %s)' % (old, keep, field)
+
 
 def strip_header(code):
     at = code.find(PREFETCH, 0, 0x80)
@@ -286,7 +318,7 @@ class Stage:
         _, ops, mods = parse(asm)
         base = re.sub(r'_e(32|64)$', '', name)
         if base in ('s_inst_prefetch', 's_waitcnt', 's_nop', 'v_nop', 's_clause', 's_sopp_0f', 's_wqm_b64', 's_wqm_b32',
-                    's_setreg_imm32_b32', 's_code_end'):
+                    's_setreg_imm32_b32', 's_code_end', 's_setprio'):
             return None
         if base == 's_endpgm':
             return ('end',)
@@ -303,6 +335,8 @@ class Stage:
             return handler(ops, mods)
         if base.startswith('v_cmp'):
             return self.compare(base, ops)
+        if base.endswith('_sdwa'):
+            return self.sdwa(base[:-len('_sdwa')], ops, mods)
         if base in VEC_F:
             arity, text = VEC_F[base]
             args = [self.f(o) for o in ops[1:1 + arity]]
@@ -317,6 +351,42 @@ class Stage:
         if base in SCA:
             return self.scalar(base, ops)
         raise Unsupported(base)
+
+    # VOP1/VOP2 with sub-dword addressing: select the source fields, run the same operation, then place
+    # the low bits of the result in the destination field. The integer forms reuse VEC_U unchanged;
+    # float forms are not lowered yet, and dst_unused UNUSED_SEXT has no lowering.
+    def sdwa(self, base, ops, mods):
+        fields = {}
+        for m in mods:
+            key, _, value = m.partition(':')
+            if key in ('src0_sel', 'src1_sel', 'src2_sel', 'dst_sel', 'dst_unused') and value:
+                fields[key] = value
+            else:
+                raise Unsupported('%s with SDWA modifier %s' % (base, m))
+        if base not in VEC_U:
+            raise Unsupported('SDWA form of %s' % base)
+        arity, text = VEC_U[base]
+        sources = []
+        for index in range(arity):
+            token = ops[1 + index]
+            sext = token.startswith('sext(') and token.endswith(')')
+            if sext:
+                token = token[len('sext('):-1]
+            selection = fields.get('src%d_sel' % index)
+            if not selection:
+                raise Unsupported('%s SDWA without src%d_sel' % (base, index))
+            sources.append(sdwa_source(self.u(token), selection, sext))
+        result = text.format(*sources)
+        select = fields.get('dst_sel')
+        if not select:
+            raise Unsupported('%s SDWA without dst_sel' % base)
+        # The operation's HLSL carries its own operators, so it has to be grouped before the
+        # destination field masks it: "v7 | v8 & 0xffff" would otherwise bind as "v7 | (v8 & 0xffff)".
+        if SDWA_SEL[select][1] < 32:
+            result = '(%s)' % result
+        destination = reg_range(ops[0])[1]
+        self.set_v(destination, sdwa_dest(result, select, fields.get('dst_unused', 'UNUSED_PAD'),
+                                          'v%d' % destination))
 
     # scalar ALU with descriptor-word bookkeeping
     def scalar(self, base, ops):
@@ -570,6 +640,7 @@ class Stage:
         table = {'BUF_FMT_8_8_8_8_UNORM': ('ldu({0}, a)', ['U((w & 255) / 255.0)', 'U(((w >> 8) & 255) / 255.0)', 'U(((w >> 16) & 255) / 255.0)', 'U((w >> 24) / 255.0)']),
                  'BUF_FMT_8_8_UNORM': ('ldu({0}, a)', ['U((w & 255) / 255.0)', 'U(((w >> 8) & 255) / 255.0)', '0u', 'U(1.0)']),
                  'BUF_FMT_8_UNORM': ('ldu({0}, a)', ['U((w & 255) / 255.0)', '0u', '0u', 'U(1.0)']),
+                 'BUF_FMT_8_UINT': ('{0}.Load(a & ~3u) >> ((a & 3u) * 8u)', ['w & 255u', '0u', '0u', '1u']),
                  'BUF_FMT_16_16_UNORM': ('ldu({0}, a)', ['U((w & 65535) / 65535.0)', 'U((w >> 16) / 65535.0)', '0u', 'U(1.0)']),
                  'BUF_FMT_16_16_FLOAT': ('ldu({0}, a)', ['U(f16tof32(w))', 'U(f16tof32(w >> 16))', '0u', 'U(1.0)']),
                  'BUF_FMT_32_32_32_32_FLOAT': (None, ['{0}.Load(a)', '{0}.Load(a + 4)', '{0}.Load(a + 8)', '{0}.Load(a + 12)']),
@@ -609,6 +680,21 @@ class Stage:
         else:
             r = reg_range(coords)
             cs = ['v%d' % n for n in range(r[1], r[2] + 1)]
+        lod = None
+        if how == 'l':
+            # Address dwords are the coordinates and then the explicit level; offsets, bias, clamp and derivatives
+            # would add dwords or modifiers this lowering does not read, so they are refused. Only the cache-policy
+            # bits (glc, slc, dlc), which never change the sampled value, are accepted next to dim and dmask;
+            # unorm, r128, tfe, lwe, a16, d16 and reserved bits would each change the address, resource or result
+            # layout and are refused by name.
+            for m in mods:
+                if not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'glc', 'slc')):
+                    raise Unsupported('image_sample_l modifier %s' % m)
+            if dmask == 0:
+                raise Unsupported('image_sample_l with an empty dmask')
+            if len(cs) != (4 if three else 3):
+                raise Unsupported('image_sample_l with %d address registers' % len(cs))
+            lod, cs = cs[-1], cs[:-1]
         tex = self.pipe.resource(self.descriptor(ops[2]), 'tex3d' if three else 'tex2d')
         if how == 'load':
             if three:
@@ -621,7 +707,9 @@ class Stage:
             smp = heap or self.pipe.sampler(tuple(words) if words else self.descriptor(ops[3]))
             uv = ('float3(%s, %s, %s)' % (self.f(cs[0]), self.f(cs[1]), self.f(cs[2])) if three
                   else 'float2(%s, %s)' % (self.f(cs[0]), self.f(cs[1])))
-            if how == 'lz' or not self.exec_known or self.kind != 'ps' or len(self.blocks) > 0:
+            if how == 'l':
+                call = '%s.SampleLevel(%s, %s, %s)' % (tex, smp, uv, self.f(lod))
+            elif how == 'lz' or not self.exec_known or self.kind != 'ps' or len(self.blocks) > 0:
                 call = '%s.SampleLevel(%s, %s, 0)' % (tex, smp, uv)
             else:
                 call = '%s.Sample(%s, %s)' % (tex, smp, uv)
@@ -637,6 +725,9 @@ class Stage:
 
     def op_image_sample_lz(self, ops, mods):
         self.image(ops, mods, 'lz')
+
+    def op_image_sample_l(self, ops, mods):
+        self.image(ops, mods, 'l')
 
     def op_image_load(self, ops, mods):
         self.image(ops, mods, 'load')
