@@ -231,6 +231,13 @@ ctest --preset release --no-tests=error -R '^startup_inflate$' -V
 | `X2W_VALLOC_MIN=<hex bytes>` | the startup debugger logs each virtual-memory allocation of at least that size to `files.txt` (`VALLOC`), with the requested address (0 for any, unreadable for an incomplete read), size, type, protection and the main-image and stand-in return addresses on the caller's stack |
 | `X2W_HOST_CPU=1` (`run.ps1 -HostCpu`) | the startup debugger rewrites main-image instructions the host processor lacks at their first fault: see [Host processors without the console's instructions](#host-processors-without-the-consoles-instructions) |
 
+The stand-ins share one switch reader and line logger (`src/startup_stubs/local_log.h`): a value
+that starts with `1` is on; `0`, an empty value and another first character are off. Neither changes
+the caller's last error, and each line ends in CRLF on stderr and is appended to `X2W_TRAP_LOG`.
+`ctest --preset dev --no-tests=error -R '^startup_local_log$' -V` checks those switch values, the kept
+last error and the exact bytes on stderr and in the log, including a line cut to 1,533 bytes, an
+existing log that keeps its contents and log paths at and past `MAX_PATH`.
+
 The startup shader cache key includes the translator revision. After updating from
 an earlier translation revision, run the recording build once to emit
 requests, run `python tools/startup/gfx2hlsl.py --pending <cache-directory>`,

@@ -411,6 +411,12 @@ endforeach()
 set_tests_properties(xmem_page_runs_device_hardware PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(startup_launch_probe tests/startup_launch_probe.cpp)
 target_compile_features(startup_launch_probe PRIVATE cxx_std_17)
+# Switch values, the kept last error and the stderr and X2W_TRAP_LOG lines of the logging every
+# permissive stand-in shares (src/startup_stubs/local_log.h).
+add_executable(startup_local_log_check tests/startup_local_log_check.cpp)
+target_include_directories(startup_local_log_check PRIVATE src)
+target_compile_features(startup_local_log_check PRIVATE cxx_std_17)
+add_test(NAME startup_local_log COMMAND startup_local_log_check)
 # Input for the startup debugger's diagnostics check (tests/startup_debug_check.py).
 add_executable(startup_debug_probe tests/startup_debug_probe.cpp)
 target_compile_features(startup_debug_probe PRIVATE cxx_std_17)
