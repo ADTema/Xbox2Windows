@@ -481,6 +481,20 @@ target_include_directories(startup_placement_publish_check PRIVATE src)
 add_test(NAME startup_placement_publish COMMAND startup_placement_publish_check)
 add_test(NAME startup_placement_publish_shrink_control COMMAND startup_placement_publish_check --mutate shrink)
 set_tests_properties(startup_placement_publish_shrink_control PROPERTIES WILL_FAIL TRUE)
+# Device slot 133 proves that the allocation is committed from its base to the end of the buffer with
+# one region-information call when the whole private allocation is committed, else with a walk that
+# stops at the end of the buffer; every alias or refusal must equal the full walk's on the same memory,
+# including a decommitted page before the buffer and a block replaced at the same base, and a large
+# touched block must need no VirtualQuery (src/startup_stubs/placed_buffer_range.h). The mutated runs
+# are the negative controls.
+add_executable(startup_placed_buffer_range_check tests/startup_placed_buffer_range_check.cpp)
+target_compile_features(startup_placed_buffer_range_check PRIVATE cxx_std_17)
+target_include_directories(startup_placed_buffer_range_check PRIVATE src)
+add_test(NAME startup_placed_buffer_range COMMAND startup_placed_buffer_range_check)
+add_test(NAME startup_placed_buffer_range_region_only_control COMMAND startup_placed_buffer_range_check --mutate region-only)
+add_test(NAME startup_placed_buffer_range_walk_only_control COMMAND startup_placed_buffer_range_check --mutate walk-only)
+set_tests_properties(startup_placed_buffer_range_region_only_control startup_placed_buffer_range_walk_only_control
+    PROPERTIES WILL_FAIL TRUE SKIP_RETURN_CODE 77)
 add_executable(startup_storage_file_range tests/startup_storage_file_range.cpp)
 target_compile_features(startup_storage_file_range PRIVATE cxx_std_17)
 target_include_directories(startup_storage_file_range PRIVATE src)
