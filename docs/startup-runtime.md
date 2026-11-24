@@ -427,6 +427,14 @@ These are measured on one executable; treat them as hypotheses for others.
   stand-in must be loaded for render-mode copies. The reported pitch describes the padded
   block-row extent of the surface. Synthetic copy and draw checks run with
   `ctest --preset dev --no-tests=error -R '^startup_xg_bc7_' -V`.
+  Those checks use only accepted descriptions at 81x69 and 64x64 (square 2x2 and 1x1 tile grids),
+  and the draw check tiles and detiles with the same block offsets. `tests/startup_bc7_4k_s_check.cpp`
+  covers `src/startup_stubs/bc7_4k_s.h` without a device. It compares every block offset with the
+  documented bit order on partial and non-square tile grids (200x72 is 4x2 tiles). It checks the
+  padded sizes from 1x1 to 16384x16384 and detile at three row pitches with guard bytes. It also
+  refuses each description with one field changed, such as two mips or 4 KiB alignment. Run
+  `ctest --preset dev --no-tests=error -R '^startup_bc7_4k_s' -V`; the `_x_first_control` run
+  checks an x-first order and must fail.
 - The default translator uses a static default sampler for a dynamically indexed sampler-heap load.
   With the sampler-heap opt-in, translated draws snapshot the bound heap's 16-byte sampler entries and
   bind a private desktop table beside the static samplers. Missing, out-of-range, or unreadable entries
