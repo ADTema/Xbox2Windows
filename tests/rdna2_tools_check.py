@@ -811,6 +811,26 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertEqual([(r["length"], r["assembly"]) for r in records],
                          [(8, "s_movrels_b32 s1, 0x12345678"), (4, "s_endpgm")])
 
+    def test_vop1_f64_source_conversions_have_one_register_result(self):
+        # Words from `llvm-mc -arch=amdgcn -mcpu=gfx1013 -show-encoding`. A 32-bit result from a binary64 source
+        # names one VGPR; a binary64 result (or a binary64-to-binary64 op) names a pair, as before.
+        vectors = (
+            ("0207087e", 4, "v_cvt_i32_f64_e32 v4, v[2:3]"),
+            ("042b027e", 4, "v_cvt_u32_f64_e32 v1, v[4:5]"),
+            ("021ffe7f", 4, "v_cvt_f32_f64_e32 v255, v[2:3]"),
+            ("0206007e", 4, "v_cvt_i32_f64_e32 v0, s[2:3]"),
+            ("f22a0e7e", 4, "v_cvt_u32_f64_e32 v7, 1.0"),
+            ("ff1e067e78563412", 8, "v_cvt_f32_f64_e32 v3, 0x12345678"),
+            # Controls that keep the pair: binary64 results.
+            ("0209087e", 4, "v_cvt_f64_i32_e32 v[4:5], v2"),
+            ("0221fc7f", 4, "v_cvt_f64_f32_e32 v[254:255], v2"),
+            ("025f087e", 4, "v_rcp_f64_e32 v[4:5], v[2:3]"),
+        )
+        for raw, length, assembly in vectors:
+            with self.subTest(assembly=assembly):
+                self.assertEqual(decode_instruction(bytes.fromhex(raw), 0)[::2], (length, assembly))
+                self.assertTrue(is_opcode_recognized(assembly.split()[0]))
+
     def test_hwreg_operands_use_llvm_spelling(self):
         """Issue #938: hwreg operands and s_setreg_imm32_b32 literals print as LLVM 15 prints them for gfx1013.
 

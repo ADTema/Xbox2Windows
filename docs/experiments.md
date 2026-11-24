@@ -10046,6 +10046,21 @@ with backface culling enabled (`D3D12_CULL_MODE_BACK`):
 Not covered by this experiment: geometry or tessellation shader stages preceding the
 input assembler, primitive ID generation in pixel shaders, runtime driver hooking, and title CPU code execution.
 
+## gfx1013 VOP1 conversions from binary64 to a 32-bit result
+
+`tools/disasm_rdna2.py` printed the destination of the unextended (`_e32`) VOP1 forms `v_cvt_i32_f64`, `v_cvt_u32_f64`
+and `v_cvt_f32_f64` as a VGPR pair (`v[4:5]`) because their names end in `_f64`. The result is one dword, and the VOP3
+(`_e64`) spelling of the same operations already printed one VGPR. The decoder now prints `v_cvt_i32_f64_e32 v4, v[2:3]`;
+the binary64 source keeps its pair, and `v_cvt_f64_i32`, `v_cvt_f64_f32` and `v_rcp_f64` keep their pair destination.
+The expected texts are the disassembly of words assembled with llvm-mc for gfx1013 (VGPR pair, SGPR pair, inline constant
+and literal sources, `v255` as the destination).
+```sh
+python3 -B tests/rdna2_tools_check.py TestRdna2Disasm.test_vop1_f64_source_conversions_have_one_register_result
+```
+
+Scope: decoder text only. No translator lowers these conversions, so there is no draw or readback, and no measurement on
+hardware backs the descriptions.
+
 ## gfx1013 SOP1 relative scalar moves
 
 `tools/disasm_rdna2.py` decodes the five relative scalar moves of the `SOP1` encoding (issue #938):
