@@ -8,7 +8,9 @@
 ;   R8  = void*       output  (16-byte aligned; 512+ bytes)
 .code
 
-; --- Entry-state FXSAVE / FXSAVE64 ---
+; --- Entry-state FXSAVE / FXSAVE64 (opt-in canonical-entry profile) ---
+; Native callers targeting lifted canonical exports must establish canonical FX state
+; (FCW=0x037F, FSW=0, FTW=0, FOP=0, FIP=0, FCS=0, FDP=0, FDS=0, MXCSR=0x1F80, zero ST/XMM).
 
 op_fxsave_only PROC FRAME
     .endprolog

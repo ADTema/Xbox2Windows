@@ -7,6 +7,15 @@ output). The translator models the full 512-byte FXSAVE/FXRSTOR architectural
 state in a local portable FxState struct (leaving host XMM6..15, x87/MMX and
 MXCSR untouched across lifted calls).
 
+Entry-state contract (`--entry-state`):
+  - defined (default): the three-pointer ABI carries no incoming x87/MMX/MXCSR/XMM
+    state; every fxsave/fxsave64 must follow a supported fxrstor/fxrstor64 that
+    establishes FxState. Bare fxsave/fxsave64 before fxrstor is rejected.
+  - canonical (opt-in): allows fxsave/fxsave64 before fxrstor assuming the
+    native caller establishes canonical architectural state on entry
+    (FCW=0x037F, FSW=0, FTW=0, FOP=0, FIP=0, FCS=0, FDP=0, FDS=0,
+    MXCSR=0x1F80, ST0..7=0, XMM0..15=0).
+
 Supported SSE state instructions (4 forms from docs/coverage/x64_zen2.tsv group SSE):
   - fxsave / fxsave64:   store 416 architectural state bytes to 16-byte-aligned
                          [r8 + disp], zeroing reserved byte 5, reserved ST/MM
@@ -69,6 +78,7 @@ FXRSTOR_CODES = {
     Code.FXRSTOR_M512BYTE: False,
     Code.FXRSTOR64_M512BYTE: True,
 }
+ENTRY_STATES = ("defined", "canonical")
 
 XSAVE_REJECT_CODES = {
     Code.XSAVE_MEM,
@@ -140,6 +150,29 @@ extern "C" __declspec(dllexport) std::uint32_t host_deprecates_fpu_cs_ds() {
     int info7[4]{};
     __cpuidex(info7, 7, 0);
     return (info7[1] & (1 << 13)) != 0 ? 1u : 0u;
+}
+
+extern "C" __declspec(dllexport) std::uint32_t host_fp_err_cpuid_info() {
+    // Bit 0: CPUID.07H.0:EBX[6] FDP_EXCPTN_ONLY
+    // Bit 1: CPUID.07H.0:EBX[13] ZERO_FCS_FDS
+    // Bit 2: CPUID.80000008H:EBX[2] RstrFpErrPtrs
+    std::uint32_t flags = 0u;
+    int info0[4]{};
+    __cpuid(info0, 0);
+    if (info0[0] >= 7) {
+        int info7[4]{};
+        __cpuidex(info7, 7, 0);
+        if ((info7[1] & (1 << 6)) != 0) flags |= 1u;
+        if ((info7[1] & (1 << 13)) != 0) flags |= 2u;
+    }
+    int ext0[4]{};
+    __cpuid(ext0, static_cast<int>(0x80000000u));
+    if (static_cast<std::uint32_t>(ext0[0]) >= 0x80000008u) {
+        int ext8[4]{};
+        __cpuid(ext8, static_cast<int>(0x80000008u));
+        if ((ext8[1] & (1 << 2)) != 0) flags |= 4u;
+    }
+    return flags;
 }
 
 extern "C" __declspec(dllexport) std::uint32_t host_mxcsr_mask() {
@@ -405,8 +438,10 @@ def flat_address(ins, clobbered_ptrs, *, expected_bytes=None, write=False):
     return f"({name} + {disp:#x}ull)" if disp else name
 
 
-def lift_code(name, start, raw):
+def lift_code(name, start, raw, *, entry_state="defined"):
     """Decode and lift one bounded straight-line SSE FXSAVE/FXRSTOR leaf function."""
+    if entry_state not in ENTRY_STATES:
+        raise ValueError(f"unsupported entry-state profile {entry_state!r}")
     instructions = list(Decoder(64, raw, ip=start))
     if not instructions or instructions[-1].next_ip != start + len(raw):
         raise ValueError(f"truncated instruction stream in {name} at RVA {start:#x}")
@@ -420,6 +455,8 @@ def lift_code(name, start, raw):
     defined_gpr = {"rcx", "rdx", "r8"}
     clobbered_ptrs = set()
     mmx_active = False
+    fx_state_defined = False
+    used_canonical_entry = False
     statements = []
     returned = False
 
@@ -501,6 +538,12 @@ def lift_code(name, start, raw):
             if ins.op0_kind != OpKind.MEMORY:
                 raise ValueError(f"expected memory operand for fxsave at RVA {ins.ip:#x}: {ins}")
             addr = flat_address(ins, clobbered_ptrs, expected_bytes=512, write=True)
+            if not fx_state_defined:
+                if entry_state != "canonical":
+                    raise ValueError(
+                        f"fxsave before fxrstor requires explicit --entry-state canonical at RVA {ins.ip:#x}: {ins}"
+                    )
+                used_canonical_entry = True
             is64 = "true" if FXSAVE_CODES[ins.code] else "false"
             statements.append(f"op_fxsave(state, {addr}, {is64});")
 
@@ -510,6 +553,7 @@ def lift_code(name, start, raw):
             addr = flat_address(ins, clobbered_ptrs, expected_bytes=512, write=False)
             is64 = "true" if FXRSTOR_CODES[ins.code] else "false"
             statements.append(f"op_fxrstor(state, {addr}, {is64});")
+            fx_state_defined = True
             defined_xmm.update(range(6))
             defined_mm.update(range(8))
 
@@ -619,7 +663,15 @@ def lift_code(name, start, raw):
         if gpr in used_gpr:
             decls.append(f"    word {gpr} = 0ull;")
     body = [f"    {stmt}" for stmt in statements]
+    if used_canonical_entry:
+        contract = (
+            "// Entry-state profile: canonical (caller must establish FCW=0x037F, FSW=0, "
+            "FTW=0, FOP=0, FIP=0, FCS=0, FDP=0, FDS=0, MXCSR=0x1F80, ST0..7=0, XMM0..15=0)."
+        )
+    else:
+        contract = f"// Entry-state profile: {entry_state} (all fxsave/fxsave64 follow fxrstor/fxrstor64)."
     lines = [
+        contract,
         f'extern "C" __declspec(dllexport) void lifted_{name}(word rcx, word rdx, word r8) {{',
         "    (void)rcx; (void)rdx; (void)r8;",
         *decls,
@@ -629,25 +681,33 @@ def lift_code(name, start, raw):
     return "\n".join(lines), len(instructions)
 
 
-def lift(pe, name):
+def lift(pe, name, *, entry_state="defined"):
     entry = export_rva(pe, name)
     raw = bounded_code(pe, entry)
-    source, count = lift_code(name, entry, raw)
+    source, count = lift_code(name, entry, raw, entry_state=entry_state)
     return source, entry, count
 
 
-def translate_pe(pe, names):
+def translate_pe(pe, names, *, entry_state="defined"):
+    if entry_state not in ENTRY_STATES:
+        raise ValueError(f"unsupported entry-state profile {entry_state!r}")
     if pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20B:
         raise ValueError("expected AMD64 PE32+")
-    lifted = [lift(pe, name) for name in names]
-    source = PRELUDE + "\n".join(f"\n{text}" for text, _, _ in lifted) + "\n"
+    lifted = [lift(pe, name, entry_state=entry_state) for name in names]
+    is_canonical = 1 if entry_state == "canonical" else 0
+    profile_block = (
+        f'\n// Entry-state profile: {entry_state}\n'
+        f'extern "C" __declspec(dllexport) const char* lifted_entry_state_profile() {{ return "{entry_state}"; }}\n'
+        f'extern "C" __declspec(dllexport) std::uint32_t lifted_requires_canonical_entry() {{ return {is_canonical}u; }}\n'
+    )
+    source = PRELUDE + profile_block + "\n".join(f"\n{text}" for text, _, _ in lifted) + "\n"
     meta = [(name, entry, count) for name, (_, entry, count) in zip(names, lifted)]
     return source, meta
 
 
-def translate(image, names):
+def translate(image, names, *, entry_state="defined"):
     with pefile.PE(str(image), fast_load=True) as pe:
-        return translate_pe(pe, names)
+        return translate_pe(pe, names, entry_state=entry_state)
 
 
 if __name__ == "__main__":
@@ -655,11 +715,17 @@ if __name__ == "__main__":
     parser.add_argument("image", type=Path)
     parser.add_argument("exports", help="comma-separated export names")
     parser.add_argument("output", type=Path)
+    parser.add_argument(
+        "--entry-state",
+        choices=ENTRY_STATES,
+        default="defined",
+        help="entry-state profile: defined (default, requires fxrstor before fxsave) or canonical (opt-in caller-initialized canonical FX state)",
+    )
     args = parser.parse_args()
     try:
-        source, meta = translate(args.image, args.exports.split(","))
+        source, meta = translate(args.image, args.exports.split(","), entry_state=args.entry_state)
         args.output.write_text(source, encoding="utf-8")
         for name, entry, count in meta:
-            print(f"{name} at RVA {entry:#x}: {count} instructions")
+            print(f"{name} at RVA {entry:#x} ({args.entry_state}): {count} instructions")
     except (ValueError, OSError, pefile.PEFormatError) as error:
         parser.exit(1, f"{error}\n")

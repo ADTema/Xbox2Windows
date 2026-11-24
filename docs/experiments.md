@@ -6341,11 +6341,18 @@ straight-line Windows x64 leaf functions exercising the four legacy SSE state fo
 
 Each lifted export takes `(word rcx, word rdx, word r8)` pointing to caller-owned buffers
 and models the full FXSAVE state in a portable local `FxState` struct (leaving host
-`XMM6`..`15`, x87/MMX, and `MXCSR` untouched across lifted calls). Transport and ABI glue
-covers `movdqa`/`movdqu` (`XMM0`..`XMM5`), `paddd` (`XMM0`..`XMM5`), `movq` (`MM0`..`MM7`
-<-> `m64`/volatile scratch GPRs), `emms`, 64-bit volatile `mov`, and terminal `ret`. The
-lifted DLL exports `host_has_fxsr()` (`CPUID.01H:EDX.FXSR[24]`, returning exit code 77 when
-absent), `host_deprecates_fpu_cs_ds()` (`CPUID.7.0:EBX[13]`), and `host_mxcsr_mask()`.
+`XMM6`..`15`, x87/MMX, and `MXCSR` untouched across lifted calls). Entry-state contracts are
+explicit via `--entry-state {defined,canonical}` and exported via
+`lifted_entry_state_profile()` / `lifted_requires_canonical_entry()`: the default `defined`
+profile requires a supported `fxrstor`/`fxrstor64` before any `fxsave`/`fxsave64` (rejecting
+bare entry-state saves), while the opt-in `canonical` profile permits entry-state
+`fxsave`/`fxsave64` provided the native caller establishes canonical architectural FX state
+(`FCW=0x037F`, `FSW=0`, `FTW=0`, `FOP=0`, `FIP=0`, `FCS=0`, `FDP=0`, `FDS=0`, `MXCSR=0x1F80`,
+zero `ST0..7`/`XMM0..15`). Transport and ABI glue covers `movdqa`/`movdqu` (`XMM0`..`XMM5`),
+`paddd` (`XMM0`..`XMM5`), `movq` (`MM0`..`MM7` <-> `m64`/volatile scratch GPRs), `emms`, 64-bit
+volatile `mov`, and terminal `ret`. The lifted DLL exports `host_has_fxsr()`
+(`CPUID.01H:EDX.FXSR[24]`, returning exit code 77 when absent), `host_deprecates_fpu_cs_ds()`
+(`CPUID.7.0:EBX[13]`), `host_fp_err_cpuid_info()`, and `host_mxcsr_mask()`.
 `XSAVE`-family instructions (`xsave*`, `xrstor*`), `VEX`/`EVEX`/`XOP` encodings,
 `maskmovq`/`maskmovdqu`, nonvolatile registers (`XMM6`..`15`, `RBX`/`RBP`/`RSI`/`RDI`/
 `R12`..`R15`/`RSP`), non-argument memory bases, stores outside `r8`, RIP-relative
@@ -6353,26 +6360,30 @@ addressing, prefixes, branches, unclosed MMX state before `ret`, undefined regis
 trailing bytes reject.
 
 ```powershell
-cmake --build --preset dev --target cpu_sse_fxsave_original cpu_sse_fxsave_original_lifted cpu_sse_fxsave_altered cpu_sse_fxsave_altered_lifted
+cmake --build --preset dev --target cpu_sse_fxsave_original cpu_sse_fxsave_original_lifted cpu_sse_fxsave_altered cpu_sse_fxsave_altered_lifted cpu_sse_fxsave_canonical_lifted
 ctest --preset dev --no-tests=error -R '^cpu_aot_sse_fxsave$' -V
 ```
 
 ### Measured results and open scope
 
-The [MASM fixture](../tests/cpu/sse_fxsave.asm) exports 9 functions covering entry-state
-`fxsave`/`fxsave64`, all four 32/64-bit `fxrstor*` -> `fxsave*` combinations, displaced
-`[rcx+64]`/`[r8+64]` operands, a chained `fxrstor64` + `movq` MMX GPR bridge + `paddd` +
-`fxsave64` + `emms` pipeline, and a discarded-read fault-ordering control
-(`op_discarded_read`). [The differential check](../tests/cpu/sse_fxsave_check.py) skips
-with exit code 77 if `CPUID.01H:EDX.FXSR[24]` is 0, runs native calls through an isolated
-caller-state trampoline preserving host `XMM6`..`15`/x87/`MXCSR`, and verifies 40 cases
-across 8 exports bit-for-bit against both the native MASM DLL and an independent Python
-reference model with 64-byte pre/post buffer guards across `dev` and `release` (`/O2`)
-builds, plus 8 `+8` misaligned `#GP` controls, 4 invalid `MXCSR` (`0x11F80`) `#GP` controls,
-lifted host-canary preservation, dead-read fault ordering (`op_discarded_read` for readable,
-unmapped `rdx=0`, and `0x11F80` `MXCSR`), 4 `ALTER_OP` divergence controls, an output-mutation
-control, 4 alternate-encoding lift checks, 45 unit rejection controls, and 12 PE-patched
-DLL rejection controls.
+The [MASM fixture](../tests/cpu/sse_fxsave.asm) exports 9 functions covering opt-in
+canonical-entry `fxsave`/`fxsave64` (`cpu_sse_fxsave_canonical_lifted`), all four 32/64-bit
+`fxrstor*` -> `fxsave*` combinations, displaced `[rcx+64]`/`[r8+64]` operands, a chained
+`fxrstor64` + `movq` MMX GPR bridge + `paddd` + `fxsave64` + `emms` pipeline, and a
+discarded-read fault-ordering control (`op_discarded_read`). [The differential
+check](../tests/cpu/sse_fxsave_check.py) skips with exit code 77 if `CPUID.01H:EDX.FXSR[24]`
+is 0, probes native `(rstor64, save64, FSW.ES)` `FIP`/`FDP` preservation on the running host
+so comparisons remain strict for fields established on that host while checking `lifted`
+against the full architectural model, runs native calls through an isolated caller-state
+trampoline, and verifies 40 cases across 8 exports bit-for-bit against both the native MASM
+DLL and an independent Python reference model with 64-byte pre/post buffer guards across
+`dev` and `release` (`/O2`) builds, plus explicit entry-state contract metadata, a
+non-default entry distinguishing control (`MXCSR=0x7FA0`, `XMM6=0x12345678`), 8 `+8`
+misaligned `#GP` controls, 4 invalid `MXCSR` (`0x11F80`) `#GP` controls, lifted host-canary
+preservation, dead-read fault ordering (`op_discarded_read` for readable, unmapped `rdx=0`,
+and `0x11F80` `MXCSR`), 4 `ALTER_OP` divergence controls, an output-mutation control, 4
+alternate-encoding lift checks, 49 unit rejection controls (including default-profile bare
+`fxsave`/`fxsave64` rejections), and 12 PE-patched DLL rejection controls.
 
 Not covered by this experiment: non-canonical 64-bit `FIP` sign-extension differences across
 CPU vendors, `XSAVE`-family state management, control flow, and title CPU code execution.
