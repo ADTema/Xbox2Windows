@@ -11,6 +11,7 @@ The instruction bytes are **constructed here** from the field layout the checked
 `w0[7:0]`, src0 in `w1[8:0]`, src1 in `w1[17:9]`, and source 255 followed by a literal dword.
 """
 import os
+import re
 import struct
 import sys
 
@@ -46,10 +47,11 @@ def encode_vopc_e32(op, src0, vsrc1, literal=None):
         code += struct.pack('<I', literal)
     return code
 
-def encode_vopc(op, sdst, src0, src1, literal=None):
+def encode_vopc(op, sdst, src0, src1, literal=None, abs_src0=0, neg_src0=0):
     """Encode a VOPC comparison in its VOP3A form; a source of 255 is followed by its literal dword."""
-    w0 = (0b110101 << 26) | ((op & 0x3FF) << 16) | (sdst & 0xFF)
-    w1 = (src0 & 0x1FF) | ((src1 & 0x1FF) << 9)
+    w0 = ((0b110101 << 26) | ((op & 0x3FF) << 16) | (sdst & 0xFF)
+          | ((abs_src0 & 1) << 8))
+    w1 = ((src0 & 0x1FF) | ((src1 & 0x1FF) << 9) | ((neg_src0 & 1) << 29))
     code = struct.pack('<II', w0, w1)
     if literal is not None:
         code += struct.pack('<I', literal)
@@ -126,6 +128,175 @@ decoded = G.decode(encode_vopc(VOPC_CMP_CLASS_F32, VCC_LO, V4, INLINE_MINUS_ONE)
 for _o, _s, name, asm_text in decoded:
     stage.one(name, asm_text)
 check('a narrowed exec is intersected with the predicate', 'exec & ' in ' '.join(stage.lines), ' '.join(stage.lines))
+
+# 8. Abs and neg on the value arrive as operand text (`|v4|`, `-v4`), not as a modifier list, so the class
+#    helper must see the modified value bits.
+_asm, emitted, _stage = translate(encode_vopc(VOPC_CMP_CLASS_F32, VCC_LO, V4, INLINE_MINUS_ONE, abs_src0=1))
+check('an absolute value reaches the helper as abs', 'class32(abs(F(v4)))' in emitted, emitted)
+_asm, emitted, _stage = translate(encode_vopc(VOPC_CMP_CLASS_F32, VCC_LO, V4, INLINE_MINUS_ONE, neg_src0=1))
+check('a negated value reaches the helper as a negation', 'class32((-F(v4)))' in emitted, emitted)
+
+
+# ---- value-level check of the emitted class helper -------------------------------------------------------
+# The reference below is written from the IEEE binary32 layout, not from the lowering's expressions: a wrong
+# class bit must fail even though the emitted text still looks plausible.
+def ref_class32(bits):
+    """The LLVM class bit of a binary32 pattern: sNaN qNaN -inf -normal -subnormal -0 +0 +subnormal +normal +inf."""
+    sign = (bits >> 31) & 1
+    exponent = (bits >> 23) & 0xFF
+    mantissa = bits & 0x7FFFFF
+    if exponent == 0xFF:
+        if mantissa == 0:
+            return 0x4 if sign else 0x200
+        return 0x2 if mantissa & 0x400000 else 0x1
+    if exponent == 0:
+        if mantissa == 0:
+            return 0x20 if sign else 0x40
+        return 0x10 if sign else 0x80
+    return 0x8 if sign else 0x100
+
+
+TOKEN = re.compile(r'\s*(0x[0-9a-fA-F]+u?|\d+u?|[A-Za-z_]\w*|>=|<=|==|!=|&&|\|\||[&|<>?:()!~^+-])')
+
+
+def tokens(source):
+    out, position = [], 0
+    while position < len(source):
+        match = TOKEN.match(source, position)
+        if not match:
+            raise ValueError('cannot tokenise %r' % source[position:position + 20])
+        out.append(match.group(1))
+        position = match.end()
+    return out
+
+
+class Expr:
+    """A recursive-descent evaluator for the subset of HLSL the helper uses (32-bit integer bits)."""
+
+    LEVELS = [('||',), ('&&',), ('|',), ('^',), ('&',), ('==', '!='), ('>=', '<=', '>', '<'), ('+', '-')]
+
+    def __init__(self, source, variables):
+        self.items, self.at, self.vars = tokens(source), 0, variables
+
+    def peek(self):
+        return self.items[self.at] if self.at < len(self.items) else ''
+
+    def take(self):
+        item = self.peek()
+        self.at += 1
+        return item
+
+    def ternary(self):
+        condition = self.binary(0)
+        if self.peek() == '?':
+            self.take()
+            yes = self.ternary()
+            if self.take() != ':':
+                raise ValueError('missing :')
+            return yes if condition else self.ternary()
+        return condition
+
+    def binary(self, level):
+        if level == len(self.LEVELS):
+            return self.unary()
+        value = self.binary(level + 1)
+        while self.peek() in self.LEVELS[level]:
+            operator = self.take()
+            rhs = self.binary(level + 1)
+            if operator == '&':
+                value &= rhs
+            elif operator == '|':
+                value |= rhs
+            elif operator == '^':
+                value ^= rhs
+            elif operator == '==':
+                value = int(value == rhs)
+            elif operator == '!=':
+                value = int(value != rhs)
+            elif operator == '>=':
+                value = int(value >= rhs)
+            elif operator == '<=':
+                value = int(value <= rhs)
+            elif operator == '>':
+                value = int(value > rhs)
+            elif operator == '<':
+                value = int(value < rhs)
+            elif operator == '&&':
+                value = int(bool(value) and bool(rhs))
+            elif operator == '||':
+                value = int(bool(value) or bool(rhs))
+            elif operator == '+':
+                value = (value + rhs) & 0xFFFFFFFF
+            elif operator == '-':
+                value = (value - rhs) & 0xFFFFFFFF
+        return value
+
+    def unary(self):
+        item = self.take()
+        if item == '!':
+            return int(not self.unary())
+        if item == '~':
+            return (~self.unary()) & 0xFFFFFFFF
+        if item == '(':
+            value = self.ternary()
+            if self.take() != ')':
+                raise ValueError('missing )')
+            return value
+        if re.fullmatch(r'0x[0-9a-fA-F]+u?', item):
+            return int(item.rstrip('u'), 16)
+        if re.fullmatch(r'\d+u?', item):
+            return int(item.rstrip('u'))
+        if item == 'asuint':
+            return self.call()
+        return self.vars[item]
+
+    def call(self):
+        if self.take() != '(':
+            raise ValueError('missing (')
+        value = self.ternary()
+        if self.take() != ')':
+            raise ValueError('missing )')
+        return value & 0xFFFFFFFF
+
+
+def evaluate_class32(helper, bits):
+    """Run the emitted helper body for one bit pattern, so what is checked is the value it returns."""
+    body = helper[helper.index('{') + 1:helper.rindex('}')]
+    variables = {'value': bits}
+    for statement in (piece.strip() for piece in body.split(';')):
+        if not statement:
+            continue
+        if statement.startswith('uint '):
+            for part in statement[4:].split(','):
+                name, expr = (piece.strip() for piece in part.split('=', 1))
+                variables[name] = Expr(expr, variables).ternary() & 0xFFFFFFFF
+        elif statement.startswith('bool '):
+            name, expr = (piece.strip() for piece in statement[5:].split('=', 1))
+            variables[name] = int(bool(Expr(expr, variables).ternary()))
+        elif statement.startswith('if ') and ') return ' in statement:
+            condition, consequence = statement[3:].split(') return ', 1)
+            if Expr(condition[1:], variables).ternary():
+                return Expr(consequence, variables).ternary() & 0xFFFFFFFF
+        elif statement.startswith('return '):
+            return Expr(statement[7:], variables).ternary() & 0xFFFFFFFF
+    raise ValueError('the helper returned nothing for %#x' % bits)
+
+
+_pipe = object.__new__(G.Pipeline)
+_pipe.uds, _pipe.resources, _pipe.samplers, _pipe.uses_sampler_heap = [], {}, {}, False
+class32_text = [entry for entry in _pipe.common() if 'uint class32(' in entry][0]
+grid = [0x00000000, 0x80000000, 0x00000001, 0x80000001, 0x007FFFFF, 0x807FFFFF, 0x00800000,
+        0x80800000, 0x7F7FFFFF, 0xFF7FFFFF, 0x7F800000, 0xFF800000, 0x7F800001, 0xFF800001,
+        0x7FC00000, 0xFFC00000, 0x7FFFFFFF, 0xFFFFFFFF]
+for _sign in (0, 1):
+    for _exponent in range(256):
+        for _mantissa in (0, 1, 0x3FFFFF, 0x400000, 0x7FFFFE, 0x7FFFFF):
+            grid.append((_sign << 31) | (_exponent << 23) | _mantissa)
+grid += list(range(0, 1 << 32, 0x10001))
+_mismatches = [(bits, ref_class32(bits), evaluate_class32(class32_text, bits)) for bits in grid
+               if evaluate_class32(class32_text, bits) != ref_class32(bits)]
+check('the emitted helper agrees with the binary32 classifier on %d patterns' % len(grid),
+      not _mismatches, repr(_mismatches[:4]))
 
 if failures:
     print('FAIL')
