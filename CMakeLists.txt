@@ -2458,6 +2458,29 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(cpu_aot_pcmpstr64 PROPERTIES
         SKIP_RETURN_CODE 77
         ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_pcmpstr64.txt")
+    set(cpu_sse4a_exports
+        "op_extrq_imm_basic,op_extrq_imm_zero_len,op_extrq_imm_high_bit,"
+        "op_extrq_imm_mid,op_extrq_imm_bits76,"
+        "op_extrq_reg_basic,op_extrq_reg_self,op_extrq_reg_xmm4_xmm5,"
+        "op_insertq_imm_basic,op_insertq_imm_zero_len,op_insertq_imm_high_bit,"
+        "op_insertq_imm_self,"
+        "op_insertq_reg_basic,op_insertq_reg_self,op_insertq_reg_xmm4_xmm5,"
+        "op_movntsd_aligned,op_movntsd_disp8,op_movntsd_unaligned,"
+        "op_movntss_aligned,op_movntss_disp12,op_movntss_unaligned,"
+        "op_pipeline,op_discarded_read,op_sse4a_discarded_read")
+    string(CONCAT cpu_sse4a_exports ${cpu_sse4a_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_sse4a_${variant} sse4a)
+        cpu_translation(cpu_sse4a_${variant} cpu_sse4a_aot "${cpu_sse4a_exports}")
+    endforeach()
+    target_compile_definitions(cpu_sse4a_altered PRIVATE ALTER_IMM)
+    add_test(NAME cpu_aot_sse4a COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/sse4a_check.py"
+        "$<TARGET_FILE:cpu_sse4a_original>"
+        "$<TARGET_FILE:cpu_sse4a_original_lifted>"
+        "$<TARGET_FILE:cpu_sse4a_altered_lifted>")
+    set_tests_properties(cpu_aot_sse4a PROPERTIES
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_sse4a.txt")
     set(cpu_sse2_exports
         "op_cmppd_0,op_cmppd_1,op_cmppd_2,op_cmppd_3,op_cmppd_4,op_cmppd_5,op_cmppd_6,op_cmppd_7,"
         "op_cmppd_mem,"
