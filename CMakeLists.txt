@@ -485,6 +485,20 @@ add_test(NAME startup_storage_failure_counts COMMAND startup_storage_failure_cou
 add_test(NAME startup_storage_failure_counts_one_bucket_control COMMAND startup_storage_failure_counts --mutate one-bucket)
 set_tests_properties(startup_storage_failure_counts startup_storage_failure_counts_one_bucket_control PROPERTIES TIMEOUT 60)
 set_tests_properties(startup_storage_failure_counts_one_bucket_control PROPERTIES WILL_FAIL TRUE)
+# Page-destination requests counted by where page_offset + destination_size ends against the first 64 KiB
+# page (inside, at its end, past it), each as completed or failed, for the heartbeat (#1198). The test
+# compiles the stand-in's source into itself and loads the xmem shim for page writes; the one-bucket
+# expectations are the negative control.
+add_executable(startup_storage_page_end_counts tests/startup_storage_page_end_counts.cpp)
+target_compile_features(startup_storage_page_end_counts PRIVATE cxx_std_17)
+target_include_directories(startup_storage_page_end_counts PRIVATE src)
+target_link_libraries(startup_storage_page_end_counts PRIVATE psapi)
+add_dependencies(startup_storage_page_end_counts xmem_shim)
+add_test(NAME startup_storage_page_end_counts COMMAND startup_storage_page_end_counts "$<TARGET_FILE:xmem_shim>")
+add_test(NAME startup_storage_page_end_counts_one_bucket_control
+         COMMAND startup_storage_page_end_counts "$<TARGET_FILE:xmem_shim>" --mutate one-bucket)
+set_tests_properties(startup_storage_page_end_counts startup_storage_page_end_counts_one_bucket_control PROPERTIES TIMEOUT 60)
+set_tests_properties(startup_storage_page_end_counts_one_bucket_control PROPERTIES WILL_FAIL TRUE)
 # A queue whose worker cannot start (both CreateThread attempts fail, or the construction of its work
 # throws std::bad_alloc) completes status entries and fences at Submit, never inside Enqueue (#1199).
 # The test compiles the stand-in's source into itself so it can redirect CreateThread and operator new.
