@@ -1366,7 +1366,10 @@ def readlane_controls():
     guarded = variant(READLANE,
                       ("v_readlane_b32 s21, v1, s20",
                        "v_cmp_gt_u32_e32 vcc_lo, 10, v0\ns_and_saveexec_b32 s19, vcc_lo\n"
-                       "v_readlane_b32 s21, v1, s20\ns_or_b32 exec_lo, exec_lo, s19"))
+                       "v_readlane_b32 s21, v1, s20\nbuffer_store_dword v1, v0, s[8:11], 0 idxen\n"
+                       "s_or_b32 exec_lo, exec_lo, s19"),
+                      ("v_or_b32_e32 v2, s21, v0", ""),
+                      ("buffer_store_dword v2, v0, s[8:11], 0 idxen", ""))
     rejects("Unverified readlane operand or wave layout", aot.lower, guarded, 64, **READLANE_BINDING)
 
 
