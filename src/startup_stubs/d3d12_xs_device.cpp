@@ -24,7 +24,7 @@
 #include "startup_stubs/derived_blend.h"
 #include "startup_stubs/placement_publish.h"
 #include "startup_stubs/placed_build.h"
-#include "startup_stubs/placed_allocation_cache.h"
+#include "startup_stubs/placed_buffer_range.h"
 #include "startup_stubs/memory_srv_report.h"
 #include "startup_stubs/memory_srv_buffer.h"
 
@@ -2469,7 +2469,7 @@ HRESULT __stdcall device_frame_event(Wrapper*, UINT type, UINT offset_us, void* 
 // title address; nothing translates title GPU addresses yet. Textures trap.
 std::mutex placed_mutex;
 std::vector<std::pair<void*, ID3D12Heap*>> existing_heaps;
-x2w_startup::PlacedAllocationCache placed_allocations;
+volatile LONG64 placed_buffer_calls, placed_buffer_queries;  // reported with the five-second totals
 
 HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3D12_RESOURCE_DESC* desc, UINT state,
                                           const void* clear, const GUID* iid, void** out)
@@ -2517,14 +2517,17 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         *out = w;
         return S_OK;
     }
-    // The extent of the allocation holding the address: committed bytes from its base, measured by a
-    // region walk or taken from the cache when the buffer lies inside an extent measured before.
-    x2w_startup::AllocationExtent extent;
-    if (!placed_allocations.measure(address, desc->Width, extent)) {
+    // The allocation holding the address, and whether every byte from its base to the end of the
+    // buffer is committed in it: a region walk that stops at the end of the buffer.
+    x2w_startup::PlacedBufferRange range;
+    const bool committed = x2w_startup::measure_placed_buffer(address, desc->Width, range);
+    InterlockedIncrement64(&placed_buffer_calls);
+    InterlockedAdd64(&placed_buffer_queries, range.queries);
+    if (!committed) {
         log("x2w-d3d12 Device::slot133(CreatePlacedResourceX?) address=%p not committed -> E_INVALIDARG", address);
         return E_INVALIDARG;
     }
-    void* base = extent.base;
+    void* base = range.base;
     const auto initial_state = state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE ||
         state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS ? static_cast<D3D12_RESOURCE_STATES>(state) : D3D12_RESOURCE_STATE_COMMON;
     if (initial_state != D3D12_RESOURCE_STATE_COMMON && !(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
@@ -2535,8 +2538,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
     // Desktop only accepts 64 KiB-aligned offsets, a private (VirtualAlloc) allocation, and a buffer
     // that lies inside that one allocation. Attempts that cannot succeed are skipped: each failure
     // throws inside D3D12Core.
-    const SIZE_T allocation_bytes = extent.bytes;
-    if ((offset & 0xFFFF) || offset > allocation_bytes || desc->Width > allocation_bytes - offset || extent.type != MEM_PRIVATE ||
+    if ((offset & 0xFFFF) || !range.covered || range.type != MEM_PRIVATE ||
         initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE) hr = E_INVALIDARG;
     if (SUCCEEDED(hr)) {
         std::lock_guard lock(placed_mutex);
@@ -3079,10 +3081,10 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     }
     if (now - last_report >= 5000) {
         last_report = now;
-        log("x2w-d3d12 views noted %lld (distinct %lld), descriptors copied %lld, heaps %llu, placed allocations %llu "
-            "(walks %lld, walks saved %lld)", views_noted, views_distinct, descriptors_copied,
-            static_cast<u64>(heap_infos().size()), static_cast<u64>(placed_allocations.entries()),
-            static_cast<long long>(placed_allocations.walks()), static_cast<long long>(placed_allocations.hits()));
+        log("x2w-d3d12 views noted %lld (distinct %lld), descriptors copied %lld, heaps %llu, placed buffers %lld "
+            "(region queries %lld)", views_noted, views_distinct, descriptors_copied,
+            static_cast<u64>(heap_infos().size()), static_cast<long long>(placed_buffer_calls),
+            static_cast<long long>(placed_buffer_queries));
         {
             LARGE_INTEGER frequency;
             QueryPerformanceFrequency(&frequency);

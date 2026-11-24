@@ -372,18 +372,13 @@ target_include_directories(startup_placement_publish_check PRIVATE src)
 add_test(NAME startup_placement_publish COMMAND startup_placement_publish_check)
 add_test(NAME startup_placement_publish_shrink_control COMMAND startup_placement_publish_check --mutate shrink)
 set_tests_properties(startup_placement_publish_shrink_control PROPERTIES WILL_FAIL TRUE)
-# Allocation extents remembered for device slot 133 match the uncached region walk, one walk per
-# allocation, and a released block replaced by a smaller one at the same base is measured again
-# (src/startup_stubs/placed_allocation_cache.h). The mutated runs are the negative controls.
-add_executable(startup_placed_allocation_cache_check tests/startup_placed_allocation_cache_check.cpp)
-target_compile_features(startup_placed_allocation_cache_check PRIVATE cxx_std_17)
-target_include_directories(startup_placed_allocation_cache_check PRIVATE src)
-add_test(NAME startup_placed_allocation_cache COMMAND startup_placed_allocation_cache_check)
-add_test(NAME startup_placed_allocation_cache_unchecked_control COMMAND startup_placed_allocation_cache_check --mutate none)
-add_test(NAME startup_placed_allocation_cache_address_only_control
-    COMMAND startup_placed_allocation_cache_check --mutate address-only)
-set_tests_properties(startup_placed_allocation_cache_unchecked_control startup_placed_allocation_cache_address_only_control
-    PROPERTIES WILL_FAIL TRUE SKIP_RETURN_CODE 77)
+# Device slot 133 walks the allocation only from its base to the end of the buffer; every alias or
+# refusal must equal the full walk's on the same memory, including a decommitted page before the
+# buffer and a block replaced at the same base (src/startup_stubs/placed_buffer_range.h).
+add_executable(startup_placed_buffer_range_check tests/startup_placed_buffer_range_check.cpp)
+target_compile_features(startup_placed_buffer_range_check PRIVATE cxx_std_17)
+target_include_directories(startup_placed_buffer_range_check PRIVATE src)
+add_test(NAME startup_placed_buffer_range COMMAND startup_placed_buffer_range_check)
 add_executable(startup_storage_file_range tests/startup_storage_file_range.cpp)
 target_compile_features(startup_storage_file_range PRIVATE cxx_std_17)
 target_include_directories(startup_storage_file_range PRIVATE src)

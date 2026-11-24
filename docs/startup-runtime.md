@@ -931,29 +931,25 @@ is not affected: section-backed pages already took the committed, not-aliased pa
   (slot 133) inside one view and across three kinds of boundary: two mapping calls, two backing
   sections, and single-page views.
 
-## Placed buffer allocation extents (device slot 133)
+## Placed buffer allocation walk (device slot 133)
 
-Before placing a buffer, slot 133 measures the committed bytes of the allocation that holds the
-address with a `VirtualQuery` walk over its regions. `src/startup_stubs/placed_allocation_cache.h`
-remembers the measured extent of private allocations. A later buffer that lies inside a remembered
-extent is served without a walk after one or two queries: the region at the buffer's address and
-the region at its last byte must both be committed, belong to the remembered allocation base, and
-the address must still be private memory. Any other placement is measured as before, and the
-alignment, size, memory-type and state rules are unchanged. The five-second `x2w-d3d12 views noted`
-line in `stderr.txt` reports `placed allocations <entries> (walks <n>, walks saved <n>)`.
+Slot 133 aliases a buffer only when every byte from the base of the allocation holding the address
+to the end of the buffer is committed in that allocation, and the memory is private. It used to
+measure the whole committed run from the base with one `VirtualQuery` per region and compare the
+buffer with that length. `src/startup_stubs/placed_buffer_range.h` walks the same regions from the
+base but stops at the end of the buffer, because regions after it cannot change the answer. The
+alias or refusal is the same as before; nothing is remembered between placements, so a page
+decommitted, released or replaced directly through the Windows API is seen by the next placement.
+The alignment, memory-type and state rules are unchanged. The five-second `x2w-d3d12 views noted`
+line in `stderr.txt` reports `placed buffers <n> (region queries <n>)`.
 
-The check does not see a `MEM_DECOMMIT` of pages strictly between the two queried regions of a
-remembered allocation; no stand-in decommits part of an allocation.
-
-- `ctest --preset release --no-tests=error -R '^startup_placed_allocation_cache' -V` places 256
-  buffers into a 64 MiB private block whose alternating 64 KiB pages have different protections,
-  compares every extent and decision with the uncached walk, and expects one walk. A block released
-  and replaced by a 1 MiB block at the same base must refuse a buffer that ends past the new end and
-  one that starts past it; a mapped view is refused every time and not remembered; pages committed
-  after the first measurement are seen. The two `_control` runs disable the check
-  (`--mutate none`) or query only the buffer's address (`--mutate address-only`) and must fail,
-  each only through its own stale acceptance; any other failure makes the control fail, and a refused
-  allocation or mapping is a capability skip (77).
+- `ctest --preset release --no-tests=error -R '^startup_placed_buffer_range$' -V` compares every
+  decision with the full walk on the same memory: 256 buffers spread over a 64 MiB private block
+  whose alternating 64 KiB pages have different protections (it prints the region queries per
+  placement of both walks); a middle page decommitted under a buffer, before a buffer and five pages
+  before a buffer, then committed again; a block released and replaced by a 1 MiB block at the same
+  base; a mapped view; and a reservation committed in two steps. Each case places a buffer before
+  changing the memory, so state kept between placements would show up as a mismatch.
 
 ## Buffer memory SRVs (device slot 70)
 
