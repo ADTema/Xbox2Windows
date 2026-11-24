@@ -171,11 +171,13 @@ class NativeHarness:
         finally:
             self.rstor_fn(self._save_ptr)
 
-    def probe_fx_err_ptrs(self, mxcsr_mask: int) -> dict[tuple[bool, bool, bool], tuple[bool, bool]]:
-        """Observe whether native FXRSTOR* -> FXSAVE* preserves FIP/FDP for (rstor64, save64, FSW.ES)."""
-        caps: dict[tuple[bool, bool, bool], tuple[bool, bool]] = {}
+    def probe_fx_err_ptrs(self, mxcsr_mask: int) -> dict[tuple[bool, bool, bool], tuple[bool, bool, bool]]:
+        """Observe whether native FXRSTOR* -> FXSAVE* preserves FOP/FIP/FDP for (rstor64, save64, FSW.ES)."""
+        caps: dict[tuple[bool, bool, bool], tuple[bool, bool, bool]] = {}
+        seed_fop = 0x0357
         seed_fip = 0x00007FFF12345678
         seed_fdp = 0x00007FFF87654321
+        exp_fop = struct.pack("<H", seed_fop)
         for rstor64 in (False, True):
             eff_fip = seed_fip if rstor64 else (seed_fip & 0xFFFFFFFF)
             eff_fdp = seed_fdp if rstor64 else (seed_fdp & 0xFFFFFFFF)
@@ -187,6 +189,7 @@ class NativeHarness:
                     img = make_fx_image(
                         mxcsr_mask,
                         fsw=0x0080 if es else 0x0000,
+                        fop=seed_fop,
                         fip=seed_fip,
                         fdp=seed_fdp,
                         mxcsr=0x1F80,
@@ -203,8 +206,13 @@ class NativeHarness:
                         self.rstor_fn(self._save_ptr)
                     raw = out_buf.raw[out_off:out_post]
                     _ = in_buf
+                    got_fop = raw[6:8]
                     got_fip = raw[8 : 8 + width]
                     got_fdp = raw[16 : 16 + width]
+                    if got_fop not in (exp_fop, b"\x00\x00"):
+                        raise AssertionError(
+                            f"unexpected host FOP probe value for rstor64={rstor64}, save64={save64}, es={es}: {got_fop.hex()}"
+                        )
                     if got_fip not in (exp_fip, b"\x00" * width):
                         raise AssertionError(
                             f"unexpected host FIP probe value for rstor64={rstor64}, save64={save64}, es={es}: {got_fip.hex()}"
@@ -213,7 +221,7 @@ class NativeHarness:
                         raise AssertionError(
                             f"unexpected host FDP probe value for rstor64={rstor64}, save64={save64}, es={es}: {got_fdp.hex()}"
                         )
-                    caps[(rstor64, save64, es)] = (got_fip == exp_fip, got_fdp == exp_fdp)
+                    caps[(rstor64, save64, es)] = (got_fop == exp_fop, got_fip == exp_fip, got_fdp == exp_fdp)
         return caps
 
 
@@ -458,15 +466,17 @@ def invoke_native(harness: NativeHarness, fn, a: bytes, b: bytes, entry_ptr: int
 
 
 def expected_native_output(want: bytes, a: bytes, name: str, fp_caps: dict) -> bytes:
-    """Adapt reference FIP/FDP expectations strictly to observed host preservation."""
+    """Adapt reference FOP/FIP/FDP expectations strictly to observed host preservation."""
     rstor64, save64, off = EXPORT_MODES[name]
     fsw_in = struct.unpack_from("<H", a, off + 2)[0]
     es = (fsw_in & 0x0080) != 0
-    preserves_fip, preserves_fdp = fp_caps[(rstor64, save64, es)]
-    if preserves_fip and preserves_fdp:
+    preserves_fop, preserves_fip, preserves_fdp = fp_caps[(rstor64, save64, es)]
+    if preserves_fop and preserves_fip and preserves_fdp:
         return want
     width = 8 if save64 else 4
     out = bytearray(want)
+    if not preserves_fop:
+        out[off + 6 : off + 8] = b"\x00\x00"
     if not preserves_fip:
         out[off + 8 : off + 8 + width] = b"\x00" * width
     if not preserves_fdp:
