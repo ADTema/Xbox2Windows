@@ -61,8 +61,9 @@ int main(int argc, char** argv)
     answered("d32s8 994x624", texture(19, 994, 624), {0x4F0000, 0x10000}, pad(0x340000, 0x300000));
     // The console's 16-bit depth with stencil has no desktop format; a 4-byte desktop stand-in is assumed.
     answered("d16s8 2560x1440", texture(118, 2560, 1440), {0xF00000, 0x10000}, pad(0xB40000, 0xAA0000));
-    // An invalid desktop answer (all ones) is replaced as well.
-    answered("d32s8 after an invalid desktop answer", texture(19, 2048, 2048), {~0ull, 0}, 0x1400000);
+    // A console-only format has no desktop answer: the validated shape is answered over the failure.
+    answered("d16s8 after a desktop failure", texture(118, 2560, 1440), {~0ull, 0}, pad(0xB40000, 0xAA0000));
+    answered("d32s8 at the largest dimensions", texture(19, 16384, 16384, 8, 2048), {0x200000000000, 0x10000}, 0x140000000000);
     // Multisampling: a tile holds 64 KiB of samples, and the 4 MiB desktop alignment goes.
     answered("rgba8 1x1 4 samples", texture(28, 1, 1, 4), {0x400000, 0x400000}, 0x10000);
     answered("d32s8 1x1 4 samples", texture(19, 1, 1, 4), {0x400000, 0x400000}, 0x20000);
@@ -78,6 +79,45 @@ int main(int argc, char** argv)
     left_alone("r8 4 samples", texture(61, 256, 256, 4), {0x400000, 0x400000});
     left_alone("rgba8 3 samples", texture(28, 256, 256, 3), {0x400000, 0x400000});
     left_alone("d32s8 already smaller", texture(19, 2048, 2048), {0x1400000, 0x10000});
+    // A desktop failure is kept for desktop formats, valid shape or not.
+    left_alone("d32s8 after a desktop failure", texture(19, 2048, 2048), {~0ull, 0});
+    left_alone("rgba8 4 samples after a desktop failure", texture(28, 256, 256, 4), {~0ull, 0});
+    // Shapes outside the rule keep whatever desktop said, including for the console-only formats.
+    D3D12_RESOURCE_DESC shape = texture(19, 2048, 2048);
+    shape.Width = ~0ull;  // would wrap while padding to a tile
+    left_alone("d32s8 width all ones", shape, {~0ull, 0});
+    left_alone("d32s8 width all ones, desktop answer", shape, {0x2000000, 0x10000});
+    shape = texture(118, 16385, 64);
+    left_alone("d16s8 wider than a 2D texture can be", shape, {~0ull, 0});
+    shape = texture(118, 64, 0);
+    left_alone("d16s8 zero height", shape, {~0ull, 0});
+    shape = texture(118, 64, 64, 1, 1, 0);
+    left_alone("d16s8 full mip chain (MipLevels 0)", shape, {~0ull, 0});
+    left_alone("d32s8 full mip chain (MipLevels 0)", texture(19, 1024, 1024, 1, 1, 0), {0xA80000, 0x10000});
+    shape = texture(118, 64, 64);
+    shape.DepthOrArraySize = 0;
+    left_alone("d16s8 zero slices", shape, {~0ull, 0});
+    shape = texture(118, 64, 64, 4);
+    shape.SampleDesc.Quality = 1;
+    left_alone("d16s8 sample quality 1", shape, {~0ull, 0});
+    shape = texture(19, 64, 64, 4);
+    shape.SampleDesc.Quality = 1;
+    left_alone("d32s8 sample quality 1", shape, {0x400000, 0x400000});
+    shape = texture(118, 64, 64);
+    shape.SampleDesc.Count = 0;
+    left_alone("d16s8 zero samples", shape, {~0ull, 0});
+    shape = texture(118, 64, 64);
+    shape.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    left_alone("d16s8 row-major layout", shape, {~0ull, 0});
+    shape = texture(19, 1024, 1024);
+    shape.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+    left_alone("d32s8 64 KiB swizzle layout", shape, {0x800000, 0x10000});
+    shape = texture(118, 64, 64);
+    shape.Alignment = 0x1000;
+    left_alone("d16s8 4 KiB alignment", shape, {~0ull, 0});
+    shape = texture(19, 1024, 1024);
+    shape.Alignment = 0x400000;
+    left_alone("d32s8 4 MiB alignment", shape, {0x800000, 0x400000});
     D3D12_RESOURCE_DESC volume = texture(19, 64, 64);
     volume.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
     left_alone("3D texture", volume, {0x80000, 0x10000});
@@ -91,6 +131,6 @@ int main(int argc, char** argv)
         std::printf("startup_plane_size: %d FAILED\n", failures);
         return 1;
     }
-    std::printf("startup_plane_size: PASS (12 answered, 9 left alone)\n");
+    std::printf("startup_plane_size: PASS (13 answered, 25 left alone)\n");
     return 0;
 }

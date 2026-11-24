@@ -308,5 +308,18 @@ bytes a texel for the R32G8X24 family is left alone, because the console size is
 The tile rule reproduces the nine reference sizes that `tests/startup_plane_size_check.cpp`
 lists first. Those are console allocation sizes for descriptions the executable queries, taken
 from the log of an independent implementation of the same device interface; no code was taken
-from it. Other formats, mip chains, 3D textures and sample counts outside 1, 2, 4 and 8 keep the
-desktop answer. Run `ctest --preset release --no-tests=error -R '^startup_plane_size' -V`.
+from it.
+
+The rule covers a 2D texture with exactly one mip, dimensions within the D3D12 limits, 1, 2, 4 or
+8 samples at quality 0, the default layout and the default or 64 KiB alignment. Any other
+description keeps the desktop answer. A desktop failure is kept for desktop formats; only the
+console-only formats 118-120, which desktop cannot answer, are answered over it.
+
+- `ctest --preset release --no-tests=error -R '^startup_plane_size(_packed_control)?$' -V` checks
+  the rule without a device, including the shapes it refuses.
+- `ctest --preset release --no-tests=error -R '^startup_plane_size_device_' -V` goes through the
+  wrapper: slots 25 and 108 must both give the helper's result for this adapter's own desktop
+  answer, a placed texture (slot 133) is created over memory of the answered size and alignment,
+  and descriptions outside the rule must come back unchanged. The placed texture is a committed
+  desktop texture that does not alias the address, so this shows the answered size is accepted by
+  the creation path, not that the console layout fits in it.

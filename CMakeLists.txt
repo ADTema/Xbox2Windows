@@ -487,6 +487,15 @@ target_compile_features(startup_plane_size_check PRIVATE cxx_std_17)
 add_test(NAME startup_plane_size COMMAND startup_plane_size_check)
 add_test(NAME startup_plane_size_packed_control COMMAND startup_plane_size_check --mutate packed)
 set_tests_properties(startup_plane_size_packed_control PROPERTIES WILL_FAIL TRUE)
+# The same rule through the device wrapper: allocation-info slots 25 and 108, then a placed texture
+# (slot 133) over memory of the answered size.
+add_executable(startup_plane_size_device_check tests/startup_plane_size_device_check.cpp)
+target_compile_features(startup_plane_size_device_check PRIVATE cxx_std_17)
+target_link_libraries(startup_plane_size_device_check PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(adapter IN ITEMS warp hardware)
+    add_test(NAME startup_plane_size_device_${adapter} COMMAND startup_plane_size_device_check ${adapter})
+endforeach()
+set_tests_properties(startup_plane_size_device_hardware PROPERTIES SKIP_RETURN_CODE 77)
 
 # Colour-blend register decoding (src/startup_stubs/cb_blend.h, #1216): decoder table plus draws
 # compared with a CPU model of the register fields.

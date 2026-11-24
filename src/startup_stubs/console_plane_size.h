@@ -40,19 +40,38 @@ inline unsigned colour_texel_bytes(unsigned format)
 }
 }  // namespace plane_detail
 
-// Replaces info with the console size for a single-mip 2D texture that is depth with stencil
-// (R32G8X24 family, or the console's 16-bit depth with stencil, formats 118-120) or multisampled
-// in one of the colour formats above. Returns false and leaves info alone for every other
-// description, and when the console size would not be smaller than a valid desktop answer.
+// The descriptions the rule covers: a 2D texture with exactly one mip, dimensions within the
+// D3D12 limits, a sample count of 1, 2, 4 or 8 at quality 0, the default layout and the default or
+// 64 KiB alignment. Everything else keeps the desktop answer, including its failure.
+inline bool console_plane_shape(const D3D12_RESOURCE_DESC& desc)
+{
+    return desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.MipLevels == 1 &&
+           desc.Width >= 1 && desc.Width <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION &&
+           desc.Height >= 1 && desc.Height <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION &&
+           desc.DepthOrArraySize >= 1 && desc.DepthOrArraySize <= D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION &&
+           (desc.SampleDesc.Count == 1 || desc.SampleDesc.Count == 2 || desc.SampleDesc.Count == 4 || desc.SampleDesc.Count == 8) &&
+           desc.SampleDesc.Quality == 0 && desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN &&
+           (desc.Alignment == 0 || desc.Alignment == 0x10000);
+}
+
+// Replaces info with the console size for a description of the shape above that is depth with
+// stencil (R32G8X24 family, or the console's 16-bit depth with stencil, formats 118-120) or
+// multisampled in one of the colour formats above. Returns false and leaves info alone otherwise.
+//
+// A desktop failure (size all ones) is kept for the desktop formats: nothing here shows that a
+// shape desktop rejects is valid on the console. Formats 118-120 do not exist on desktop, so for
+// them the validated shape is answered whatever desktop said. A valid desktop answer is replaced
+// only by a smaller console size or a smaller alignment.
 inline bool console_plane_size(const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_ALLOCATION_INFO& info)
 {
     using namespace plane_detail;
-    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.MipLevels > 1 || !desc.Width || !desc.Height) return false;
+    if (!console_plane_shape(desc)) return false;
     const unsigned format = static_cast<unsigned>(desc.Format);
     const bool d32s8 = format >= 19 && format <= 22, d16s8 = format >= 118 && format <= 120;
-    const std::uint64_t samples = desc.SampleDesc.Count ? desc.SampleDesc.Count : 1;
-    const std::uint64_t slices = desc.DepthOrArraySize ? desc.DepthOrArraySize : 1;
-    if (samples != 1 && samples != 2 && samples != 4 && samples != 8) return false;
+    const bool desktop_failed = info.SizeInBytes == ~0ull;
+    if (desktop_failed && !d16s8) return false;
+    // At most 16384 x 16384 texels, 32 bytes of samples a texel and 2048 slices: below 2^45, no overflow.
+    const std::uint64_t samples = desc.SampleDesc.Count, slices = desc.DepthOrArraySize;
     std::uint64_t size = 0;
     if (d32s8) {
         size = plane_bytes(desc.Width, desc.Height, 4 * samples, slices) + plane_bytes(desc.Width, desc.Height, samples, slices);
@@ -63,7 +82,7 @@ inline bool console_plane_size(const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_A
     } else {
         return false;
     }
-    if (info.SizeInBytes != ~0ull && size >= info.SizeInBytes && info.Alignment <= 0x10000) return false;
+    if (!desktop_failed && size >= info.SizeInBytes && info.Alignment <= 0x10000) return false;
     info.SizeInBytes = size;
     info.Alignment = 0x10000;
     return true;
