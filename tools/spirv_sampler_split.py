@@ -5,7 +5,8 @@ OpImageSampleDrefExplicitLod and OpImageSampleExplicitLod, it emits a SamplerCom
 passes it to an ordinary SampleLevel call, which DXC rejects. This pass keeps the comparison
 sampler at its original binding and moves only the ordinary uses to a new sampler variable at a
 binding the caller supplies. The caller (the host) owns that binding and must bind an ordinary
-sampler there.
+sampler there. A module may hold several such samplers: the caller then supplies one distinct free
+binding per sampler, in declaration order, and each gets its own new sampler variable.
 
 The pass first looks for a standalone UniformConstant sampler, loaded directly, whose sampled
 images feed both kinds of sampling. Modules without one, including indexed sampler tables and
@@ -47,48 +48,8 @@ def _standalone_sampler(definitions, loaded):
     return load[2]
 
 
-def split_comparison_sampler(assembly, ordinary_binding):
-    """Return (assembly, mapping). mapping is None when no sampler has mixed uses."""
-    if ordinary_binding < 0:
-        raise ValueError("Ordinary sampler binding must be nonnegative")
-    lines = assembly.splitlines()
-    parsed = [_tokens(line) for line in lines]
-    definitions = {words[0]: words[2:] for words in parsed if len(words) >= 3 and words[1] == "="}
-    defined_at = {words[0]: i for i, words in enumerate(parsed) if len(words) >= 3 and words[1] == "="}
-
-    # Every non-annotation instruction that references an ID, keyed by that ID.
-    uses = defaultdict(list)
-    for words in parsed:
-        args = words[2:] if len(words) >= 3 and words[1] == "=" else words
-        if args and args[0] not in ANNOTATIONS:
-            for operand in args[1:]:
-                if operand.startswith("%"):
-                    uses[operand].append((words[0] if args is not words else None, args))
-
-    # 1. Find candidates without judging anything outside the standalone profile: a sampled image
-    # whose sampler is a direct OpLoad of a standalone UniformConstant OpTypeSampler variable.
-    kinds_by_sampler = defaultdict(set)
-    for image, definition in definitions.items():
-        if definition[:1] != ["OpSampledImage"] or len(definition) != 4:
-            continue
-        sampler = _standalone_sampler(definitions, definition[3])
-        if sampler is None:
-            continue
-        for _, use in uses[image]:
-            if use[0].startswith("OpImage") and use[0] != "OpImage":
-                kinds_by_sampler[sampler].add("compare" if "Dref" in use[0] else "ordinary")
-    mixed = [sampler for sampler, kinds in kinds_by_sampler.items() if len(kinds) == 2]
-    if not mixed:
-        return assembly, None
-    if len(mixed) != 1:
-        raise ValueError("Sampler split supports one sampler with mixed uses per module")
-    sampler = mixed[0]
-
-    # 2. Apply the narrow profile to the sampler being split, and only to it.
-    entries = [i for i, words in enumerate(parsed) if words[:1] == ["OpEntryPoint"]]
-    if len(entries) != 1 or parsed[entries[0]][1] != "GLCompute":
-        raise ValueError("Sampler split requires a single GLCompute entry point")
-    entry = entries[0]
+def _ordinary_images(sampler, uses, definitions):
+    """Apply the narrow profile to one sampler being split; return its ordinary-only sampled images."""
     images = []
     for _, use in uses[sampler]:
         if use[0] != "OpLoad":
@@ -123,6 +84,64 @@ def split_comparison_sampler(assembly, ordinary_binding):
             raise ValueError(f"{image}: one sampled image is used for both sampling kinds")
         if kinds == {"ordinary"}:
             ordinary_images.append(image)
+    return ordinary_images
+
+
+def split_comparison_sampler(assembly, ordinary_binding):
+    """Return (assembly, mapping). mapping is None when no sampler has mixed uses.
+
+    ordinary_binding is one int for a module with exactly one mixed sampler; mapping is then one dict
+    and the new IDs are %x2w_plain_sampler and %x2w_plain_sampler_<k> for its loads. For several mixed
+    samplers pass a sequence with one distinct binding per sampler, in the order the sampler variables
+    are declared; mapping is then a list of dicts, the new variables are %x2w_plain_sampler_<n> (n counts
+    from 0) and their loads %x2w_plain_sampler_<n>_load_<k>.
+    """
+    sequence = not isinstance(ordinary_binding, int)
+    requested = list(ordinary_binding) if sequence else [ordinary_binding]
+    if any(binding < 0 for binding in requested):
+        raise ValueError("Ordinary sampler binding must be nonnegative")
+    if len(set(requested)) != len(requested):
+        raise ValueError("Ordinary sampler bindings must be distinct")
+    lines = assembly.splitlines()
+    parsed = [_tokens(line) for line in lines]
+    definitions = {words[0]: words[2:] for words in parsed if len(words) >= 3 and words[1] == "="}
+    defined_at = {words[0]: i for i, words in enumerate(parsed) if len(words) >= 3 and words[1] == "="}
+
+    # Every non-annotation instruction that references an ID, keyed by that ID.
+    uses = defaultdict(list)
+    for words in parsed:
+        args = words[2:] if len(words) >= 3 and words[1] == "=" else words
+        if args and args[0] not in ANNOTATIONS:
+            for operand in args[1:]:
+                if operand.startswith("%"):
+                    uses[operand].append((words[0] if args is not words else None, args))
+
+    # 1. Find candidates without judging anything outside the standalone profile: a sampled image
+    # whose sampler is a direct OpLoad of a standalone UniformConstant OpTypeSampler variable.
+    kinds_by_sampler = defaultdict(set)
+    for image, definition in definitions.items():
+        if definition[:1] != ["OpSampledImage"] or len(definition) != 4:
+            continue
+        sampler = _standalone_sampler(definitions, definition[3])
+        if sampler is None:
+            continue
+        for _, use in uses[image]:
+            if use[0].startswith("OpImage") and use[0] != "OpImage":
+                kinds_by_sampler[sampler].add("compare" if "Dref" in use[0] else "ordinary")
+    mixed = sorted((sampler for sampler, kinds in kinds_by_sampler.items() if len(kinds) == 2),
+                   key=defined_at.__getitem__)
+    if not mixed:
+        return assembly, None
+    if len(mixed) != len(requested) or (len(mixed) > 1 and not sequence):
+        raise ValueError(f"Sampler split found {len(mixed)} samplers with mixed uses and was given "
+                         f"{len(requested)} ordinary bindings; supply one distinct binding for each")
+
+    # 2. Apply the narrow profile to the samplers being split, and only to them.
+    entries = [i for i, words in enumerate(parsed) if words[:1] == ["OpEntryPoint"]]
+    if len(entries) != 1 or parsed[entries[0]][1] != "GLCompute":
+        raise ValueError("Sampler split requires a single GLCompute entry point")
+    entry = entries[0]
+    ordinary_images = {sampler: _ordinary_images(sampler, uses, definitions) for sampler in mixed}
 
     bindings = {}
     descriptor_sets = {}
@@ -136,50 +155,62 @@ def split_comparison_sampler(assembly, ordinary_binding):
                 bindings[words[1]] = (i, value)
             else:
                 descriptor_sets[words[1]] = value
-    if sampler not in parsed[entry][4:]:
-        raise ValueError(f"{sampler}: sampler must be listed in the entry-point interface")
-    if sampler not in bindings or sampler not in descriptor_sets:
-        raise ValueError(f"{sampler}: sampler needs a DescriptorSet and Binding decoration")
-    binding_line, comparison_binding = bindings[sampler]
-    descriptor_set = descriptor_sets[sampler]
-    for variable, (_, slot) in bindings.items():
-        # A Binding without a DescriptorSet decoration is counted as set 0, so it cannot hide.
-        if descriptor_sets.get(variable, 0) == descriptor_set and slot == ordinary_binding:
-            raise ValueError(f"Ordinary sampler binding {ordinary_binding} is occupied in set "
-                             f"{descriptor_set} by {variable}")
+    for sampler, binding in zip(mixed, requested):
+        if sampler not in parsed[entry][4:]:
+            raise ValueError(f"{sampler}: sampler must be listed in the entry-point interface")
+        if sampler not in bindings or sampler not in descriptor_sets:
+            raise ValueError(f"{sampler}: sampler needs a DescriptorSet and Binding decoration")
+        for variable, (_, slot) in bindings.items():
+            # A Binding without a DescriptorSet decoration is counted as set 0, so it cannot hide.
+            if descriptor_sets.get(variable, 0) == descriptor_sets[sampler] and slot == binding:
+                raise ValueError(f"Ordinary sampler binding {binding} is occupied in set "
+                                 f"{descriptor_sets[sampler]} by {variable}")
     if any(word.startswith(PREFIX) for words in parsed for word in words):
         raise ValueError("Reserved sampler split ID is already in use")
 
-    lines[entry] = " ".join([*parsed[entry], PREFIX])
-    lines[binding_line] += (f"\nOpDecorate {PREFIX} DescriptorSet {descriptor_set}"
-                            f"\nOpDecorate {PREFIX} Binding {ordinary_binding}")
-    lines[defined_at[sampler]] += f"\n{PREFIX} = OpVariable {definitions[sampler][1]} UniformConstant"
-    sampler_type = definitions[definitions[sampler][1]][2]
-    for index, image in enumerate(ordinary_images):
-        i = defined_at[image]
-        load = f"{PREFIX}_{index}"
-        lines[i] = f"{load} = OpLoad {sampler_type} {PREFIX}\n" + " ".join([*parsed[i][:-1], load])
-    mapping = {"descriptor_set": descriptor_set, "comparison_binding": comparison_binding,
-               "ordinary_binding": ordinary_binding}
-    return "\n".join(lines) + "\n", mapping
+    mappings = []
+    new_ids = []
+    for n, (sampler, binding) in enumerate(zip(mixed, requested)):
+        plain = f"{PREFIX}_{n}" if sequence else PREFIX
+        new_ids.append(plain)
+        binding_line, comparison_binding = bindings[sampler]
+        descriptor_set = descriptor_sets[sampler]
+        lines[binding_line] += (f"\nOpDecorate {plain} DescriptorSet {descriptor_set}"
+                                f"\nOpDecorate {plain} Binding {binding}")
+        lines[defined_at[sampler]] += f"\n{plain} = OpVariable {definitions[sampler][1]} UniformConstant"
+        sampler_type = definitions[definitions[sampler][1]][2]
+        for index, image in enumerate(ordinary_images[sampler]):
+            i = defined_at[image]
+            load = f"{plain}_load_{index}" if sequence else f"{PREFIX}_{index}"
+            lines[i] = f"{load} = OpLoad {sampler_type} {plain}\n" + " ".join([*parsed[i][:-1], load])
+        mapping = {"descriptor_set": descriptor_set, "comparison_binding": comparison_binding,
+                   "ordinary_binding": binding}
+        if sequence:
+            mapping = {"comparison_sampler": sampler, "plain_sampler": plain, **mapping}
+        mappings.append(mapping)
+    lines[entry] = " ".join([*parsed[entry], *new_ids])
+    return "\n".join(lines) + "\n", mappings if sequence else mappings[0]
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("input", type=Path, help="SPIR-V assembly")
     parser.add_argument("output", type=Path, help="lowered SPIR-V assembly")
-    parser.add_argument("--ordinary-binding", type=int, required=True,
-                        help="free binding, in the comparison sampler's descriptor set, for the ordinary sampler")
+    parser.add_argument("--ordinary-binding", type=int, required=True, action="append",
+                        help="free binding, in the comparison sampler's descriptor set, for the ordinary sampler; "
+                             "repeat once per mixed sampler, in declaration order, with distinct values")
     args = parser.parse_args()
     try:
         assembly, mapping = split_comparison_sampler(args.input.read_text(encoding="utf-8"),
-                                                     args.ordinary_binding)
+                                                     args.ordinary_binding[0] if len(args.ordinary_binding) == 1
+                                                     else args.ordinary_binding)
     except ValueError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
     args.output.write_text(assembly, encoding="utf-8", newline="\n")
     if mapping:
-        print(" ".join(f"{key}={value}" for key, value in mapping.items()))
+        for entry in mapping if isinstance(mapping, list) else [mapping]:
+            print(" ".join(f"{key}={value}" for key, value in entry.items()))
     else:
         print("unchanged: no sampler with mixed uses")
     return 0

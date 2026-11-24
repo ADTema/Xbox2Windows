@@ -6625,8 +6625,27 @@ sampling. Modules without one are returned byte-for-byte unchanged. That include
 indexed table above and unrelated samples on other samplers. For the sampler it splits,
 the profile covers direct float32 `Texture1D`, `Texture2D` and `TextureCube` sampling,
 including their array forms, in one compute entry point at a constant LOD of zero.
-Other uses of that sampler, an occupied binding, a
-nonzero LOD and more than one mixed sampler are rejected with a specific diagnostic.
+Other uses of that sampler, an occupied binding and a
+nonzero LOD are rejected with a specific diagnostic.
+
+A module may hold several such samplers. Repeat `--ordinary-binding` once per mixed sampler, in
+the order the sampler variables are declared; the values must be distinct and each must be free in its
+sampler's descriptor set. Each mixed sampler gets its own new variable `%x2w_plain_sampler_<n>`
+(n from 0), with loads `%x2w_plain_sampler_<n>_load_<k>`, and the tool prints one mapping line per
+sampler. A count that differs from the number of mixed samplers, a repeated or occupied binding, and a
+module that already uses a `%x2w_plain_sampler` name are refused with their own messages. One binding
+for one mixed sampler keeps the single-sampler names. The profile check applies to every mixed sampler.
+A [two-sampler fixture](../tests/spirv_window/shared_sampler_multi.spvasm) (comparison samplers at s2
+and s6, each also feeding one ordinary sample) is split to s5 and s7. On Linux the test validates the
+split module with `spirv-val`, checks the `SamplerState` and `SamplerComparisonState` registers in the
+`spirv-cross` output, and exercises the refusals above and the declaration-order mapping. The Windows
+stage first confirms DXC rejects the unsplit module, then reads back four result words and 12 guards
+against a CPU reference (0.25 against 0.5 passes, 0.875 against 0.75 fails, ordinary 0.375 and 0.875).
+One static sampler changes per control and only its own word moves: s2 to `GREATER` (word 0), s6 to
+`GREATER` (word 1), s5 or s7 clamped to `MinLOD` 1 (words 2 or 3, to 0.625). A module split with the
+bindings in the other order shows the s5 clamp moving word 3, not word 2. The pass emits no stores, and
+the guard words stay unchanged in every readback. Not run here: the Windows GPU stage
+(`spirv_compare_sampler_warp`), which needs DXC and D3D12.
 
 A [synthetic arrayed variant](../tests/spirv_window/shared_sampler_array.spvasm) of the fixture below
 uses `Texture2DArray` images with a float3 coordinate at layer 0. The test splits it to the same
