@@ -1070,6 +1070,15 @@ These are measured on one executable; treat them as hypotheses for others.
   The fixture exercises allocation and retirement without queue submission or guest slot binding.
   Run `cmake --build --preset release --target startup_upload_arena` and
   `ctest --preset release --no-tests=error -R '^startup_upload_arena_' -V`.
+- **Upload arena lifetime.** A queue waits on a fence while the fixture submits a copy of
+  payload A (640 bytes, 16-byte alignment), resets the arena, writes a distinct payload B into
+  a new page and submits a second copy. It opens the gate only after both submissions and
+  compares the exact A and B bytes in readbacks. The reset releases the arena's own page
+  reference, so the fixture holds A's page until the queue drains; this stands in for the
+  retirement a production caller owes. An overwrite control writes B into A's live range
+  before the gate opens and must read B back from A's copy. The fixture does not cover
+  refusal after a normal Close or any command-buffer interaction. Run
+  `ctest --preset release --no-tests=error -R '^startup_upload_lifetime_' -V`.
 - **Inline samplers.** Pixel shaders build sampler descriptors from constants (`s_movk_i32`,
   `s_bfm_b32`, 64-bit moves); the translator folds those into static samplers. A source-built
   pixel stage checks all four manifest words, rejects a mask width from a root constant, and
