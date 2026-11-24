@@ -4443,13 +4443,16 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertFalse(is_instruction_supported(line), line)
 
     def test_low16_binary16_e32_scanner_support(self):
-        """The ten plain binary16 e32 forms pixel_aot lowers (low 16 bits only) are supported; modifiers, e64 and
+        """The twelve plain binary16 e32 forms pixel_aot lowers (low 16 bits only) are supported; modifiers, e64 and
         sources the translator refuses are not."""
         supported = []
         for op in ("add", "sub", "subrev", "mul"):
             supported += [f"v_{op}_f16_e32 v24, v18, v19", f"v_{op}_f16_e32 v24, 1.0, v19",
                           f"v_{op}_f16_e32 v24, -0.5, v19", f"v_{op}_f16_e32 v24, 0x3c00, v19",
                           f"v_{op}_f16_e32 v24, s45, v19", f"v_{op}_f16_e32 v24, 0, v19"]
+        for op in ("fmac", "ldexp"):
+            supported += [f"v_{op}_f16_e32 v24, v18, v19", f"v_{op}_f16_e32 v24, 1.0, v19", f"v_{op}_f16_e32 v24, s45, v19",
+                          f"v_{op}_f16_e32 v24, 0x3c00, v19", f"v_{op}_f16_e32 v24, 0, v19"]
         for op in ("floor", "ceil", "trunc", "rndne"):
             supported += [f"v_{op}_f16_e32 v24, v18", f"v_{op}_f16_e32 v24, 2.0", f"v_{op}_f16_e32 v24, 0x4248"]
         for kind in ("i16", "u16"):
@@ -4469,6 +4472,14 @@ class TestRdna2Scanner(unittest.TestCase):
             "v_mul_f16_e64 v24, v18, v19",
             "v_add_f16 v24, v18, v19",
             "v_add_f16_e32 v24, v18",
+            "v_fmac_f16_e32 v24, v18, 1.0",         # e32 src1 must be a VGPR
+            "v_ldexp_f16_e32 v24, v18, 3",
+            "v_fmac_f16_e32 v24, -v18, v19",
+            "v_ldexp_f16_e32 v24, v18, v19 clamp",
+            "v_fmac_f16_e64 v24, v18, v19",
+            "v_ldexp_f16_e64 v24, v18, v19",
+            "v_fmac_f16 v24, v18, v19",
+            "v_fmac_f16_e32 v24, 3, v19",
             "v_floor_f16_e32 v24, -v18",
             "v_floor_f16_e32 v24, v18 clamp",
             "v_floor_f16_e64 v24, v18",
@@ -4481,7 +4492,7 @@ class TestRdna2Scanner(unittest.TestCase):
         ]
         for line in refused:
             self.assertFalse(is_instruction_supported(line), line)
-        for opcode in ("v_add_f16", "v_subrev_f16", "v_rndne_f16", "v_cvt_f16_u16"):
+        for opcode in ("v_add_f16", "v_subrev_f16", "v_rndne_f16", "v_cvt_f16_u16", "v_fmac_f16", "v_ldexp_f16"):
             self.assertIn(opcode, KNOWN_RDNA2_BASE_OPCODES)
 
     def test_sopk_s_version(self):
