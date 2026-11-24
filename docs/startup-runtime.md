@@ -840,6 +840,9 @@ Typed element bytes come from the format (1 to 16 bytes). Formats that cannot ba
 `unsupported_description` and leave the destination descriptor unchanged. Translated draws bind typed
 views with the format's element size and stride. The refusal reasons are listed in
 `docs/experiments.md` ("Name the cause of a refused slot 70 call").
+`ctest --preset dev --no-tests=error -R '^startup_memory_srv_report$' -V` checks the refusal line
+without a device, with a distinct value in each 2D and 2D-array view field, the raw words of a
+cube-array view, and widths, first elements, addresses and destinations above 4 GiB.
 
 Checks:
 
