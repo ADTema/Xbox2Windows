@@ -5931,6 +5931,8 @@ The table repeats `root_probe`'s two calls with the `dxcompiler.dll` and `dxil.d
 
 The SDK's own validator depends on its servicing level. On native Windows 11 build 26200.9974, Windows SDK 10.0.26100.8249 installs `dxcompiler.dll` and `dxil.dll` 1.8.2502.11 under `bin/10.0.26100.0/x64`. CMake selected that `dxc.exe` by default, and `shader_metadata_probe` passed with `module_only=validated`. Which servicing update first shipped 1.8.2502 is untested.
 
+A later servicing level ships no separate validator. On native Windows 11 build 26300 with Visual Studio 2022 Build Tools (MSVC 14.44.35207) and Windows SDK 10.0.26100.9457 installed, `bin/10.0.26100.0/x64` holds `dxc.exe` and `dxcompiler.dll` 1.9.2602.17 and no `dxil.dll`. `root_probe` then validates through `dxcompiler.dll`, and the checks read the validator version from that file: `shader_metadata_probe` passed with `file_version=1.9.2602.17 module_only=validated`, and `compressed_scene_metadata`, `dxil_retarget_probe` and `dxil_retarget_probe_hardware` passed. Before that fallback, `root_probe --container` returned 4 and those four tests failed. With the separate `dxil.dll` of DXC 1.9.2609 selected through `DXC_EXECUTABLE`, the same four tests passed before and after.
+
 To check another release on Windows, configure a separate build directory with its compiler, then run the test:
 
 ```powershell
