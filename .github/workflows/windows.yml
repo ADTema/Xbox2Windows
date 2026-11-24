@@ -74,54 +74,56 @@ jobs:
         run: python -m pip install -r requirements-dev.txt
       - name: Run Python checks
         run: |
-          python -B tests/script_state_check.py
-          python -B tests/resource_root_check.py
-          python -B tests/bcpack_check.py
-          python -B tests/bcpack_symbols_check.py
-          python -B tests/bcpack_tables_check.py
-          python -B tests/bc7_blocks_check.py
-          python -B tests/bc7_tiles_check.py
-          python -B tests/gfx10_texture_roundtrip_check.py
-          python -B tests/texture_bc_volume_check.py
-          python -B tests/form_coverage_check.py
-          python -B tests/resource_ranges_check.py
-          python -B tests/ttpf_batch_export_check.py
-          python -B tests/awc_metadata_check.py
-          python -B tests/sgd5_effects_check.py
-          python -B tests/dxcontainer_part_offsets_check.py
-          python -B tests/layout_chunks_check.py
-          python -B tests/dependency_paths_check.py
-          python -B tests/pe_package_preflight_check.py
-          python -B tests/host_commit_check.py
-          python -B tests/pe_package_ordinal_plan_check.py
-          python -B tests/compat_report_check.py
-          python -B tests/intake/paths_check.py
-          python -B tests/intake/routing_check.py
-          python -B tests/intake/import_forms_check.py
-          python -B tests/shader_probe_check.py
-          python -B tests/shader_census_check.py
-          python -B tests/shader_corpus_report_check.py
-          python -B tests/dxil_retarget_check.py
-          python -B tests/rdna2_tools_check.py
-          python -B tests/pso_readiness_check.py
-          python -B tests/xmem_attribute_scan_check.py
-          python -B tests/xgameruntime_table_check.py
-          python -B tests/docs_links_check.py
-          python -B tests/bidi_controls_check.py
-          python -B tests/gpu_report_format_check.py
-          python -B tests/hardware_reports_check.py
-          python -B tests/rectlist_topology_check.py
-          python -B tests/startup_sampler_heap_check.py
-          python -B tests/startup_image_sample_l_check.py
-          python -B tests/startup_image_3d_check.py
-          python -B tests/startup_image_load_mip_check.py
-          python -B tests/startup_image_2d_array_check.py
-          python -B tests/startup_host_cpu_check.py
-          python -B tests/startup_translator_check.py
-          python -B tests/startup_triage_run_check.py
-          python -B tests/startup_flat_param_check.py
-          python -B tests/startup_gfx2hlsl_bit_alu_check.py
-          python -B tests/startup_inline_sampler_check.py
+          python -B tools/run_checks_parallel.py \
+            tests/script_state_check.py \
+          tests/resource_root_check.py \
+          tests/bcpack_check.py \
+          tests/bcpack_symbols_check.py \
+          tests/bcpack_tables_check.py \
+          tests/bc7_blocks_check.py \
+          tests/bc7_tiles_check.py \
+          tests/gfx10_texture_roundtrip_check.py \
+          tests/texture_bc_volume_check.py \
+          tests/form_coverage_check.py \
+          tests/resource_ranges_check.py \
+          tests/ttpf_batch_export_check.py \
+          tests/awc_metadata_check.py \
+          tests/sgd5_effects_check.py \
+          tests/dxcontainer_part_offsets_check.py \
+          tests/layout_chunks_check.py \
+          tests/dependency_paths_check.py \
+          tests/pe_package_preflight_check.py \
+          tests/host_commit_check.py \
+          tests/pe_package_ordinal_plan_check.py \
+          tests/compat_report_check.py \
+          tests/intake/paths_check.py \
+          tests/intake/routing_check.py \
+          tests/intake/import_forms_check.py \
+          tests/shader_probe_check.py \
+          tests/shader_census_check.py \
+          tests/shader_corpus_report_check.py \
+          tests/dxil_retarget_check.py \
+          tests/rdna2_tools_check.py \
+          tests/pso_readiness_check.py \
+          tests/xmem_attribute_scan_check.py \
+          tests/xgameruntime_table_check.py \
+          tests/docs_links_check.py \
+          tests/bidi_controls_check.py \
+          tests/gpu_report_format_check.py \
+          tests/hardware_reports_check.py \
+          tests/rectlist_topology_check.py \
+          tests/startup_sampler_heap_check.py \
+          tests/startup_image_sample_l_check.py \
+          tests/startup_image_3d_check.py \
+          tests/startup_image_load_mip_check.py \
+          tests/startup_image_2d_array_check.py \
+          tests/startup_host_cpu_check.py \
+          tests/startup_translator_check.py \
+          tests/startup_triage_run_check.py \
+          tests/startup_flat_param_check.py \
+          tests/startup_gfx2hlsl_bit_alu_check.py \
+          tests/startup_inline_sampler_check.py \
+          tests/run_checks_parallel_check.py
   build-and-test:
     name: Build and test on Windows
     runs-on: windows-2025
