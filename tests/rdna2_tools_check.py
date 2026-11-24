@@ -4378,6 +4378,48 @@ class TestRdna2Scanner(unittest.TestCase):
                      "v_lshlrev_b64_e32 v[2:3], v1, v[4:5]", "v_lshlrev_b64 v[2:3], -v1, v[4:5]"):
             self.assertFalse(is_instruction_supported(line), line)
 
+    def test_low16_binary16_e32_scanner_support(self):
+        """The ten plain binary16 e32 forms pixel_aot lowers (low 16 bits only) are supported; modifiers, e64 and
+        sources the translator refuses are not."""
+        supported = []
+        for op in ("add", "sub", "subrev", "mul"):
+            supported += [f"v_{op}_f16_e32 v24, v18, v19", f"v_{op}_f16_e32 v24, 1.0, v19",
+                          f"v_{op}_f16_e32 v24, -0.5, v19", f"v_{op}_f16_e32 v24, 0x3c00, v19",
+                          f"v_{op}_f16_e32 v24, s45, v19", f"v_{op}_f16_e32 v24, 0, v19"]
+        for op in ("floor", "ceil", "trunc", "rndne"):
+            supported += [f"v_{op}_f16_e32 v24, v18", f"v_{op}_f16_e32 v24, 2.0", f"v_{op}_f16_e32 v24, 0x4248"]
+        for kind in ("i16", "u16"):
+            supported += [f"v_cvt_f16_{kind}_e32 v24, v18", f"v_cvt_f16_{kind}_e32 v24, s45",
+                          f"v_cvt_f16_{kind}_e32 v24, 5", f"v_cvt_f16_{kind}_e32 v24, 0x1234"]
+        for line in supported:
+            self.assertTrue(is_instruction_supported(line), line)
+        refused = [
+            "v_add_f16_e32 v24, v18, 1.0",          # e32 src1 must be a VGPR
+            "v_add_f16_e32 v24, -v18, v19",         # source modifiers
+            "v_add_f16_e32 v24, |v18|, v19",
+            "v_add_f16_e32 v24, 3, v19",            # integer inline constant other than 0
+            "v_add_f16_e32 v24, 0x10000, v19",      # literal wider than 16 bits
+            "v_add_f16_e32 v24, 3.0, v19",          # not a binary16 inline constant
+            "v_add_f16_e32 v24, v256, v19",
+            "v_add_f16_e32 v24, v18, v19 clamp",
+            "v_mul_f16_e64 v24, v18, v19",
+            "v_add_f16 v24, v18, v19",
+            "v_add_f16_e32 v24, v18",
+            "v_floor_f16_e32 v24, -v18",
+            "v_floor_f16_e32 v24, v18 clamp",
+            "v_floor_f16_e64 v24, v18",
+            "v_fract_f16_e32 v24, v18",
+            "v_cvt_f16_i16_e32 v24, 65",
+            "v_cvt_f16_u16_e32 v24, 0x10000",
+            "v_cvt_f16_i16_e32 v24, 1.0",
+            "v_cvt_f16_u16_e32 v24, v18 clamp",
+            "v_cvt_f16_i16_e64 v24, v18",
+        ]
+        for line in refused:
+            self.assertFalse(is_instruction_supported(line), line)
+        for opcode in ("v_add_f16", "v_subrev_f16", "v_rndne_f16", "v_cvt_f16_u16"):
+            self.assertIn(opcode, KNOWN_RDNA2_BASE_OPCODES)
+
     def test_sopk_s_version(self):
         """s_version with a 16-bit immediate is supported and known; larger, negative and register operands are not."""
         for operand in ("0x0", "0x1004", "0xffff", "0x00ff", "0", "1", "4100", "9999", "10000", "65535", "59999",
