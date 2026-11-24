@@ -541,6 +541,12 @@ These are measured on one executable; treat them as hypotheses for others.
   ([#1259](https://github.com/R0Y00/Xbox2Windows/issues/1259)). Colour exports of constant integer
   words still go through `float4` and have the same loss. Reproduce with
   `ctest --preset release --no-tests=error -R "^startup_flat_param_"`.
+- **Non-fused multiply-add.** The gfx1013 `v_mad_f32`, `v_mac_f32`, `v_madmk_f32`,
+  `v_madak_f32` and `v_mad_legacy_f32` forms round the product before the sum and flush
+  binary32 denormals to signed zero at each step. The legacy form keeps its zero
+  multiplication rule. The existing HLSL for `v_fma_f32` and `v_fmac_f32` does not
+  guarantee a fused result. Run `ctest --preset release --no-tests=error -R '^startup_gfx2hlsl_mad_'`.
+  [#1728](https://github.com/R0Y00/Xbox2Windows/issues/1728)
 - **Stream-cache identity.** A cached zlib stream is served only to the exact queued
   continuation entries in the same DirectStorage queue. The lookup checks the enqueued request
   id, the source, the compressed size and the destination chunk size. A later independent

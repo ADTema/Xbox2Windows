@@ -10625,6 +10625,40 @@ Not covered: a D3D12 readback of a translated comparison draw. The compared resu
 
 The binary32 table (`VEC_F`) applies the same operand-count rule. Before this change, a form one source short (`v_add_f32 v1, v2`) raised `IndexError` in `Stage.one` instead of `Unsupported`. A form with one source too many (`v_med3_f32 v1, v2, v3, v4, v5`) translated with the extra source dropped. `tests/startup_gfx2hlsl_operand_count_check.py` (`startup_gfx2hlsl_operand_count`) checks every operation of both tables: one source fewer and one source more are refused, and the exact count translates. It also checks that the constant and accumulator forms (`v_fmac_f32`, `v_mac_f32`, `v_fmamk_f32`, `v_fmaak_f32`, `v_madmk_f32`, `v_madak_f32`) keep translating with their usual operands. As a control, it loads the translator with the new `VEC_F` guard removed and requires both old failures to come back.
 
+## Non-fused multiply-add in the startup translator
+
+The gfx1013 `v_mad_f32`, `v_mac_f32`, `v_madmk_f32`, `v_madak_f32` and
+`v_mad_legacy_f32` lower to HLSL with a separately rounded `precise` product and
+sum. Inputs and both results flush binary32 denormals to signed zero. The legacy
+form still defines zero times infinity as zero. The startup shader cache revision
+changes so a cached shader with the original lowering gets retranslated on request.
+`v_fma_f32` and `v_fmac_f32` still use the existing HLSL expression, which does
+not guarantee a fused result. [#1728](https://github.com/R0Y00/Xbox2Windows/issues/1728)
+
+`startup_gfx2hlsl_mad_check.py` decodes the recorded words of five source-built
+pixel stages. An exact rational model rounds each step to binary32 and supplies
+all expected words. The SM 6.0 dispatch feeds raw runtime operands to the
+translated pixel body and reads back raw words. When FXC is available, the test
+also draws each translated vertex and pixel pair at Shader Model 5.1. The
+SM 6.2 dispatch requests `-denorm preserve` so removing the software flushes
+changes both the denormal product and the denormal addend from `00800000` to
+`00c00000`. Only the preserve test requires Shader Model 6.2.
+
+On Windows 10 22H2 (19045.6456), the correct rounding word was `40000002` on
+the GTX 1060 6GB (32.0.15.6094) and in-box WARP (10.0.19041.5794). The plain
+expression produced the fused word `40000003` for four forms on the GTX 1060.
+The legacy form on that adapter and all five forms on WARP kept the separate
+rounding word. The translation controls catch the plain expression on either
+adapter. The fixture also checks the sign of a flushed negative sum and the
+legacy result of zero times infinity plus one.
+LLVM 15.0.7 and 23.1.6 assembled identical bytes for these fixtures, even
+though newer LLVM can fill unused VOP3 fields differently in other forms.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_mad_' -V
+python -B tests/startup_gfx2hlsl_mad_check.py binary llvm-mc-15
+```
+
 ## Startup translator: SMEM offset operands
 
 `tools/startup/gfx2hlsl.py` accepts these offset operands for the scalar memory loads ([issue #1674](https://github.com/R0Y00/Xbox2Windows/issues/1674)):
