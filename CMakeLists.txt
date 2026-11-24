@@ -334,6 +334,54 @@ target_link_libraries(startup_stub_consumer PRIVATE startup_stub_chad startup_st
 
 add_executable(startup_draw_bmp_check tests/startup_draw_bmp.cpp)
 add_test(NAME startup_draw_bmp COMMAND startup_draw_bmp_check)
+# Game-save stand-in storage (src/startup_stubs/save_store.h): a blob written by one process is read by a second.
+add_executable(startup_gamesave_persist tests/startup_gamesave_persist.cpp)
+target_compile_features(startup_gamesave_persist PRIVATE cxx_std_17)
+add_test(NAME startup_gamesave_persist COMMAND startup_gamesave_persist)
+# Publication of a multi-blob update: a second process sees the whole old generation or the whole
+# new one. The test is built from two generated copies of the store headers, each with a pause
+# point at every step of the publication (the `x2w-seam` comments). In the second copy the file lock
+# is also turned into a no-op: that build must be caught by the same test, which proves the check
+# can fail. Nothing of this reaches the production headers.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/startup_stubs/save_store.h" gamesave_store_text)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/startup_stubs/file_lock.h" gamesave_lock_text)
+foreach(anchor "#pragma once" "// x2w-seam: moved-aside" "// x2w-seam: published")
+    string(FIND "${gamesave_store_text}" "${anchor}" gamesave_anchor)
+    if(gamesave_anchor LESS 0)
+        message(FATAL_ERROR "save_store.h lost the anchor '${anchor}' used by startup_gamesave_publish")
+    endif()
+endforeach()
+string(FIND "${gamesave_lock_text}" "// x2w-seam: lock-attempt" gamesave_anchor)
+if(gamesave_anchor LESS 0)
+    message(FATAL_ERROR "file_lock.h lost the anchor used by startup_gamesave_publish")
+endif()
+string(REPLACE "#pragma once" "#pragma once\nvoid x2w_save_test_point(unsigned point);" gamesave_store_text "${gamesave_store_text}")
+string(REPLACE "// x2w-seam: moved-aside" "x2w_save_test_point(2u * static_cast<unsigned>(&step - steps.data()));" gamesave_store_text "${gamesave_store_text}")
+string(REPLACE "// x2w-seam: published" "x2w_save_test_point(2u * static_cast<unsigned>(&step - steps.data()) + 1u);" gamesave_store_text "${gamesave_store_text}")
+string(REPLACE "// x2w-seam: lock-attempt" "static volatile bool x2w_no_lock = true;\n        if (x2w_no_lock) return Attempt::locked;" gamesave_nolock_text "${gamesave_lock_text}")
+foreach(variant locked unlocked)
+    set(gamesave_dir "${CMAKE_CURRENT_BINARY_DIR}/gamesave_publish_${variant}")
+    file(WRITE "${gamesave_dir}/startup_stubs/save_store.h" "${gamesave_store_text}")
+    if(variant STREQUAL "locked")
+        file(WRITE "${gamesave_dir}/startup_stubs/file_lock.h" "${gamesave_lock_text}")
+    else()
+        file(WRITE "${gamesave_dir}/startup_stubs/file_lock.h" "${gamesave_nolock_text}")
+    endif()
+    add_executable(startup_gamesave_publish_${variant} tests/startup_gamesave_publish.cpp)
+    target_include_directories(startup_gamesave_publish_${variant} PRIVATE "${gamesave_dir}")
+    target_compile_features(startup_gamesave_publish_${variant} PRIVATE cxx_std_17)
+    add_test(NAME startup_gamesave_publish_${variant} COMMAND startup_gamesave_publish_${variant})
+    set_tests_properties(startup_gamesave_publish_${variant} PROPERTIES TIMEOUT 120)
+endforeach()
+# The copy without the lock must be caught by the reader that sees a mixed or incomplete generation.
+set_tests_properties(startup_gamesave_publish_unlocked PROPERTIES PASS_REGULAR_EXPRESSION "reader saw a mixed generation")
+add_executable(startup_gamesave_lock_errors tests/startup_gamesave_lock_errors.cpp)
+target_include_directories(startup_gamesave_lock_errors PRIVATE src)
+target_compile_features(startup_gamesave_lock_errors PRIVATE cxx_std_17)
+add_test(NAME startup_gamesave_lock_errors COMMAND startup_gamesave_lock_errors)
+add_executable(startup_gamesave_submit tests/startup_gamesave_submit.cpp)
+target_include_directories(startup_gamesave_submit PRIVATE src)
+target_compile_features(startup_gamesave_submit PRIVATE cxx_std_17)
 
 # Input for the launcher containment check (docs/startup-runtime.md): writes known bytes to both
 # streams and the trap log, reports a known exit code, or holds memory, spawns a child or stays
@@ -1157,6 +1205,12 @@ if(FFX_UPSCALER_IMAGE)
 endif()
 if(EXISTS "${INTAKE_PYTHON}")
     # Startup stand-ins: exports, named traps and permissive answers (docs/startup-runtime.md).
+    foreach(scheduler IN ITEMS controlled system)
+        add_test(NAME startup_gamesave_submit_${scheduler} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gamesave_submit_check.py" "$<TARGET_FILE:startup_gamesave_submit>" ${scheduler})
+        set_tests_properties(startup_gamesave_submit_${scheduler} PROPERTIES TIMEOUT 30)
+    endforeach()
+    set_tests_properties(startup_gamesave_submit_system PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME startup_stubs COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stub_check.py"
         "$<TARGET_FILE:startup_stub_consumer>" "${CMAKE_CURRENT_SOURCE_DIR}/src/startup_stubs"
         "$<TARGET_FILE:startup_stub_acphal>" "$<TARGET_FILE:startup_stub_chad>" "$<TARGET_FILE:startup_stub_xapu>"
