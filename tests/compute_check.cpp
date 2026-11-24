@@ -22,8 +22,8 @@ static_assert(constants_offset % alignment == 0);
 constexpr UINT sentinel = 0xc5c5c5c5u;
 constexpr std::array<UINT, 16> constants{count, 73, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 19, 23, 29};
 constexpr UINT uavs = 13, srvs = 21;
-// The image-load case binds one UINT source texture at t0. Bit 24 of the dispatch word selects
-// RGBA8 instead of RGBA32. The case file carries the raw texels for either format.
+// Bit 24 of an image case's dispatch word selects RGBA8 instead of RGBA32.
+// The case file carries the raw texels for either format.
 constexpr UINT texture_rgba8_flag = 1u << 24;
 constexpr UINT texture_width = 32, texture_height = 8, texture_channels = 4;
 constexpr UINT texture_mip_levels = 3;
@@ -319,23 +319,26 @@ void check_compute_texture_file(ID3D12Device* device, const char* path, const ch
 
 bool check_compute_texture_store_file(ID3D12Device* device, const char* path, const char* reference)
 {
-    constexpr auto format = DXGI_FORMAT_R32G32B32A32_UINT;
-    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
-    check(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)),
-          "Check texture UAV format");
-    if (!(support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE)) return false;
-
-    constexpr UINT base_words = texture_width * texture_height * texture_channels;
-    constexpr UINT all_words = base_words + base_words / 4 + base_words / 16;
     UINT groups = 0, mip = 0;
-    std::vector<UINT> initial(all_words), expected(all_words);
     std::ifstream source(reference, std::ios::binary);
     source.read(reinterpret_cast<char*>(&groups), sizeof(groups));
     source.read(reinterpret_cast<char*>(&mip), sizeof(mip));
+    const bool rgba8 = (groups & texture_rgba8_flag) != 0;
+    groups &= ~texture_rgba8_flag;
+    const auto format = rgba8 ? DXGI_FORMAT_R8G8B8A8_UINT : DXGI_FORMAT_R32G32B32A32_UINT;
+    const UINT words_per_texel = rgba8 ? 1 : texture_channels;
+    const UINT base_words = texture_width * texture_height * words_per_texel;
+    const UINT all_words = base_words + base_words / 4 + base_words / 16;
+    std::vector<UINT> initial(all_words), expected(all_words);
     source.read(reinterpret_cast<char*>(initial.data()), all_words * sizeof(UINT));
     source.read(reinterpret_cast<char*>(expected.data()), all_words * sizeof(UINT));
     if (!source || source.peek() != std::char_traits<char>::eof() || !groups || groups > 2 || mip >= texture_mip_levels)
         throw std::runtime_error("Invalid compute image store reference");
+
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
+    check(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)),
+          "Check texture UAV format");
+    if (!(support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE)) return false;
 
     const auto code = read_texture_shader(path);
     ComPtr<ID3D12RootSignature> signature;
@@ -381,7 +384,7 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
     UINT word = 0, mismatches = 0;
     for (UINT level = 0; level < texture_mip_levels; ++level) {
         const auto& layout = layouts[level];
-        const UINT row_words = (texture_width >> level) * texture_channels;
+        const UINT row_words = (texture_width >> level) * words_per_texel;
         for (UINT y = 0; y < (texture_height >> level); ++y) {
             const auto* row = reinterpret_cast<const UINT*>(static_cast<const unsigned char*>(mapped) +
                                                              layout.Offset + y * layout.Footprint.RowPitch);
