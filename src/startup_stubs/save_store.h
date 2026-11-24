@@ -10,9 +10,11 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 namespace x2w_save {
@@ -187,12 +189,19 @@ public:
                 return Status::io_error;
             }
         }
-        fs::rename(part, file, ec);
-        if (ec) {
-            fs::remove(part, ec);
-            return Status::io_error;
+        // Replacing a file another writer is replacing at the same moment can fail on Windows
+        // (access denied or a sharing violation instead of last-writer-wins), so the rename is
+        // serialised in this process and, for another process, retried a few times.
+        static std::mutex commit;
+        const std::lock_guard<std::mutex> guard(commit);
+        for (int attempt = 0;; ++attempt) {
+            fs::rename(part, file, ec);
+            if (!ec) return Status::ok;
+            if (attempt == 8) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5 << (attempt < 4 ? attempt : 4)));
         }
-        return Status::ok;
+        fs::remove(part, ec);
+        return Status::io_error;
     }
 
     // not_found only when the blob is truly absent; any other failure is io_error.
