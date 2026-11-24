@@ -20,6 +20,7 @@
 #include "startup_stubs/translated_sampler_bindings.h"
 
 #include "startup_stubs/slice_footprints.h"
+#include "startup_stubs/bc16_surface.h"
 
 #include <d3d12.h>
 #include "null_texture_view.h"
@@ -73,6 +74,7 @@ struct WrapperOwn {
     // Updated when the fence is signaled; GPU work counts as complete at once while lists are no-ops.
     volatile LONG64 completed;
     bool list_open;   // CommandList (render mode): recording between reset and close
+    bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
     bool list_ready;  // CommandList (render mode): closed with recorded work, not yet submitted
     void* pass;       // CommandList (render mode): recording state (Pass)
     std::uint64_t pad;  // keeps the size a multiple of 16: the title uses aligned loads on objects
@@ -1483,6 +1485,7 @@ void __stdcall list_draw(Wrapper* self, UINT vertices, UINT instances, UINT firs
 
 extern SRWLOCK written_lock;
 std::unordered_map<u64, u64>& written_textures();
+ID3D12Resource* sampled_address_texture(Wrapper* resource);
 #include "startup_stubs/d3d12_draw.inl"
 
 // Queue slot 10, desktop ExecuteCommandLists(count, lists).

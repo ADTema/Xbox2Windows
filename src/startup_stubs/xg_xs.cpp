@@ -6,6 +6,7 @@
 #include "startup_stubs/local_log.h"
 
 #include "startup_stubs/slice_footprints.h"
+#include "startup_stubs/bc16_surface.h"
 
 #include <array>
 #include <cstdio>
@@ -89,54 +90,26 @@ bool use_bc7_4k_s_layout(const D3D12_RESOURCE_DESC& desc)
 void put64(unsigned char* at, u64 value) { std::memcpy(at, &value, sizeof(value)); }
 void put32(unsigned char* at, std::uint32_t value) { std::memcpy(at, &value, sizeof(value)); }
 
-struct Bc7Surface {
-    static constexpr UINT block_texels = 4, block_bytes = 16;
-    static constexpr UINT tile_blocks = 16, tile_bytes = tile_blocks * tile_blocks * block_bytes;
-
-    const UINT columns, rows, tile_columns, tile_rows;
-
-    explicit Bc7Surface(const D3D12_RESOURCE_DESC& desc)
-        : columns((static_cast<UINT>(desc.Width) + block_texels - 1) / block_texels),
-          rows((desc.Height + block_texels - 1) / block_texels),
-          tile_columns((columns + tile_blocks - 1) / tile_blocks),
-          tile_rows((rows + tile_blocks - 1) / tile_blocks)
-    {
-    }
-
-    UINT padded_width() const { return tile_columns * tile_blocks * block_texels; }
-    UINT padded_height() const { return tile_rows * tile_blocks * block_texels; }
-    UINT padded_row_bytes() const { return tile_columns * tile_blocks * block_bytes; }
-    u64 size() const { return u64{tile_columns} * tile_rows * tile_bytes; }
-
-    u64 block_offset(UINT column, UINT row) const
-    {
-        const UINT x = column % tile_blocks, y = row % tile_blocks;
-        // GFX10 4 KiB standard non-XOR BC7 order: y0 y1 x0 x1 y2 x2 y3 x3.
-        const UINT block = (y & 3) | ((x & 3) << 2) | ((y & 4) << 2) |
-                           ((x & 4) << 3) | ((y & 8) << 3) | ((x & 8) << 4);
-        const u64 tile = u64{row / tile_blocks} * tile_columns + column / tile_blocks;
-        return tile * tile_bytes + block * block_bytes;
-    }
-};
+using x2w_startup::Bc16Surface;
 
 void write_bc7_4k_s_layout(const D3D12_RESOURCE_DESC& desc, unsigned char* layout)
 {
-    const Bc7Surface surface(desc);
+    const Bc16Surface surface(desc);
     const u64 bytes = surface.size();
 
     put64(layout + 0x00, bytes);
-    put64(layout + 0x08, Bc7Surface::tile_bytes);
+    put64(layout + 0x08, Bc16Surface::tile_bytes);
     put32(layout + 0x10, 1);
     put32(layout + 0x14, 1);
     auto* plane = layout + layout_header;
     put64(plane + 0x08, bytes);
-    put64(plane + 0x18, Bc7Surface::tile_bytes);
+    put64(plane + 0x18, Bc16Surface::tile_bytes);
     auto* mip = plane + mip_base;
     put64(mip + 0x00, bytes);
     put64(mip + 0x10, bytes);
     put32(mip + 0x18, surface.padded_width());
     put32(mip + 0x1c, surface.padded_row_bytes());
-    put32(mip + 0x20, Bc7Surface::tile_bytes);
+    put32(mip + 0x20, Bc16Surface::tile_bytes);
     put32(mip + 0x24, surface.padded_width());
     put32(mip + 0x28, surface.padded_height());
     put32(mip + 0x2c, 1);
@@ -149,8 +122,8 @@ void write_bc7_4k_s_layout(const D3D12_RESOURCE_DESC& desc, unsigned char* layou
 HRESULT copy_bc7_4k_s(const D3D12_RESOURCE_DESC& desc, unsigned char* dest, const unsigned char* source,
                      UINT row_pitch, UINT slice_pitch)
 {
-    const Bc7Surface surface(desc);
-    const UINT row_bytes = surface.columns * Bc7Surface::block_bytes;
+    const Bc16Surface surface(desc);
+    const UINT row_bytes = surface.columns * Bc16Surface::block_bytes;
     const u64 source_bytes = u64{surface.rows - 1} * row_pitch + row_bytes;
     if (!dest || !source || row_pitch < row_bytes || (slice_pitch && slice_pitch < source_bytes))
         return E_INVALIDARG;
@@ -166,7 +139,7 @@ HRESULT copy_bc7_4k_s(const D3D12_RESOURCE_DESC& desc, unsigned char* dest, cons
     for (UINT y = 0; y < surface.rows; ++y) {
         const auto* row = source + u64{y} * row_pitch;
         for (UINT x = 0; x < surface.columns; ++x)
-            std::memcpy(dest + surface.block_offset(x, y), row + x * Bc7Surface::block_bytes, Bc7Surface::block_bytes);
+            std::memcpy(dest + surface.block_offset(x, y), row + x * Bc16Surface::block_bytes, Bc16Surface::block_bytes);
     }
     return S_OK;
 }

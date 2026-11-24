@@ -492,7 +492,9 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     ReleaseSRWLockShared(&written_lock);
     const bool announced = state.generation != generation;
     const UINT elapsed = static_cast<UINT>(frame_number) - static_cast<UINT>(state.checked_frame);
-    if (state.done && !announced && !x2w_startup::recheck_cpu_texture(desc, total, elapsed)) return;
+    const bool recheck = resource->own().tiled_address_srv ? elapsed != 0
+        : x2w_startup::recheck_cpu_texture(desc, total, elapsed);
+    if (state.done && !announced && !recheck) return;
     if (readable_window(reinterpret_cast<u64>(memory), static_cast<std::size_t>(total)) < total) {
         if (!state.done) InterlockedIncrement(&textures_unreadable);
         state.done = true;
@@ -511,7 +513,14 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
             const auto& fp = plan.placed[i];
             const u64 bytes = plan.bytes(i);
             u64 offset = 0;
-            if (!ring_copy(reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes), &offset)) {
+            const unsigned char* source = memory + stride * s + fp.Offset;
+            std::vector<unsigned char> rows;
+            if (resource->own().tiled_address_srv) {
+                rows.resize(static_cast<std::size_t>(bytes));
+                x2w_startup::copy_4k_s_to_rows(rows.data(), fp.Footprint.RowPitch, memory, x2w_startup::Bc16Surface(desc));
+                source = rows.data();
+            }
+            if (!ring_copy(reinterpret_cast<u64>(source), static_cast<std::size_t>(bytes), &offset)) {
                 state.done = false;
                 return;
             }
@@ -689,7 +698,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             desc.ViewDimension = srv.kind == 3 ? D3D12_SRV_DIMENSION_TEXTURE3D : D3D12_SRV_DIMENSION_TEXTURE2D;
             desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             desc.Texture2D.MipLevels = 1;  // same offset as Texture3D.MipLevels
-            ID3D12Resource* texture = resource && resource->own().kind == resource_kind ? static_cast<ID3D12Resource*>(resource->own().real) : nullptr;
+            ID3D12Resource* texture = sampled_address_texture(resource);
             if (texture && record.desc_bytes >= 40) {
                 std::memcpy(&desc, record.desc, 40);
                 desc.Format = desktop_format(desc.Format);
