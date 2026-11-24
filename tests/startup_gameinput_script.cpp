@@ -104,7 +104,7 @@ int main(int argc, char** argv)
     // startup_gameinput_script <GameInput.dll> long|entries
     //   long:    41 entries, 725 characters. Before this change the stand-in read the value into a
     //            512-byte buffer, which then stayed empty, so no entry ran and bit 0x200 was never set.
-    //   entries: 33 entries, 230 characters. Before this change only the first 32 entries were kept,
+    //   entries: 33 entries, 229 characters. Before this change only the first 32 entries were kept,
     //            so the last one, the only one due at second 0, was dropped.
     if (argc < 3) return usage_error("usage: startup_gameinput_script <GameInput.dll> long|entries");
     std::string script;
