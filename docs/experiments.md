@@ -6564,6 +6564,8 @@ On Windows 10 19045 with D3D12 10.0.19041.7291, both device cases passed on in-b
 
 On Windows 11 build 26300.9974, the Intel Arc 140T (device `7d51`, driver 32.0.101.8132) reported 44 GPU virtual address bits per resource and 48 per process, and passed both device cases: a reserve-only range and an address inside the allocation both returned `0x80070057`, and shifting `B` by one 64 KiB page missed the intended destination in all 1,024 words.
 
+The range, lifetime and partial-failure cases pass on the same adapter: the 32 GiB range is created in eight 4,096 MiB windows, the released device keeps 8 references with the range open, matching the RTX rather than in-box WARP's 9, and a window-1 failure at `0x8007000E` leaves the windows created before it without the device.
+
 Because reserve-only ranges and addresses inside an allocation cannot be opened, the committed-heap layout of the device cases needs all of A committed and wrapped once. A 16 or 24 GiB range would be committed in full, and separately opened pieces would each get their own GPU base. The range uses reserved buffers instead, filled by copy. Neither the CPU range A nor the title's device is connected to it yet.
 
 Run `ctest --preset dev --no-tests=error -R '^vm_translation_' -V`.
