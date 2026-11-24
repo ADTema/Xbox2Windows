@@ -375,6 +375,8 @@ target_compile_features(startup_inflate_status PRIVATE cxx_std_17)
 target_include_directories(startup_inflate_status PRIVATE src)
 add_test(NAME startup_inflate_status COMMAND startup_inflate_status)
 target_compile_features(startup_stub_consumer PRIVATE cxx_std_17)
+target_include_directories(startup_stub_consumer PRIVATE src)
+target_sources(startup_stub_consumer PRIVATE src/startup_stubs/runtime_proxy.cpp)
 target_link_libraries(startup_stub_consumer PRIVATE startup_stub_chad startup_stub_xg_xs xmem_shim d3d12_xs_shim)
 # APU heap stand-in: ApuFree reuse, coalescing, refused requests and concurrent callers (docs/startup-runtime.md).
 add_executable(startup_acphal_apu_free tests/startup_acphal_apu_free.cpp)
