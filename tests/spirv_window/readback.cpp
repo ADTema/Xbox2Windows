@@ -13,6 +13,7 @@ struct WindowCase {
     const char* name;
     std::array<UINT, 4> parameters;  // first base, second address, destination address, first base high
     UINT expected;
+    int atomic_word = -1;
 };
 
 constexpr UINT left = 0xfedcba98u;
@@ -27,9 +28,17 @@ constexpr WindowCase cases[] = {
     {"unaligned write", {8, 28, 45, 0}, 0},
     {"write beyond descriptor", {8, 28, 64, 0}, 0},
 };
-}
 
-void check_spirv_window(ID3D12Device* device, const char* shader_path)
+constexpr WindowCase atomic_cases[] = {
+    // Base low, addend, old-value destination, base high. The shader adds one DWORD to the base.
+    {"atomic valid", {8, 7, 44, 0}, 0, 3},
+    {"atomic misaligned", {9, 7, 44, 0}, 0},
+    {"atomic out of window", {0xfffffff8u, 7, 44, 0}, 0},
+    {"atomic index addition wraps", {0xfffffffcu, 7, 44, 0xffffffffu}, 0},
+};
+
+template <size_t Count>
+void check_window_cases(ID3D12Device* device, const char* shader_path, const WindowCase (&cases)[Count])
 {
     std::ifstream shader(shader_path, std::ios::binary);
     if (!shader) throw std::runtime_error("Cannot open address-window shader");
@@ -69,8 +78,14 @@ void check_spirv_window(ID3D12Device* device, const char* shader_path)
         std::memcpy(mapped, test.parameters.data(), sizeof(test.parameters));
         std::memcpy(static_cast<BYTE*>(mapped) + 64, expected.data(), sizeof(expected));
         upload->Unmap(0, nullptr);
+        UINT result = test.expected;
+        if (test.atomic_word >= 0) {
+            auto& word = expected[static_cast<size_t>(test.atomic_word)];
+            result = word;
+            word += test.parameters[1];
+        }
         const UINT destination = test.parameters[2];
-        if (destination % 4 == 0 && destination < sizeof(expected)) expected[destination / 4] = test.expected;
+        if (destination % 4 == 0 && destination < sizeof(expected)) expected[destination / 4] = result;
 
         D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
@@ -122,4 +137,15 @@ void check_spirv_window(ID3D12Device* device, const char* shader_path)
         }
         std::printf("%s: all %zu words matched\n", test.name, expected.size());
     }
+}
+}
+
+void check_spirv_window(ID3D12Device* device, const char* shader_path)
+{
+    check_window_cases(device, shader_path, cases);
+}
+
+void check_spirv_window_atomic(ID3D12Device* device, const char* shader_path)
+{
+    check_window_cases(device, shader_path, atomic_cases);
 }

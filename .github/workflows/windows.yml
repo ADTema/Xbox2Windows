@@ -62,6 +62,8 @@ jobs:
           python -B tests/bcpack_symbols_check.py
           python -B tests/bc7_blocks_check.py
           python -B tests/bc7_tiles_check.py
+          python -B tests/gfx10_texture_roundtrip_check.py
+          python -B tests/texture_bc_volume_check.py
           python -B tests/form_coverage_check.py
           python -B tests/resource_ranges_check.py
           python -B tests/ttpf_batch_export_check.py
@@ -72,16 +74,23 @@ jobs:
           python -B tests/dependency_paths_check.py
           python -B tests/pe_package_preflight_check.py
           python -B tests/pe_package_ordinal_plan_check.py
+          python -B tests/compat_report_check.py
           python -B tests/intake/paths_check.py
+          python -B tests/intake/routing_check.py
+          python -B tests/intake/import_forms_check.py
           python -B tests/shader_probe_check.py
           python -B tests/shader_census_check.py
+          python -B tests/shader_corpus_report_check.py
           python -B tests/dxil_retarget_check.py
           python -B tests/rdna2_tools_check.py
           python -B tests/pso_readiness_check.py
           python -B tests/xmem_attribute_scan_check.py
+          python -B tests/xgameruntime_table_check.py
           python -B tests/docs_links_check.py
           python -B tests/bidi_controls_check.py
+          python -B tests/gpu_report_format_check.py
           python -B tests/hardware_reports_check.py
+          python -B tests/rectlist_topology_check.py
   build-and-test:
     name: Build and test on Windows
     runs-on: windows-2025

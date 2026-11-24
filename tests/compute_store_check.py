@@ -328,6 +328,7 @@ def controls():
     guard_controls()
     read_controls()
     alu_controls()
+    scalar_alu_controls()
 
 
 def grid_controls():
@@ -768,10 +769,28 @@ READ_MUL_LO = variant(
     ("v_mad_u32_u24 v1, v2, v1, v0", "v_mul_lo_u32 v1, s0, v1"),
     ("v_min_u32_e32 v1, s0, v1", ""),
 )
+# The remaining unsigned VOP2 operations of the subset, chained so each result feeds the next: the cap constant added
+# to the product (it wraps for most lanes), a high-bit OR and a high-bit XOR, then the unsigned maximum of the product
+# and the chain (the product wins for some lanes and the chain for others).
+READ_VOP2 = variant(
+    READ_COMPUTE,
+    ("v_min_u32_e32 v1, s0, v1", "v_add_nc_u32_e32 v2, s0, v1\nv_or_b32_e32 v2, 0x80000010, v2\n"
+                                 "v_xor_b32_e32 v2, 0x80000001, v2\nv_max_u32_e32 v1, v1, v2"),
+)
+# The shift and subtract operations of the subset on a computed word: the product is shifted left until its
+# bit 14 is the sign bit, shifted right arithmetically, subtracted from the cap (src0 - src1), and the literal
+# 0x1234 is reverse-subtracted (src1 - src0).
+READ_SHIFT_SUB = variant(
+    READ_COMPUTE,
+    ("v_min_u32_e32 v1, s0, v1", "v_lshlrev_b32_e32 v2, 17, v1\nv_ashrrev_i32_e32 v2, 20, v2\n"
+                                 "v_sub_nc_u32_e32 v3, s0, v2\nv_subrev_nc_u32_e32 v1, 0x1234, v3"),
+)
 ALU_CASES = [
     ("read_compute", READ_COMPUTE, 32, READ_BINDING),
     ("read_mad24", READ_MAD24, 32, READ_BINDING),
     ("read_mul_lo", READ_MUL_LO, 32, READ_BINDING),
+    ("read_vop2", READ_VOP2, 32, READ_BINDING),
+    ("read_shift_sub", READ_SHIFT_SUB, 32, READ_BINDING),
 ]
 
 
@@ -989,6 +1008,16 @@ def alu_controls():
     load = READ_LOADS["read_copy"]
     assert (f"min(params[0].y, (((0x0000012cu & 0xffffffu) * ((0xfffffff0u & {load}) & 0xffffffu)) + params[0].y)"
             in alu(("0xffff, v1", "-16, v1"), (mad, "v_mad_u32_u24 v1, 0x12c, v2, s0"))[-3])
+    # Add, or, xor and max apply in order: max(cap, 0x80000001 ^ (cap | (7 + mad))); src0 prints first.
+    mad_word = ALU_WORD.split(", ", 1)[1][:-1]
+    vop2 = aot.lower(READ_VOP2, 32, **READ_BINDING).splitlines()
+    assert vop2[-3] == ("        outputData.Store(tid.x * 4u + 0u, max(" + mad_word + ", (0x80000001u ^ (0x80000010u | "
+                        f"(params[0].y + {mad_word})))));"), vop2
+    # Shift and subtract in order; src0 prints first for the reversed-operand forms, so each operand order is pinned.
+    shift_sub = aot.lower(READ_SHIFT_SUB, 32, **READ_BINDING).splitlines()
+    product = f"((((0x0000ffffu & {load}) & 0xffffffu) * (({load} >> (0x00000010u & 31u)) & 0xffffffu)) + tid.x)"
+    assert shift_sub[-3] == ("        outputData.Store(tid.x * 4u + 0u, ((params[0].y - asuint(asint((" + product
+                             + " << (0x00000011u & 31u))) >> (0x00000014u & 31u))) - 0x00001234u));"), shift_sub
     mul = "v_mul_lo_u32 v1, s0, v1"
     lines = aot.lower(READ_MUL_LO, 32, **READ_BINDING).splitlines()
     assert lines[-4:] == [GUARD_IF, f"        outputData.Store(tid.x * 4u + 0u, (params[0].y * {load}));",
@@ -1006,9 +1035,9 @@ def alu_controls():
     for message, changes in (
         # Wrong opcodes: signed or other operations, and a carry form that would write vcc.
         (unsupported + "v_min_i32_e32", (("v_min_u32_e32", "v_min_i32_e32"),)),
-        (unsupported + "v_max_u32_e32", (("v_min_u32_e32", "v_max_u32_e32"),)),
-        (unsupported + "v_ashrrev_i32_e32", (("v_lshrrev_b32_e32", "v_ashrrev_i32_e32"),)),
-        (unsupported + "v_or_b32_e32", (("v_and_b32_e32", "v_or_b32_e32"),)),
+        (unsupported + "v_max_i32_e32", (("v_min_u32_e32", "v_max_i32_e32"),)),
+        (unsupported + "v_mul_hi_u32_e32", (("v_lshrrev_b32_e32", "v_mul_hi_u32_e32"),)),
+        (unsupported + "v_xnor_b32_e32", (("v_and_b32_e32", "v_xnor_b32_e32"),)),
         (unsupported + "v_mad_i32_i24", ((mad, "v_mad_i32_i24 v1, v2, v1, v0"),)),
         (unsupported + "v_add_co_u32", ((mad, "v_add_co_u32 v1, vcc_lo, v2, v0"),)),
         # Wrong operand widths: 16-bit, 64-bit and sub-dword (SDWA) forms, and a register range.
@@ -1055,6 +1084,63 @@ def alu_controls():
     assert alu(*restored, ("s_or_b32 exec_lo, exec_lo, s2", "s_or_b32 exec_lo, exec_lo, s2\nv_mov_b32_e32 v1, 9"),
                stride=8)[-5:] == [GUARD_IF, "        outputData.Store(tid.x * 8u + 0u, tid.x);", "    }",
                                   "    outputData.Store(tid.x * 8u + 4u, 0x00000009u);", "}"]
+
+
+# The read-compute-write fixture with a scalar chain over the cap word s0 and the bound s3 feeding the min:
+# add and sub that both wrap, and with a literal, or, xor with the bound and a logical shift right, each reading the
+# previous result.
+SCALAR_CHAIN = ("s_add_u32 s16, s0, -16\ns_sub_u32 s17, s16, 0x10000\ns_and_b32 s18, s17, 0xffffffe0\n"
+                "s_or_b32 s19, s18, 10\ns_xor_b32 s20, s19, s3\ns_lshr_b32 s21, s20, 3")
+READ_SCALAR = variant(READ_COMPUTE, ("v_and_b32_e32 v2, 0xffff, v1", SCALAR_CHAIN + "\nv_and_b32_e32 v2, 0xffff, v1"),
+                      ("v_min_u32_e32 v1, s0, v1", "v_min_u32_e32 v1, s21, v1"))
+SCALAR_WORD = ("min(((((((params[0].y + 0xfffffff0u) - 0x00010000u) & 0xffffffe0u) | 0x0000000au) ^ params[0].x)"
+               " >> (0x00000003u & 31u)), ")
+
+SCALAR_CASES = [("read_scalar", READ_SCALAR, 32, READ_BINDING)]
+
+
+def scalar_alu_controls():
+    """Scalar ALU on known words: exact output, then one rejection per operand or opcode outside the subset."""
+    def scalar(*changes):
+        return aot.lower(variant(READ_SCALAR, *changes), 32, **READ_BINDING).splitlines()
+
+    lines = scalar()
+    assert SCALAR_WORD in lines[-3] and lines[-3].startswith("        outputData.Store(tid.x * 4u + 0u, "), lines
+    # The earliest scalar results stay inline in the chain: the first operand prints before the second.
+    assert scalar(("s_lshr_b32 s21, s20, 3", "s_sub_u32 s21, 100, s20"))[-3].count("(0x00000064u - ") == 1
+    # A scalar result can feed a vector instruction as a source, and a copy of it is the same program.
+    assert scalar(("v_min_u32_e32 v1, s21, v1", "s_mov_b32 s22, s21\nv_min_u32_e32 v1, s22, v1")) == lines
+    unsupported, operand = "Unsupported compute instruction: ", "Unverified scalar ALU operand"
+    for message, changes in (
+        # Opcodes outside the subset: signed, carry-in and 64-bit forms.
+        (unsupported + "s_ashr_i32", (("s_lshr_b32 s21", "s_ashr_i32 s21"),)),
+        (unsupported + "s_addc_u32", (("s_add_u32 s16", "s_addc_u32 s16"),)),
+        (unsupported + "s_and_b64", (("s_and_b32 s18, s17, 0xffffffe0", "s_and_b64 s[18:19], s[16:17], 0xffffffe0"),)),
+        # Sources that are not known words: an unwritten SGPR, a descriptor SGPR, the saved exec mask, and a
+        # constant word still waiting for its s_waitcnt.
+        (operand, (("s_add_u32 s16, s0, -16", "s_add_u32 s16, s30, 7"),)),
+        (operand, (("s_add_u32 s16, s0, -16", "s_add_u32 s16, s8, 7"),)),
+        (operand, (("s_add_u32 s16, s0, -16", "s_add_u32 s16, s2, 7"),)),
+        (operand, (("s_add_u32 s16, s0, -16", "s_buffer_load_dword s23, s[4:7], 0x8\ns_add_u32 s16, s23, 7"),)),
+        # A destination past s105, and a pending destination.
+        (operand, (("s_add_u32 s16, s0, -16", "s_add_u32 s106, s0, 7"),)),
+        (operand, (("s_add_u32 s16, s0, -16", "s_buffer_load_dword s16, s[4:7], 0x8\ns_add_u32 s16, s0, 7"),)),
+        # A source wider than 32 bits.
+        (operand, (("s_add_u32 s16, s0, -16", "s_add_u32 s16, s0, 0x1ffffffff"),)),
+        # A vector register is not a scalar source.
+        (unsupported + "s_add_u32", (("s_add_u32 s16, s0, -16", "s_add_u32 s16, s0, v1"),)),
+        # Overwriting the saved exec mask breaks the guard restore.
+        ("Unverified lane guard restore", (("s_cbranch_execz .LBB0_2", ""), (".LBB0_2:", "s_add_u32 s2, s0, 7"),
+                                           ("s_endpgm", "s_or_b32 exec_lo, exec_lo, s2\ns_endpgm"))),
+        # A scalar result is data only: not an address and not a lane-guard compare operand.
+        ("Unsupported store address", (("v1, v0, s[8:11]", "v1, v21, s[8:11]"),
+                                       ("v_min_u32_e32 v1, s21, v1", "v_min_u32_e32 v1, s21, v1\nv_mov_b32_e32 v21, s21"))),
+        ("Unverified lane guard compare", (("v_min_u32_e32 v1, s21, v1",
+                                            "v_min_u32_e32 v1, s21, v1\nv_cmp_gt_u32_e32 vcc_lo, s21, v1"),)),
+        # Expressions are inline, so a scalar result that keeps doubling is rejected.
+        ("ALU expression too large", (("s_lshr_b32 s21, s20, 3", "s_lshr_b32 s21, s20, 3" + "\ns_add_u32 s21, s21, s21" * 8),)),
+    ):
+        rejects(message, scalar, *changes)
 
 
 def assemble(directory, assembler, objcopy, lines):
@@ -1590,6 +1676,17 @@ LDS_STRIDED_PROGRAMS = {
         "ds_read2st64_b64 v[10:13], v5 offset0:2 offset1:1", "s_waitcnt lgkmcnt(0)",
         "buffer_store_dwordx4 v[10:13], v8, s[20:23], 0 idxen", "s_endpgm",
     ],
+    "lds_st64_xchg_b64": DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 3, v0", "v_mad_u32_u24 v6, 1, v8, 0x76543210", "v_mov_b32_e32 v7, 0x89abcdef",
+        "v_mov_b32_e32 v10, 0x12345678", "v_mov_b32_e32 v11, 0x9abcdef0",
+        "ds_write2st64_b64 v5, v[6:7], v[10:11] offset0:1 offset1:2", "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v12, 0x11111111", "v_mov_b32_e32 v13, 0x22222222",
+        "v_mov_b32_e32 v14, 0x33333333", "v_mov_b32_e32 v15, 0x44444444",
+        "ds_wrxchg2st64_rtn_b64 v[12:15], v5, v[12:13], v[14:15] offset0:2 offset1:1", "s_waitcnt lgkmcnt(0)",
+        "ds_read2st64_b64 v[16:19], v5 offset0:1 offset1:2", "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx4 v[12:15], v8, s[20:23], 0 idxen",
+        "buffer_store_dwordx4 v[16:19], v8, s[20:23], 0 idxen offset:16", "s_endpgm",
+    ],
     "lds_st64_xchg": DS_PREFIX + [
         "v_lshlrev_b32_e32 v5, 2, v0", "v_mad_u32_u24 v6, 1, v8, 0x76543210", "v_mov_b32_e32 v7, 0x89abcdef",
         "ds_write2st64_b32 v5, v6, v7 offset0:2 offset1:3", "s_waitcnt lgkmcnt(0)",
@@ -1599,7 +1696,7 @@ LDS_STRIDED_PROGRAMS = {
         "buffer_store_dwordx4 v[10:13], v8, s[20:23], 0 idxen", "s_endpgm",
     ],
 }
-LDS_STRIDED_CASES = [(name, lines, LDS_BINDING | {"lds_bytes": 1280, "stride": 8 if name.endswith("b32") else 16})
+LDS_STRIDED_CASES = [(name, lines, LDS_BINDING | {"lds_bytes": 1280, "stride": {"lds_st64_b32": 8, "lds_st64_xchg_b64": 32}.get(name, 16)})
                      for name, lines in LDS_STRIDED_PROGRAMS.items()]
 
 
@@ -1609,6 +1706,9 @@ def lds_strided_reference(name, groups):
         first = 0x76543210 + lane
         if name == "lds_st64_b32":
             words.extend((0x89abcdef, first))
+        elif name == "lds_st64_xchg_b64":
+            words.extend((0x12345678, 0x9abcdef0, first, 0x89abcdef,
+                          0x33333333, 0x44444444, 0x11111111, 0x22222222))
         elif name == "lds_st64_b64":
             words.extend((0x12345678, 0x9abcdef0, first, 0x89abcdef))
         else:
@@ -1621,6 +1721,8 @@ LDS_F32_BINDING = LDS_BINDING | {"stride": 8, "lds_f32_mode": "normal-rne"}
 LDS_F32_OPS = {
     "ds_add_f32": "v5, v7", "ds_add_rtn_f32": "v11, v5, v11",
     "ds_min_f32": "v5, v7", "ds_max_f32": "v5, v7", "ds_cmpst_f32": "v5, v6, v7",
+    "ds_min_rtn_f32": "v11, v5, v11", "ds_max_rtn_f32": "v11, v5, v11",
+    "ds_cmpst_rtn_f32": "v11, v5, v6, v11",
 }
 
 
@@ -1632,8 +1734,8 @@ def lds_f32_program(op):
         "ds_write_b32 v5, v6", "s_waitcnt lgkmcnt(0)",
         "ds_read_b32 v11, v5", "s_waitcnt lgkmcnt(0)",
         f"v_mov_b32_e32 v7, {'0xc0400000' if add else '0x40400000'}",
-    ] + (["v_mov_b32_e32 v11, v7"] if op == "ds_add_rtn_f32" else []) + (
-        ["v_mov_b32_e32 v6, 0x40200000"] if op == "ds_cmpst_f32" else []) + [
+    ] + (["v_mov_b32_e32 v11, v7"] if "_rtn" in op else []) + (
+        ["v_mov_b32_e32 v6, 0x40200000"] if op.startswith("ds_cmpst") else []) + [
         f"{op} {LDS_F32_OPS[op]}", "s_waitcnt lgkmcnt(0)",
         "ds_read_b32 v10, v5", "s_waitcnt lgkmcnt(0)",
         "buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen", "s_endpgm",
@@ -1646,10 +1748,10 @@ def lds_f32_reference(op, groups):
         old = 2.5 if lane % 2 == 0 else 5.0
         if op.startswith("ds_add"):
             new = old - 3.0
-        elif op == "ds_cmpst_f32":
+        elif op.startswith("ds_cmpst"):
             new = 3.0 if old == 2.5 else old
         else:
-            new = (min if op == "ds_min_f32" else max)(old, 3.0)
+            new = (min if op.startswith("ds_min") else max)(old, 3.0)
         words.extend(struct.unpack("<II", struct.pack("<ff", new, old)))
     return words
 
@@ -1664,31 +1766,120 @@ LDS_WIDE_SETUP = DS_PREFIX + [
     "v_mov_b32_e32 v7, 0x89abcdef",
     "v_mov_b32_e32 v9, 0x76543210",
 ]
+
+
+def _signed64(value):
+    return value - (1 << 64) if value >> 63 else value
+
+
+def _min_i64(a, b):
+    return a if _signed64(a) < _signed64(b) else b
+
+
+def _max_i64(a, b):
+    return a if _signed64(a) > _signed64(b) else b
+
+
 LDS_QWORD_UPDATES = {
     "ds_add_u64": operator.add, "ds_sub_u64": operator.sub, "ds_rsub_u64": lambda a, b: b - a,
-    "ds_and_b64": operator.and_, "ds_or_b64": operator.or_,
+    "ds_and_b64": operator.and_, "ds_or_b64": operator.or_, "ds_xor_b64": operator.xor,
+    "ds_min_u64": min, "ds_max_u64": max, "ds_min_i64": _min_i64, "ds_max_i64": _max_i64,
 }
 
 
-def lds_qword_program(op):
+LDS_QWORD_RETURNS = {f"{stem}_rtn_{width}": op for op in LDS_QWORD_UPDATES
+                     for stem, width in [op.rsplit("_", 1)]}
+
+
+LDS_QWORD_COUNTERS = ("ds_inc_u64", "ds_inc_rtn_u64", "ds_dec_u64", "ds_dec_rtn_u64", "ds_condxchg32_rtn_b64")
+
+
+def lds_qword_counter_program(op):
+    returns = "_rtn" in op
+    dest = "v[18:19], " if returns else ""
+    inputs = (["v_mov_b32_e32 v18, 0x92345678", "v_mov_b32_e32 v19, 0x12345678"]
+              if "condxchg" in op else ["v_mov_b32_e32 v18, 8", "v_mov_b32_e32 v19, 1"])
     return LDS_WIDE_SETUP + [
-        "v_mad_u32_u24 v16, 1, v8, 0xfffffff0",
-        "v_mov_b32_e32 v17, 0xfffffff1",
-        "v_mov_b32_e32 v18, 0x00000018", "v_mov_b32_e32 v19, 0x0000000e",
+        "v_and_b32_e32 v16, 31, v8", "v_mad_u32_u24 v16, 1, v16, 0xfffffff0", "v_lshrrev_b32_e32 v17, 5, v8",
         "ds_write_b64 v5, v[16:17] offset:8", "s_waitcnt lgkmcnt(0)",
-        f"{op} v5, v[18:19] offset:8", "s_waitcnt lgkmcnt(0)",
+    ] + inputs + [
+        f"{op} {dest}v5, v[18:19] offset:8", "s_waitcnt lgkmcnt(0)",
         "ds_read_b64 v[10:11], v5 offset:8", "s_waitcnt lgkmcnt(0)",
-        "buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen", "s_endpgm",
-    ]
+    ] + (["v_mov_b32_e32 v12, v18", "v_mov_b32_e32 v13, v19",
+          "buffer_store_dwordx4 v[10:13], v8, s[20:23], 0 idxen"] if returns else
+         ["buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen"]) + ["s_endpgm"]
+
+
+def lds_qword_counter_reference(op, groups):
+    words = []
+    for lane in range(groups * 32):
+        old = (lane // 32 << 32) | ((0xfffffff0 + lane % 32) & 0xffffffff)
+        limit = 0x100000008
+        if "inc" in op:
+            new = 0 if old >= limit else old + 1
+        elif "dec" in op:
+            new = limit if old == 0 or old > limit else old - 1
+        else:
+            new = old & 0xffffffff00000000 | 0x92345678
+        words.extend((new & 0xffffffff, new >> 32))
+        if "_rtn" in op:
+            words.extend((old & 0xffffffff, old >> 32))
+    return words
+
+
+def lds_qword_program(op):
+    returns = op in LDS_QWORD_RETURNS
+    ret_operand = "v[18:19], " if returns else ""
+    if LDS_QWORD_RETURNS.get(op, op) in ("ds_min_i64", "ds_max_i64", "ds_min_u64", "ds_max_u64"):
+        # Even lanes cross the signed high-word boundary; odd lanes repeat the
+        # high word and exercise the unsigned low-word tie-break.
+        prior = [
+            "v_mad_u32_u24 v16, 1, v8, 0xfffffff0",
+            "v_and_b32_e32 v17, 1, v8",
+            "v_mad_u32_u24 v17, 1, v17, 0x7fffffff",
+            "v_mov_b32_e32 v18, 0x00000018", "v_mov_b32_e32 v19, 0x80000000",
+        ]
+    else:
+        prior = [
+            "v_mad_u32_u24 v16, 1, v8, 0xfffffff0",
+            "v_mov_b32_e32 v17, 0xfffffff1",
+            "v_mov_b32_e32 v18, 0x00000018", "v_mov_b32_e32 v19, 0x0000000e",
+        ]
+    return LDS_WIDE_SETUP + [
+        *prior,
+        "ds_write_b64 v5, v[16:17] offset:8", "s_waitcnt lgkmcnt(0)",
+        f"{op} {ret_operand}v5, v[18:19] offset:8", "s_waitcnt lgkmcnt(0)",
+        "ds_read_b64 v[10:11], v5 offset:8", "s_waitcnt lgkmcnt(0)",
+    ] + (["v_mov_b32_e32 v12, v18", "v_mov_b32_e32 v13, v19",
+          "buffer_store_dwordx4 v[10:13], v8, s[20:23], 0 idxen"] if returns else
+         ["buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen"]) + ["s_endpgm"]
 
 
 def lds_qword_reference(op, groups):
     words = []
     for lane in range(groups * 32):
-        previous = (0xfffffff1 << 32) | ((0xfffffff0 + lane) & 0xffffffff)
-        current = LDS_QWORD_UPDATES[op](previous, 0x0000000e00000018)
+        if LDS_QWORD_RETURNS.get(op, op) in ("ds_min_i64", "ds_max_i64", "ds_min_u64", "ds_max_u64"):
+            previous = ((0x7fffffff + (lane & 1)) << 32) | ((0xfffffff0 + lane) & 0xffffffff)
+            source = 0x8000000000000018
+        else:
+            previous = (0xfffffff1 << 32) | ((0xfffffff0 + lane) & 0xffffffff)
+            source = 0x0000000e00000018
+        current = LDS_QWORD_UPDATES[LDS_QWORD_RETURNS.get(op, op)](previous, source)
         words.extend((current & 0xffffffff, (current >> 32) & 0xffffffff))
+        if op in LDS_QWORD_RETURNS:
+            words.extend((previous & 0xffffffff, previous >> 32))
     return words
+
+
+def without_low_tiebreak(source):
+    """Remove the low-word clause from a qword min/max condition."""
+    start = source.index(" || ((")
+    depth = 0
+    for end in range(start + len(" || "), len(source)):
+        depth += {"(": 1, ")": -1}.get(source[end], 0)
+        if depth == 0:
+            return source[:start] + source[end + 1:]
+    raise AssertionError("Missing qword comparison tie-break")
 
 
 LDS_WIDE_QUAD_SETUP = [
@@ -1715,6 +1906,13 @@ LDS_WIDE_PROGRAMS = {
         "ds_write_b96 v5, v[16:18]", "s_waitcnt lgkmcnt(0)",
         "ds_read_b96 v[10:12], v5", "s_waitcnt lgkmcnt(0)",
     ],
+    "lds_xchg2_b32": [
+        "v_mov_b32_e32 v16, v6", "v_mov_b32_e32 v17, v7", "v_mov_b32_e32 v18, v9",
+        "ds_write_b96 v5, v[16:18]", "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v10, 0x13572468", "v_mov_b32_e32 v11, 0x24681357",
+        "ds_wrxchg2_rtn_b32 v[10:11], v5, v10, v11 offset0:2", "s_waitcnt lgkmcnt(0)",
+        "ds_read2_b32 v[12:13], v5 offset0:2", "s_waitcnt lgkmcnt(0)",
+    ],
     "lds_read2_b32": [
         "v_mov_b32_e32 v16, v6", "v_mov_b32_e32 v17, v7", "v_mov_b32_e32 v18, v9",
         "ds_write_b96 v5, v[16:18]", "s_waitcnt lgkmcnt(0)",
@@ -1730,8 +1928,10 @@ def lds_wide_program(name):
         return LDS_WIDE_SETUP + LDS_WIDE_QUAD_SETUP + ds + [
             "buffer_store_dwordx4 v[10:13], v8, s[20:23], 0 idxen", "s_endpgm",
         ]
+    store = ("buffer_store_dwordx4 v[10:13]" if name == "lds_xchg2_b32"
+             else "buffer_store_dwordx3 v[10:12]")
     return LDS_WIDE_SETUP + LDS_WIDE_PROGRAMS[name] + [
-        "buffer_store_dwordx3 v[10:12], v8, s[20:23], 0 idxen", "s_endpgm",
+        store + ", v8, s[20:23], 0 idxen", "s_endpgm",
     ]
 
 
@@ -1739,6 +1939,9 @@ def lds_wide_reference(name, groups):
     words = []
     for lane in range(groups * 32):
         data = 0x12345670 + lane
+        if name == "lds_xchg2_b32":
+            words.extend((0x76543210, data, 0x13572468, 0x24681357))
+            continue
         if name in LDS_WIDE_QUADS:
             words.extend({
                 "lds_b128": (data, 0x89abcdef, 0x76543210, 0xf0e1d2c3),
@@ -1751,7 +1954,8 @@ def lds_wide_reference(name, groups):
     return words
 
 
-LDS_PACKED_CASES = [(name, lds_wide_program(name), LDS_WIDE_BINDING) for name in LDS_WIDE_PROGRAMS]
+LDS_PACKED_CASES = [(name, lds_wide_program(name), LDS_WIDE_BINDING | {"stride": 16} if name == "lds_xchg2_b32"
+                     else LDS_WIDE_BINDING) for name in LDS_WIDE_PROGRAMS]
 LDS_PACKED_CASES += [(name, lds_wide_program(name), LDS_WIDE_BINDING | {"stride": 16}) for name in LDS_WIDE_QUADS]
 
 
@@ -1849,6 +2053,68 @@ LDS_WIDE_REPLACEMENT_CASES = [
 
 LDS_QWORD_BINDING = LDS_WIDE_BINDING | {"stride": 8}
 LDS_QWORD_CASES = [(op, lds_qword_program(op), LDS_QWORD_BINDING) for op in LDS_QWORD_UPDATES]
+LDS_QWORD_RETURN_BINDING = LDS_WIDE_BINDING | {"stride": 16}
+LDS_QWORD_CASES += [(op, lds_qword_program(op), LDS_QWORD_RETURN_BINDING) for op in LDS_QWORD_RETURNS]
+LDS_QWORD_CASES += [(op, lds_qword_counter_program(op),
+                     LDS_QWORD_RETURN_BINDING if "_rtn" in op else LDS_QWORD_BINDING) for op in LDS_QWORD_COUNTERS]
+
+
+LDS_F64_CMPST = ("ds_cmpst_f64", "ds_cmpst_rtn_f64")
+
+
+def lds_f64_cmpst(op):
+    returns = "_rtn" in op
+    dest = "v[18:19], " if returns else ""
+    return LDS_WIDE_SETUP + [
+        "v_and_b32_e32 v16, 1, v8", "v_lshrrev_b32_e32 v17, 1, v8", "v_and_b32_e32 v17, 1, v17",
+        "v_mad_u32_u24 v17, 1, v17, 0x40040000",
+        "v_mov_b32_e32 v18, 0x12345678", "v_mov_b32_e32 v19, 0xbff80000",
+        "v_mov_b32_e32 v20, 0", "v_mov_b32_e32 v21, 0x40040000",
+        "ds_write_b64 v5, v[16:17] offset:8", "s_waitcnt lgkmcnt(0)",
+        f"{op} {dest}v5, v[20:21], v[18:19] offset:8", "s_waitcnt lgkmcnt(0)",
+        "ds_read_b64 v[10:11], v5 offset:8", "s_waitcnt lgkmcnt(0)",
+    ] + (["v_mov_b32_e32 v12, v18", "v_mov_b32_e32 v13, v19",
+          "buffer_store_dwordx4 v[10:13], v8, s[20:23], 0 idxen"] if returns else
+         ["buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen"]) + ["s_endpgm"]
+
+
+def lds_f64_reference(op, groups):
+    words = []
+    for lane in range(groups * 32):
+        previous = (lane & 1, 0x40040000 + (lane >> 1 & 1))
+        value = struct.unpack("<d", struct.pack("<II", *previous))[0]
+        words.extend((0x12345678, 0xbff80000) if value == 2.5 else previous)
+        if "_rtn" in op:
+            words.extend(previous)
+    return words
+
+
+LDS_F64_CASES = [(op, lds_f64_cmpst(op), LDS_WIDE_BINDING | {"stride": 16 if "_rtn" in op else 8,
+                                                          "lds_f64_mode": "normal"}) for op in LDS_F64_CMPST]
+LDS_FLOAT_CASES = LDS_F32_CASES + LDS_F64_CASES
+
+
+LDS_WAVE_COUNTER = DS_PREFIX + [
+    "s_mov_b32 m0, 0", "v_lshlrev_b32_e32 v5, 2, v0",
+    "v_mad_u32_u24 v6, 1, v8, 0xfffffff0", "ds_write_b32 v5, v6", "s_waitcnt lgkmcnt(0)",
+    "ds_append v10", "s_waitcnt lgkmcnt(0)",
+    "ds_read_b32 v11, v5", "s_waitcnt lgkmcnt(0)",
+    "ds_consume v12", "s_waitcnt lgkmcnt(0)",
+    "ds_read_b32 v13, v5", "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx4 v[10:13], v8, s[20:23], 0 idxen", "s_endpgm",
+]
+LDS_CASES += [("lds_wave_counter", LDS_WAVE_COUNTER, LDS_BINDING | {"stride": 16})]
+
+
+def lds_wave_counter_reference(groups):
+    words = []
+    for lane in range(groups * 32):
+        first = lane // 32 * 32
+        seed = (0xfffffff0 + first) & 0xffffffff
+        incremented = (seed + 32) & 0xffffffff
+        private = (0xfffffff0 + lane) & 0xffffffff
+        words.extend((seed, incremented if lane == first else private, incremented, private))
+    return words
 
 
 def lds_controls():
@@ -1861,6 +2127,9 @@ def lds_controls():
         (target + " gds", "Unsupported compute instruction"),
     ):
         rejects(message, aot.lower, variant(lines, (target, replacement)), 32, **binding)
+
+    lines = lds_f64_cmpst("ds_cmpst_f64")
+    rejects("Unverified private LDS binary64 mode", aot.lower, lines, 32, **(LDS_WIDE_BINDING | {"stride": 8}))
     lines = lds_f32_program("ds_add_f32")
     rejects("Unverified private LDS floating-point mode", aot.lower, lines, 32, **LDS_BINDING)
     for bad, message in (
@@ -1896,6 +2165,13 @@ def lds_controls():
     rejects("Unverified private LDS write", aot.lower,
             variant(high, ("ds_write_b32 v5, v6", "s_nop 0")), 32, **LDS_BINDING)
 
+    ret = lds_qword_program("ds_add_rtn_u64")
+    instruction = "ds_add_rtn_u64 v[18:19], v5, v[18:19] offset:8"
+    for bad in (instruction.replace("v[18:19], v5", "v[18:20], v5"),
+                instruction.replace("v[18:19], v5", "v[255:256], v5")):
+        rejects("Unverified private wide LDS update", aot.lower, variant(ret, (instruction, bad)), 32,
+                **LDS_QWORD_RETURN_BINDING)
+
     quad = lds_qword_program("ds_add_u64")
     op = "ds_add_u64 v5, v[18:19] offset:8"
     for bad, message in (
@@ -1905,6 +2181,15 @@ def lds_controls():
         (op + " gds", "Unsupported compute instruction"),
     ):
         rejects(message, aot.lower, variant(quad, (op, bad)), 32, **LDS_QWORD_BINDING)
+
+    for name in ("ds_xor_b64", "ds_min_u64", "ds_max_u64", "ds_min_i64", "ds_max_i64"):
+        lines = lds_qword_program(name)
+        update = f"{name} v5, v[18:19] offset:8"
+        for bad, message in (
+            (f"{name} v5, v[18:19]", "Unverified private wide LDS update"),
+            (update + " gds", "Unsupported compute instruction"),
+        ):
+            rejects(message, aot.lower, variant(lines, (update, bad)), 32, **LDS_QWORD_BINDING)
 
     pair = lds_wide_program("lds_pair_b64")
     for before, after, message in (
@@ -1931,6 +2216,21 @@ def lds_controls():
     ):
         rejects(message, aot.lower, variant(lines, (before, after)), 32, **binding)
     rejects("Unverified private strided LDS access", aot.lower, lines, 32, **(binding | {"lds_bytes": 1279}))
+    for old, bad, message in (
+        ("s_mov_b32 m0, 0", "s_nop 0", "Unverified LDS wave counter"),
+        ("s_mov_b32 m0, 0", "s_mov_b32 m0, 4", "Unsupported compute instruction"),
+        ("ds_write_b32 v5, v6", "s_nop 0", "Unverified LDS wave counter"),
+        ("ds_append v10", "ds_append v10 gds", "Unsupported compute instruction"),
+        ("ds_consume v12", "ds_consume v12 offset:4", "Unsupported compute instruction"),
+        ("ds_append v10", "ds_append v10\ns_nop 0", "Expected immediate s_waitcnt lgkmcnt(0) after DS"),
+    ):
+        rejects(message, aot.lower, variant(LDS_WAVE_COUNTER, (old, bad)), 32, **LDS_BINDING)
+    lines = lds_wide_program("lds_xchg2_b32")
+    rejects("Unverified private paired dword exchange", aot.lower,
+            variant(lines, ("v10, v11 offset0:2", "v10, v11")), 32, **LDS_WIDE_BINDING)
+    rejects("Uninitialized private paired dword exchange", aot.lower,
+            variant(lines, ("ds_wrxchg2_rtn_b32 v[10:11], v5, v10, v11 offset0:2",
+                            "ds_wrxchg2_rtn_b32 v[10:11], v5, v10, v11 offset0:3")), 32, **LDS_WIDE_BINDING)
     wide = lds_wide_program("lds_b96")
     rejects("Unverified dispatch byte offset", aot.lower, wide, 32, **LDS_BINDING)
     for old, bad, message in (
@@ -2005,7 +2305,7 @@ def lds_controls():
         ("ds_add_u32 v5, v254", "Unverified private LDS update"),
         ("ds_add_u32 v5, v6 offset:4", "Unsupported compute instruction"),
         ("ds_add_u32 v5, v6 gds", "Unsupported compute instruction"),
-        ("ds_inc_rtn_u64 v[10:11], v5, v[6:7]", "Unsupported compute instruction"),
+        ("ds_inc_rtn_u64 v[10:11], v5, v[6:7] offset:4", "Unsupported compute instruction"),
     ):
         rejects(message, aot.lower, variant(lines, (update, bad)), 32, **LDS_BINDING)
     i = lines.index(update)
@@ -2090,7 +2390,7 @@ def ds_binary(directory, assembler, objcopy, library):
     cases = DS_CASES + LDS_CASES + LDS_ARITHMETIC_CASES + LDS_REPLACEMENT_CASES + LDS_PACKED_CASES + LDS_STRIDED_CASES
     cases += LDS_WIDE_REPLACEMENT_CASES
     cases += LDS_QWORD_CASES
-    cases += LDS_F32_CASES
+    cases += LDS_FLOAT_CASES
     for name, lines, binding in cases:
         src, obj, raw = (directory / f"{name}.{ext}" for ext in ("s", "o", "bin"))
         src.write_text("\n".join(lines) + "\n", encoding="ascii")
@@ -2161,18 +2461,53 @@ def ds_mutants(name, lines, binding, source):
         if name in ("ds_read_i8_d16", "ds_read_i8_d16_hi"):
             changed = variant(lines, (f"{name} v10, v5", f"{name.replace('i8', 'u8')} v10, v5"))
             yield aot.lower(changed, 32, **binding), 0
+    elif name == "lds_wave_counter":
+        yield aot.lower(variant(lines, ("ds_append v10", "ds_consume v10")), 32, **binding), 1
+        yield aot.lower(variant(lines, ("ds_consume v12", "ds_append v12")), 32, **binding), 3
+    elif name in LDS_QWORD_COUNTERS:
+        if "condxchg" in name:
+            # Incorrectly perform the high-half store when its sign bit is clear.
+            wrong = source.replace("(0x12345678u & 0x80000000u) != 0u", "true")
+            yield wrong, 1
+        else:
+            # Returning forms use the read to keep the old pair observable.
+            no_update = ("ds_read_b64 v[18:19], v5 offset:8" if "_rtn" in name else "s_nop 0")
+            instruction = next(line for line in lines if line.startswith(name + " "))
+            yield aot.lower(variant(lines, (instruction, no_update)), 32, **binding), 0
+    elif name in LDS_QWORD_RETURNS:
+        # Substitute the post-update word pair for the returned pre-update pair.
+        changed = variant(lines, ("v_mov_b32_e32 v12, v18", "v_mov_b32_e32 v12, v10"),
+                          ("v_mov_b32_e32 v13, v19", "v_mov_b32_e32 v13, v11"))
+        ref = lds_qword_reference(name, 2)
+        word = next(i for i in range(len(ref)) if i % 4 >= 2 and ref[i] != ref[i - 2])
+        yield aot.lower(changed, 32, **binding), word
     elif name in LDS_QWORD_UPDATES:
         if name == "ds_add_u64":
             wrong = source.replace(" + uint(", " + 0u * uint(")
             word = 1
+            yield wrong, word
         elif name in ("ds_sub_u64", "ds_rsub_u64"):
             wrong = source.replace(" - uint(", " - 0u * uint(")
             word = 33 if name == "ds_sub_u64" else 1
+            yield wrong, word
+        elif name == "ds_xor_b64":
+            wrong = aot.lower(variant(lines, (name, "ds_and_b64")), 32, **binding)
+            yield wrong, 0
+        elif name in ("ds_min_u64", "ds_max_u64", "ds_min_i64", "ds_max_i64"):
+            alternate = {"ds_min_u64": "ds_max_u64", "ds_max_u64": "ds_min_u64",
+                         "ds_min_i64": "ds_max_i64", "ds_max_i64": "ds_min_i64"}[name]
+            wrong = aot.lower(variant(lines, (name, alternate)), 32, **binding)
+            yield wrong, 0
+            # With only the high-word test left, min keeps the source on a tie
+            # and first differs at lane 17. Max instead keeps the source at
+            # lane 1, whose low word should have won.
+            wrong = without_low_tiebreak(source)
+            assert wrong != source
+            yield wrong, 34 if name.startswith("ds_min") else 2
         else:
             alternate = "ds_or_b64" if name == "ds_and_b64" else "ds_and_b64"
             wrong = aot.lower(variant(lines, (name, alternate)), 32, **binding)
-            word = 0
-        yield wrong, word
+            yield wrong, 0
     elif name in LDS_WIDE_QUADS:
         if name == "lds_b128":
             change = ("v_mov_b32_e32 v19, 0xf0e1d2c3", "v_mov_b32_e32 v19, 0")
@@ -2185,7 +2520,10 @@ def ds_mutants(name, lines, binding, source):
             word = 0
         yield aot.lower(variant(lines, change), 32, **binding), word
     elif name in LDS_WIDE_PROGRAMS:
-        if name == "lds_read2_b32":
+        if name == "lds_xchg2_b32":
+            change = ("ds_wrxchg2_rtn_b32 v[10:11], v5, v10, v11 offset0:2",
+                      "ds_wrxchg2_rtn_b32 v[10:11], v5, v10, v11 offset1:2")
+        elif name == "lds_read2_b32":
             change = ("offset0:2 offset1:1", "offset0:1 offset1:2")
         elif name == "lds_b64":
             change = ("ds_read_b64 v[10:11], v5 offset:8", "ds_read_b64 v[10:11], v5")
@@ -2206,11 +2544,15 @@ def ds_mutants(name, lines, binding, source):
         no_update = "ds_read_b32 v10, v5" if "_rtn_" in name else "s_nop 0"
         changed = variant(lines, (lds_counter_instruction(name), no_update))
         yield aot.lower(changed, 32, **binding), 1
+    elif name in LDS_F64_CMPST:
+        changed = variant(lines, ("v[20:21], v[18:19] offset:8", "v[18:19], v[20:21] offset:8"))
+        yield aot.lower(changed, 32, **binding), 0
     elif name in LDS_STRIDED_PROGRAMS:
         change = {
             "lds_st64_b32": ("offset0:3 offset1:2", "offset0:2 offset1:3"),
             "lds_st64_b64": ("offset0:2 offset1:1", "offset0:1 offset1:2"),
             "lds_st64_xchg": ("offset0:3 offset1:2", "offset0:2 offset1:3"),
+            "lds_st64_xchg_b64": ("offset0:2 offset1:1", "offset0:1 offset1:2"),
         }[name]
         yield aot.lower(variant(lines, change), 32, **binding), 0
     elif name in LDS_WIDE_REPLACEMENTS:
@@ -2226,7 +2568,13 @@ def ds_mutants(name, lines, binding, source):
             word = 4
         yield aot.lower(changed, 32, **binding), word
     elif name in LDS_F32_OPS:
-        if name.startswith("ds_add"):
+        if name in ("ds_min_rtn_f32", "ds_max_rtn_f32", "ds_cmpst_rtn_f32"):
+            changed = variant(lines, ("buffer_store_dwordx2 v[10:11]", "v_mov_b32_e32 v11, v10\n"
+                                      "buffer_store_dwordx2 v[10:11]"))
+            ref = lds_f32_reference(name, 3)
+            word = next(i for i in range(1, len(ref), 2) if ref[i - 1] != ref[i])
+            yield aot.lower(changed, 32, **binding), word
+        elif name.startswith("ds_add"):
             yield source.replace(" + asfloat(", " - asfloat("), 0
         elif name == "ds_cmpst_f32":
             yield aot.lower(variant(lines, ("ds_cmpst_f32 v5, v6, v7", "ds_cmpst_f32 v5, v7, v6")),
@@ -2257,9 +2605,15 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
         subprocess.run(compile, check=True)
         run = [renderer, backend, "--compute-store-case", cso, case]
         # Four words per lane fill the fixed 320-word readback before three groups.
-        four_words = (name in LDS_WIDE_QUADS or name in LDS_STRIDED_PROGRAMS
+        four_words = (name in ("lds_wave_counter", "lds_xchg2_b32") or name in LDS_QWORD_RETURNS
+                      or name in LDS_WIDE_QUADS or name in LDS_STRIDED_PROGRAMS
+                      or name in LDS_F64_CMPST and "_rtn" in name
+                      or name in LDS_QWORD_COUNTERS and "_rtn" in name
                       or name in LDS_WIDE_REPLACEMENTS and "_rtn" in name)
-        for groups in (1, 2) if four_words else (1, 3):
+        group_counts = (1, 2) if four_words else (1, 3)
+        if name == "lds_st64_xchg_b64":
+            group_counts = (1,)
+        for groups in group_counts:
             if name in LDS_UPDATES or name in LDS_RETURN_UPDATES:
                 words = lds_update_reference(LDS_RETURN_UPDATES.get(name, name), groups)
             elif name in LDS_SUBWORDS:
@@ -2274,7 +2628,11 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
                 words = [base + lane for lane in range(groups * 32) for base in (0x12345670, 0x89abcdef)]
             elif name == "lds_overlap":
                 words = lds_overlap_reference(groups)
-            elif name in LDS_QWORD_UPDATES:
+            elif name == "lds_wave_counter":
+                words = lds_wave_counter_reference(groups)
+            elif name in LDS_QWORD_COUNTERS:
+                words = lds_qword_counter_reference(name, groups)
+            elif name in LDS_QWORD_UPDATES or name in LDS_QWORD_RETURNS:
                 words = lds_qword_reference(name, groups)
             elif name in LDS_WIDE_PROGRAMS or name in LDS_WIDE_QUADS:
                 words = lds_wide_reference(name, groups)
@@ -2286,6 +2644,8 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
                 words = lds_wide_replacement_reference(name, groups)
             elif name in LDS_F32_OPS:
                 words = lds_f32_reference(name, groups)
+            elif name in LDS_F64_CMPST:
+                words = lds_f64_reference(name, groups)
             elif private:
                 words = lds_reference(groups)
             else:
@@ -2311,7 +2671,18 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
     return 0
 
 
+def scalar_alu_binary(directory, assembler, objcopy, library):
+    """The assembled scalar chain decodes to the same program as its text."""
+    src, obj, raw = [directory / x for x in ("scalar.s", "scalar.o", "scalar.bin")]
+    src.write_text("\n".join(READ_SCALAR) + "\n", encoding="ascii")
+    subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-filetype=obj", src, "-o", obj], check=True)
+    subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, raw], check=True)
+    decoded = aot.labelled(disassemble(raw.read_bytes(), library, offsets=True))
+    assert aot.lower(decoded, 32, **READ_BINDING) == aot.lower(READ_SCALAR, 32, **READ_BINDING)
+
+
 def binary(directory, assembler, objcopy, library):
+    scalar_alu_binary(directory, assembler, objcopy, library)
     ds_controls()
     lds_controls()
     ds_binary(directory, assembler, objcopy, library)
@@ -2644,6 +3015,223 @@ def draw_alu(directory, compiler, cmd, case, name):
     return 0
 
 
+SCALAR_CAP = 0x8068  # cap + 0xfffffff0 and then - 0x10000 both wrap; bits 5 and 6 survive the and mask
+
+
+def scalar_chain(cap, bound, *, skip=(), shift=3, bound_word=None):
+    """Independent CPU reference of the scalar chain: add -16, sub 0x10000, and, or 10, xor the bound, shift."""
+    word = (cap + 0xfffffff0) & 0xffffffff if "add" not in skip else cap
+    word = (word - 0x10000) & 0xffffffff if "sub" not in skip else word
+    word = word & 0xffffffe0 if "and" not in skip else word
+    word = word | 10 if "or" not in skip else word
+    word = word ^ (bound if bound_word is None else bound_word) if "xor" not in skip else word
+    return word >> shift
+
+
+def scalar_word(gid, bound, *, pick=min, **chain):
+    """Reference of read_scalar for one lane: the unsigned minimum of the chain and the product plus the lane index."""
+    word = source_word(gid)
+    product = ((word & 0xffff) * (word >> 16) + gid) & 0xffffffff
+    return pick(product, scalar_chain(SCALAR_CAP, bound, **chain))
+
+
+def scalar_words(groups, bound, **reference):
+    words = [SENTINEL] * 320
+    for gid in range(min(32 * groups, bound)):
+        words[gid] = scalar_word(gid, bound, **reference)
+    return words
+
+
+def draw_scalar(directory, compiler, cmd, case, name):
+    """Scalar chain against scalar_word, from the 320-word case format, with wrong references and mutated sources."""
+    constants = [0x5eed0000 + i for i in range(16)]
+    constants[1] = SCALAR_CAP
+
+    def write(groups, bound, words):
+        case.write_bytes(struct.pack("<337I", groups, *words, bound, *constants[1:]))
+
+    for groups, bound in READ_RUNS:
+        write(groups, bound, scalar_words(groups, bound))
+        result = subprocess.run(cmd)
+        if result.returncode:
+            return result.returncode
+    groups, bound = READ_RUNS[-1]
+    expected = scalar_words(groups, bound)
+    products = [scalar_word(g, bound, pick=lambda p, c: p) for g in range(bound)]
+    chain = scalar_chain(SCALAR_CAP, bound)
+    # Inputs must show both add and sub wrapping, and the minimum taking each operand.
+    assert SCALAR_CAP + 0xfffffff0 >= 1 << 32 and (SCALAR_CAP + 0xfffffff0) & 0xffffffff < 0x10000, "no wrap"
+    assert any(p < chain for p in products) and any(p >= chain for p in products), "min takes one operand only"
+    controls = (("max for min", dict(pick=max)), ("add dropped", dict(skip=("add",))),
+                ("sub dropped", dict(skip=("sub",))), ("and dropped", dict(skip=("and",))),
+                ("or dropped", dict(skip=("or",))), ("xor dropped", dict(skip=("xor",))),
+                ("shift by 2", dict(shift=2)), ("cap for bound", dict(bound_word=SCALAR_CAP)))
+    for label, reference in controls:
+        wrong = scalar_words(groups, bound, **reference)
+        word = next(i for i, (a, b) in enumerate(zip(expected, wrong)) if a != b)
+        write(groups, bound, wrong)
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"{name}: reference '{label}' escaped detection\n{bad.stderr}")
+    write(groups, bound, expected)
+    source = (directory / "store.hlsl").read_text(encoding="ascii")
+    for label, old, new in (("max for min", "min(((((((params", "max(((((((params"),
+                            ("add dropped", "(params[0].y + 0xfffffff0u)", "params[0].y"),
+                            ("sub dropped", "- 0x00010000u)", "- 0x00000000u)"),
+                            ("and dropped", "& 0xffffffe0u", "& 0xffffffffu"),
+                            ("or dropped", "| 0x0000000au", "| 0x00000000u"),
+                            ("xor dropped", "^ params[0].x", "^ 0x00000000u"),
+                            ("shift by 2", ">> (0x00000003u", ">> (0x00000002u")):
+        mutated = source.replace(old, new)
+        if mutated == source:
+            raise AssertionError(f"{name}: mutation '{label}' did not change the source")
+        src, cso = directory / "mutated.hlsl", directory / "mutated.cso"
+        src.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+        bad = subprocess.run([*cmd[:3], cso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"{name}: mutation '{label}' escaped detection")
+    return 0
+
+
+VOP2_CAP = 0xe0000000  # large enough that the product plus the cap wraps for many lanes
+
+
+def vop2_word(gid, *, pick="max", skip=()):
+    """Independent CPU reference of the read_vop2 result for one lane: the product p is added to the cap (wrapping),
+    OR-ed and XOR-ed with high-bit constants, and the unsigned maximum of p and that chain is stored."""
+    word = source_word(gid)
+    product = ((word & 0xffff) * (word >> 16) + gid) & 0xffffffff
+    chain = product if "add" in skip else (product + VOP2_CAP) & 0xffffffff
+    chain = chain if "or" in skip else chain | 0x80000010
+    chain = chain if "xor" in skip else chain ^ 0x80000001
+    if pick == "signed":
+        return max(product, chain, key=lambda v: v - (1 << 32) if v >> 31 else v)
+    return min(product, chain) if pick == "min" else max(product, chain)
+
+
+def vop2_words(groups, bound, **reference):
+    words = [SENTINEL] * 320
+    for gid in range(min(32 * groups, bound)):
+        words[gid] = vop2_word(gid, **reference)
+    return words
+
+
+def draw_vop2(directory, compiler, cmd, case, name):
+    """Chained add, or, xor and unsigned max against vop2_word, from the 320-word case format."""
+    constants = [0x5eed0000 + i for i in range(16)]
+    constants[1] = VOP2_CAP
+    groups, bound = READ_RUNS[-1]
+
+    def write(words):
+        case.write_bytes(struct.pack("<337I", groups, *words, bound, *constants[1:]))
+
+    expected = vop2_words(groups, bound)
+    products = [((source_word(g) & 0xffff) * (source_word(g) >> 16) + g) & 0xffffffff for g in range(bound)]
+    # Inputs must show an add that wraps, the max choosing each operand, and a signed max that would differ.
+    assert any(p + VOP2_CAP >= 1 << 32 for p in products), "no lane wraps the add"
+    assert any(e == p for e, p in zip(expected, products)), "no lane takes the product"
+    assert any(e != p for e, p in zip(expected, products)), "no lane takes the chain"
+    assert expected != vop2_words(groups, bound, pick="signed"), "a signed max would go unseen"
+    write(expected)
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+    # Each wrong reference must fail the run at the first word where it differs from the right one.
+    for label, reference in (("signed max", vop2_words(groups, bound, pick="signed")),
+                             ("min for max", vop2_words(groups, bound, pick="min")),
+                             ("add dropped", vop2_words(groups, bound, skip=("add",))),
+                             ("or dropped", vop2_words(groups, bound, skip=("or",))),
+                             ("xor dropped", vop2_words(groups, bound, skip=("xor",)))):
+        word = next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b)
+        write(reference)
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"{name}: reference '{label}' escaped detection\n{bad.stderr}")
+    write(expected)
+    source = (directory / "store.hlsl").read_text(encoding="ascii")
+    for label, old, new in (("min for max", "max(((((", "min((((("), ("xor dropped", "0x80000001u ^", "0x00000000u ^"),
+                            ("or dropped", "0x80000010u |", "0x00000000u |"),
+                            ("add dropped", "(params[0].y + (", "(0u + (")):
+        mutated = source.replace(old, new)
+        if mutated == source:
+            raise AssertionError(f"{name}: mutation '{label}' did not change the source")
+        src, cso = directory / "mutated.hlsl", directory / "mutated.cso"
+        src.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+        bad = subprocess.run([*cmd[:3], cso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"{name}: mutation '{label}' escaped detection")
+    return 0
+
+
+SHIFT_SUB_CAP = 0x0badf00d
+
+
+def shift_sub_word(gid, *, logical=False, shift=17, reverse_sub=False, reverse_subrev=False, skip=()):
+    """Independent CPU reference of the read_shift_sub result for one lane: the product is shifted left, shifted
+    right (arithmetically unless logical), subtracted from the cap, and 0x1234 is reverse-subtracted."""
+    word = source_word(gid)
+    value = (((word & 0xffff) * (word >> 16) + gid) & 0xffffffff)
+    value = value if "shl" in skip else (value << shift) & 0xffffffff
+    signed = value - (1 << 32) if value >> 31 else value
+    value = value >> 20 if logical else (signed >> 20) & 0xffffffff
+    value = (value - SHIFT_SUB_CAP if reverse_sub else SHIFT_SUB_CAP - value) & 0xffffffff
+    return (0x1234 - value if reverse_subrev else value - 0x1234) & 0xffffffff
+
+
+def shift_sub_words(groups, bound, **reference):
+    words = [SENTINEL] * 320
+    for gid in range(min(32 * groups, bound)):
+        words[gid] = shift_sub_word(gid, **reference)
+    return words
+
+
+def draw_shift_sub(directory, compiler, cmd, case, name):
+    """Shift and subtract chain against shift_sub_word, from the 320-word case format."""
+    constants = [0x5eed0000 + i for i in range(16)]
+    constants[1] = SHIFT_SUB_CAP
+    groups, bound = READ_RUNS[-1]
+
+    def write(words):
+        case.write_bytes(struct.pack("<337I", groups, *words, bound, *constants[1:]))
+
+    expected = shift_sub_words(groups, bound)
+    wrong = (("logical right shift", dict(logical=True)), ("shift by 16", dict(shift=16)),
+             ("shift dropped", dict(skip=("shl",))), ("sub reversed", dict(reverse_sub=True)),
+             ("subrev not reversed", dict(reverse_subrev=True)))
+    for label, reference in wrong:
+        assert expected != shift_sub_words(groups, bound, **reference), f"{label} would go unseen"
+    write(expected)
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+    # Each wrong reference must fail the run at the first word where it differs from the right one.
+    for label, reference in wrong:
+        wrong_words = shift_sub_words(groups, bound, **reference)
+        word = next(i for i, (a, b) in enumerate(zip(expected, wrong_words)) if a != b)
+        write(wrong_words)
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"{name}: reference '{label}' escaped detection\n{bad.stderr}")
+    write(expected)
+    source = (directory / "store.hlsl").read_text(encoding="ascii")
+    for label, old, new in (("logical right shift", "asuint(asint(", "(("),
+                            ("shift by 16", "(0x00000011u & 31u)", "(0x00000010u & 31u)"),
+                            ("sub dropped", "(params[0].y - ", "(0u - "),
+                            ("subrev dropped", " - 0x00001234u)", " - 0x00000000u)")):
+        mutated = source.replace(old, new)
+        if mutated == source:
+            raise AssertionError(f"{name}: mutation '{label}' did not change the source")
+        src, cso = directory / "mutated.hlsl", directory / "mutated.cso"
+        src.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+        bad = subprocess.run([*cmd[:3], cso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"{name}: mutation '{label}' escaped detection")
+    return 0
+
+
 def draw_mad24(directory, compiler, cmd, case):
     # Dispatch one group, enable only lane zero and leave all 319 other words
     # at their sentinel. With cap = UINT_MAX the entire multiply is observable.
@@ -2719,6 +3307,11 @@ def draw(directory, compiler, renderer, backend, cases=None):
             if result:
                 return result
             continue
+        if name == "read_scalar":
+            result = draw_scalar(directory, compiler, cmd, case, name)
+            if result:
+                return result
+            continue
         if name == "read_mad24":
             result = draw_mad24(directory, compiler, cmd, case)
             if result:
@@ -2726,6 +3319,7 @@ def draw(directory, compiler, renderer, backend, cases=None):
             continue
         if name.startswith(("guard_", "read_")):
             result = (draw_guard if name.startswith("guard_") else draw_alu if name == "read_compute"
+                      else draw_vop2 if name == "read_vop2" else draw_shift_sub if name == "read_shift_sub"
                       else draw_read)(directory, compiler, cmd, case, name)
             if result:
                 return result
@@ -2781,10 +3375,10 @@ if __name__ == "__main__":
                  "draw-lds-qword": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_QWORD_CASES),
                  "draw-lds-strided": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_STRIDED_CASES),
                  "draw-lds-wide-replacement": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_WIDE_REPLACEMENT_CASES),
-                 "draw-lds-f32": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_F32_CASES),
+                 "draw-lds-f32": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_FLOAT_CASES),
                  "draw-lds-private": lambda d, *a: ds_draw(d, *a, private=True),
                  "draw-lds-packed": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_PACKED_CASES),
                  "draw-lds-arithmetic": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_ARITHMETIC_CASES),
                  "draw-lds-replacement": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_REPLACEMENT_CASES),
-                 "draw-guard-read": lambda d, *a: draw(d, *a, cases=GUARD_CASES + READ_CASES + ALU_CASES)}
+                 "draw-guard-read": lambda d, *a: draw(d, *a, cases=GUARD_CASES + READ_CASES + ALU_CASES + SCALAR_CASES)}
         sys.exit(modes[mode](Path(tmp), *args))

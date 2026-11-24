@@ -19,6 +19,8 @@
 #include "ffx_provider_loop.h"
 #include "desktop_gpu.h"
 
+void check_spirv_window_atomic(ID3D12Device* device, const char* shader_path);
+
 #ifdef OFFSCREEN_AGILITY_620
 extern "C" {
 __declspec(dllexport) extern const UINT D3D12SDKVersion = 620;
@@ -28,6 +30,8 @@ __declspec(dllexport) const char* D3D12SDKPath = ".\\D3D12\\";
 
 using Microsoft::WRL::ComPtr;
 constexpr UINT side = 64;
+
+void check_descriptor_heap_paging(ID3D12Device* device, bool swapped);
 
 bool contains_ignoring_case(const wchar_t* text, const wchar_t* part)
 {
@@ -508,6 +512,12 @@ OperationResult run_spirv_address_window(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_spirv_address_window_atomic(const OperationContext& ctx)
+{
+    check_spirv_window_atomic(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_spirv_compare_sampler(const OperationContext& ctx)
 {
     check_spirv_compare_sampler(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5],
@@ -542,6 +552,34 @@ OperationResult run_ffx_recurrent(const OperationContext& ctx)
 OperationResult run_dual_uav(const OperationContext& ctx)
 {
     check_dual_uav(ctx.device);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_descriptor_window_submissions(const OperationContext& ctx)
+{
+    check_descriptor_window_submissions(ctx.device, DescriptorWindowCase::direct);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_descriptor_window_stale(const OperationContext& ctx)
+{
+    check_descriptor_window_submissions(ctx.device, DescriptorWindowCase::stale_window);
+    return {OutcomeKind::pass, nullptr};
+}
+
+bool validate_descriptor_record_args(int, char** argv)
+{
+    const std::string_view scenario = argv[3];
+    return scenario == "live" || scenario == "stale" || scenario == "unknown";
+}
+
+OperationResult run_descriptor_record_copy(const OperationContext& ctx)
+{
+    const std::string_view scenario = ctx.argv[3];
+    auto test = DescriptorWindowCase::copied_record;
+    if (scenario == "stale") test = DescriptorWindowCase::stale_record;
+    if (scenario == "unknown") test = DescriptorWindowCase::unknown_record;
+    check_descriptor_window_submissions(ctx.device, test);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -880,6 +918,44 @@ OperationResult run_wave_shuffle(const OperationContext& ctx)
         "skip: wave shuffle fixture requires SM 6.6 and a supported forced wave width");
 }
 
+OperationResult run_shader_wave(const OperationContext& ctx)
+{
+    return skip_if_false(check_shader_wave(ctx.device, 0),
+                         "skip: shader wave fixture requires SM 6.0 and WaveOps");
+}
+
+OperationResult run_shader_wave32(const OperationContext& ctx)
+{
+    return skip_if_false(check_shader_wave(ctx.device, 32),
+                         "skip: shader wave32 fixture requires SM 6.6, WaveOps, and a 32-lane wave");
+}
+
+OperationResult run_shader_wave64(const OperationContext& ctx)
+{
+    return skip_if_false(check_shader_wave(ctx.device, 64),
+                         "skip: shader wave64 fixture requires SM 6.6, WaveOps, and a 64-lane wave");
+}
+
+template<bool Swapped>
+OperationResult run_descriptor_heap_paging(const OperationContext& ctx)
+{
+    check_descriptor_heap_paging(ctx.device, Swapped);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_wave64_emulate(const OperationContext& ctx)
+{
+    check_wave64_emulate(ctx.device);
+    return {OutcomeKind::pass, nullptr};
+}
+
+template<bool Swapped>
+OperationResult run_startup_sampler_x(const OperationContext& ctx)
+{
+    return skip_if_false(check_startup_sampler_x(ctx.device, Swapped),
+                         "skip: R32_FLOAT does not report filtered sampling with mips");
+}
+
 constexpr CapabilityGate kNoGate{};
 constexpr CapabilityGate kGateSm60BufferOps{
     D3D_SHADER_MODEL_6_0, false, false, 0,
@@ -896,6 +972,18 @@ constexpr CapabilityGate kGateWave64{
 constexpr CapabilityGate kGateWaveShuffle{
     D3D_SHADER_MODEL_6_5, false, true, 0,
     "skip: wave shuffle fixture requires SM 6.5 and WaveOps",
+    CapsDiagnostic::wave_6_6};
+constexpr CapabilityGate kGateShaderWave{
+    D3D_SHADER_MODEL_6_0, false, true, 0,
+    "skip: shader wave fixture requires SM 6.0 and WaveOps",
+    CapsDiagnostic::none};
+constexpr CapabilityGate kGateShaderWave32{
+    D3D_SHADER_MODEL_6_6, false, true, 32,
+    "skip: shader wave32 fixture requires SM 6.6, WaveOps, and a 32-lane wave",
+    CapsDiagnostic::wave_6_6};
+constexpr CapabilityGate kGateShaderWave64{
+    D3D_SHADER_MODEL_6_6, false, true, 64,
+    "skip: shader wave64 fixture requires SM 6.6, WaveOps, and a 64-lane wave",
     CapsDiagnostic::wave_6_6};
 constexpr CapabilityGate kGateSm60MeshFallback{
     D3D_SHADER_MODEL_6_0, false, false, 0,
@@ -956,6 +1044,7 @@ const OperationSpec kOperations[] = {
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},
     {"--spirv-address-window", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window},
+    {"--spirv-address-window-atomic", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_atomic},
     {"--spirv-compare-sampler", 6, 7, nullptr, kGateSm60CompareSampler, run_spirv_compare_sampler},
     // The SPIR-V ballot fixture compiles cs_6_6; it uses the compute-store readback behind an SM 6.6 gate.
     {"--spirv-ballot", 5, 5, nullptr, kGateSm66Ballot, run_compute_store_case},
@@ -964,6 +1053,9 @@ const OperationSpec kOperations[] = {
     {"--ffx-provider-loop", 3, 3, nullptr, kNoGate, run_ffx_provider_loop},
     {"--ffx-recurrent", 3, 3, nullptr, kNoGate, run_ffx_recurrent},
     {"--dual-uav", 3, 3, nullptr, kNoGate, run_dual_uav},
+    {"--descriptor-window-submissions", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_window_submissions},
+    {"--descriptor-window-stale", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_window_stale},
+    {"--descriptor-record-copy", 4, 4, validate_descriptor_record_args, kGateSm60BufferOps, run_descriptor_record_copy},
     {"--texture-mips", 3, 3, nullptr, kNoGate, run_texture_mips},
     {"--check-bc7-tail", 6, kUnboundedArgc, nullptr, kNoGate, run_check_bc7_tail},
     {"--check-bc7-mip1", 6, 6, nullptr, kNoGate, run_check_bc7_mip1},
@@ -1022,7 +1114,15 @@ const OperationSpec kOperations[] = {
     {"--gpu-alias-atomic-waterfall", 3, 3, nullptr, kGateSm60AtomicWaterfall, run_gpu_alias_atomic_waterfall},
     {"--gpu-alias-registry", 3, 3, nullptr, kNoGate, run_gpu_alias_registry},
     {"--buffer-ops", 3, 3, nullptr, kGateSm60BufferOps, run_buffer_ops},
+    {"--descriptor-heap-paging", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_heap_paging<false>},
+    {"--descriptor-heap-paging-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_heap_paging<true>},
+    {"--startup-sampler-x", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<false>},
+    {"--startup-sampler-x-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<true>},
     {"--wave-shuffle", 3, 3, nullptr, kGateWaveShuffle, run_wave_shuffle},
+    {"--wave64-emulate", 3, 3, nullptr, kNoGate, run_wave64_emulate},
+    {"--shader-wave", 3, 3, nullptr, kGateShaderWave, run_shader_wave},
+    {"--shader-wave32", 3, 3, nullptr, kGateShaderWave32, run_shader_wave32},
+    {"--shader-wave64", 3, 3, nullptr, kGateShaderWave64, run_shader_wave64},
 };
 
 struct DiagnosticTarget {
@@ -1195,6 +1295,9 @@ int run_self_test()
                    "Unknown GPU operation or invalid arguments: --bvh-wave")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--dual-uav", "extra"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --dual-uav")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--descriptor-record-copy", "invalid"}, CliAction::usage_error,
+                   "Unknown GPU operation or invalid arguments: --descriptor-record-copy")) return 1;
+    if (!check_cli({"offscreen_check", "warp", "--descriptor-record-copy", "unknown"}, CliAction::operation)) return 1;
     if (!check_cli({"offscreen_check", "warp", "--compute-root-file"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --compute-root-file")) return 1;
     if (!check_cli({"offscreen_check", "warp", "--spirv-sampler-views"}, CliAction::usage_error,
@@ -1506,6 +1609,14 @@ int main(int argc, char** argv)
         } else {
             std::puts("driver=unavailable via DXGI");
         }
+#if defined(__ID3D12Device12_INTERFACE_DEFINED__)
+        D3D12_FEATURE_DATA_D3D12_OPTIONS19 options19{};
+        if (SUCCEEDED(check_feature(device.Get(), D3D12_FEATURE_D3D12_OPTIONS19,
+                                    &options19, sizeof(options19))) &&
+            options19.MaxViewDescriptorHeapSize) {
+            std::printf("max_view_descriptor_heap_size=%u\n", options19.MaxViewDescriptorHeapSize);
+        }
+#endif
         if (debug) check(device.As(&messages), "Read debug queue");
         const AdapterCaps caps = query_adapter_caps(device.Get());
         if (cli.action == CliAction::draw) {

@@ -126,6 +126,7 @@ SOPP_OPS = {
     0x00: ("s_nop", "No operation (wait cycles)"),
     0x01: ("s_endpgm", "Terminate shader execution"),
     0x02: ("s_branch", "Unconditional branch"),
+    0x03: ("s_wakeup", "Wake a sleeping wave"),
     0x04: ("s_cbranch_scc0", "Branch if SCC == 0"),
     0x05: ("s_cbranch_scc1", "Branch if SCC == 1"),
     0x06: ("s_cbranch_vccz", "Branch if VCC is zero"),
@@ -133,9 +134,28 @@ SOPP_OPS = {
     0x08: ("s_cbranch_execz", "Branch if EXEC is zero"),
     0x09: ("s_cbranch_execnz", "Branch if EXEC is non-zero"),
     0x0a: ("s_barrier", "Synchronize wavefronts in workgroup"),
+    0x0b: ("s_setkill", "Set the wave kill bit"),
     0x0c: ("s_waitcnt", "Wait for memory operations"),
+    0x0d: ("s_sethalt", "Set the wave halt bit"),
+    0x0e: ("s_sleep", "Suspend the wave temporarily"),
+    0x0f: ("s_setprio", "Set wave priority"),
+    0x10: ("s_sendmsg", "Send a message"),
+    0x11: ("s_sendmsghalt", "Send a message and halt the wave"),
+    0x12: ("s_trap", "Raise a trap"),
+    0x13: ("s_icache_inv", "Invalidate the instruction cache"),
+    0x14: ("s_incperflevel", "Increment the selected performance counter"),
+    0x15: ("s_decperflevel", "Decrement the selected performance counter"),
+    0x16: ("s_ttracedata", "Emit thread trace data"),
+    0x1b: ("s_endpgm_saved", "Terminate the wave and signal that its context was saved"),
+    0x1e: ("s_endpgm_ordered_ps_done", "Terminate an ordered pixel shader wave"),
+    0x1f: ("s_code_end", "Code end marker"),
     0x20: ("s_inst_prefetch", "Instruction cache prefetch"),
     0x21: ("s_clause", "Begin hard clause"),
+    0x22: ("s_wait_idle", "Wait for outstanding operations to finish"),
+    0x23: ("s_waitcnt_depctr", "Wait for dependency counters"),
+    0x24: ("s_round_mode", "Set floating-point rounding mode"),
+    0x25: ("s_denorm_mode", "Set floating-point denormal mode"),
+    0x28: ("s_ttracedata_imm", "Emit immediate thread trace data"),
 }
 
 SOP1_OPS = {
@@ -206,6 +226,8 @@ SOP2_OPS = {
     0x01: ("s_sub_u32", "Scalar sub unsigned 32-bit"),
     0x02: ("s_add_i32", "Scalar add signed 32-bit"),
     0x03: ("s_sub_i32", "Scalar sub signed 32-bit"),
+    0x04: ("s_addc_u32", "Scalar add unsigned 32-bit with carry in SCC"),
+    0x05: ("s_subb_u32", "Scalar sub unsigned 32-bit with borrow in SCC"),
     0x06: ("s_min_i32", "Scalar minimum signed 32-bit"),
     0x07: ("s_min_u32", "Scalar minimum unsigned 32-bit"),
     0x08: ("s_max_i32", "Scalar maximum signed 32-bit"),
@@ -220,6 +242,14 @@ SOP2_OPS = {
     0x13: ("s_xor_b64", "Scalar bitwise XOR 64-bit"),
     0x14: ("s_andn2_b32", "Scalar AND with NOT 32-bit"),
     0x15: ("s_andn2_b64", "Scalar AND with NOT 64-bit"),
+    0x16: ("s_orn2_b32", "Scalar OR with NOT 32-bit"),
+    0x17: ("s_orn2_b64", "Scalar OR with NOT 64-bit"),
+    0x18: ("s_nand_b32", "Scalar bitwise NAND 32-bit"),
+    0x19: ("s_nand_b64", "Scalar bitwise NAND 64-bit"),
+    0x1a: ("s_nor_b32", "Scalar bitwise NOR 32-bit"),
+    0x1b: ("s_nor_b64", "Scalar bitwise NOR 64-bit"),
+    0x1c: ("s_xnor_b32", "Scalar bitwise XNOR 32-bit"),
+    0x1d: ("s_xnor_b64", "Scalar bitwise XNOR 64-bit"),
     0x1e: ("s_lshl_b32", "Scalar logical shift left 32-bit"),
     0x1f: ("s_lshl_b64", "Scalar logical shift left 64-bit"),
     0x20: ("s_lshr_b32", "Scalar logical shift right 32-bit"),
@@ -238,6 +268,9 @@ SOP2_OPS = {
     0x2f: ("s_lshl2_add_u32", "Scalar shift left 2 and add 32-bit"),
     0x30: ("s_lshl3_add_u32", "Scalar shift left 3 and add 32-bit"),
     0x31: ("s_lshl4_add_u32", "Scalar shift left 4 and add 32-bit"),
+    0x32: ("s_pack_ll_b32_b16", "Scalar pack low halves of two sources into 32-bit"),
+    0x33: ("s_pack_lh_b32_b16", "Scalar pack low half and high half into 32-bit"),
+    0x34: ("s_pack_hh_b32_b16", "Scalar pack high halves of two sources into 32-bit"),
     0x35: ("s_mul_hi_u32", "Scalar multiply high unsigned 32-bit"),
     0x36: ("s_mul_hi_i32", "Scalar multiply high signed 32-bit"),
 }
@@ -249,11 +282,21 @@ SOPK_OPS = {
     0x03: ("s_cmpk_eq_i32", "Scalar compare equal immediate"),
     0x04: ("s_cmpk_lg_i32", "Scalar compare not-equal immediate"),
     0x05: ("s_cmpk_gt_i32", "Scalar compare greater immediate"),
+    0x06: ("s_cmpk_ge_i32", "Scalar signed compare greater-or-equal immediate"),
+    0x07: ("s_cmpk_lt_i32", "Scalar signed compare less immediate"),
+    0x08: ("s_cmpk_le_i32", "Scalar signed compare less-or-equal immediate"),
+    0x09: ("s_cmpk_eq_u32", "Scalar unsigned compare equal immediate"),
+    0x0a: ("s_cmpk_lg_u32", "Scalar unsigned compare not-equal immediate"),
+    0x0b: ("s_cmpk_gt_u32", "Scalar unsigned compare greater immediate"),
+    0x0c: ("s_cmpk_ge_u32", "Scalar unsigned compare greater-or-equal immediate"),
+    0x0d: ("s_cmpk_lt_u32", "Scalar unsigned compare less immediate"),
+    0x0e: ("s_cmpk_le_u32", "Scalar unsigned compare less-or-equal immediate"),
     0x0f: ("s_addk_i32", "Scalar add immediate"),
     0x10: ("s_mulk_i32", "Scalar multiply immediate"),
     0x12: ("s_getreg_b32", "Read a hardware register field into an SGPR"),
     0x13: ("s_setreg_b32", "Write a hardware register field from an SGPR"),
     0x15: ("s_setreg_imm32_b32", "Write a hardware register field from a 32-bit literal"),
+    0x16: ("s_call_b64", "Call a PC-relative target and save the return address"),
     0x17: ("s_waitcnt_vscnt", "Wait for vector store counter"),
     0x18: ("s_waitcnt_vmcnt", "Wait for vector memory counter"),
     0x19: ("s_waitcnt_expcnt", "Wait for export counter"),
@@ -358,18 +401,41 @@ SMEM_OPS = {
     0x0a: "s_buffer_load_dwordx4",
     0x0b: "s_buffer_load_dwordx8",
     0x0c: "s_buffer_load_dwordx16",
+    0x18: "s_buffer_store_dword",
+    0x19: "s_buffer_store_dwordx2",
+    0x1a: "s_buffer_store_dwordx4",
+    0x1f: "s_gl1_inv",
+    0x20: "s_dcache_inv",
+    0x21: "s_dcache_wb",
+    0x24: "s_memtime",
+    0x25: "s_memrealtime",
+    0x26: "s_atc_probe",
+    0x27: "s_atc_probe_buffer",
 }
+
+# SMEM ops that take no operands (cache control) and ops whose sdata field is a 7-bit probe immediate.
+SMEM_NO_OPERANDS = frozenset({0x1f, 0x20, 0x21})
+SMEM_PROBE_OPS = frozenset({0x26, 0x27})
 
 SMEM_WIDTHS = {
     0x00: (1, 2), 0x01: (2, 2), 0x02: (4, 2), 0x03: (8, 2), 0x04: (16, 2),
     0x08: (1, 4), 0x09: (2, 4), 0x0a: (4, 4), 0x0b: (8, 4), 0x0c: (16, 4),
+    0x18: (1, 4), 0x19: (2, 4), 0x1a: (4, 4),
+    0x24: (2, 0), 0x25: (2, 0),
+    0x26: (0, 2), 0x27: (0, 4),
 }
 
 MIMG_OPS = {
     0x00: ("image_load", False, 0),
     0x01: ("image_load_mip", False, 1),
+    0x02: ("image_load_pck", False, 0),
+    0x03: ("image_load_pck_sgn", False, 0),
+    0x04: ("image_load_mip_pck", False, 1),
+    0x05: ("image_load_mip_pck_sgn", False, 1),
     0x08: ("image_store", False, 0),
     0x09: ("image_store_mip", False, 1),
+    0x0a: ("image_store_pck", False, 0),
+    0x0b: ("image_store_mip_pck", False, 1),
     0x0e: ("image_get_resinfo", False, 0),
     0x0f: ("image_atomic_swap", False, 0),
     0x10: ("image_atomic_cmpswap", False, 0),
@@ -390,23 +456,106 @@ MIMG_OPS = {
     0x20: ("image_sample", True, 0),
     0x21: ("image_sample_cl", True, 1),
     0x22: ("image_sample_d", True, 0),
+    0x23: ("image_sample_d_cl", True, 1),
     0x24: ("image_sample_l", True, 1),
     0x25: ("image_sample_b", True, 1),
     0x26: ("image_sample_b_cl", True, 2),
     0x27: ("image_sample_lz", True, 0),
     0x28: ("image_sample_c", True, 1),
+    0x29: ("image_sample_c_cl", True, 2),
+    0x2a: ("image_sample_c_d", True, 1),
+    0x2b: ("image_sample_c_d_cl", True, 2),
     0x2c: ("image_sample_c_l", True, 2),
     0x2d: ("image_sample_c_b", True, 2),
+    0x2e: ("image_sample_c_b_cl", True, 3),
     0x2f: ("image_sample_c_lz", True, 1),
     0x30: ("image_sample_o", True, 1),
+    0x31: ("image_sample_cl_o", True, 2),
+    0x32: ("image_sample_d_o", True, 1),
+    0x33: ("image_sample_d_cl_o", True, 2),
     0x34: ("image_sample_l_o", True, 2),
     0x35: ("image_sample_b_o", True, 2),
+    0x36: ("image_sample_b_cl_o", True, 3),
     0x37: ("image_sample_lz_o", True, 1),
+    0x38: ("image_sample_c_o", True, 2),
+    0x39: ("image_sample_c_cl_o", True, 3),
+    0x3a: ("image_sample_c_d_o", True, 2),
+    0x3b: ("image_sample_c_d_cl_o", True, 3),
+    0x3c: ("image_sample_c_l_o", True, 3),
+    0x3d: ("image_sample_c_b_o", True, 3),
+    0x3e: ("image_sample_c_b_cl_o", True, 4),
+    0x3f: ("image_sample_c_lz_o", True, 2),
     0x40: ("image_gather4", True, 0),
+    0x41: ("image_gather4_cl", True, 1),
     0x44: ("image_gather4_l", True, 1),
+    0x45: ("image_gather4_b", True, 1),
+    0x46: ("image_gather4_b_cl", True, 2),
     0x47: ("image_gather4_lz", True, 0),
+    0x48: ("image_gather4_c", True, 1),
+    0x49: ("image_gather4_c_cl", True, 2),
+    0x4c: ("image_gather4_c_l", True, 2),
+    0x4d: ("image_gather4_c_b", True, 2),
+    0x4e: ("image_gather4_c_b_cl", True, 3),
+    0x4f: ("image_gather4_c_lz", True, 1),
+    0x50: ("image_gather4_o", True, 1),
+    0x51: ("image_gather4_cl_o", True, 2),
+    0x54: ("image_gather4_l_o", True, 2),
+    0x55: ("image_gather4_b_o", True, 2),
+    0x56: ("image_gather4_b_cl_o", True, 3),
+    0x57: ("image_gather4_lz_o", True, 1),
+    0x58: ("image_gather4_c_o", True, 2),
+    0x59: ("image_gather4_c_cl_o", True, 3),
+    0x5c: ("image_gather4_c_l_o", True, 3),
+    0x5d: ("image_gather4_c_b_o", True, 3),
+    0x5e: ("image_gather4_c_b_cl_o", True, 4),
+    0x5f: ("image_gather4_c_lz_o", True, 2),
     0x60: ("image_get_lod", True, 0),
+    0x68: ("image_sample_cd", True, 0),
+    0x69: ("image_sample_cd_cl", True, 1),
+    0x6a: ("image_sample_c_cd", True, 1),
+    0x6b: ("image_sample_c_cd_cl", True, 2),
+    0x6c: ("image_sample_cd_o", True, 1),
+    0x6d: ("image_sample_cd_cl_o", True, 2),
+    0x6e: ("image_sample_c_cd_o", True, 2),
+    0x6f: ("image_sample_c_cd_cl_o", True, 3),
+    0x80: ("image_msaa_load", False, 0),
+    0xa2: ("image_sample_d_g16", True, 0),
+    0xa3: ("image_sample_d_cl_g16", True, 1),
+    0xaa: ("image_sample_c_d_g16", True, 1),
+    0xab: ("image_sample_c_d_cl_g16", True, 2),
+    0xb2: ("image_sample_d_o_g16", True, 1),
+    0xb3: ("image_sample_d_cl_o_g16", True, 2),
+    0xba: ("image_sample_c_d_o_g16", True, 2),
+    0xbb: ("image_sample_c_d_cl_o_g16", True, 3),
+    0xe8: ("image_sample_cd_g16", True, 0),
+    0xe9: ("image_sample_cd_cl_g16", True, 1),
+    0xea: ("image_sample_c_cd_g16", True, 1),
+    0xeb: ("image_sample_c_cd_cl_g16", True, 2),
+    0xec: ("image_sample_cd_o_g16", True, 1),
+    0xed: ("image_sample_cd_cl_o_g16", True, 2),
+    0xee: ("image_sample_c_cd_o_g16", True, 2),
+    0xef: ("image_sample_c_cd_cl_o_g16", True, 3),
 }
+
+# Sampling ops whose address carries explicit derivatives (the _d and _cd families).
+MIMG_DERIV_OPS = frozenset({
+    0x22, 0x23, 0x2a, 0x2b, 0x32, 0x33, 0x3a, 0x3b,
+    0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f,
+})
+# The _g16 forms take packed 16-bit derivatives: address dwords per dimension code.
+MIMG_G16_DERIV_OPS = frozenset({
+    0xa2, 0xa3, 0xaa, 0xab, 0xb2, 0xb3, 0xba, 0xbb,
+    0xe8, 0xe9, 0xea, 0xeb, 0xec, 0xed, 0xee, 0xef,
+})
+MIMG_G16_DERIV_ADDRS = (2, 2, 4, 2, 2, 2, 2, 2)
+
+# Ray-intersection ops: opcode -> (name, address dwords, address dwords with a16).
+MIMG_BVH_OPS = {
+    0xe6: ("image_bvh_intersect_ray", 11, 8),
+    0xe7: ("image_bvh64_intersect_ray", 12, 9),
+}
+# Word 0 of a BVH op with the opcode field masked out (r128, unorm and dmask 0xf are implied).
+MIMG_BVH_W0 = 0xf0009f01
 
 MIMG_DIMS = {
     0: ("SQ_RSRC_IMG_1D", 1, 2),
@@ -462,6 +611,10 @@ VOP1_OPS = {
     0x39: ("v_ffbh_u32_e32", "Find first bit high uint32"),
     0x3a: ("v_ffbl_b32_e32", "Find first bit low uint32"),
     0x3b: ("v_ffbh_i32_e32", "Find first bit high int32"),
+    0x42: ("v_movreld_b32_e32", "Vector copy with relative destination"),
+    0x43: ("v_movrels_b32_e32", "Vector copy with relative source"),
+    0x44: ("v_movrelsd_b32_e32", "Vector copy with relative source and destination"),
+    0x48: ("v_movrelsd_2_b32_e32", "Vector copy with relative source and destination (extended form)"),
 }
 
 VOPC_OPS = {
@@ -696,8 +849,10 @@ VOP2_OPS = {
     0x2c: ("v_fmamk_f32", "Vector fused multiply-add with literal multiplier"),
     0x2d: ("v_fmaak_f32", "Vector fused multiply-add with literal addend"),
     0x2f: ("v_cvt_pkrtz_f16_f32_e32", "Convert two float32 to packed float16 (round to zero)"),
+    0x36: ("v_fmac_f16_e32", "Vector fused multiply-accumulate float16"),
     0x37: ("v_fmamk_f16", "Vector fused multiply-add float16 with literal multiplier"),
     0x38: ("v_fmaak_f16", "Vector fused multiply-add float16 with literal addend"),
+    0x3b: ("v_ldexp_f16_e32", "Vector scale float16 by a power of two"),
 }
 
 VOP3_NATIVE_OPS = {
@@ -1041,6 +1196,22 @@ MTBUF_FORMATS = {
 # the lane or sub-dword controls.
 VOP_EXTENSION_FORMS = {233: "DPP8", 234: "DPP8", 249: "SDWA", 250: "DPP16"}
 SDWA_SEL_NAMES = ("BYTE_0", "BYTE_1", "BYTE_2", "BYTE_3", "WORD_0", "WORD_1", "DWORD")
+# Scalar source codes 209-234 are outside the supported LLVM 15 decoder subset for GFX10 SDWA: LLVM 15
+# refuses every VOPC SDWA record that names one as src0 or src1. This records LLVM 15's behaviour; it is
+# not a claim about the ISA.
+SDWA_LLVM15_UNSUPPORTED_SCALAR_CODES = range(209, 235)
+
+
+def _format_sdwa_float_modifiers(val: str, scalar_code: int | None, is_abs: int, is_neg: int) -> str:
+    """Wrap a float SDWA source in abs/neg modifiers as LLVM 15 prints them.
+
+    neg without abs on an inline constant (scalar codes 128-208 and 240-248) is printed `neg(c)`, as LLVM 15
+    does: `-1` would name the inline constant -1 (0xffffffff), not 1 with its sign bit flipped (0x80000001).
+    """
+    inline_constant = scalar_code is not None and (128 <= scalar_code <= 208 or 240 <= scalar_code <= 248)
+    if inline_constant and is_neg and not is_abs:
+        return f"neg({val})"
+    return _format_operand_modifiers(val, is_abs, is_neg)
 
 
 def _decode_vopc_sdwa(w1: int, vsrc1: int, op_name: str, comment: str) -> tuple[int, str, str, str]:
@@ -1069,6 +1240,10 @@ def _decode_vopc_sdwa(w1: int, vsrc1: int, op_name: str, comment: str) -> tuple[
         return (8, "vopc_sdwa", f"{op_name} <unsupported SDWA>", "VOPCX SDWA forbids sdst_en")
     if (src0_sgpr and src0_raw in (249, 250, 255)) or (src1_sgpr and vsrc1 in (249, 250, 255)):
         return (8, "vopc_sdwa", f"{op_name} <unsupported SDWA>", "Invalid VOPC SDWA scalar operand")
+    if ((src0_sgpr and src0_raw in SDWA_LLVM15_UNSUPPORTED_SCALAR_CODES)
+            or (src1_sgpr and vsrc1 in SDWA_LLVM15_UNSUPPORTED_SCALAR_CODES)):
+        return (8, "vopc_sdwa", f"{op_name} <unsupported SDWA>",
+                "VOPC SDWA scalar operand outside the supported LLVM 15 decoder subset")
 
     is_float = op_name.endswith(("_f32_e32", "_f16_e32"))
     is_class = "_class_" in op_name
@@ -1084,11 +1259,11 @@ def _decode_vopc_sdwa(w1: int, vsrc1: int, op_name: str, comment: str) -> tuple[
     src1_str = decode_s_reg(vsrc1) if src1_sgpr else f"v{vsrc1}"
 
     if src0_is_float:
-        src0_str = _format_operand_modifiers(src0_str, src0_abs, src0_neg)
+        src0_str = _format_sdwa_float_modifiers(src0_str, src0_raw if src0_sgpr else None, src0_abs, src0_neg)
     elif src0_sext:
         src0_str = f"sext({src0_str})"
     if src1_is_float:
-        src1_str = _format_operand_modifiers(src1_str, src1_abs, src1_neg)
+        src1_str = _format_sdwa_float_modifiers(src1_str, vsrc1 if src1_sgpr else None, src1_abs, src1_neg)
     elif src1_sext:
         src1_str = f"sext({src1_str})"
 
@@ -1643,6 +1818,42 @@ def _decode_interp_f16(op: int, w0: int, w1: int) -> tuple[int, str, str, str]:
     return (8, name, asm, comment)
 
 
+def _packed_addr_regs(count: int) -> int:
+    """Registers LLVM 15 prints for a packed (non-NSA) MIMG address of count dwords.
+
+    LLVM 15 has no tuple class for 9 to 15 registers and prints those as 16, so the printed tuple is wider than the
+    number of address dwords the instruction consumes.
+    """
+    return count if count <= 8 else 16
+
+
+def _decode_mimg_bvh(op: int, w0: int, w1: int, length: int, data: bytes = b"",
+                     offset: int = 0) -> tuple[int, str, str, str]:
+    """Decode image_bvh_intersect_ray and image_bvh64_intersect_ray.
+
+    The hardware fixes every modifier field of these ops except the non-sequential-address length in w0[2:1], so
+    anything else is reported as unsupported with the record length intact. A non-sequential-address form lists
+    one VGPR per address dword, the first from the instruction word and the rest from the appended bytes.
+    """
+    op_name, addr_dwords, addr_dwords_a16 = MIMG_BVH_OPS[op]
+    a16 = (w1 >> 30) & 1
+    if (w0 & ~((0x7f << 18) | 0x6)) != MIMG_BVH_W0 or (w1 >> 31) or (w1 >> 21) & 0x1f:
+        return (length, f"{op_name}_unsupported", f"{op_name} <unsupported MIMG modifier bits>",
+                "Modifier bits the ray-intersection encoding does not allow")
+    vaddr = w1 & 0xff
+    vdata = (w1 >> 8) & 0xff
+    srsrc = ((w1 >> 16) & 0x1f) * 4
+    count = addr_dwords_a16 if a16 else addr_dwords
+    if (w0 >> 1) & 0x3:
+        appended = list(data[offset + 8:offset + length])
+        vaddr_str = "[" + ", ".join(f"v{r}" for r in [vaddr] + appended[:count - 1]) + "]"
+    else:
+        vaddr_str = f"v[{vaddr}:{vaddr + _packed_addr_regs(count) - 1}]"
+    asm = (f"{op_name} v[{vdata}:{vdata + 3}], {vaddr_str}, "
+           f"s[{srsrc}:{srsrc + 3}]" + (" a16" if a16 else ""))
+    return (length, op_name, asm, "Ray-box and ray-triangle intersection against a BVH")
+
+
 def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
     """
     Decode one RDNA 2 instruction at given offset.
@@ -1653,6 +1864,9 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
 
     w0, = struct.unpack_from("<I", data, offset)
 
+    if w0 == 0:
+        return (4, "word_0x00000000", ".long 0x00000000", "Unrecognized RDNA 2 instruction encoding")
+
     # 1. SOPP: [31:23] == 0b101111111 (0xbf800000)
     if (w0 & 0xff800000) == 0xbf800000:
         op = (w0 >> 16) & 0x7f
@@ -1661,10 +1875,16 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         op_info = SOPP_OPS.get(op, (f"s_sopp_{op:02x}", "Unknown SOPP"))
         op_name, comment = op_info
 
-        if op_name == "s_endpgm":
-            asm = "s_endpgm"
-        elif op_name == "s_nop":
-            asm = f"s_nop {simm}"
+        if op_name in {
+            "s_endpgm", "s_code_end", "s_wakeup", "s_icache_inv", "s_ttracedata",
+            "s_endpgm_saved", "s_endpgm_ordered_ps_done", "s_wait_idle",
+        }:
+            asm = op_name
+        elif op_name in {
+            "s_nop", "s_setkill", "s_sethalt", "s_sleep", "s_setprio", "s_trap",
+            "s_incperflevel", "s_decperflevel", "s_denorm_mode",
+        }:
+            asm = f"{op_name} {simm}"
         elif op_name == "s_waitcnt":
             # GFX10 split: vmcnt is simm16[3:0] plus [15:14], expcnt [6:4], lgkmcnt [13:8].
             # Like LLVM, omit counters at their "no wait" maximum unless all three are.
@@ -1758,6 +1978,8 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         if op_name == "s_version":
             # No destination operand; the SDST field is not printed.
             return (4, op_name, f"{op_name} 0x{simm:x}", comment)
+        if op_name == "s_call_b64":
+            return (4, op_name, f"{op_name} {decode_s_reg64(sdst)}, {simm}", comment)
         asm = f"{op_name} {decode_s_reg(sdst)}, 0x{simm:x}"
         return (4, op_name, asm, comment)
 
@@ -1943,7 +2165,17 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         sbase = (w0 & 0x3f) * 2
         op_name = SMEM_OPS.get(op, f"s_smem_{op:02x}")
         data_width, base_width = SMEM_WIDTHS.get(op, (4, 2))
-        sdata_str = decode_s_reg(sdata) if data_width == 1 else f"s[{sdata}:{sdata + data_width - 1}]"
+        if op in SMEM_NO_OPERANDS:
+            return (8, op_name, op_name, "Scalar memory cache control")
+        if op in SMEM_PROBE_OPS:
+            sdata_str = str(sdata)
+        else:
+            sdata_str = decode_s_reg(sdata) if data_width == 1 else f"s[{sdata}:{sdata + data_width - 1}]"
+        if base_width == 0:
+            # s_memtime / s_memrealtime read no memory address: only the destination pair.
+            # Named 64-bit specials (vcc, ttmp pairs, null) keep their spelling.
+            timer_dst = decode_s_reg64(sdata) if sdata >= 106 else sdata_str
+            return (8, op_name, f"{op_name} {timer_dst}", "Read a 64-bit hardware timer")
         if base_width == 2 and sbase == 106:
             sbase_str = "vcc"
         else:
@@ -1964,6 +2196,10 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         mod_str = (" " + " ".join(mods)) if mods else ""
         asm = f"{op_name} {sdata_str}, {sbase_str}, {off_str}{mod_str}"
         comment = "Scalar memory load from constant buffer/resource descriptor"
+        if op in (0x18, 0x19, 0x1a):
+            comment = "Scalar memory store to a buffer resource"
+        elif op in SMEM_PROBE_OPS:
+            comment = "Probe the address translation cache"
         return (8, op_name, asm, comment)
 
     # 11. MIMG: 64-bit + optional NSA dwords [31:26] == 0b111100 (0xf0000000)
@@ -1973,14 +2209,21 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         if offset + length > len(data):
             return (len(data) - offset, "mimg_truncated", "mimg <truncated>", "Incomplete MIMG instruction")
         w1, = struct.unpack_from("<I", data, offset + 4)
-        op = (w0 >> 18) & 0x7f
+        op = ((w0 >> 18) & 0x7f) | ((w0 & 1) << 7)
+        if op in MIMG_BVH_OPS:
+            return _decode_mimg_bvh(op, w0, w1, length, data, offset)
         op_name, has_sampler, extra_addrs = MIMG_OPS.get(op, (f"image_mimg_{op:02x}", False, 0))
         dmask = (w0 >> 8) & 0xf
         dim_code = (w0 >> 3) & 0x7
         dim_name, base_addrs, deriv_addrs = MIMG_DIMS[dim_code]
-        addr_count = base_addrs + extra_addrs + (deriv_addrs if op == 0x22 else 0)
+        if op in MIMG_G16_DERIV_OPS:
+            deriv_addrs = MIMG_G16_DERIV_ADDRS[dim_code]
+        elif op not in MIMG_DERIV_OPS:
+            deriv_addrs = 0
+        addr_count = base_addrs + extra_addrs + deriv_addrs
         d16 = (w1 >> 31) & 1
-        n_data = max(1, bin(dmask).count("1"))
+        # A gather returns the four texels of the selected component whatever the one-hot mask is.
+        n_data = 4 if op_name.startswith("image_gather4") else max(1, bin(dmask).count("1"))
         if d16:
             n_data = (n_data + 1) // 2
         vaddr0 = w1 & 0xff
@@ -1994,7 +2237,8 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             addrs = [vaddr0] + extra_bytes[:max(0, addr_count - 1)]
             vaddr_str = "[" + ", ".join(f"v{r}" for r in addrs) + "]"
         else:
-            vaddr_str = f"v{vaddr0}" if addr_count == 1 else f"v[{vaddr0}:{vaddr0 + addr_count - 1}]"
+            addr_regs = _packed_addr_regs(addr_count)
+            vaddr_str = f"v{vaddr0}" if addr_regs == 1 else f"v[{vaddr0}:{vaddr0 + addr_regs - 1}]"
         srsrc_width = 4 if r128 else 8
         srsrc_str = f"s[{srsrc}:{srsrc + srsrc_width - 1}]"
         operands = [vdata_str, vaddr_str, srsrc_str]
@@ -2330,9 +2574,13 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
 
 
 def disassemble_binary(data: bytes, shader_name: str = "shader") -> list[dict]:
-    """Disassemble raw binary RDNA 2 shader into structured instruction records."""
+    """Decode the complete span and mark records after the first s_endpgm.
+
+    after_endpgm describes byte order only. A branch can still reach a later record.
+    """
     instructions = []
     offset = 0
+    after_endpgm = False
     while offset < len(data):
         length, op_name, asm, comment = decode_instruction(data, offset)
         hex_bytes = data[offset:offset + length].hex()
@@ -2343,11 +2591,11 @@ def disassemble_binary(data: bytes, shader_name: str = "shader") -> list[dict]:
             "opcode": op_name,
             "assembly": asm,
             "comment": comment,
+            "after_endpgm": after_endpgm,
         })
         offset += length
         if op_name == "s_endpgm":
-            # Some shaders have 4 trailing zero padding bytes after endpgm
-            break
+            after_endpgm = True
     return instructions
 
 

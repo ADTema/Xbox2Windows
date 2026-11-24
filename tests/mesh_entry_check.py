@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import json
+import re
 import struct
 import subprocess
 import sys
@@ -151,6 +152,173 @@ def source():
     return lower(decoded, [0x1003], (3, 1))
 
 
+ALU_PROGRAM = PROGRAM.copy()
+ALU_PROGRAM[-2:-2] = [
+    # Carry out of an add and no borrow from a subtract; multiplies keep SCC.
+    "s_add_u32 s5, 1, 0xffffffff",
+    "s_mul_i32 s6, s5, 7",
+    "s_cselect_b32 s14, 0x3e800000, 0",
+    "s_sub_u32 s9, 11, 3",
+    "s_mul_i32 s6, s9, 0x07800000",
+    "s_cselect_b32 s4, 0, 0x3e000000",
+    "v_mov_b32_e32 v11, 0x3f000000",
+    "v_or_b32_e32 v11, 0x200000, v11",
+    "v_xor_b32_e32 v12, 0x600000, v11",
+    "v_min_u32_e32 v13, v11, v12",
+    "v_max_u32_e32 v14, v11, v12",
+    "v_mov_b32_e32 v16, 0x100000",
+    "v_sub_nc_u32_e32 v15, v14, v16",
+    # The sign bit makes these differ from signed comparisons.
+    "v_max_u32_e32 v17, 0xbfc00000, v13",
+    "v_min_u32_e32 v18, 0xbfc00000, v13",
+    "v_add_f32_e32 v3, s14, v3",
+    "v_add_f32_e32 v3, s4, v3",
+    "v_add_f32_e32 v3, s6, v3",
+    "v_add_f32_e32 v3, v15, v3",
+    # Unequal use counts: a signed min/max would swap the two results and change the depth.
+    "v_add_f32_e32 v3, v18, v3",
+    "v_add_f32_e32 v3, v18, v3",
+    "v_add_f32_e32 v3, v18, v3",
+    "v_add_f32_e32 v3, v17, v3",
+    "v_add_f32_e32 v3, v17, v3",
+]
+# Operands of the float adds above, as bit patterns.
+ALU_OPERANDS = (0x3e800000, 0x3e000000, 0x3c000000, 0x3f300000, 0x3f200000, 0xbfc00000)
+
+
+def alu_draw():
+    # 0.5 + 0.25 + 0.125 + 2**-7 + 0.6875 + 3 * 0.625 - 2 * 1.5, all exact in binary32. Swapping the unsigned
+    # min and max results (a signed comparison) would give 0.5 + ... + 3 * -1.5 + 2 * 0.625, which is -3.2578125.
+    depth = 0.4453125
+    positions = [(x, y, depth, w) for x, y, _, w in TRIANGLE]
+    return (
+        lower(enumerate_pcs(ALU_PROGRAM), [4099], (3, 1)),
+        [(triangle_inputs(), positions, True)],
+    )
+
+
+FLOAT_PROGRAM = PROGRAM.copy()
+FLOAT_PROGRAM[-2:-2] = [
+    "v_mov_b32_e32 v10, 0x40800000",
+    "v_mov_b32_e32 v11, 0x3fc00000",
+    "v_mov_b32_e32 v12, 0x3ec00000",
+    "v_mov_b32_e32 v13, 0x3e000000",
+    "v_mov_b32_e32 v14, 0x3d800000",
+    "v_mov_b32_e32 v15, 0x3e800000",
+    "v_mov_b32_e32 v16, 0x3f000000",
+    "v_sub_f32_e32 v3, v10, v3",
+    "v_subrev_f32_e32 v3, v11, v3",
+    "v_mul_f32_e32 v3, v12, v3",
+    "v_add_f32_e64 v3, v3, v13",
+    "v_sub_f32_e64 v3, v3, v14",
+    "v_subrev_f32_e64 v3, v15, v3",
+    "v_mul_f32_e64 v3, v3, v16",
+]
+# Each result below is exact in binary32; the sibling opcode gives a different depth.
+SIBLINGS = {
+    "v_sub_f32_e32": "v_subrev_f32_e32",
+    "v_subrev_f32_e32": "v_sub_f32_e32",
+    "v_mul_f32_e32": "v_add_f32_e32",
+    "v_add_f32_e64": "v_sub_f32_e64",
+    "v_sub_f32_e64": "v_subrev_f32_e64",
+    "v_subrev_f32_e64": "v_sub_f32_e64",
+    "v_mul_f32_e64": "v_add_f32_e64",
+}
+
+
+def float_reference():
+    # Independent of the lowering: plain arithmetic in the order the program runs.
+    z = 0.125 + 0.375  # v3 = pointData y, then plus the matrix value
+    z = 4.0 - z  # v_sub_f32_e32 v3, v10, v3
+    z = z - 1.5  # v_subrev_f32_e32 v3, v11, v3 is v3 - v11
+    z = 0.375 * z  # v_mul_f32_e32
+    z = z + 0.125  # v_add_f32_e64
+    z = z - 0.0625  # v_sub_f32_e64
+    z = z - 0.25  # v_subrev_f32_e64 v3, v15, v3 is v3 - v15
+    return z * 0.5  # v_mul_f32_e64
+
+
+class F32(float):
+    def __new__(cls, x):
+        return super().__new__(cls, struct.unpack("<f", struct.pack("<f", x))[0])
+
+    def __add__(self, o):
+        return F32(float(self) + float(o))
+
+    def __sub__(self, o):
+        return F32(float(self) - float(o))
+
+    def __mul__(self, o):
+        return F32(float(self) * float(o))
+
+
+def evaluate_depth(text, inputs):
+    # Evaluate the emitted float chain in binary32 and return position component z of vertex 0.
+    def word(m):
+        return repr(F32(struct.unpack("<f", struct.pack("<I", int(m[1], 16)))[0]))
+
+    def buffer(m):
+        base = 0 if m[1] == "point" else 512
+        return repr(F32(struct.unpack_from("<f", inputs, base + int(m[2]) * 16 + 4 * "xyzw".index(m[3]))[0]))
+
+    def value(expr):
+        expr = re.sub(r"asfloat\(0x([0-9a-f]+)u\)", word, expr)
+        expr = re.sub(r"(point|matrix)Data\[(\d+)\]\.([xyzw])", buffer, expr)
+        return eval(re.sub(r"(?<![\w.])(-?\d+\.\d+(?:e[+-]?\d+)?)", r"F32(\1)", expr), {"F32": F32}, names)
+
+    names = {}
+    for name, expr in re.findall(r"precise float (f\d+) = (.*);", text):
+        names[name] = value(expr)
+    q = re.search(r"if\(id==0\) \{ float4 q=float4\((.*?)\);", text)[1].split(", ")
+    return value(q[2])
+
+
+def float_draw(program=FLOAT_PROGRAM):
+    depth = float_reference()
+    positions = [(x, y, depth, w) for x, y, _, w in TRIANGLE]
+    return lower(enumerate_pcs(program), [4099], (3, 1)), [(triangle_inputs(), positions, True)]
+
+
+def mismatch(dxc, renderer, adapter, tmp, source, positions):
+    # A wrong expected depth word must be reported by the export trace comparison.
+    ps, ms = tmp / "pixel.dxil", tmp / "mesh.dxil"
+    (tmp / "pixel.hlsl").write_text(PIXEL)
+    (tmp / "mesh.hlsl").write_text(source)
+    if not ps.exists():
+        subprocess.run([dxc, "-T", "ps_6_0", "-E", "main", "-Fo", ps, tmp / "pixel.hlsl"], check=True)
+    subprocess.run(
+        [dxc, "-T", "ms_6_5", "-E", "main", "-DTRACE_EXPORTS", "-Fo", ms, tmp / "mesh.hlsl"],
+        check=True,
+    )
+    path = tmp / "draw.bin"
+    path.write_bytes(fixture(triangle_inputs(), positions, True, True))
+    result = subprocess.run(
+        [renderer, adapter, "--mesh-entry", ms, ps, path], capture_output=True, text=True
+    )
+    if result.returncode == 77:
+        return 77
+    if result.returncode != 1 or "Mesh export trace mismatch" not in result.stderr:
+        raise AssertionError("A wrong depth word was not reported")
+    return 0
+
+
+def float_negative_draws(dxc, renderer, adapter, tmp):
+    source, cases = float_draw()
+    expected = cases[0][1]
+    # One unit in the last place of the depth word, and every sibling opcode.
+    word = struct.unpack("<I", struct.pack("<f", expected[0][2]))[0]
+    off_by_one = struct.unpack("<f", struct.pack("<I", word + 1))[0]
+    wrong = [[(x, y, off_by_one, w) for x, y, _, w in TRIANGLE]]
+    for op, other in SIBLINGS.items():
+        program = [line.replace(op, other, 1) if line.startswith(op) else line for line in FLOAT_PROGRAM]
+        wrong.append((float_draw(program)[0], expected))
+    for item in wrong:
+        text, positions = (source, item) if isinstance(item, list) else item
+        if mismatch(dxc, renderer, adapter, tmp, text, positions) == 77:
+            return 77
+    return 0
+
+
 def binary(tmp, assembler, objcopy, library, *, program=None, words=None, header=None):
     from pixel_aot_check import envelope
     from pixel_aot import _read_named_container
@@ -221,6 +389,30 @@ def binary(tmp, assembler, objcopy, library, *, program=None, words=None, header
         subprocess.run([*command, "--compute-fallback"], check=True)
         expected = lower(enumerate_pcs(program), words, (3, 1), header, compute_fallback=True)
         assert translated.read_text() == expected
+    return translated.read_text()
+
+
+def float_binary(tmp, tools):
+    inputs, reference = triangle_inputs(), float_reference()
+    text = binary(tmp, *tools, program=FLOAT_PROGRAM, words=[4099])
+    assert evaluate_depth(text, inputs) == reference, text
+    for op, other in SIBLINGS.items():
+        program = [l.replace(op, other, 1) if l.startswith(op) else l for l in FLOAT_PROGRAM]
+        mutated = evaluate_depth(binary(tmp, *tools, program=program, words=[4099]), inputs)
+        assert mutated != reference, (op, mutated)
+    # Source modifiers and output modifiers change the result, so they are refused.
+    for line in (
+        "v_add_f32_e64 v3, -v3, v13",
+        "v_add_f32_e64 v3, |v3|, v13",
+        "v_mul_f32_e64 v3, v3, v16 mul:2",
+        "v_sub_f32_e64 v3, v3, v14 clamp",
+    ):
+        program = [line if l == "v_mul_f32_e64 v3, v3, v16" else l for l in FLOAT_PROGRAM]
+        try:
+            lower(enumerate_pcs(program), [4099], (3, 1))
+        except ValueError:
+            continue
+        raise AssertionError(line)
 
 
 def offset_draw():
@@ -258,7 +450,23 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as directory:
         if sys.argv[1] == "binary":
             binary(Path(directory), *sys.argv[2:])
+            text = binary(
+                Path(directory), *sys.argv[2:], program=ALU_PROGRAM, words=[4099]
+            )
+            for operand in ALU_OPERANDS:
+                assert f"asfloat(0x{operand:08x}u)" in text, hex(operand)
+            # The unsigned min is 0x3f200000 and the unsigned max 0xbfc00000; a signed comparison swaps them, and the
+            # unequal use counts (three and two) make the swap visible in the text and in the drawn depth.
+            assert text.count("asfloat(0x3f200000u)") == 3, text
+            assert text.count("asfloat(0xbfc00000u)") == 2, text
+            float_binary(Path(directory), sys.argv[2:])
             sys.exit(0)
+        if sys.argv[1] == "draw-float":
+            args = sys.argv[2:]
+            sys.exit(
+                draw(*args, Path(directory), *float_draw())
+                or float_negative_draws(*args, Path(directory))
+            )
         clipped = triangle_inputs()
         struct.pack_into("<f", clipped, 4, -0.625)  # Plus 0.375 gives Z = -0.25.
         clipped_positions = [(x, y, -0.25, w) for x, y, _, w in TRIANGLE]
@@ -277,4 +485,5 @@ if __name__ == "__main__":
                 pixel_source=winding_pixel,
             )
             or draw(*sys.argv[1:], Path(directory), *offset_draw())
+            or draw(*sys.argv[1:], Path(directory), *alu_draw())
         )
