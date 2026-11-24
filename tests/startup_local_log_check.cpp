@@ -179,6 +179,8 @@ int concurrency_child(bool reopen)
     check(lines == want && bad == 0 && duplicate == 0 && missing == 0,
           "concurrent logf lines are all present and intact");
 
+    check(DeleteFileW(path) != FALSE, "the kept trap log can be deleted while this module holds it");
+
     const int before = failures;
     check(opens == 1, "trap log is opened once per module");
     const bool open_failed = failures != before;

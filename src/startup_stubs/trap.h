@@ -63,8 +63,8 @@ inline volatile LONG& log_opens() noexcept
 
 // Appends one line to %X2W_TRAP_LOG% with one WriteFile. Under the startup launcher every file
 // open is a traced call that stops the process, so the first path a module logs to is opened once
-// (append access, shared read/write) and the handle is kept; a failed open is kept too, so it is
-// not retried per line. A line for another path (the variable changed in-process) is appended the
+// (append access, shared read/write/delete so readers and cleanup still work) and the handle is
+// kept; a failed open is kept too, so it is not retried per line. A line for another path (the variable changed in-process) is appended the
 // old way: open, write, close. Nothing is written when the variable is unset or too long. flush
 // asks for FlushFileBuffers before returning (the trap path, which may end the process next).
 inline void append_log(const char* line, DWORD size, bool flush) noexcept
@@ -89,8 +89,8 @@ inline void append_log(const char* line, DWORD size, bool flush) noexcept
     }
 
     InterlockedIncrement(&log_opens());
-    HANDLE out = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
-                             FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE out = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                             OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (out != INVALID_HANDLE_VALUE) {
         write_all(out, line, size);
         if (flush) FlushFileBuffers(out);
