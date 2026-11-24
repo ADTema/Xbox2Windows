@@ -458,8 +458,16 @@ foreach(scenario IN ITEMS exports serialize deserialize warp_root)
     add_test(NAME d3d12_xs_shim_${scenario} COMMAND d3d12_xs_shim_check ${scenario})
 endforeach()
 # D3D12XboxCreateDevice device-slot inventory and source-built creation fixture (#XCL-08).
-add_executable(d3d12x_device_check tests/d3d12x_device_check.cpp)
+set(d3d12x_pso_header "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_pso_cs.h")
+add_custom_command(OUTPUT "${d3d12x_pso_header}"
+    COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E CSMain -Qstrip_rootsignature -Vn d3d12x_pso_cs
+            -Fh "${d3d12x_pso_header}" -Fo "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_pso_cs.cso"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/d3d12x_pso.hlsl"
+    DEPENDS tests/d3d12x_pso.hlsl
+    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_pso_cs.cso" VERBATIM)
+add_executable(d3d12x_device_check tests/d3d12x_device_check.cpp "${d3d12x_pso_header}")
 add_dependencies(d3d12x_device_check d3d12_xs_shim)
+target_include_directories(d3d12x_device_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_compile_features(d3d12x_device_check PRIVATE cxx_std_17)
 target_link_libraries(d3d12x_device_check PRIVATE d3d12 dxgi)
 foreach(adapter IN ITEMS warp hardware)
@@ -472,6 +480,14 @@ set_tests_properties(d3d12x_device_create_hardware d3d12x_device_negative_hardwa
     SKIP_RETURN_CODE 77)
 set_tests_properties(d3d12x_device_negative_warp d3d12x_device_negative_hardware PROPERTIES
     PASS_REGULAR_EXPRESSION "D3D12XboxCreateDevice: unsupported IID \\{7c0e1a10-5f2d-4b7a-9a51-3d9c6b2e8f01\\}")
+# Static-sampler root signature and compute PSO through D3D12XboxCreateDevice (#XCL-19).
+foreach(adapter IN ITEMS warp hardware)
+    add_test(NAME d3d12x_pso_static_sampler_${adapter} COMMAND d3d12x_device_check
+        "$<TARGET_FILE:d3d12_xs_shim>" pso ${adapter})
+endforeach()
+add_test(NAME d3d12x_pso_reject_warp COMMAND d3d12x_device_check
+    "$<TARGET_FILE:d3d12_xs_shim>" reject warp)
+set_tests_properties(d3d12x_pso_static_sampler_hardware PROPERTIES SKIP_RETURN_CODE 77)
 # The main executable's CPU/GPU range translation against a desktop D3D12 heap (#874).
 set(vm_translation_header "${CMAKE_CURRENT_BINARY_DIR}/vm_translation_cs.h")
 add_custom_command(OUTPUT "${vm_translation_header}"

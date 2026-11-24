@@ -4132,6 +4132,62 @@ It also keeps a non-null parameter block at `E_INVALIDARG`.
 
 Run `ctest --preset dev --no-tests=error -R '^d3d12x_device_' -V`.
 
+#### D3D12.X static-sampler compute PSO (XCL-19)
+
+[`tests/d3d12x_pso.hlsl`](../tests/d3d12x_pso.hlsl) is a source-built `cs_6_0` shader with
+`Texture2D t0`, `RWTexture2D u0` and `SamplerState s0`. Its entry samples `t0` at LOD 0 and writes
+`u0`. The fixture compiles it with `-Qstrip_rootsignature`, so the PSO uses the signature
+serialized by the test instead of an embedded one.
+
+The test root is a v1.1 root signature with two one-descriptor tables, `SRV(t0)` and `UAV(u0)`, and
+one static sampler at `s0`. The tables are required because D3D12 root descriptors can only name
+raw or structured buffers, not textures. The sampler uses non-default values so a dropped or
+rewritten field shows up:
+
+| Field | Value |
+|---|---|
+| `Filter` | `D3D12_FILTER_MIN_MAG_MIP_LINEAR` (`0x15`) |
+| `AddressU`, `AddressV`, `AddressW` | `WRAP` (1), `CLAMP` (3), `BORDER` (4) |
+| `MipLODBias` | 2.5 |
+| `MaxAnisotropy` | 4 |
+| `ComparisonFunc` | `D3D12_COMPARISON_FUNC_GREATER_EQUAL` (7) |
+| `BorderColor` | `D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE` (2) |
+| `MinLOD`, `MaxLOD` | 1.5, 9.0 |
+| `ShaderRegister`, `RegisterSpace` | 0, 0 |
+| `ShaderVisibility` | `D3D12_SHADER_VISIBILITY_ALL` (0) |
+
+The descriptor carries the observed console root-signature flags `0x03000000`.
+`src/d3d12_xs_shim.cpp` clears only those two bits in a local copy and leaves the parameter types,
+static-sampler pointer and count untouched.
+
+The positive case first confirms that desktop `d3d12.dll` rejects the tagged descriptor with
+`E_INVALIDARG` and no blob, then serializes it through `d3d12_xs.dll` and compares that blob byte
+for byte with the desktop baseline whose flags are 0. It deserializes the shim blob through
+`d3d12_xs.dll!D3D12CreateRootSignatureDeserializer` and compares every static-sampler field listed
+above. It creates the device through `D3D12XboxCreateDevice` with `parameters == nullptr` and
+`IID_ID3D12Device`, then creates the root signature and the compute PSO, requiring `S_OK` and
+non-null objects.
+
+The reject case covers an unknown static-sampler `ShaderVisibility` (99), an unrecognized
+static-sampler `Filter` (`0x7fffffff`), unknown root-signature flag `0x04000000` and unknown
+`D3D12_ROOT_PARAMETER_TYPE` `0x7fffffff`. Desktop `d3d12.dll` must return `E_INVALIDARG` with no
+blob for each, and `d3d12_xs.dll` must return the same HRESULT with no blob. Creating a compute PSO
+with a null `pRootSignature` must also return `E_INVALIDARG` and no PSO.
+
+| CTest case | Inputs and checks |
+|---|---|
+| `d3d12x_pso_static_sampler_warp` | Runs the positive case on WARP. |
+| `d3d12x_pso_static_sampler_hardware` | Runs the positive case on the first non-software D3D12 adapter, or the one selected by `XBOX2WINDOWS_ADAPTER`; skips (77) without a physical adapter. |
+| `d3d12x_pso_reject_warp` | Runs the four serialization rejects and the null-root PSO reject on WARP. |
+
+Run `ctest --preset dev --no-tests=error -R '^d3d12x_pso_' -V`.
+
+This fixture covers creation only. It dispatches no work, binds no descriptor heap and reads nothing
+back, so it does not establish that a dispatch using this root signature produces correct results.
+It also makes no console descriptor or vtable claim: the public
+`D3D12XBOX_CREATE_DEVICE_PARAMETERS` block and `IID_ID3D12Device1` remain unimplemented on this
+device path.
+
 #### D3D12ConfigureVirtualMemoryX call shape (#874)
 
 The main executable imports `d3d12_xs.dll!D3D12ConfigureVirtualMemoryX` and calls it once, before the D3D12 device is created. A static read of the call site shows:
