@@ -134,6 +134,7 @@ SOPP_OPS = {
     0x09: ("s_cbranch_execnz", "Branch if EXEC is non-zero"),
     0x0a: ("s_barrier", "Synchronize wavefronts in workgroup"),
     0x0c: ("s_waitcnt", "Wait for memory operations"),
+    0x1f: ("s_code_end", "Code end marker"),
     0x20: ("s_inst_prefetch", "Instruction cache prefetch"),
     0x21: ("s_clause", "Begin hard clause"),
 }
@@ -1673,6 +1674,9 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
 
     w0, = struct.unpack_from("<I", data, offset)
 
+    if w0 == 0:
+        return (4, "word_0x00000000", ".long 0x00000000", "Unrecognized RDNA 2 instruction encoding")
+
     # 1. SOPP: [31:23] == 0b101111111 (0xbf800000)
     if (w0 & 0xff800000) == 0xbf800000:
         op = (w0 >> 16) & 0x7f
@@ -1681,8 +1685,8 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         op_info = SOPP_OPS.get(op, (f"s_sopp_{op:02x}", "Unknown SOPP"))
         op_name, comment = op_info
 
-        if op_name == "s_endpgm":
-            asm = "s_endpgm"
+        if op_name in {"s_endpgm", "s_code_end"}:
+            asm = op_name
         elif op_name == "s_nop":
             asm = f"s_nop {simm}"
         elif op_name == "s_waitcnt":
@@ -2365,9 +2369,6 @@ def disassemble_binary(data: bytes, shader_name: str = "shader") -> list[dict]:
             "comment": comment,
         })
         offset += length
-        if op_name == "s_endpgm":
-            # Some shaders have 4 trailing zero padding bytes after endpgm
-            break
     return instructions
 
 
