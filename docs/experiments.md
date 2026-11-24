@@ -6889,6 +6889,8 @@ Build the same `xg_swizzle_select_check` target and run both factory tests with 
 
 The GPU check report includes the adapter's shader-visible CBV/SRV/UAV descriptor heap limit from D3D12 OPTIONS19. Compare the `max_view_descriptor_heap_size` line in `ctest --preset dev --no-tests=error -R '^offscreen_(hardware|warp)$' -V`. The report says `not reported` when the runtime does not provide a limit.
 
+On Windows 11 build 26300.9974 the Intel Arc 140T (device `7d51`, driver 32.0.101.8132) reports `max_view_descriptor_heap_size=1000000` and matches all 4,096 pixels with a 512-byte row pitch.
+
 The original test machine had Windows Graphics Tools installed. A second build in `out/build/agility` used Microsoft Agility SDK 1.620.2. Set `-DOFFSCREEN_AGILITY_620_DIR=<directory containing the x64 SDK DLLs>` to reproduce it. This configuration verifies debug interface activation. [Agility SDK package](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12/1.620.2)
 
 ### Two logical heaps in one shader-visible descriptor heap
