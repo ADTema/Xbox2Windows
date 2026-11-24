@@ -482,6 +482,19 @@ add_executable(startup_gamesave_lock_errors tests/startup_gamesave_lock_errors.c
 target_include_directories(startup_gamesave_lock_errors PRIVATE src)
 target_compile_features(startup_gamesave_lock_errors PRIVATE cxx_std_17)
 add_test(NAME startup_gamesave_lock_errors COMMAND startup_gamesave_lock_errors)
+# Negative control: the same check built against a generated copy of file_lock.h whose acquire no
+# longer drops the lock the object already holds. The check must report that leaked lock. The copy
+# exists only in the test build.
+string(REGEX REPLACE "release\\(\\);([\r\n]+ +last_error_ = 0;)" "\\1" gamesave_lock_keep_text "${gamesave_lock_text}")
+if(gamesave_lock_keep_text STREQUAL gamesave_lock_text)
+    message(FATAL_ERROR "file_lock.h lost the release at the start of acquire used by startup_gamesave_lock_errors_reacquire_control")
+endif()
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/gamesave_lock_keep/startup_stubs/file_lock.h" "${gamesave_lock_keep_text}")
+add_executable(startup_gamesave_lock_errors_keep tests/startup_gamesave_lock_errors.cpp)
+target_include_directories(startup_gamesave_lock_errors_keep PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/gamesave_lock_keep")
+target_compile_features(startup_gamesave_lock_errors_keep PRIVATE cxx_std_17)
+add_test(NAME startup_gamesave_lock_errors_reacquire_control COMMAND startup_gamesave_lock_errors_keep)
+set_tests_properties(startup_gamesave_lock_errors_reacquire_control PROPERTIES PASS_REGULAR_EXPRESSION "FAIL: re-acquire")
 add_executable(startup_gamesave_submit tests/startup_gamesave_submit.cpp)
 target_include_directories(startup_gamesave_submit PRIVATE src)
 target_compile_features(startup_gamesave_submit PRIVATE cxx_std_17)
