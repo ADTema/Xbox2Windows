@@ -8401,10 +8401,13 @@ control:
 Every one of the 19 clamps follows those two rules exactly: the Arc reads
 `floor(clamp)` and the RTX and WARP read `floor(clamp + 0.5)`. Translated and
 direct HLSL agreed in all 57 cells, so the split is the adapter's mip selection,
-not the `MinLod` clamp translation or the readback. Two consequences for the
-fixtures: the stale-reference control at 1.5625 cannot reject on this adapter,
-because the adapter genuinely reads mip 1 there, while the wrong-mip control at
-clamp 1 still rejects on all three because both rules agree at an exact mip.
+not the `MinLod` clamp translation or the readback. `spirv_minlod_fractional_*`
+covers both rules instead of asserting one: it accepts mip 1 or 2 at 1.5 and
+1.5625, requires the two shader sources to agree, and takes `--strict-rounding`
+to assert nearest-mip selection. Run on the Arc at commit `0a679c06` it passed,
+reporting mip 1 at 1.4375, 1.5 and 1.5625 and mip 3 at 3.75 with both sources
+agreeing, and the wrong-mip control still rejects on all three adapters because
+both rules agree at an exact mip.
 [Measurement](https://github.com/R0Y00/Xbox2Windows/issues/809#issuecomment-7119349577)
 
 Mip-linear results (`MIN_MAG_POINT_MIP_LINEAR`, `ps_6_6`, debug layer): WARP
