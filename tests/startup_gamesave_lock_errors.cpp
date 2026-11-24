@@ -4,7 +4,7 @@
 // reports; the wait and error cases use real lock files in a temporary folder. Synthetic data only.
 #include <startup_stubs/file_lock.h>
 
-#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -56,6 +56,7 @@ void check_long_wait(const std::filesystem::path& lock_file)
     FileLock holder;
     expect(holder.acquire(lock_file, true, std::chrono::milliseconds(0)) == LockResult::locked, "holder takes a free lock");
 
+    const auto start = Clock::now();
     std::thread releaser([&holder] {
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
         holder.release();
@@ -72,8 +73,7 @@ void check_long_wait(const std::filesystem::path& lock_file)
     });
 
     FileLock waiter;
-    const auto start = Clock::now();
-    const LockResult result = waiter.acquire(lock_file, true, std::chrono::milliseconds::max());
+    const LockResult result = waiter.acquire(lock_file, true, (std::chrono::milliseconds::max)());
     const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start);
     {
         std::lock_guard<std::mutex> lock(gate);
@@ -93,11 +93,11 @@ void check_long_wait(const std::filesystem::path& lock_file)
     expect(held.acquire(lock_file, true, std::chrono::milliseconds(0)) == LockResult::locked, "second holder takes the free lock");
     FileLock probe;
     const auto probe_start = Clock::now();
-    expect(probe.acquire(lock_file, true, std::chrono::milliseconds::min()) == LockResult::timeout,
+    expect(probe.acquire(lock_file, true, (std::chrono::milliseconds::min)()) == LockResult::timeout,
            "the most negative timeout is one attempt: timeout while held");
     expect(Clock::now() - probe_start < std::chrono::seconds(2), "the most negative timeout does not wait");
     held.release();
-    expect(probe.acquire(lock_file, true, std::chrono::milliseconds::min()) == LockResult::locked,
+    expect(probe.acquire(lock_file, true, (std::chrono::milliseconds::min)()) == LockResult::locked,
            "the most negative timeout still locks a free file");
 }
 

@@ -98,9 +98,14 @@ private:
     {
         using Clock = std::chrono::steady_clock;
         if (timeout <= std::chrono::milliseconds::zero()) return now;
-        if (now.time_since_epoch() < Clock::duration::zero()) return now + std::chrono::milliseconds(0);
-        const auto room = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::time_point::max() - now);
-        if (timeout >= room) return Clock::time_point::max();
+        const auto max_step = std::chrono::duration_cast<std::chrono::milliseconds>((Clock::duration::max)());
+        while (now.time_since_epoch() < Clock::duration::zero()) {
+            if (timeout <= max_step) return now + timeout;
+            now += max_step;
+            timeout -= max_step;
+        }
+        const auto room = std::chrono::duration_cast<std::chrono::milliseconds>((Clock::time_point::max)() - now);
+        if (timeout >= room) return (Clock::time_point::max)();
         return now + timeout;
     }
 
