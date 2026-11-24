@@ -13,84 +13,19 @@ import sys
 
 import pefile
 
+from import_routing import POLICY_VERSION, RESOLUTION, ROUTES, ROUTE_KIND, annotate
 from pe_inventory import import_tables
 
 
 SCHEMA = "xbox2windows.report/1"
 TOOL_VERSION = 1
-POLICY_VERSION = 1
 AMD64 = 0x8664
-ROUTE_KIND = "candidate"
-RESOLUTION = "not_checked"
 SCOPE = (
     "Candidate module routes from PE import module names. "
     "The report does not resolve exports or prove a provider, and does not load or execute the image."
 )
 
 KIND_ORDER = {"normal": 0, "delay": 1}
-ROUTES = ("hle", "windows", "stub", "unsupported")
-
-# Each entry is data, not a guess. HLE modules are built by this tree. Stub
-# entries are public GDK modules without a shim here. Windows entries are
-# explicit system DLLs plus the documented API-set prefixes.
-POLICY = {
-    "hle": {
-        "xmem.dll": "Xbox2Windows builds src/xmem_shim.cpp as xmem.dll",
-        "d3d12_xs.dll": "Xbox2Windows builds src/d3d12_xs_shim.cpp as d3d12_xs.dll",
-    },
-    "stub": {
-        "xgameruntime.dll": "GDK runtime module; no Xbox2Windows shim in this tree",
-        "xg_xs.dll": "GDK console GPU module; no Xbox2Windows shim in this tree",
-    },
-    "windows": frozenset({
-        "advapi32.dll",
-        "bcrypt.dll",
-        "cfgmgr32.dll",
-        "combase.dll",
-        "crypt32.dll",
-        "d3d12.dll",
-        "d3dcompiler_47.dll",
-        "dbghelp.dll",
-        "dxgi.dll",
-        "gdi32.dll",
-        "kernel32.dll",
-        "kernelbase.dll",
-        "msvcrt.dll",
-        "ntdll.dll",
-        "ole32.dll",
-        "oleaut32.dll",
-        "powrprof.dll",
-        "psapi.dll",
-        "rpcrt4.dll",
-        "setupapi.dll",
-        "shell32.dll",
-        "shlwapi.dll",
-        "ucrtbase.dll",
-        "user32.dll",
-        "userenv.dll",
-        "version.dll",
-        "winmm.dll",
-        "ws2_32.dll",
-        "xaudio2_8.dll",
-        "xaudio2_9.dll",
-    }),
-    "windows_prefixes": ("api-ms-win-", "ext-ms-"),
-}
-
-
-def classify(module):
-    """Return (route, reason) for a module name. No route is inferred."""
-    name = module.lower()
-    if name in POLICY["hle"]:
-        return "hle", POLICY["hle"][name]
-    if name in POLICY["stub"]:
-        return "stub", POLICY["stub"][name]
-    if name in POLICY["windows"]:
-        return "windows", "Windows system DLL"
-    for prefix in POLICY["windows_prefixes"]:
-        if name.startswith(prefix):
-            return "windows", "Windows API-set contract"
-    return "unsupported", "no matching policy entry"
 
 
 def _directory(pe, index):
@@ -160,21 +95,12 @@ def build_report(image_bytes, image_name):
 
     rows = []
     for kind, module, symbol in imports:
-        route, reason = classify(module)
-        stub = route == "stub"
-        rows.append({
+        rows.append(annotate({
             "image": image_name,
             "kind": kind,
             "module": module,
             "symbol": symbol,
-            "route": route,
-            "reason": reason,
-            "route_kind": ROUTE_KIND,
-            "resolution": RESOLUTION,
-            "provider": None,
-            "stub": stub,
-            "candidate_provider": module if route == "hle" else None,
-        })
+        }))
     rows.sort(key=_row_key)
     unknown = [dict(row) for row in rows if row["route"] == "unsupported"]
 

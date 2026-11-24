@@ -12,14 +12,22 @@ import sys
 from pe_package_preflight import inspect
 
 
-def plan(report):
-    """Resolve the entire import graph before any guest attachment."""
+def plan(report, *, allow_external=True):
+    """Resolve the entire import graph before any guest attachment.
+
+    The default keeps external host imports as unverified candidates. Set
+    allow_external=False for a strict closed-package plan: every reachable
+    import must terminate in an export bundled in the package. This pure check
+    runs before any module is loaded or mapped.
+    """
+    accepted = {"bundled_export_present"}
+    if allow_external:
+        accepted.update(("external_unverified", "forwarded_external_unverified"))
     routes = defaultdict(dict)
     needs = defaultdict(set)
     for row in report["imports"]:
         image, name = row["image"], (row["dll"].casefold(), row["symbol"])
-        if row["status"] not in ("bundled_export_present", "external_unverified",
-                                 "forwarded_external_unverified"):
+        if row["status"] not in accepted:
             raise ValueError(f"{image}: {name[0]}!{name[1]}: {row['status']}")
         chain = row["chain"]
         for caller, provider in zip([image, *(step["provider"] for step in chain)], chain):

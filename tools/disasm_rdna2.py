@@ -134,6 +134,7 @@ SOPP_OPS = {
     0x09: ("s_cbranch_execnz", "Branch if EXEC is non-zero"),
     0x0a: ("s_barrier", "Synchronize wavefronts in workgroup"),
     0x0c: ("s_waitcnt", "Wait for memory operations"),
+    0x1f: ("s_code_end", "Code end marker"),
     0x20: ("s_inst_prefetch", "Instruction cache prefetch"),
     0x21: ("s_clause", "Begin hard clause"),
 }
@@ -462,6 +463,10 @@ VOP1_OPS = {
     0x39: ("v_ffbh_u32_e32", "Find first bit high uint32"),
     0x3a: ("v_ffbl_b32_e32", "Find first bit low uint32"),
     0x3b: ("v_ffbh_i32_e32", "Find first bit high int32"),
+    0x42: ("v_movreld_b32_e32", "Vector copy with relative destination"),
+    0x43: ("v_movrels_b32_e32", "Vector copy with relative source"),
+    0x44: ("v_movrelsd_b32_e32", "Vector copy with relative source and destination"),
+    0x48: ("v_movrelsd_2_b32_e32", "Vector copy with relative source and destination (extended form)"),
 }
 
 VOPC_OPS = {
@@ -696,8 +701,10 @@ VOP2_OPS = {
     0x2c: ("v_fmamk_f32", "Vector fused multiply-add with literal multiplier"),
     0x2d: ("v_fmaak_f32", "Vector fused multiply-add with literal addend"),
     0x2f: ("v_cvt_pkrtz_f16_f32_e32", "Convert two float32 to packed float16 (round to zero)"),
+    0x36: ("v_fmac_f16_e32", "Vector fused multiply-accumulate float16"),
     0x37: ("v_fmamk_f16", "Vector fused multiply-add float16 with literal multiplier"),
     0x38: ("v_fmaak_f16", "Vector fused multiply-add float16 with literal addend"),
+    0x3b: ("v_ldexp_f16_e32", "Vector scale float16 by a power of two"),
 }
 
 VOP3_NATIVE_OPS = {
@@ -1673,6 +1680,9 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
 
     w0, = struct.unpack_from("<I", data, offset)
 
+    if w0 == 0:
+        return (4, "word_0x00000000", ".long 0x00000000", "Unrecognized RDNA 2 instruction encoding")
+
     # 1. SOPP: [31:23] == 0b101111111 (0xbf800000)
     if (w0 & 0xff800000) == 0xbf800000:
         op = (w0 >> 16) & 0x7f
@@ -1681,8 +1691,8 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         op_info = SOPP_OPS.get(op, (f"s_sopp_{op:02x}", "Unknown SOPP"))
         op_name, comment = op_info
 
-        if op_name == "s_endpgm":
-            asm = "s_endpgm"
+        if op_name in {"s_endpgm", "s_code_end"}:
+            asm = op_name
         elif op_name == "s_nop":
             asm = f"s_nop {simm}"
         elif op_name == "s_waitcnt":
@@ -2365,9 +2375,6 @@ def disassemble_binary(data: bytes, shader_name: str = "shader") -> list[dict]:
             "comment": comment,
         })
         offset += length
-        if op_name == "s_endpgm":
-            # Some shaders have 4 trailing zero padding bytes after endpgm
-            break
     return instructions
 
 
