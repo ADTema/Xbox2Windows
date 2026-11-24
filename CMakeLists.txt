@@ -637,6 +637,15 @@ target_compile_features(startup_plane_size_check PRIVATE cxx_std_17)
 add_test(NAME startup_plane_size COMMAND startup_plane_size_check)
 add_test(NAME startup_plane_size_packed_control COMMAND startup_plane_size_check --mutate packed)
 set_tests_properties(startup_plane_size_packed_control PROPERTIES WILL_FAIL TRUE)
+# The blend patch a slot 55 derivation applies (src/startup_stubs/derived_blend.h): the last part-2
+# record, its descriptor offset and bytes, and lists that are not whole records. The mutated run is
+# the negative control.
+add_executable(startup_derived_blend_check tests/startup_derived_blend_check.cpp)
+target_include_directories(startup_derived_blend_check PRIVATE src)
+target_compile_features(startup_derived_blend_check PRIVATE cxx_std_17)
+add_test(NAME startup_derived_blend COMMAND startup_derived_blend_check)
+add_test(NAME startup_derived_blend_first_wins_control COMMAND startup_derived_blend_check --mutate first-wins)
+set_tests_properties(startup_derived_blend_first_wins_control PROPERTIES WILL_FAIL TRUE)
 # The same rule through the device wrapper: allocation-info slots 25 and 108, then a placed texture
 # (slot 133) over memory of the answered size.
 add_executable(startup_plane_size_device_check tests/startup_plane_size_device_check.cpp)
