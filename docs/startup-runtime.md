@@ -618,7 +618,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call |
 | `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user, and creates one offline store context for that user |
 | `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is UTF-8, with a trailing separator added when missing. If the path is invalid or exceeds 259 bytes including the separator, the proxy logs the refusal and uses `S:\` (`src/startup_stubs/storage_root_utf8.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`). |
-| `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses (0x4 = A); keyboard and XInput pad 0 also work. Up to 256 entries and 4,095 characters; a longer value is ignored and logged, and dropped or malformed entries are logged (`ctest --preset dev --no-tests=error -R '^startup_gameinput_script_(long|entries)$'`) |
+| `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses, holds and stick or trigger values: see [Input script](#input-script); keyboard and XInput pad 0 also work. Up to 256 entries and 4,095 characters; a longer value is ignored and logged, and dropped or malformed entries are logged (`ctest --preset dev --no-tests=error -R '^startup_gameinput_script_(long|entries|syntax)$'`) |
 | `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into `SamplerState qh[2048] : register(s0, space1)` and writes `smpheap 2048 1 fallback 2047`. The stand-in uses entries 0 to 2046 for the bound heap and reserves entry 2047 for unaligned or out-of-range offsets. It also accepts the original `smpheap 2048 1` manifest with all 2,048 entries available. [#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143) |
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
 | `X2W_XG_BC7_4K_S_LAYOUT=1` | enables the BC7 tiled layout, copy and draw upload when `X2W_D3D12_PERMISSIVE=1` |
@@ -640,6 +640,57 @@ requests, run `python tools/startup/gfx2hlsl.py --pending <cache-directory>`,
 then start the build again. The new key keeps the former bytecode and manifest
 together under their original name. A 16-dword table load can contain two
 independent image descriptors at offsets 0 and 32 from the load address.
+
+## Input script
+
+`X2W_INPUT_SCRIPT` (`run.ps1 -InputScript`) drives the virtual gamepad of the `GameInput.dll`
+stand-in. It is a comma-separated list; empty items and blanks around an item are ignored. Each
+item is one of:
+
+| Item | Effect |
+|---|---|
+| `<mask>@<s>[+<d>]` | sets the GameInput button bits `<mask>` (hexadecimal, `0x` optional; 4 = A, 8 = B, 1 = Menu) from second `<s>` for `<d>` seconds, default 0.3 |
+| `<axis>=<value>@<s>[+<d>]` | sets one axis from second `<s>` for `<d>` seconds, default 0.3. `lx`, `ly`, `rx`, `ry` are the thumbsticks in [-1, 1] (+1 is right or up); `lt`, `rt` are the triggers in [0, 1]. These are the units of the GameInput gamepad state. |
+| `base=poll` or `base=start` | time base of every entry; first item only. `poll` (the default) counts seconds from the first input poll of the process, `start` from process start. |
+
+Entries that are active at the same time combine: button masks are OR-ed; for one axis the later
+item wins. When an axis entry ends the axis returns to 0. Keyboard and XInput values still merge
+in (buttons OR-ed, for an axis the larger magnitude wins). Examples:
+
+```text
+4@60,1@70,20@80                  A, Menu, then Y for 0.3 s each, counted from the first poll
+4@60+2,8@61                      A held 2 s; B pressed at 61 s while A is still held (mask 0xC)
+base=start,lx=-1@40+1.5,rt=1@41  left stick fully left for 1.5 s and the right trigger at 41 s after process start
+```
+
+A script that was valid before holds and axes (`<mask>@<s>` items only) keeps its meaning: the
+same buttons at the same times on the first-poll base.
+
+Up to 256 timed entries and 4,095 characters are accepted, as before. A longer value is ignored
+as a whole and logged as `x2w-input X2W_INPUT_SCRIPT ignored: <n> characters, at most 4095`. When
+any item is rejected, the stand-in logs
+`x2w-input X2W_INPUT_SCRIPT: <used> of <items> entries used (<malformed> malformed, at most 256)`.
+When it is created it also logs
+`x2w-input script: <n> entries accepted, <m> rejected, time base first-poll|process-start` and, for
+each of the first 32 rejected items,
+`x2w-input script item <index> rejected (<reason>): "<item>"` (index 1 is the first non-empty item).
+Reasons: `missing @<seconds>`, `bad time`, `bad duration`, `trailing text`, `bad mask`, `bad value`,
+`value out of range [-1, 1]` or `[0, 1]`, `unknown token`, `base= must be the first item`,
+`unknown base (use poll or start)` and `over 256 entries`. At the first poll it logs
+`x2w-input script time base <base>: first poll at <s> s, first entry at <s> s since process start`,
+and once the script time passes the end of the last entry
+`x2w-input script time passed its last entry (<n> entries, ended at <s> s on the script time base)`.
+
+The parser and playback are in `src/startup_stubs/input_script.h`. The check reads the stand-in
+through `IGameInput::GetCurrentReading` with the script clock set by `X2W_INPUT_CLOCK_MS`
+(milliseconds since process start; a test seam, not for runs):
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gameinput_script_(long|entries|syntax)$' -V
+```
+
+It exits 77 (skip) after the parser checks when XInput pad 0 is connected, because that pad's
+values merge into every reading.
 
 ## Game saves
 
