@@ -776,10 +776,25 @@ void fail_unrecorded(Object* self)
     }
 }
 
+// Fails every entry still waiting, in order; none of them will run.
+void fail_waiting(Object* self, QueueWork* work)
+{
+    for (;;) {
+        Entry entry{};
+        {
+            const std::lock_guard guard(work->mutex);
+            if (work->waiting.empty()) break;
+            entry = std::move(work->waiting.front());
+            work->waiting.pop_front();
+        }
+        fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value);
+    }
+}
+
 // Submit: entries that could not be stored fail now; waiting entries go to the worker, which is
 // started if it is not running yet (resources may have recovered since Enqueue). If it still cannot
-// be started, the waiting entries fail too: their status entries and fences complete here, not
-// earlier in Enqueue.
+// be started, or the worker's list cannot grow, the waiting entries fail too: their status entries
+// and fences complete here, not earlier in Enqueue. No exception leaves Submit.
 void submit(Object* self)
 {
     QueueWork* work = ensure_work(self);
@@ -787,28 +802,27 @@ void submit(Object* self)
     fail_unrecorded(self);
     if (!work) return;
     if (!started) {
-        for (;;) {
-            Entry entry{};
-            {
-                const std::lock_guard guard(work->mutex);
-                if (work->waiting.empty()) break;
-                entry = std::move(work->waiting.front());
-                work->waiting.pop_front();
-            }
-            fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value);
-        }
+        fail_waiting(self, work);
         return;
     }
+    bool all_moved = true;
     {
         const std::lock_guard guard(work->mutex);
         const u64 submission_id = ++work->next_submission_id;
-        for (auto& entry : work->waiting) {
-            entry.submission_id = submission_id;
-            work->submitted.push_back(std::move(entry));
+        try {
+            // An entry leaves `waiting` only after it is in `submitted`, so a failed growth loses none.
+            while (!work->waiting.empty()) {
+                Entry& entry = work->waiting.front();
+                entry.submission_id = submission_id;
+                work->submitted.push_back(std::move(entry));
+                work->waiting.pop_front();
+            }
+        } catch (const std::bad_alloc&) {
+            all_moved = false;
         }
-        work->waiting.clear();
     }
     work->wake.notify_one();
+    if (!all_moved) fail_waiting(self, work);
 }
 
 // Enqueue only records the entry, whether or not a worker runs; nothing completes before Submit.
@@ -851,7 +865,12 @@ void __stdcall queue_enqueue_request(Object* self, const unsigned char* request)
         const unsigned page_offset = static_cast<unsigned>(*reinterpret_cast<const u64*>(request + 0x10) & 0xFFFF);
         const std::size_t pages = (std::size_t{page_offset} + destination_size + 0xFFFF) / 0x10000;
         if (title && pages && x2w_local::readable(title, pages * sizeof(ULONG_PTR))) {
-            entry.tokens.assign(title, title + pages);
+            try {
+                entry.tokens.assign(title, title + pages);
+            } catch (const std::bad_alloc&) {
+                defer_unrecorded(self, entry);  // fails at Submit; nothing leaves Enqueue
+                return;
+            }
             for (ULONG_PTR token : entry.tokens)
                 if (!token) InterlockedIncrement(&zero_tokens_at_enqueue);
         }

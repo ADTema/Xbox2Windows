@@ -421,11 +421,14 @@ These are measured on one executable; treat them as hypotheses for others.
   its status entry takes the pending failure (`E_OUTOFMEMORY` when nothing worse is pending) and
   its fence is signaled, so nothing is left at `E_PENDING`. An entry that could not even be
   recorded loses its request bytes, so it fails at Submit even if the worker starts then; only when
-  the small record itself cannot be allocated is the entry failed inside Enqueue.
+  the small record itself cannot be allocated is the entry failed inside Enqueue. No exception
+  leaves Enqueue or Submit: a request whose page tokens cannot be copied is recorded the same way,
+  and if Submit cannot grow the worker's list the entries still waiting fail there.
   `startup_storage_worker_start` compiles the stand-in into the test, redirects `CreateThread`
-  and replaces `operator new` to make both failures on demand, and checks pending status and an
-  unsignaled fence before Submit, failure status and a signaled fence after it, and a correct
-  request on the same queue afterwards.
+  and replaces `operator new` with one that fails the N-th allocation once and then behaves
+  normally. It sweeps N over Enqueue and Submit, and checks pending status and an unsignaled fence
+  before Submit, then a request that completed with correct data or a failure, a fence signaled
+  once, and a correct request on the same queue afterwards. A crash names the stage it was in.
 
 ## Shortcuts that are known to be wrong
 

@@ -5,15 +5,19 @@
 // of loading as a DLL, so it shares the test's allocator and CreateThread:
 //   - CreateThread is redirected, for the stand-in's translation unit only, to a function that can
 //     fail every thread creation (both the committed-stack attempt and the default-stack attempt);
-//   - operator new is replaced with one that throws std::bad_alloc on the calling thread when armed.
-//     The queue's three std::deque members allocate in their constructors, so the construction of
-//     the queue's work throws although the work itself is allocated with new (std::nothrow).
+//   - operator new is replaced with one that, when armed with N, throws std::bad_alloc from the N-th
+//     throwing-form allocation on the calling thread and then disarms itself, so exactly one
+//     allocation fails and everything after it (logging, library internals, recovery) behaves
+//     normally. Which allocation that is differs between standard libraries (a std::deque allocates
+//     in its constructor on some and at its first push_back on others), so the test sweeps N.
 //
 // Checks, each on a fresh queue: with no worker, before Submit the status entry is still pending, the
 // fence is not signaled and the destination is untouched; after Submit the status entry holds a
-// failure and the fence is signaled; with a throwing queue construction no exception reaches the caller
-// and the same holds; and once the failure is gone a request on the same queue returns correct data.
-// A worker that cannot start at Enqueue but can at Submit runs the entries normally.
+// failure and the fence is signaled. A worker that cannot start at Enqueue but can at Submit runs the
+// entries normally. For every N at Enqueue and every N at Submit no exception reaches the caller,
+// nothing completes inside Enqueue, and afterwards the request either completed with correct data or
+// completed with a failure, the fence was signaled exactly once, and a later request on the same queue
+// returns correct data. A crash or an unhandled exception names the stage it happened in.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -25,14 +29,16 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <csignal>
 #include <cstdlib>
+#include <exception>
 #include <new>
 #include <vector>
 
 namespace {
 std::atomic<bool> fail_thread_creation{false};
 std::atomic<int> thread_attempts{0};
-thread_local bool throw_on_new = false;
+thread_local int fail_countdown = 0;  // 0: disarmed; N: the N-th throwing-form allocation throws
 std::atomic<int> thrown{0};
 
 HANDLE WINAPI creator_under_test(LPSECURITY_ATTRIBUTES attributes, SIZE_T stack, LPTHREAD_START_ROUTINE start,
@@ -49,7 +55,7 @@ HANDLE WINAPI creator_under_test(LPSECURITY_ATTRIBUTES attributes, SIZE_T stack,
 
 void* operator new(std::size_t size)
 {
-    if (throw_on_new) {
+    if (fail_countdown > 0 && --fail_countdown == 0) {
         ++thrown;
         throw std::bad_alloc();
     }
@@ -199,19 +205,21 @@ bool untouched_bytes(const std::vector<unsigned char>& bytes)
     return true;
 }
 
-// A request, a status entry and a fence signal are enqueued; nothing may complete until Submit.
-// before_enqueue / before_submit let the caller arm a failure around each step.
-template <class Arm>
-bool enqueue_without_effects(Fixture& f, Fixture::Queue& q, std::vector<unsigned char>& destination, Arm arm)
+// Requests, a status entry and a fence signal are enqueued; nothing may complete until Submit. Enough
+// requests are enqueued to cross a block boundary of the queue's lists. fail_nth arms the N-th
+// allocation to fail during the whole sequence (0: none).
+constexpr int requests_per_run = 4;
+
+bool enqueue_without_effects(Fixture& f, Fixture::Queue& q, std::vector<unsigned char>& destination, int fail_nth)
 {
     try {
-        arm(true);
-        f.request(q, destination);
+        fail_countdown = fail_nth;
+        for (int i = 0; i < requests_per_run; ++i) f.request(q, destination);
         f.status_entry(q, 0);
         f.signal(q, 7);
-        arm(false);
+        fail_countdown = 0;
     } catch (...) {
-        arm(false);
+        fail_countdown = 0;
         return fail("an exception left an Enqueue call");
     }
     if (f.complete(q, 0) || f.hresult(q, 0) != pending_status) return fail("the status entry completed inside Enqueue");
@@ -246,7 +254,7 @@ bool worker_cannot_start(Fixture& f)
     std::vector<unsigned char> destination(f.plain.size(), untouched);
     fail_thread_creation = true;
     thread_attempts = 0;
-    const bool effects_deferred = enqueue_without_effects(f, q, destination, [](bool) {});
+    const bool effects_deferred = enqueue_without_effects(f, q, destination, 0);
     const int attempts = thread_attempts;
     f.submit(q);
     fail_thread_creation = false;
@@ -264,7 +272,7 @@ bool worker_starts_at_submit(Fixture& f)
     if (!f.create(q, f.vtables)) return fail("cannot create the queue");
     std::vector<unsigned char> destination(f.plain.size(), untouched);
     fail_thread_creation = true;
-    const bool effects_deferred = enqueue_without_effects(f, q, destination, [](bool) {});
+    const bool effects_deferred = enqueue_without_effects(f, q, destination, 0);
     fail_thread_creation = false;
     if (!effects_deferred) return false;
     f.submit(q);
@@ -275,33 +283,141 @@ bool worker_starts_at_submit(Fixture& f)
     return true;
 }
 
-// Constructing the queue's work throws std::bad_alloc, at Enqueue and also at Submit.
-bool construction_throws(Fixture& f, bool throw_at_submit)
+// One allocation fails at Enqueue (the fail_enqueue-th) and one at Submit (the fail_submit-th); 0 means
+// none. A later request completing means every earlier entry has run or failed, since the worker runs
+// entries in order and failures are completed inside Submit.
+bool one_allocation_fails(Fixture& f, int fail_enqueue, int fail_submit, int& thrown_at_enqueue, int& thrown_at_submit)
 {
     Fixture::Queue q;
     if (!f.create(q, f.vtables)) return fail("cannot create the queue");
     std::vector<unsigned char> destination(f.plain.size(), untouched);
     thrown = 0;
-    const bool effects_deferred = enqueue_without_effects(f, q, destination, [](bool on) { throw_on_new = on; });
-    if (!effects_deferred) return false;
-    if (thrown == 0) return fail("the queue construction never threw: the control did not reach the deques");
+    if (!enqueue_without_effects(f, q, destination, fail_enqueue)) return false;
+    thrown_at_enqueue += thrown;
+    thrown = 0;
     try {
-        throw_on_new = throw_at_submit;
+        fail_countdown = fail_submit;
         f.submit(q);
-        throw_on_new = false;
+        fail_countdown = 0;
     } catch (...) {
-        throw_on_new = false;
+        fail_countdown = 0;
         return fail("an exception left Submit");
     }
-    if (!failed_at_submit(f, q)) return false;
-    if (!untouched_bytes(destination)) return fail("the failed request changed its destination");
-    return serves_next_request(f, q);
+    thrown_at_submit += thrown;
+    if (!serves_next_request(f, q)) return false;
+    if (!f.complete(q, 0)) return fail("the status entry stayed pending after later work completed");
+    if (f.hresult(q, 0) == 0) {
+        if (destination != f.plain) return fail("a successful status entry has no data");
+    } else if (f.hresult(q, 0) > 0 || (!untouched_bytes(destination) && destination != f.plain)) {
+        return fail("a failed request left partial data or a success-like status");
+    }
+    if (q.fence.signals != 1 || q.fence.value != 7) return fail("the fence was not signaled exactly once");
+    return true;
+}
+
+// Every allocation point of Enqueue and of Submit is failed once, alone and in combination.
+bool every_allocation_can_fail(Fixture& f)
+{
+    constexpr int sweep = 10;
+    int thrown_at_enqueue = 0, thrown_at_submit = 0;
+    for (int at_enqueue = 0; at_enqueue <= sweep; ++at_enqueue)
+        for (int at_submit = 0; at_submit <= sweep; ++at_submit)
+            if (!one_allocation_fails(f, at_enqueue, at_submit, thrown_at_enqueue, thrown_at_submit)) {
+                std::fprintf(stderr, "  (allocation %d at Enqueue, allocation %d at Submit)\n", at_enqueue, at_submit);
+                return false;
+            }
+    if (thrown_at_enqueue == 0 || thrown_at_submit == 0)
+        return fail("the control never failed an allocation: the sweep did not reach the queue's storage");
+    std::printf("allocation sweep: %d failures at Enqueue, %d at Submit\n", thrown_at_enqueue, thrown_at_submit);
+    return true;
+}
+
+// A request with page tokens copies them into a vector at Enqueue: that allocation may fail too.
+bool page_tokens_allocation_fails(Fixture& f)
+{
+    static ULONG_PTR title[1] = {0x10000};
+    for (int fail_nth = 1; fail_nth <= 10; ++fail_nth) {
+        Fixture::Queue q;
+        if (!f.create(q, f.vtables)) return fail("cannot create the queue");
+        unsigned char bytes[0x48] = {};
+        *reinterpret_cast<std::uint64_t*>(bytes + 0x00) = 1 | (1ull << 21);
+        *reinterpret_cast<ULONG_PTR**>(bytes + 0x08) = title;
+        *reinterpret_cast<unsigned*>(bytes + 0x18) = 16;
+        try {
+            fail_countdown = fail_nth;
+            reinterpret_cast<EnqueueRequestFn>(q.queue->vtable[3])(q.queue, bytes);
+            f.status_entry(q, 0);
+            fail_countdown = 0;
+        } catch (...) {
+            fail_countdown = 0;
+            return fail("an exception left EnqueueRequest with page tokens");
+        }
+        if (f.complete(q, 0)) return fail("the status entry completed inside Enqueue");
+    }
+    return true;
+}
+
+// A crash is never silent: whatever ends the process names the stage it was in.
+const char* volatile current_stage = "start";
+
+void report_end(const char* what, unsigned long code)
+{
+    std::fprintf(stderr, "FAIL: %s (0x%08lx) during stage \"%s\"\n", what, code, current_stage);
+    std::fflush(stderr);
+}
+
+[[noreturn]] void on_terminate()
+{
+    report_end("std::terminate", 0);
+    std::_Exit(1);
+}
+
+void on_abort(int)
+{
+    report_end("abort", 0);
+    std::_Exit(1);
+}
+
+LONG WINAPI on_unhandled(EXCEPTION_POINTERS* info)
+{
+    report_end("unhandled exception", info && info->ExceptionRecord ? info->ExceptionRecord->ExceptionCode : 0);
+    TerminateProcess(GetCurrentProcess(), 1);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+#ifdef _MSC_VER
+void on_invalid_parameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned, std::uintptr_t)
+{
+    report_end("invalid parameter", 0);
+    std::_Exit(1);
+}
+#endif
+
+void install_crash_reports()
+{
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+    std::set_terminate(on_terminate);
+    std::signal(SIGABRT, on_abort);
+    SetUnhandledExceptionFilter(on_unhandled);
+#ifdef _MSC_VER
+    _set_invalid_parameter_handler(on_invalid_parameter);
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
+}
+
+bool stage(const char* name, bool (*run)(Fixture&), Fixture& f)
+{
+    current_stage = name;
+    std::fprintf(stderr, "stage: %s\n", name);
+    std::fflush(stderr);
+    return run(f);
 }
 
 }  // namespace
 
 int main()
 {
+    install_crash_reports();
     void* factory = nullptr;
     if (DStorageGetFactory(nullptr, &factory) != 0 || !factory) return fail("cannot get the factory"), 1;
     Fixture f;
@@ -310,10 +426,10 @@ int main()
     for (std::size_t i = 0; i < f.plain.size(); ++i) f.plain[i] = static_cast<unsigned char>((i % 251) ^ 0x5a);
     f.stream = stored_zlib(f.plain);
 
-    if (!worker_cannot_start(f)) return 1;
-    if (!worker_starts_at_submit(f)) return 1;
-    if (!construction_throws(f, false)) return 1;
-    if (!construction_throws(f, true)) return 1;
-    std::puts("a queue that cannot start its worker completes status and fences at Submit, and recovers");
+    if (!stage("worker_cannot_start", worker_cannot_start, f)) return 1;
+    if (!stage("worker_starts_at_submit", worker_starts_at_submit, f)) return 1;
+    if (!stage("every_allocation_can_fail", every_allocation_can_fail, f)) return 1;
+    if (!stage("page_tokens_allocation_fails", page_tokens_allocation_fails, f)) return 1;
+    std::puts("a queue that cannot start its worker or allocate completes status and fences at Submit, and recovers");
     return 0;
 }
