@@ -1069,6 +1069,15 @@ if(EXISTS "${INTAKE_PYTHON}")
         cpu_translation(cpu_switch_${variant} cpu_switch_aot select_rva,select_rel,run_ops,shift_narrow,flag_select,cmov_read,select_rel_edges)
     endforeach()
     target_compile_definitions(cpu_switch_swapped PRIVATE SWAP_TABLE)
+    foreach(variant IN ITEMS original swapped)
+        cpu_asm_fixture(cpu_switch_inverted_${variant} switch_inverted)
+        cpu_translation(cpu_switch_inverted_${variant} cpu_switch_aot inv_rva_jbe,inv_rel_jb,inv_rel_window_jbe)
+    endforeach()
+    target_compile_definitions(cpu_switch_inverted_swapped PRIVATE SWAP_TABLE)
+    add_test(NAME cpu_aot_switch_inverted COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/switch_inverted_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_switch_inverted_original>" "$<TARGET_FILE:cpu_switch_inverted_original_lifted>"
+        "$<TARGET_FILE:cpu_switch_inverted_swapped_lifted>")
     add_test(NAME cpu_aot_jump_tables COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/switch_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_switch_original>" "$<TARGET_FILE:cpu_switch_original_lifted>"
