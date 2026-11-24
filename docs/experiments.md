@@ -4405,6 +4405,19 @@ one operand at a time, and a third changes the first inactive word. The test
 requires each control to fail at the expected word. Run
 `ctest --preset dev --no-tests=error -R '^compute_store_aot_guard_read_(warp|hardware)$' -V`.
 
+#### Unsigned three-source maximum and minimum
+
+`v_max3_u32 vD, a, b, c` lowers to `max(max(a, b), c)` and `v_min3_u32 vD, a, b, c` to `min(min(a, b), c)`, the unsigned maximum and minimum of the three sources (RDNA2 ISA, VOP3A `V_MAX3_U32` and `V_MIN3_U32`). The sources are known words, as for `v_mad_u32_u24`. A source that is not one, a signed or 16-bit form (`v_max3_i32`, `v_min3_u16`), a modifier such as `clamp` or `|v1|`, a register range or a missing source stops the lowering at the instruction. A destination past v255 is `Unverified ALU operand`.
+
+The fixture changes the read-compute-write kernel above by hand. With `cap = params[0].y = 0x8c000000`:
+
+```c
+uint v = src[gid], d = v * 0x9e3779b9;
+out[gid] = umax3(v, cap, d) ^ umin3(d, 0x8c800000, v);
+```
+
+Every source word is above `0x8b000000`, and the cap and the literal are above `0x80000000`. The product `d` falls on either side of `0x80000000`, so a signed comparison picks a different source for 73 of the 150 lanes. In the largest dispatch, each operation picks each of its three sources for some lanes. The expected words come from a CPU model that sorts the three words. On five groups with `n = 150`, each of these references must fail at the first word where it differs: signed `max3` or `min3`, `min3` for `max3` and the reverse, either operation without its third source, and lane 150 also writing. So must recompiled HLSL with either operation signed or swapped, without its third source, or with the cap read from `params[0].z`. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_alu_minmax3_(warp|hardware)$' -V`. Without a Windows GPU, `python -B tests/compute_alu_minmax3_check.py controls` runs the exact-text and rejection checks.
+
 #### Guarded binary32 add, subtract and multiply
 
 Four VOP2 forms lower to one rounded binary32 operation each, on the bit pattern of a word, so a result is again a word that can be stored, copied or fed to the integer forms above:
