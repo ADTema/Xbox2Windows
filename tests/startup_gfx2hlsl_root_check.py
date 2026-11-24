@@ -38,11 +38,18 @@ BAD = {
     "part count past end": (b"DXBC" + bytes(16) + struct.pack("<III", 1, 36, 1000), TRUNCATED),
     "RTS0 without body": (container([(b"RTS0", b"")]), TRUNCATED),
     "parameter table past end": (container([(b"RTS0", struct.pack("<6I", 1, 4, 24, 0, 24, 0))]), TRUNCATED),
+    "descriptor table past end": (container([(b"RTS0", struct.pack("<6I", 1, 1, 24, 0, 36, 0)
+                                                        + struct.pack("<3I", 1, 0, 400))]), TRUNCATED),
     "no RTS0": (container([(b"ABCD", bytes(8))]), "no RTS0 part"),
 }
+# One type-1 parameter (vis 0) whose table, at byte 36 of the part, is (register 5, space 2, count 3).
+TABLE_ROOT = container([(b"RTS0", struct.pack("<6I", 1, 1, 24, 0, 36, 0)
+                         + struct.pack("<3I", 1, 0, 36) + struct.pack("<3I", 5, 2, 3))])
 
 
 def main():
+    table = gfx2hlsl.parse_root(TABLE_ROOT)["params"]
+    assert table == [dict(type=1, vis=0, reg=5, space=2, count=3)], table
     vs, ps = code(12), code(0)
     with tempfile.TemporaryDirectory() as tmp:
         directory = Path(tmp)
