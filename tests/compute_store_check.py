@@ -777,11 +777,20 @@ READ_VOP2 = variant(
     ("v_min_u32_e32 v1, s0, v1", "v_add_nc_u32_e32 v2, s0, v1\nv_or_b32_e32 v2, 0x80000010, v2\n"
                                  "v_xor_b32_e32 v2, 0x80000001, v2\nv_max_u32_e32 v1, v1, v2"),
 )
+# The shift and subtract operations of the subset on a computed word: the product is shifted left until its
+# bit 14 is the sign bit, shifted right arithmetically, subtracted from the cap (src0 - src1), and the literal
+# 0x1234 is reverse-subtracted (src1 - src0).
+READ_SHIFT_SUB = variant(
+    READ_COMPUTE,
+    ("v_min_u32_e32 v1, s0, v1", "v_lshlrev_b32_e32 v2, 17, v1\nv_ashrrev_i32_e32 v2, 20, v2\n"
+                                 "v_sub_nc_u32_e32 v3, s0, v2\nv_subrev_nc_u32_e32 v1, 0x1234, v3"),
+)
 ALU_CASES = [
     ("read_compute", READ_COMPUTE, 32, READ_BINDING),
     ("read_mad24", READ_MAD24, 32, READ_BINDING),
     ("read_mul_lo", READ_MUL_LO, 32, READ_BINDING),
     ("read_vop2", READ_VOP2, 32, READ_BINDING),
+    ("read_shift_sub", READ_SHIFT_SUB, 32, READ_BINDING),
 ]
 
 
@@ -1004,6 +1013,11 @@ def alu_controls():
     vop2 = aot.lower(READ_VOP2, 32, **READ_BINDING).splitlines()
     assert vop2[-3] == ("        outputData.Store(tid.x * 4u + 0u, max(" + mad_word + ", (0x80000001u ^ (0x80000010u | "
                         f"(params[0].y + {mad_word})))));"), vop2
+    # Shift and subtract in order; src0 prints first for the reversed-operand forms, so each operand order is pinned.
+    shift_sub = aot.lower(READ_SHIFT_SUB, 32, **READ_BINDING).splitlines()
+    product = f"((((0x0000ffffu & {load}) & 0xffffffu) * (({load} >> (0x00000010u & 31u)) & 0xffffffu)) + tid.x)"
+    assert shift_sub[-3] == ("        outputData.Store(tid.x * 4u + 0u, ((params[0].y - asuint(asint((" + product
+                             + " << (0x00000011u & 31u))) >> (0x00000014u & 31u))) - 0x00001234u));"), shift_sub
     mul = "v_mul_lo_u32 v1, s0, v1"
     lines = aot.lower(READ_MUL_LO, 32, **READ_BINDING).splitlines()
     assert lines[-4:] == [GUARD_IF, f"        outputData.Store(tid.x * 4u + 0u, (params[0].y * {load}));",
@@ -1022,7 +1036,7 @@ def alu_controls():
         # Wrong opcodes: signed or other operations, and a carry form that would write vcc.
         (unsupported + "v_min_i32_e32", (("v_min_u32_e32", "v_min_i32_e32"),)),
         (unsupported + "v_max_i32_e32", (("v_min_u32_e32", "v_max_i32_e32"),)),
-        (unsupported + "v_ashrrev_i32_e32", (("v_lshrrev_b32_e32", "v_ashrrev_i32_e32"),)),
+        (unsupported + "v_mul_hi_u32_e32", (("v_lshrrev_b32_e32", "v_mul_hi_u32_e32"),)),
         (unsupported + "v_xnor_b32_e32", (("v_and_b32_e32", "v_xnor_b32_e32"),)),
         (unsupported + "v_mad_i32_i24", ((mad, "v_mad_i32_i24 v1, v2, v1, v0"),)),
         (unsupported + "v_add_co_u32", ((mad, "v_add_co_u32 v1, vcc_lo, v2, v0"),)),
@@ -3151,6 +3165,73 @@ def draw_vop2(directory, compiler, cmd, case, name):
     return 0
 
 
+SHIFT_SUB_CAP = 0x0badf00d
+
+
+def shift_sub_word(gid, *, logical=False, shift=17, reverse_sub=False, reverse_subrev=False, skip=()):
+    """Independent CPU reference of the read_shift_sub result for one lane: the product is shifted left, shifted
+    right (arithmetically unless logical), subtracted from the cap, and 0x1234 is reverse-subtracted."""
+    word = source_word(gid)
+    value = (((word & 0xffff) * (word >> 16) + gid) & 0xffffffff)
+    value = value if "shl" in skip else (value << shift) & 0xffffffff
+    signed = value - (1 << 32) if value >> 31 else value
+    value = value >> 20 if logical else (signed >> 20) & 0xffffffff
+    value = (value - SHIFT_SUB_CAP if reverse_sub else SHIFT_SUB_CAP - value) & 0xffffffff
+    return (0x1234 - value if reverse_subrev else value - 0x1234) & 0xffffffff
+
+
+def shift_sub_words(groups, bound, **reference):
+    words = [SENTINEL] * 320
+    for gid in range(min(32 * groups, bound)):
+        words[gid] = shift_sub_word(gid, **reference)
+    return words
+
+
+def draw_shift_sub(directory, compiler, cmd, case, name):
+    """Shift and subtract chain against shift_sub_word, from the 320-word case format."""
+    constants = [0x5eed0000 + i for i in range(16)]
+    constants[1] = SHIFT_SUB_CAP
+    groups, bound = READ_RUNS[-1]
+
+    def write(words):
+        case.write_bytes(struct.pack("<337I", groups, *words, bound, *constants[1:]))
+
+    expected = shift_sub_words(groups, bound)
+    wrong = (("logical right shift", dict(logical=True)), ("shift by 16", dict(shift=16)),
+             ("shift dropped", dict(skip=("shl",))), ("sub reversed", dict(reverse_sub=True)),
+             ("subrev not reversed", dict(reverse_subrev=True)))
+    for label, reference in wrong:
+        assert expected != shift_sub_words(groups, bound, **reference), f"{label} would go unseen"
+    write(expected)
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+    # Each wrong reference must fail the run at the first word where it differs from the right one.
+    for label, reference in wrong:
+        wrong_words = shift_sub_words(groups, bound, **reference)
+        word = next(i for i, (a, b) in enumerate(zip(expected, wrong_words)) if a != b)
+        write(wrong_words)
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"{name}: reference '{label}' escaped detection\n{bad.stderr}")
+    write(expected)
+    source = (directory / "store.hlsl").read_text(encoding="ascii")
+    for label, old, new in (("logical right shift", "asuint(asint(", "(("),
+                            ("shift by 16", "(0x00000011u & 31u)", "(0x00000010u & 31u)"),
+                            ("sub dropped", "(params[0].y - ", "(0u - "),
+                            ("subrev dropped", " - 0x00001234u)", " - 0x00000000u)")):
+        mutated = source.replace(old, new)
+        if mutated == source:
+            raise AssertionError(f"{name}: mutation '{label}' did not change the source")
+        src, cso = directory / "mutated.hlsl", directory / "mutated.cso"
+        src.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+        bad = subprocess.run([*cmd[:3], cso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"{name}: mutation '{label}' escaped detection")
+    return 0
+
+
 def draw_mad24(directory, compiler, cmd, case):
     # Dispatch one group, enable only lane zero and leave all 319 other words
     # at their sentinel. With cap = UINT_MAX the entire multiply is observable.
@@ -3238,7 +3319,8 @@ def draw(directory, compiler, renderer, backend, cases=None):
             continue
         if name.startswith(("guard_", "read_")):
             result = (draw_guard if name.startswith("guard_") else draw_alu if name == "read_compute"
-                      else draw_vop2 if name == "read_vop2" else draw_read)(directory, compiler, cmd, case, name)
+                      else draw_vop2 if name == "read_vop2" else draw_shift_sub if name == "read_shift_sub"
+                      else draw_read)(directory, compiler, cmd, case, name)
             if result:
                 return result
             continue

@@ -16,11 +16,17 @@ AXES = "xyz"
 GUARD_COMPARES = {"gt": ">", "lt": "<", "ge": ">=", "le": "<="}
 # The data ALU subset: the unsigned 32-bit operations the LLVM 15 code generator emits for the
 # read-compute-write fixture, on known words only. v_and_b32, v_or_b32, v_xor_b32 and v_lshrrev_b32 (src1 >> src0[4:0])
-# reuse the pixel profile's integer templates, as does v_mul_lo_u32. v_mad_u32_u24 is
+# reuse the pixel profile's integer templates, as does v_mul_lo_u32. v_lshlrev_b32 and v_ashrrev_i32 shift src1
+# by src0[4:0], the latter arithmetically; v_sub_nc_u32 is src0 - src1 and v_subrev_nc_u32 src1 - src0, both
+# modulo 2^32. v_mad_u32_u24 is
 # src0[23:0] * src1[23:0] + src2, modulo 2^32. None of them writes vcc, so the guard compare stays valid.
 ALU = {
     "v_and_b32_e32": f"({INTEGER['and_b32'][1]})",
     "v_lshrrev_b32_e32": f"({INTEGER['lshrrev_b32'][1]})",
+    "v_lshlrev_b32_e32": f"({INTEGER['lshlrev_b32'][1]})",
+    "v_ashrrev_i32_e32": INTEGER["ashrrev_i32"][1],
+    "v_sub_nc_u32_e32": "({0} - {1})",
+    "v_subrev_nc_u32_e32": "({1} - {0})",
     "v_min_u32_e32": "min({0}, {1})",
     "v_max_u32_e32": "max({0}, {1})",
     "v_add_nc_u32_e32": "({0} + {1})",
@@ -79,6 +85,11 @@ def group_size(psv):
 def is_word(value):
     return isinstance(value, int) or (isinstance(value, tuple)
                                       and value[0] in ("constant_word", "thread", "source", "alu"))
+
+
+def alu_data_word(value):
+    """A known word that is not a dispatch index: a shift of one is data, where a shifted index is a byte offset."""
+    return is_word(value) and not (isinstance(value, tuple) and value[0] == "thread")
 
 
 def hlsl_word(value):
@@ -404,7 +415,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             if dst > 255:
                 raise ValueError("Invalid vector destination")
             vector[dst] = ("ds_lane", tag[1])
-        elif m := re.fullmatch(r"v_lshlrev_b32(?:_e32|_e64)? v(\d+), (\d+), v(\d+)", line):
+        elif ((m := re.fullmatch(r"v_lshlrev_b32(?:_e32|_e64)? v(\d+), (\d+), v(\d+)", line))
+              and not alu_data_word(vector.get(int(m[3])))):
             dst, shift, src = map(int, m.groups())
             tag = vector.get(src)
             if ds_group and dst <= 255 and shift == 2 and isinstance(tag, tuple) and tag[0] == "ds_lane":
@@ -903,7 +915,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or row_tag[1] == column_tag[1]):
                 raise ValueError("Unverified plane byte offset")
             vector[dst] = ("plane_bytes", row_tag[1], shift, *column_tag[1:])
-        elif ((m := re.fullmatch(rf"(v_(?:and_b32|lshrrev_b32|min_u32|max_u32|add_nc_u32|or_b32|xor_b32)_e32) v(\d+), {ALU_SOURCE}, (v\d+)", line))
+        elif ((m := re.fullmatch(rf"(v_(?:and_b32|lshrrev_b32|min_u32|max_u32|add_nc_u32|or_b32|xor_b32|lshlrev_b32|ashrrev_i32|sub_nc_u32|subrev_nc_u32)_e32) v(\d+), {ALU_SOURCE}, (v\d+)", line))
               or (m := re.fullmatch(rf"(v_mul_lo_u32) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}", line))
               or (m := re.fullmatch(rf"(v_mad_u32_u24) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}, {ALU_SOURCE}", line))
               and None not in [alu_word(token, scalar, vector, pending) for token in m.groups()[2:]]):
