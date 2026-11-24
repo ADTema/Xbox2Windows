@@ -18,6 +18,7 @@ struct Translation {
     std::vector<Srv> srvs;
     std::vector<Ud> uds;
     x2w_startup::TranslatedSamplers samplers;
+    x2w_startup::ExportWriteMasks write_masks;  // manifest 'wmask': channels each export leaves unwritten (#1674)
     ID3DBlob* vs = nullptr;
     ID3DBlob* ps = nullptr;
     ID3D12RootSignature* root = nullptr;
@@ -167,6 +168,11 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
                                      !std::strcmp(kind, "tex3d") ? 3 : !std::strcmp(kind, "tex1d") ? 4 : 0;
             Translation::Srv srv{texture_kind, !std::strcmp(source, "vb") ? 1 : !std::strcmp(source, "root") ? 2 : 0, x, y};
             if (static_cast<std::size_t>(i) == tr.srvs.size()) tr.srvs.push_back(srv);
+        } else if (line.compare(0, 6, "wmask ") == 0) {
+            if (!tr.write_masks.read_manifest_line(line.c_str())) {
+                log("x2w-draw invalid write mask manifest line for %016llx: %s", tr.key, line.c_str());
+                return;
+            }
         } else if (!tr.samplers.read_manifest_line(line.c_str())) {
             log("x2w-draw invalid sampler heap manifest for %016llx", tr.key);
             return;
@@ -474,6 +480,8 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
         target = {FALSE, FALSE, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_BLEND_ONE, D3D12_BLEND_ZERO,
                   D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP, D3D12_COLOR_WRITE_ENABLE_ALL};
     if (bound.has_blend) desc.BlendState = bound.blend;
+    // Channels the translated exports leave unwritten stay out of the write mask (#1674).
+    x2w_startup::apply_export_write_masks(desc.BlendState, tr.write_masks);
     if (bound.has_depth_stencil) desc.DepthStencilState = bound.depth_stencil;
     desc.SampleMask = ~0u;
     desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;

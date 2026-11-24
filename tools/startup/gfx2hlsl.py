@@ -339,6 +339,7 @@ class Stage:
         self.used_s, self.used_v = set(), set()
         self.exec_known = True    # exec still equals the entry mask (the lane is active)
         self.exports = {}         # 'pos0' / 'paramN' / 'mrtN' -> [4 expressions]
+        self.write_masks = {}     # 'mrtN' -> channels the export writes (bit c = channel c), see export()
         self.attrs = {}           # pixel: attr index -> 'linear' | 'flat'
         self.uses_pos = False
         self.masks = set()        # scalar registers currently holding lane masks
@@ -1710,8 +1711,15 @@ class Stage:
             self.masks.add(d)
 
     def export(self, asm):
-        m = re.fullmatch(r'exp (\w+) (.*?)((?: done| compr| vm)*)', asm)
+        # disasm_rdna2 prints a compressed EN that is not a whole channel pair (0x0, 0x3, 0xC or 0xF) as
+        # an explicit en:0x.. flag. As in pixel_aot, such a mask is refused rather than guessed.
+        m = re.fullmatch(r'exp (\w+) (.*?)((?: done| compr| vm| en:0x[0-9a-f]+)*)', asm)
+        if not m:
+            raise Unsupported('export form %r' % asm)
         target, vals, flags = m.group(1), [v.strip() for v in m.group(2).split(',')], m.group(3).split()
+        if any(f.startswith('en:') for f in flags):
+            raise Unsupported('compressed export enable mask %s does not select whole channel pairs'
+                              % next(f for f in flags if f.startswith('en:'))[3:])
         if 'vm' in flags and not self.exec_known:
             self.emit('if (!(exec & 1)) discard;')
         if target == 'mrtz':
@@ -1726,12 +1734,26 @@ class Stage:
         if not re.fullmatch(r'pos|param\d+|mrt[0-7]', name):
             raise Unsupported('export target %s' % target)
         kind = self.pipe.mrt_kind(int(name[3:])) if name.startswith('mrt') else 'float'
+        if len(vals) != 4:
+            raise Unsupported('export with %d operands' % len(vals))
+        # The channels the export writes. An 'off' channel is not written, so a render target keeps
+        # what it held there; the pipeline's write mask carries that (manifest 'wmask', #1674).
+        mask = sum(1 << c for c, v in enumerate(vals) if v != 'off')
         if 'compr' in flags:
             if kind in ('uint', 'int'):
                 raise Unsupported('packed integer export %s' % name)
-            a, b = self.u(vals[0]), self.u(vals[2])
-            exprs = ['f16tof32(%s)' % a, 'f16tof32(%s >> 16)' % a, 'f16tof32(%s)' % b, 'f16tof32(%s >> 16)' % b]
-            words = ['U(%s)' % e for e in exprs]
+            # Two binary16 channels per register: the low pair (0, 1) from the first, the high pair
+            # (2, 3) from the second, each printed twice or as 'off', 'off'.
+            if vals[1] != vals[0] or vals[3] != vals[2]:
+                raise Unsupported('compressed export operands %s' % ', '.join(vals))
+            if mask != 0xF and not name.startswith('mrt'):
+                raise Unsupported('partial compressed export to %s' % name)
+            pairs = []
+            for v in (vals[0], vals[2]):
+                r = self.u(v) if v != 'off' else None
+                pairs += ['f16tof32(%s)' % r, 'f16tof32(%s >> 16)' % r] if r else ['0.0', '0.0']
+            exprs = pairs
+            words = ['0u' if e == '0.0' else 'U(%s)' % e for e in exprs]
         elif kind in ('uint', 'int'):
             exprs = ['0u' if v == 'off' else self.u(v) for v in vals]
             words = exprs
@@ -1742,6 +1764,14 @@ class Stage:
         else:
             exprs = ['0.0' if v == 'off' else 'F(%s)' % self.u(v) for v in vals]
             words = ['0u' if v == 'off' else self.u(v) for v in vals]
+        if name.startswith('mrt'):
+            # One pipeline write mask per target: an export of no channel, or two exports of one target
+            # with different channels, cannot be represented and is refused.
+            if not mask:
+                raise Unsupported('export to %s writes no channel' % name)
+            known = self.write_masks.setdefault(name, mask)
+            if known != mask:
+                raise Unsupported('exports to %s write channel masks 0x%x and 0x%x' % (name, known, mask))
         self.exports[name] = True
         expr = '%s(%s)' % ('uint4' if kind in ('uint', 'int') else 'float4', ', '.join(exprs))
         self.emit('o.%s = %s;' % (name, 'asint(%s)' % expr if kind == 'int' else expr))
@@ -2138,6 +2168,11 @@ class Pipeline:
             lines.append('smpheap %d %d fallback %d' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE, SAMPLER_HEAP_FALLBACK))
         lines.append('params %d' % (max(self.params) + 1 if self.params else 0))
         lines.append('targets %s' % ' '.join(k[3:] for k in sorted(self.ps.exports) if k.startswith('mrt')))
+        # 'wmask <target> <mask>': the export leaves the channels outside the mask unwritten, so the
+        # runtime keeps them out of that target's RenderTargetWriteMask. Full masks are not written.
+        for name, mask in sorted(self.ps.write_masks.items(), key=lambda kv: int(kv[0][3:])):
+            if mask != 0xF:
+                lines.append('wmask %d 0x%x' % (int(name[3:]), mask))
         return '\n'.join(lines) + '\n'
 
 
