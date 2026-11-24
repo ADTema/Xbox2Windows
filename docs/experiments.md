@@ -5710,6 +5710,15 @@ control mismatching. The D3D12 debug layer was unavailable.
 [Leonida RDNA2 measurements](https://github.com/ItsNotRexed/Leonida/pull/1685) ·
 [AMD RDNA 2 instruction set](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
 
+**Output modifiers on float-result conversions.** The float-result conversions (`v_cvt_f32_i32`,
+`v_cvt_f32_u32`, `v_cvt_f32_ubyte0..3`, `v_cvt_f32_f16`) sat in the uint-result table, whose dispatch
+refused every modifier, so `v_cvt_f32_i32_e64 v1, v1 mul:2` did not translate - 5 of the 29 refused
+shaders in the first main-game loading-screen cache (#870, issue #1705). They are now their own table,
+lowered through the float path, and accept exactly `clamp`, `mul:2`, `mul:4` and `div:2`; without a
+modifier the emitted text is unchanged. `op_sel` and source modifiers are still refused on a conversion
+rather than silently ignored, and a uint-result conversion such as `v_cvt_f16_f32` keeps refusing output
+modifiers. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_vcvt_omod$' -V`.
+
 ## Pixel color without a texture sample
 
 For an unsampled pixel program, a matched P1/P2 interpolation in the entry mask can supply attr0.x/y/z/w from a four-component TEXCOORD0. The profile binds entry v0/v1 to the barycentric pair and the observed m0 source to the interpolation base. Each completed P2 produces a distinct value, including when the destination overwrites v0. The test vertex shader varies all four channels across a full-screen triangle. CPU references check all four output words at 1,024 pixel centers; an incorrect channel at an interior pixel must fail. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_attribute_'`.
