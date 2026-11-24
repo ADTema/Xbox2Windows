@@ -4,7 +4,7 @@
 
 Xbox2Windows researches static recompilation from Xbox Series X|S (Scarlett) to x64 Windows. It translates selected x64 machine code into C++ and selected gfx1013 shaders into desktop DXIL. You can run the public tests without a game installation.
 
-> **Current status.** Source-built programs run from PE entry to exit, and selected shader fixtures produce checked D3D12 output. Execution of the title's CPU code, full-game startup and frame rate remain unverified.
+> **Current status.** The full-package DXIL compilation scan found a compiled route for 26,500 of 26,503 shader records. Local main-executable diagnostics reach D3D12 pipeline creation, with a verified rendered frame still pending. [Live startup progress #870](https://github.com/R0Y00/Xbox2Windows/issues/870) · [GPU tasks #874](https://github.com/R0Y00/Xbox2Windows/issues/874)
 
 ## Community and contributions
 
@@ -230,6 +230,8 @@ Maintainers link independent results to the original report and record the adapt
 The installation metadata inspected for this case study lists a Scarlett executable. The main executable was absent from the inspected files. The public regression suite uses source-built fixtures and independently built shaders. [Intake methods and evidence](docs/experiments.md#static-executable-intake)
 
 Windows Authenticode verification on the local copy reported `HashMismatch` for 12 DLLs and `NotSigned` for four. Three independently compared whole-file SHA-256 values matched the community reports. The cause of the digest mismatch and the original signing path remain undetermined. [Methods and fingerprints](https://github.com/R0Y00/Xbox2Windows/issues/52)
+
+XCL is a public behavioural reference for what a retail title may ask of the platform. The [XCL reference](docs/xcl-reference.md) records the GPL-2.0-only boundary and the pinned revision; the [capability matrix](docs/xcl-capability-matrix.md) maps selected XCL behaviours to named checked-in tests. Neither document is an Xbox2Windows measurement or a roadmap.
 
 ## License
 

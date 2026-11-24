@@ -114,11 +114,46 @@ def envelope(code: bytes, name: bytes = b"fixture_ps") -> bytes:
 class TestRdna2Disasm(unittest.TestCase):
     """Test pure-Python RDNA 2 disassembler and verify against golden vectors and LLVM."""
 
+    # GFX1013 e32 encodings from llvm-mc 19 -show-encoding.
+    VOP1_VOP2_E32_VECTORS = (
+        ("050f066c", "v_fmac_f16_e32 v3, v5, v7"),
+        ("0d231676", "v_ldexp_f16_e32 v11, v13, v17"),
+        ("1785267e", "v_movreld_b32_e32 v19, v23"),
+        ("1f873a7e", "v_movrels_b32_e32 v29, v31"),
+        ("29894a7e", "v_movrelsd_b32_e32 v37, v41"),
+        ("2f91567e", "v_movrelsd_2_b32_e32 v43, v47"),
+    )
+
+    def test_vop1_vop2_e32_gfx1013(self):
+        for encoding, assembly in self.VOP1_VOP2_E32_VECTORS:
+            with self.subTest(assembly=assembly):
+                record, = disasm_rdna2(bytes.fromhex(encoding))
+                self.assertEqual(record["assembly"], assembly)
+
+    def test_vop1_vop2_e32_llvm_round_trip(self):
+        if not os.environ.get("LLVM_LIB"):
+            self.skipTest("LLVM_LIB environment variable not set; verified against golden vectors")
+        resolved_lib = resolve_llvm_lib(os.environ["LLVM_LIB"])
+        assembler = resolve_tool("LLVM_MC", ["llvm-mc-15", "llvm-mc"])
+        objcopy = resolve_tool("LLVM_OBJCOPY", ["llvm-objcopy-15", "llvm-objcopy"])
+        if not assembler or not objcopy:
+            self.fail(f"VOP1/VOP2 round trip requires llvm-mc and llvm-objcopy (assembler={assembler}, objcopy={objcopy})")
+        source = [assembly for _, assembly in self.VOP1_VOP2_E32_VECTORS]
+        expected = bytes.fromhex("".join(encoding for encoding, _ in self.VOP1_VOP2_E32_VECTORS))
+        emitted = assemble_with_llvm_mc(source, assembler, objcopy)
+        self.assertEqual(emitted, expected)
+        decoded = [record["assembly"] for record in disasm_rdna2(emitted)]
+        self.assertEqual(decoded, llvm_disassemble(emitted, resolved_lib))
+        self.assertEqual(decoded, source)
+        self.assertEqual(assemble_with_llvm_mc(decoded, assembler, objcopy), emitted)
+
     def test_golden_vectors(self):
         vectors = [
             # (hex_bytes, expected_opcode, expected_mnemonic)
             ("000080bf", "s_nop", "s_nop 0"),
             ("000081bf", "s_endpgm", "s_endpgm"),
+            ("00009fbf", "s_code_end", "s_code_end"),
+            ("00000000", "word_0x00000000", ".long 0x00000000"),
             ("000082bf", "s_branch", "s_branch label_0x4"),
             ("7f008cbf", "s_waitcnt", "s_waitcnt vmcnt(15) lgkmcnt(0)"),
             ("000382be", "s_mov_b32", "s_mov_b32 s2, s0"),
@@ -682,14 +717,12 @@ class TestRdna2Disasm(unittest.TestCase):
                 (4, 4, "sopk_truncated", "s_setreg_imm32_b32 <truncated>"),
             ],
         )
-        # Boundary control: a 32-bit literal equal to s_endpgm (0xbf810000) must be consumed as the
-        # s_setreg_imm32_b32 literal rather than ending the stream early, while the real s_endpgm still
-        # terminates disassembly before trailing bytes.
+        # A 32-bit literal equal to s_endpgm (0xbf810000) belongs to s_setreg_imm32_b32.
         stream = bytes.fromhex(
             "810880ba000081bf"  # s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0xbf810000
             "01f804b9"          # s_getreg_b32 s4, hwreg(HW_REG_MODE)
             "000081bf"          # s_endpgm
-            "810884b9"          # trailing s_setreg_b32 after s_endpgm (must not be decoded)
+            "810884b9"          # s_setreg_b32 after s_endpgm is still in the supplied span
         )
         insns = disasm_rdna2(stream)
         self.assertEqual(
@@ -698,8 +731,123 @@ class TestRdna2Disasm(unittest.TestCase):
                 (0, 8, "s_setreg_imm32_b32", "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0xbf810000"),
                 (8, 4, "s_getreg_b32", "s_getreg_b32 s4, hwreg(HW_REG_MODE)"),
                 (12, 4, "s_endpgm", "s_endpgm"),
+                (16, 4, "s_setreg_b32", "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s4"),
             ],
         )
+
+    def test_s_code_end_is_recognized_but_not_translated(self):
+        instruction = disasm_rdna2(bytes.fromhex("00009fbf"))[0]
+        self.assertEqual((instruction["opcode"], instruction["assembly"]), ("s_code_end", "s_code_end"))
+        self.assertTrue(is_opcode_recognized(instruction["opcode"]))
+        self.assertFalse(is_instruction_supported(instruction["assembly"]))
+
+    def test_binary_scan_counts_records_after_s_endpgm(self):
+        code = bytes.fromhex("000081bf0403067e000081bf")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ps_after_end.bin"
+            path.write_bytes(code)
+            result, = scan_directory_or_files([path])
+        self.assertEqual(result["total_instructions"], 3)
+        self.assertEqual(result["opcode_distribution"],
+                         {"s_endpgm": 2, "v_mov_b32_e32": 1})
+        self.assertTrue(result["opcodes_recognized"])
+        self.assertFalse(result["translator_accepted"])
+
+    def test_source_built_records_after_s_endpgm(self):
+        """Decode and scan the complete supplied span, including records after the first program end."""
+        if not os.environ.get("LLVM_LIB"):
+            self.skipTest("LLVM_LIB environment variable not set; verified against golden vectors")
+        resolved_lib = resolve_llvm_lib(os.environ["LLVM_LIB"])
+        assembler = resolve_tool("LLVM_MC", ["llvm-mc-15", "llvm-mc"])
+        objcopy = resolve_tool("LLVM_OBJCOPY", ["llvm-objcopy-15", "llvm-objcopy"])
+        if not assembler or not objcopy:
+            self.fail(
+                f"post-endpgm source fixture requires llvm-mc and llvm-objcopy "
+                f"(assembler={assembler}, objcopy={objcopy})"
+            )
+
+        closed = assemble_with_llvm_mc(["v_mov_b32_e32 v1, v2", "s_endpgm"], assembler, objcopy)
+        closed_records = disasm_rdna2(closed)
+        self.assertEqual(
+            [(record["offset"], record["length"], record["assembly"]) for record in closed_records],
+            [(0, 4, "v_mov_b32_e32 v1, v2"), (4, 4, "s_endpgm")],
+        )
+        self.assertEqual(llvm_disassemble(closed, resolved_lib, offsets=True),
+                         [(record["offset"], record["assembly"]) for record in closed_records])
+
+        boundary = assemble_with_llvm_mc(
+            [
+                "s_branch after_first_exit",
+                "s_endpgm",
+                "v_mov_b32_e32 v1, v2",
+                "s_code_end",
+                "after_first_exit:",
+                "s_endpgm",
+                ".long 0",
+            ],
+            assembler,
+            objcopy,
+        )
+        records = disasm_rdna2(boundary)
+        expected = [
+            (0, 4, "s_branch", "s_branch label_0x10"),
+            (4, 4, "s_endpgm", "s_endpgm"),
+            (8, 4, "v_mov_b32_e32", "v_mov_b32_e32 v1, v2"),
+            (12, 4, "s_code_end", "s_code_end"),
+            (16, 4, "s_endpgm", "s_endpgm"),
+            (20, 4, "word_0x00000000", ".long 0x00000000"),
+        ]
+        self.assertEqual(
+            [(record["offset"], record["length"], record["opcode"], record["assembly"]) for record in records],
+            expected,
+        )
+        llvm_prefix = llvm_disassemble(boundary[:-4], resolved_lib, offsets=True)
+        self.assertEqual([offset for offset, _ in llvm_prefix], [0, 4, 8, 12, 16])
+        self.assertEqual(
+            [(offset, line) for offset, line in llvm_prefix if offset != 0],
+            [(offset, assembly) for offset, _, _, assembly in expected[1:5]],
+        )
+        with self.assertRaisesRegex(ValueError, "at byte 20$"):
+            llvm_disassemble(boundary, resolved_lib)
+
+        self.assertTrue(is_opcode_recognized("s_code_end"))
+        self.assertFalse(is_instruction_supported("s_code_end"))
+        scan_source = [
+            "s_mov_b64 s[50:51], exec",
+            "s_wqm_b64 exec, exec",
+            "s_mov_b32 m0, s24",
+            "v_interp_p1_f32_e32 v8, v0, attr0.x",
+            "v_interp_p1_f32_e32 v9, v0, attr0.y",
+            "v_interp_p2_f32_e32 v9, v1, attr0.y",
+            "v_interp_p2_f32_e32 v8, v1, attr0.x",
+            "s_and_b64 exec, exec, s[50:51]",
+            "s_mov_b32 s21, 0",
+            "s_load_dwordx8 s[28:35], s[20:21], null",
+            "s_mov_b32 s40, 1",
+            "s_mov_b32 s41, 2",
+            "s_mov_b32 s42, 3",
+            "s_mov_b32 s43, 4",
+            "s_waitcnt lgkmcnt(0)",
+            "image_sample v[12:15], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "s_waitcnt vmcnt(0)",
+            "v_cvt_pkrtz_f16_f32_e32 v16, v12, v13",
+            "v_cvt_pkrtz_f16_f32_e32 v17, v14, v15",
+            "exp mrt0 v16, v16, v17, v17 done compr vm",
+            "s_endpgm",
+            "v_mov_b32_e32 v1, v2",
+            "s_endpgm",
+        ]
+        scan_code = assemble_with_llvm_mc(scan_source, assembler, objcopy)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ps_after_end.bin"
+            path.write_bytes(scan_code)
+            result, = scan_directory_or_files([path])
+        self.assertEqual(result["total_instructions"], len(scan_source))
+        self.assertEqual(result["opcode_distribution"]["v_mov_b32_e32"], 1)
+        self.assertTrue(result["opcodes_recognized"])
+        self.assertEqual(result["supported_instructions"], len(scan_source))
+        self.assertFalse(result["translator_accepted"])
+        self.assertEqual(result["lower_error"], "Instruction follows program end")
 
     def test_second_dword_forms_keep_the_stream_aligned(self):
         # Independent GFX10 encodings from LLVM MC 15.0.7 test/MC/AMDGPU (gfx10_asm_vop1.s,

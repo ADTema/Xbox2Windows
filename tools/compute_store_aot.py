@@ -166,7 +166,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
     lds_strided_width = None
     lds_wide_words = {}
     lds_address_shift = None
-    lds_addtid_base_zero = False
+    lds_m0_zero = False
     ds_wait = False
     written_spans = []
     layout = None
@@ -264,7 +264,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
         elif line in ("s_mov_b32 m0, 0", "s_mov_b32 m0, 0x0"):
             if not lds_enabled or guard_span is not None:
                 raise ValueError("Unverified private LDS thread-ID base")
-            lds_addtid_base_zero = True
+            lds_m0_zero = True
         elif m := re.fullmatch(r"s_mov_b32 s(\d+), (s\d+|-?\d+|0x[0-9a-f]+)", line):
             dst, src = int(m[1]), m[2]
             if dst in pending or dst > 105:
@@ -585,7 +585,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             lds_wide_words.update(zip(range(slot, slot + 2), source))
             ds_wait = True
         elif m := re.fullmatch(
-                r"ds_(read2st64_b(?:32|64)|write2st64_b(?:32|64)|wrxchg2st64_rtn_b32) "
+                r"ds_(read2st64_b(?:32|64)|write2st64_b(?:32|64)|wrxchg2st64_rtn_b(?:32|64)) "
                 r"(v\[\d+:\d+\]|v\d+), (v\[\d+:\d+\]|v\d+)"
                 r"(?:, (v\[\d+:\d+\]|v\d+))?(?:, (v\[\d+:\d+\]|v\d+))?"
                 r" offset0:(\d+) offset1:(\d+)", line):
@@ -659,6 +659,39 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     raise ValueError("Uninitialized private wide LDS word")
                 vector.update(zip(registers, (lds_wide_words[slot] for slot in slots)))
             ds_wait = True
+        elif m := re.fullmatch(r"ds_wrxchg2_rtn_b32 v\[(\d+):(\d+)\], v(\d+), v(\d+), v(\d+)"
+                               r"(?: offset0:([0-3]))?(?: offset1:([0-3]))?", line):
+            first, last, addr, src0, src1 = map(int, m.groups()[:5])
+            slots = tuple(int(offset or 0) for offset in m.groups()[5:])
+            if (guard_span is not None or max(last, addr, src0, src1) > 255 or last != first + 1
+                    or vector.get(addr) != ("lds_wide_address",) or slots[0] == slots[1]):
+                raise ValueError("Unverified private paired dword exchange")
+            previous = [lds_wide_words.get(slot) for slot in slots]
+            replacement = [vector.get(reg) for reg in (src0, src1)]
+            if not all(map(is_word, previous + replacement)):
+                raise ValueError("Uninitialized private paired dword exchange")
+            vector.update(zip(range(first, last + 1), previous))
+            lds_wide_words.update(zip(slots, replacement))
+            ds_wait = True
+        elif m := re.fullmatch(r"ds_(append|consume) v(\d+)(?: offset:0)?", line):
+            op, dst = m[1], int(m[2])
+            if (not lds_m0_zero or guard_span is not None or dst > 255
+                    or lds_address_shift != 2 or not is_word(lds_word) or len(ds_steps) >= 64):
+                raise ValueError("Unverified LDS wave counter")
+            old = hlsl_word(lds_word)
+            slot = f"ds_stage_{len(ds_steps)}"
+            previous = f"ds_result_{len(ds_steps)}"
+            # LDS byte zero is lane zero's word. Snapshot it once per group,
+            # then only change that lane's word in the private layout.
+            operator = "+" if op == "append" else "-"
+            ds_steps.append((slot, f"    if (local.x == 0u) {slot}[0] = {old};\n"
+                             "    GroupMemoryBarrierWithGroupSync();\n"
+                             f"    uint {previous} = {slot}[0];"))
+            vector[dst] = ("alu", previous)
+            lds_word = ("alu", f"(local.x == 0u ? ({previous} {operator} 32u) : {old})")
+            if len(hlsl_word(lds_word)) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("LDS expression exceeds the profile limit")
+            ds_wait = True
         elif m := re.fullmatch(
                 r"ds_(read|write)2_b(32|64) (v\[\d+:\d+\]|v\d+), (v\[\d+:\d+\]|v\d+)"
                 r"(?:, (v\[\d+:\d+\]|v\d+))?(?: offset0:([0-3]))?(?: offset1:([0-3]))?", line):
@@ -693,16 +726,20 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     raise ValueError("Uninitialized private wide LDS word")
                 vector.update(zip(registers, (lds_wide_words[slot] for slot in slots)))
             ds_wait = True
-        elif m := re.fullmatch(r"ds_(add_u64|sub_u64|rsub_u64|and_b64|or_b64|xor_b64|"
-                               r"min_i64|max_i64|min_u64|max_u64) v(\d+), "
-                               r"v\[(\d+):(\d+)\](?: offset:(0|8))?", line):
-            op = m[1]
-            addr, first, last = map(int, m.groups()[1:4])
-            slot = int(m[5] or 0) // 4
+        elif ((m := re.fullmatch(r"ds_(add|sub|rsub|and|or|xor|min|max)(?P<ret>_rtn)?(_[uib]64) "
+                                 r"(?(ret)v\[(?P<dst_first>\d+):(?P<dst_last>\d+)\], )"
+                                 r"v(?P<addr>\d+), v\[(?P<src_first>\d+):(?P<src_last>\d+)\]"
+                                 r"(?: offset:(?P<offset>0|8))?", line))
+              and ((op := m[1] + m[3]) in ("add_u64", "sub_u64", "rsub_u64", "and_b64", "or_b64")
+                   or not m["ret"] and op in ("xor_b64", "min_i64", "max_i64", "min_u64", "max_u64"))):
+            addr, first, last = (int(m[key]) for key in ("addr", "src_first", "src_last"))
+            destination = tuple(int(m[key]) for key in ("dst_first", "dst_last")) if m["ret"] else None
+            slot = int(m["offset"] or 0) // 4
             source = (vector.get(first), vector.get(last))
             previous = (lds_wide_words.get(slot), lds_wide_words.get(slot + 1))
             if (guard_span is not None or vector.get(addr) != ("lds_wide_address",)
-                    or last > 255 or last != first + 1 or not all(map(is_word, previous + source))):
+                    or last > 255 or last != first + 1 or not all(map(is_word, previous + source))
+                    or destination and (destination[1] > 255 or destination[1] != destination[0] + 1)):
                 raise ValueError("Unverified private wide LDS update")
             left, right = (source, previous) if op == "rsub_u64" else (previous, source)
             lo, hi = map(hlsl_word, left)
@@ -730,12 +767,14 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("LDS expression exceeds the profile limit")
             lds_wide_words[slot] = ("alu", low)
             lds_wide_words[slot + 1] = ("alu", high)
+            if destination is not None:
+                vector.update(zip(destination, previous))
             ds_wait = True
         elif m := re.fullmatch(r"ds_(write|read)_addtid_b32 v(\d+)(?: offset:0)?", line):
             op, reg = m[1], int(m[2])
             # A single full wave32 makes TID equal to local.x. Zero M0 and
             # offset make this the same private word as an explicit byte address.
-            if not lds_addtid_base_zero or guard_span is not None or reg > 255:
+            if not lds_m0_zero or guard_span is not None or reg > 255:
                 raise ValueError("Unverified private LDS thread-ID access")
             if lds_address_shift not in (None, 2):
                 raise ValueError("Mixed private LDS address strides")
