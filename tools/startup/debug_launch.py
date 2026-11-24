@@ -141,6 +141,12 @@ def main():
         wait = host_cpu.wait_rewrite(code)
         if wait:
             return ("mwaitx" if code[2] == 0xFB else "monitorx") if write(address, wait) else None
+        store = host_cpu.nt_store_rewrite(code)
+        if store:
+            return ("movntss" if code[0] == 0xF3 else "movntsd") if write(address + store[0], store[1]) else None
+        rdpru = host_cpu.rdpru_rewrite(code)
+        if rdpru:
+            return "rdpru" if write(address, rdpru) else None
         found = host_cpu.stub_for(code)
         if not found:
             return None
@@ -160,7 +166,36 @@ def main():
         if not plan or not write(stub_area[0], plan[0]) or not write(address, plan[1]):
             return None
         stub_area[0] += (len(plan[0]) + 15) & ~15
-        return "clzero" if length == 3 else ("insertq" if code[0] == 0xF2 else "extrq")
+        if code[:3] == host_cpu.CLZERO:
+            return "clzero"
+        if host_cpu.rdpid_stub(code):
+            return "rdpid"
+        return "insertq" if code[0] == 0xF2 else "extrq"
+
+    def sha_for_host(tid, address):
+        """Performs a SHA instruction on the stopped thread's context; True when it did."""
+        thread, ctx = get_ctx(tid)
+        if not thread:
+            return False
+
+        def gpr(n):
+            return struct.unpack_from("<Q", ctx, 0x78 + 8 * n)[0]
+
+        def xmm(n):
+            return int.from_bytes(bytes(ctx[0x1A0 + 16 * n:0x1B0 + 16 * n]), "little")
+
+        try:
+            done = host_cpu.sha_apply(read(address, 15), address, gpr, xmm, read)
+        except ImportError:
+            done = None
+        if not done:
+            k32.CloseHandle(wt.HANDLE(thread))
+            return False
+        length, dest, value = done
+        struct.pack_into("<16s", ctx, 0x1A0 + 16 * dest, value.to_bytes(16, "little"))
+        struct.pack_into("<Q", ctx, 0xF8, address + length)
+        set_ctx(thread)
+        return True
 
     ctx_raw = (ctypes.c_ubyte * (1232 + 16))()
     ctx_addr = (ctypes.addressof(ctx_raw) + 15) & ~15
@@ -502,6 +537,8 @@ def main():
             if (ex_code == 0xC000001D and first and host_cpu_on and not stop_first and main_base
                     and main_base <= ex_addr < main_base + 0x10000000):
                 name = rewrite_for_host(ex_addr)
+                if not name and sha_for_host(tid, ex_addr):
+                    name = "sha (per hit)"
                 if name:
                     host_cpu_sites[name] = host_cpu_sites.get(name, 0) + 1
                     if sum(host_cpu_sites.values()) <= 40:

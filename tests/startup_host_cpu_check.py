@@ -84,6 +84,11 @@ def cpuid(leaf):
 def host_features():
     features = set()
     # Leaves 0x80000001 and 0x80000008 exist on every x86-64 processor.
+    ebx7, ecx7 = cpuid(7)
+    if ebx7 >> 29 & 1:
+        features.add("sha")
+    if ecx7 >> 22 & 1:
+        features.add("rdpid")
     _, ecx = cpuid(0x80000001)
     if ecx >> 6 & 1:
         features.add("sse4a")
@@ -223,6 +228,212 @@ def rewrites():
         assert host_cpu.sse4a_stub(refused) is None and host_cpu.stub_for(refused) is None, refused.hex()
 
 
+# ---- MOVNTSS / MOVNTSD, RDPRU, RDPID ------------------------------------------------------------
+def more_rewrites(features):
+    import iced_x86
+
+    def one(code):
+        return iced_x86.Decoder(64, bytes(code), ip=0x1000).decode()
+
+    stores = ((bytes.fromhex("f30f2b01"), iced_x86.Mnemonic.MOVNTSS, iced_x86.Mnemonic.MOVSS),
+              (bytes.fromhex("f20f2b01"), iced_x86.Mnemonic.MOVNTSD, iced_x86.Mnemonic.MOVSD),
+              (bytes.fromhex("f3450f2b4c2410"), iced_x86.Mnemonic.MOVNTSS, iced_x86.Mnemonic.MOVSS),
+              (bytes.fromhex("f2440f2b3d00100000"), iced_x86.Mnemonic.MOVNTSD, iced_x86.Mnemonic.MOVSD))
+    for code, original, wanted in stores:
+        before = one(code)
+        assert before.mnemonic == original, code.hex()
+        offset, byte = host_cpu.nt_store_rewrite(code)
+        after = one(code[:offset] + byte + code[offset + 1:])
+        assert after.mnemonic == wanted and after.len == before.len == len(code), code.hex()
+        assert after.op0_kind == iced_x86.OpKind.MEMORY and after.op1_register == before.op1_register, code.hex()
+        for field in ("memory_base", "memory_index", "memory_index_scale", "memory_displacement"):
+            assert getattr(after, field) == getattr(before, field), (code.hex(), field)
+    for refused in (bytes.fromhex("0f2b0100"),      # movntps
+                    bytes.fromhex("660f2b01"),      # movntpd
+                    bytes.fromhex("f30f2bc1"),      # register form (not an instruction)
+                    bytes.fromhex("f30f1101")):     # movss already
+        assert host_cpu.nt_store_rewrite(refused) is None, refused.hex()
+    # The rewritten stores run on any host: mov rax, 0x4142434445464748; movq xmm1, rax | store [rcx] | ret
+    for prefix, stored in ((0xF3, 4), (0xF2, 8)):
+        code = bytes([prefix, 0x0F, 0x2B, 0x09])  # movnts[sd] [rcx], xmm1
+        offset, byte = host_cpu.nt_store_rewrite(code)
+        f = build(bytes.fromhex("48b84847464544434241") + bytes.fromhex("66480f6ec8"), code[:offset] + byte + code[offset + 1:],
+                  b"\xc3", patch=False)
+        target = ctypes.create_string_buffer(b"\xee" * 16, 16)
+        f(ctypes.addressof(target), 0)
+        assert target.raw == b"HGFEDCBA"[:stored] + b"\xee" * (16 - stored), target.raw
+
+    # RDPRU -> RDTSC; NOP. | rdtsc; nop | shl rdx, 32; or rax, rdx; ret: two calls give rising values.
+    rdpru = host_cpu.rdpru_rewrite(b"\x0f\x01\xfd")
+    assert len(rdpru) == 3 and one(rdpru).mnemonic == iced_x86.Mnemonic.RDTSC and rdpru[2] == 0x90
+    assert host_cpu.rdpru_rewrite(b"\x0f\x01\xf9") is None and host_cpu.rdpru_rewrite(host_cpu.CLZERO) is None
+    counter = build(b"", rdpru, bytes.fromhex("48c1e2204809d0c3"), patch=False)
+    first, second = counter(1, 0), counter(1, 0)
+    assert 0 < first < second, (first, second)
+
+    # RDPID: the value RDTSCP leaves in ecx. A thread can move between two calls, so the reference
+    # is sampled on both sides. rdtscp; mov eax, ecx; ret
+    aux = build(b"", b"", bytes.fromhex("0f01f989c8c3"), patch=False)
+    gprs = {"rax": 0, "rcx": 1, "rdx": 2, "r8": 8, "r9": 9, "r10": 10, "r11": 11}
+    for name, number in gprs.items():
+        rex = bytes([0x41]) if number >= 8 else b""
+        instruction = b"\xf3" + rex + b"\x0f\xc7" + bytes([0xF8 | (number & 7)])
+        assert one(instruction).mnemonic == iced_x86.Mnemonic.RDPID, instruction.hex()
+        move = bytes([0x4C if number >= 8 else 0x48, 0x89, 0xC0 | (number & 7) << 3])  # mov rax, <register>
+        f = build(b"", instruction, move + b"\xc3")
+        for _ in range(8):
+            before, got, after = aux(0, 0), f(0, 0), aux(0, 0)
+            if got in (before, after):
+                break
+        assert got in (before, after), f"rdpid {name}: {got:#x}, rdtscp {before:#x}/{after:#x}"
+        if "rdpid" in features:
+            native = build(b"", instruction, move + b"\xc3", patch=False)
+            assert native(0, 0) in (aux(0, 0), got, before, after), f"native rdpid {name} differs"
+    # The stub keeps the registers it borrows and the flags:
+    # mov rax, rcx; stc | rdpid r8 | jnc bad; lea rax, [rax + rdx]; ret; bad: xor eax, eax; ret
+    kept = build(b"\x48\x89\xc8\xf9", bytes.fromhex("f3410fc7f8"), bytes.fromhex("7305488d0410c331c0c3"))
+    assert kept(0x1000, 0x234) == 0x1234, "rdpid stub changed rax, rdx or CF"
+    for refused in (bytes.fromhex("f30fc7fc"),      # rdpid rsp
+                    bytes.fromhex("f30fc738"),      # memory operand: another instruction
+                    bytes.fromhex("0fc7f8ff"),      # no f3: rdseed
+                    bytes.fromhex("f30fc7f0")):     # /6
+        assert host_cpu.rdpid_stub(refused) is None, refused.hex()
+    return len(stores), len(gprs)
+
+
+# ---- SHA extensions ------------------------------------------------------------------------------
+K256 = [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2]
+
+
+def padded(message):
+    return message + b"\x80" + b"\0" * ((55 - len(message)) % 64) + struct.pack(">Q", len(message) * 8)
+
+
+def sha256_by_instructions(message, ops=host_cpu):
+    """SHA-256 the way code written for the extensions computes it: every schedule word past the
+    first sixteen through SHA256MSG1 and SHA256MSG2, every round through SHA256RNDS2."""
+    add = lambda a, b: host_cpu._pack([x + y for x, y in zip(host_cpu._dwords(a), host_cpu._dwords(b))])  # noqa: E731
+    state = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]
+    data = padded(message)
+    for at in range(0, len(data), 64):
+        w = [host_cpu._pack(struct.unpack(">4I", data[at + 16 * i:at + 16 * i + 16])) for i in range(4)]
+        for t in range(4, 16):
+            high, low = host_cpu._dwords(w[t - 1]), host_cpu._dwords(w[t - 2])
+            shifted = host_cpu._pack([low[1], low[2], low[3], high[0]])  # palignr(w[t-1], w[t-2], 4)
+            w.append(ops.sha256msg2(add(ops.sha256msg1(w[t - 4], w[t - 3]), shifted), w[t - 1]))
+        a, b, c, d, e, f, g, h = state
+        abef, cdgh = host_cpu._pack([f, e, b, a]), host_cpu._pack([h, g, d, c])
+        for t in range(16):
+            wk = add(w[t], host_cpu._pack(K256[4 * t:4 * t + 4]))
+            cdgh = ops.sha256rnds2(cdgh, abef, wk)
+            abef = ops.sha256rnds2(abef, cdgh, wk >> 64)
+        f, e, b, a = host_cpu._dwords(abef)
+        h, g, d, c = host_cpu._dwords(cdgh)
+        state = [(x + y) & 0xFFFFFFFF for x, y in zip(state, (a, b, c, d, e, f, g, h))]
+    return b"".join(struct.pack(">I", x) for x in state)
+
+
+def sha1_by_instructions(message, ops=host_cpu):
+    """SHA-1 through SHA1MSG1, SHA1MSG2, SHA1NEXTE and SHA1RNDS4 in the usual arrangement."""
+    state = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0]
+    data = padded(message)
+    for at in range(0, len(data), 64):
+        w = [host_cpu._pack(struct.unpack(">4I", data[at + 16 * i:at + 16 * i + 16])[::-1]) for i in range(4)]
+        for t in range(4, 20):
+            w.append(ops.sha1msg2(ops.sha1msg1(w[t - 4], w[t - 3]) ^ w[t - 2], w[t - 1]))
+        a, b, c, d, e = state
+        abcd, previous = host_cpu._pack([d, c, b, a]), None
+        for group in range(20):
+            if group == 0:
+                wk = host_cpu._pack([x + y for x, y in zip(host_cpu._dwords(w[0]), (0, 0, 0, e))])
+            else:
+                wk = ops.sha1nexte(previous, w[group])
+            previous = abcd
+            abcd = ops.sha1rnds4(abcd, wk, group // 5)
+        d, c, b, a = host_cpu._dwords(abcd)
+        e = host_cpu._rol(host_cpu._dwords(previous)[3], 30)
+        state = [(x + y) & 0xFFFFFFFF for x, y in zip(state, (a, b, c, d, e))]
+    return b"".join(struct.pack(">I", x) for x in state)
+
+
+SHA_FORMS = {  # mnemonic: opcode bytes after 0F
+    "sha1nexte": b"\x38\xc8", "sha1msg1": b"\x38\xc9", "sha1msg2": b"\x38\xca", "sha256rnds2": b"\x38\xcb",
+    "sha256msg1": b"\x38\xcc", "sha256msg2": b"\x38\xcd", "sha1rnds4": b"\x3a\xcc"}
+
+
+def sha_cases(native):
+    import hashlib
+    import random
+    messages = (b"", b"abc", b"a" * 200, bytes(range(256)) * 3)
+    for message in messages:
+        assert sha256_by_instructions(message) == hashlib.sha256(message).digest(), f"sha-256 of {len(message)} bytes"
+        assert sha1_by_instructions(message) == hashlib.sha1(message).digest(), f"sha-1 of {len(message)} bytes"
+
+    # Negative controls: one changed detail in one operation must change the digest.
+    class Wrong:
+        sha256msg1, sha256msg2, sha1msg1, sha1msg2, sha1nexte = (host_cpu.sha256msg1, host_cpu.sha256msg2, host_cpu.sha1msg1,
+                                                                 host_cpu.sha1msg2, host_cpu.sha1nexte)
+        sha256rnds2 = staticmethod(lambda dest, source, xmm0: host_cpu.sha256rnds2(dest, source, xmm0 >> 32))
+        sha1rnds4 = staticmethod(lambda dest, source, function: host_cpu.sha1rnds4(dest, source, function ^ 1))
+    assert sha256_by_instructions(b"abc", Wrong) != hashlib.sha256(b"abc").digest(), "a wrong round constant order passed"
+    assert sha1_by_instructions(b"abc", Wrong) != hashlib.sha1(b"abc").digest(), "a wrong round function passed"
+
+    # sha_apply: operand forms, on a made-up register file and memory.
+    rng = random.Random(0x5AA5)
+    xmm = [rng.getrandbits(128) for _ in range(16)]
+    gpr = [0x1000 * (i + 1) for i in range(16)]
+    memory = {}
+
+    def read_memory(address, size):
+        return memory.get(address)
+
+    def apply(code, rip=0x7000):
+        return host_cpu.sha_apply(code, rip, lambda n: gpr[n], lambda n: xmm[n], read_memory)
+
+    operand = rng.getrandbits(128)
+    # sha256msg1 xmm3, xmm5
+    assert apply(bytes.fromhex("0f38ccdd")) == (4, 3, host_cpu.sha256msg1(xmm[3], xmm[5]))
+    # sha1rnds4 xmm9, xmm12, 2 (REX.RB)
+    assert apply(bytes.fromhex("450f3acccc02")) == (6, 9, host_cpu.sha1rnds4(xmm[9], xmm[12], 2))
+    # sha256rnds2 xmm2, [rbx + rsi*4 + 0x20]: xmm0 is the implicit third operand
+    memory[gpr[3] + gpr[6] * 4 + 0x20] = operand.to_bytes(16, "little")
+    assert apply(bytes.fromhex("0f38cb54b320")) == (6, 2, host_cpu.sha256rnds2(xmm[2], operand, xmm[0]))
+    # sha1msg2 xmm1, [rip + 0x100]: relative to the end of the 8-byte instruction
+    memory[0x7000 + 8 + 0x100] = operand.to_bytes(16, "little")
+    assert apply(bytes.fromhex("0f38ca0d00010000")) == (8, 1, host_cpu.sha1msg2(xmm[1], operand))
+    # Refused: an unreadable operand, a segment override, and other instructions.
+    assert apply(bytes.fromhex("0f38cc5510")) is None                      # [rbp + 0x10] is not in the made-up memory
+    assert apply(bytes.fromhex("640f38cc1b")) is None                      # fs:
+    assert apply(bytes.fromhex("660f38dcc1")) is None                      # aesenc
+    assert apply(bytes.fromhex("0f0b9090")) is None                        # ud2
+
+    compared = 0
+    if native:
+        # movdqu xmm1, [rcx]; movdqu xmm2, [rdx]; movdqu xmm0, [rdx + 16] | op xmm1, xmm2 | movdqu [rcx], xmm1; ret
+        before = bytes.fromhex("f30f6f09f30f6f12f30f6f4210")
+        for name, opcode in SHA_FORMS.items():
+            code = b"\x0f" + opcode + b"\xca" + (b"\x01" if name == "sha1rnds4" else b"")
+            f = build(before, code, bytes.fromhex("f30f7f09c3"), patch=False)
+            for _ in range(16):
+                dest, source, implicit = (rng.getrandbits(128) for _ in range(3))
+                first = ctypes.create_string_buffer(dest.to_bytes(16, "little"), 16)
+                second = ctypes.create_string_buffer(source.to_bytes(16, "little") + implicit.to_bytes(16, "little"), 32)
+                f(ctypes.addressof(first), ctypes.addressof(second))
+                operation = getattr(host_cpu, name)
+                expected = (operation(dest, source, 1) if name == "sha1rnds4" else
+                            operation(dest, source, implicit) if name == "sha256rnds2" else operation(dest, source))
+                assert int.from_bytes(first.raw, "little") == expected, f"native {name} differs from the model"
+                compared += 1
+    return len(messages), compared
+
+
 def main():
     if platform.machine().lower() not in ("x86_64", "amd64"):
         print("startup_host_cpu: SKIP, host is not x86-64")
@@ -248,9 +459,14 @@ def main():
     a, b = VALUES[0]
     assert mutant(a, b) != insertq_model(a, b, 16, 16), "a stub for another bit offset passed"
 
+    stores, rdpid_registers = more_rewrites(features)
+    digests, native_sha = sha_cases("sha" in features)
+
     native = ", ".join(sorted(features)) or "none"
     print(f"startup_host_cpu: PASS ({checked} insertq/extrq results, clzero with two moved-instruction forms, "
-          f"5 clwb and 2 wait rewrites; native comparison: {native})")
+          f"5 clwb and 2 wait rewrites, {stores} non-temporal stores, rdpru, rdpid into {rdpid_registers} registers, "
+          f"sha-1 and sha-256 of {digests} messages through the seven sha operations with {native_sha} native results; "
+          f"native comparison: {native})")
     return 0
 
 

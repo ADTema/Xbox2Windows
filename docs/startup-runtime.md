@@ -300,6 +300,10 @@ debugger round trip.
 | `MONITORX`, `MWAITX` | a 3-byte `NOP`; `PAUSE` and `NOP` (the wait may end at any time) |
 | `CLZERO` | a jump to a stub that stores 64 zero bytes at `rax & ~63` |
 | `INSERTQ xmm, xmm, len, idx`, `EXTRQ xmm, len, idx` (xmm0-7) | a jump to a stub that does the field move in integer registers |
+| `MOVNTSS m32, xmm`, `MOVNTSD m64, xmm` | `MOVSS`, `MOVSD` stores (one opcode byte; the non-temporal hint is dropped) |
+| `RDPRU` | `RDTSC`; `NOP` (the time-stamp counter stands in for MPERF and APERF, so their ratio reads 1) |
+| `RDPID r64` | a jump to a stub that runs `RDTSCP` and moves its `ecx` to the register |
+| `SHA1RNDS4`, `SHA1NEXTE`, `SHA1MSG1`, `SHA1MSG2`, `SHA256RNDS2`, `SHA256MSG1`, `SHA256MSG2` | not rewritten: performed by the debugger on the stopped thread at every hit, counted as `sha (per hit)` |
 
 The stubs keep the other registers and the flags. Instructions that the 5-byte jump overwrites
 are re-encoded behind the stub with iced-x86. `events.txt` names the first 40 rewritten sites and
@@ -311,6 +315,12 @@ way and calls them on the host: 288 `INSERTQ`/`EXTRQ` results against a model, `
 moved `lea` and a moved rip-relative load, and decoded `CLWB` and wait rewrites. Stubs that zero 56
 or 72 bytes, and a stub for another bit offset, fail it. On a processor that has SSE4a or CLZERO
 the unpatched functions are compared as well. It exits 77 on a host that is not x86-64.
+
+The SHA instructions cost a debugger round trip each, which is acceptable for an occasional
+digest and too slow for bulk hashing. `python -B tests/startup_host_cpu_check.py` computes SHA-1
+and SHA-256 of four messages through the seven operations and compares them with `hashlib`, and
+`ctest --preset release --no-tests=error -R '^startup_host_cpu_debug$' -V` runs the debugger on a
+source-built probe that executes SHA-256 and `RDPID` instructions.
 
 Measured so far on one host without these instructions; the rewrites of `EXTRQ` have only run in
 the check. A thread that is executing inside the bytes of a jump site while another thread faults

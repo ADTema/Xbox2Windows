@@ -313,6 +313,9 @@ add_test(NAME startup_draw_bmp COMMAND startup_draw_bmp_check)
 # Input for the launcher containment check (docs/startup-runtime.md): writes known bytes to both
 # streams and the trap log, reports a known exit code, or holds memory, spawns a child or stays
 # alive so the launch tool's job limits have to stop it.
+# Input for tests/startup_host_cpu_debug_check.py.
+add_executable(startup_host_cpu_probe tests/startup_host_cpu_probe.cpp)
+target_compile_features(startup_host_cpu_probe PRIVATE cxx_std_17)
 add_executable(startup_launch_probe tests/startup_launch_probe.cpp)
 target_compile_features(startup_launch_probe PRIVATE cxx_std_17)
 
@@ -1121,6 +1124,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_host_cpu COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_host_cpu_check.py")
     set_tests_properties(startup_host_cpu PROPERTIES SKIP_RETURN_CODE 77)
+    # The same switch in the startup debugger, on a probe that executes SHA-extension and RDPID instructions.
+    add_test(NAME startup_host_cpu_debug COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_host_cpu_debug_check.py" "$<TARGET_FILE:startup_host_cpu_probe>")
+    set_tests_properties(startup_host_cpu_debug PROPERTIES TIMEOUT 300)
     # tools/startup/capture.py against synthetic capture.bin files laid out like the writer's (#1149).
     add_test(NAME startup_capture COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_capture_check.py")
