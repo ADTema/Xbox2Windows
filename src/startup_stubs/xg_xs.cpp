@@ -4,9 +4,9 @@
 #define X2W_TRAP_MODULE_ID 5
 #include "startup_stubs/trap.h"
 #include "startup_stubs/local_log.h"
+#include "startup_stubs/bc7_4k_s.h"
 
 #include "startup_stubs/slice_footprints.h"
-#include "startup_stubs/bc16_surface.h"
 
 #include <array>
 #include <cstdio>
@@ -22,6 +22,7 @@
 // standard 4 KiB tiled geometry for layout queries.
 namespace {
 using u64 = std::uint64_t;
+using x2w_startup::Bc16Surface;
 
 bool permissive() noexcept { return x2w_local::env_on("X2W_D3D12_PERMISSIVE"); }
 
@@ -79,18 +80,11 @@ constexpr int max_mips = 15;
 bool use_bc7_4k_s_layout(const D3D12_RESOURCE_DESC& desc)
 {
     return x2w_local::env_on("X2W_XG_BC7_4K_S_LAYOUT") &&
-           desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-           desc.Format == DXGI_FORMAT_BC7_UNORM && desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN &&
-           desc.Width > 0 && desc.Width <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION &&
-           desc.Height > 0 && desc.Height <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION &&
-           desc.DepthOrArraySize == 1 && desc.MipLevels == 1 && desc.SampleDesc.Count == 1 &&
-           desc.SampleDesc.Quality == 0 && desc.Alignment == 0 && desc.Flags == D3D12_RESOURCE_FLAG_NONE;
+           x2w_startup::supports_bc7_4k_s(desc);
 }
 
 void put64(unsigned char* at, u64 value) { std::memcpy(at, &value, sizeof(value)); }
 void put32(unsigned char* at, std::uint32_t value) { std::memcpy(at, &value, sizeof(value)); }
-
-using x2w_startup::Bc16Surface;
 
 void write_bc7_4k_s_layout(const D3D12_RESOURCE_DESC& desc, unsigned char* layout)
 {
@@ -250,15 +244,19 @@ void __stdcall computer_tiling(Computer* self, UINT* tiles, D3D12_PACKED_MIP_INF
 // Slot 1: called when the title is done with the computer.
 // Slot 8, CopyIntoSubresource(tiled base, plane, subresource, linear data, row pitch, slice pitch)
 // The default path uses desktop copyable footprints and notifies the D3D12
-// stand-in. The opt-in BC7 path writes tiled data for CPU diagnostics.
+// stand-in. The opt-in BC7 path announces the tiled backing separately.
 long __stdcall computer_copy_into(Computer* self, unsigned char* base, unsigned plane, unsigned subresource,
                                   const unsigned char* linear, unsigned row_pitch, unsigned slice_pitch)
 {
     if (self->bc7_4k_s_layout) {
-        // The renderer currently interprets backing bytes as desktop rows.
-        if (x2w_local::env_on("X2W_D3D12_RENDER")) return E_NOTIMPL;
         if (plane || subresource) return E_INVALIDARG;
-        return copy_bc7_4k_s(self->desc, base, linear, row_pitch, slice_pitch);
+        using NotifyBc7 = void (*)(void*, UINT, UINT);
+        const HMODULE d3d = GetModuleHandleW(L"d3d12_xs.dll");
+        const auto notify = d3d ? reinterpret_cast<NotifyBc7>(GetProcAddress(d3d, "x2w_d3d12_bc7_4k_s_written")) : nullptr;
+        if (!notify && x2w_local::env_on("X2W_D3D12_RENDER")) return E_NOTIMPL;
+        const HRESULT hr = copy_bc7_4k_s(self->desc, base, linear, row_pitch, slice_pitch);
+        if (SUCCEEDED(hr) && notify) notify(base, static_cast<UINT>(self->desc.Width), self->desc.Height);
+        return hr;
     }
     static LONG calls, refused;
     ID3D12Device* device = layout_device();

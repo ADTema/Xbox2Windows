@@ -92,7 +92,7 @@ Wrapper* publish_tiled_texture(Wrapper* device, u64 address, const D3D12_RESOURC
         const auto& known = tiled_srv_textures.at(it->second);
         if (known.device == device && same_texture_description(known.desc, desc)) {
             AcquireSRWLockExclusive(&written_lock);
-            ++written_textures()[address];
+            ++written_textures()[address].generation;
             ReleaseSRWLockExclusive(&written_lock);
             return known.resource;
         }

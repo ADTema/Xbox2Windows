@@ -1,6 +1,7 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <wrl/client.h>
 
@@ -9,10 +10,10 @@
 #include <iterator>
 #include <vector>
 
+#include "startup_stream_draw.h"
+
 using Microsoft::WRL::ComPtr;
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
-
-int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels);
 
 struct alignas(8) Stage {
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE tag;
@@ -30,7 +31,16 @@ struct Stream {
 
 int main(int argc, char** argv)
 {
-    if (argc != 4 && argc != 6) return 2;
+    if (argc != 4 && argc != 6 && argc != 10) return 2;
+    const bool draw = argc == 6 || argc == 10;
+    StartupBc7Input bc7{};
+    if (argc == 10) {
+        bc7 = {argv[6], static_cast<UINT>(std::strtoul(argv[7], nullptr, 10)),
+               static_cast<UINT>(std::strtoul(argv[8], nullptr, 10)),
+               std::strcmp(argv[9], "tiled") == 0};
+        if ((bc7.width != 64 || bc7.height != 64) && (bc7.width != 81 || bc7.height != 69)) return 2;
+        if (!bc7.tiled && std::strcmp(argv[9], "linear") != 0) return 2;
+    }
     std::ifstream vs_file(argv[1], std::ios::binary), ps_file(argv[2], std::ios::binary);
     std::vector<char> vs{std::istreambuf_iterator<char>(vs_file), {}};
     std::vector<char> ps{std::istreambuf_iterator<char>(ps_file), {}};
@@ -39,7 +49,7 @@ int main(int argc, char** argv)
     ComPtr<IDXGIFactory4> factory;
     ComPtr<IDXGIAdapter> adapter;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 4;
-    if (argc == 6 && std::strcmp(argv[4], "hardware") == 0) {
+    if (draw && std::strcmp(argv[4], "hardware") == 0) {
         ComPtr<IDXGIFactory6> factory6;
         if (FAILED(factory.As(&factory6))) return 77;
         for (UINT n = 0;; ++n) {
@@ -67,6 +77,15 @@ int main(int argc, char** argv)
     if (FAILED(D3D12XboxCreateDevice(adapter.Get(), parameters.data(), __uuidof(ID3D12Device), &device))) return 5;
 
     D3D12_ROOT_SIGNATURE_DESC root_desc{};
+    const D3D12_DESCRIPTOR_RANGE srv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+    D3D12_ROOT_PARAMETER table{};
+    if (bc7.blocks) {
+        table.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        table.DescriptorTable = {1, &srv};
+        table.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        root_desc.NumParameters = 1;
+        root_desc.pParameters = &table;
+    }
     ComPtr<ID3DBlob> blob;
     if (FAILED(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr))) return 6;
     std::ofstream(argv[3], std::ios::binary).write(static_cast<const char*>(blob->GetBufferPointer()), blob->GetBufferSize());
@@ -90,5 +109,5 @@ int main(int argc, char** argv)
     if (!submit(sizeof(stream) - 8)) return 8;
     if (GetEnvironmentVariableW(L"X2W_TEST_TRUNCATED_ONLY", nullptr, 0)) return 0;
     if (!submit(sizeof(stream))) return 9;
-    return argc == 6 ? check_stream_draw(adapter.Get(), device, pso, argv[5]) : 0;
+    return draw ? check_stream_draw(adapter.Get(), device, pso, argv[5], bc7.blocks ? &bc7 : nullptr) : 0;
 }
