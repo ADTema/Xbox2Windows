@@ -25,6 +25,19 @@ ALU = {
     "v_mul_lo_u32": INTEGER["mul_lo_u32"][1],
     "v_mad_u32_u24": "((({0} & 0xffffffu) * ({1} & 0xffffffu)) + {2})",
 }
+# The scalar ALU subset, on known words only: s_<op> sD, a, b with two scalar sources (an SGPR holding a known
+# word, an integer inline constant or a 32-bit literal). The carry out of s_add_u32 and s_sub_u32 and the
+# nonzero flag of the logic forms go to SCC, which no accepted instruction reads. s_lshr_b32 is a logical
+# shift of src0 by src1[4:0].
+SALU = {
+    "s_add_u32": "({0} + {1})",
+    "s_sub_u32": "({0} - {1})",
+    "s_and_b32": "({0} & {1})",
+    "s_or_b32": "({0} | {1})",
+    "s_xor_b32": "({0} ^ {1})",
+    "s_lshr_b32": "({0} >> ({1} & 31u))",
+}
+SALU_SOURCE = r"(s\d+|-?\d+|0x[0-9a-f]+)"
 ALU_SOURCE = r"(s\d+|v\d+|-?\d+|0x[0-9a-f]+)"
 # Results are inline HLSL expressions; a longer one is rejected instead of growing without bound.
 ALU_EXPRESSION_LIMIT = 1024
@@ -279,6 +292,16 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 if not -(1 << 31) <= value <= 0xffffffff:
                     raise ValueError("Invalid scalar immediate")
                 scalar[dst] = value & 0xffffffff
+        elif m := re.fullmatch(rf"(s_(?:add_u32|sub_u32|and_b32|or_b32|xor_b32|lshr_b32)) s(\d+), {SALU_SOURCE}, {SALU_SOURCE}",
+                               line):
+            op, dst = m[1], int(m[2])
+            words = [alu_word(token, scalar, vector, pending) for token in m.groups()[2:]]
+            if dst > 105 or dst in pending or None in words:
+                raise ValueError("Unverified scalar ALU operand")
+            expression = SALU[op].format(*map(hlsl_word, words))
+            if len(expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            scalar[dst] = ("alu", expression)
         elif m := re.fullmatch(r"s_movk_i32 s(\d+), (-?\d+|0x[0-9a-f]+)", line):
             dst = int(m[1])
             value = int(m[2], 0)

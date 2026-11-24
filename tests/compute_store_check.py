@@ -328,6 +328,7 @@ def controls():
     guard_controls()
     read_controls()
     alu_controls()
+    scalar_alu_controls()
 
 
 def grid_controls():
@@ -1055,6 +1056,60 @@ def alu_controls():
     assert alu(*restored, ("s_or_b32 exec_lo, exec_lo, s2", "s_or_b32 exec_lo, exec_lo, s2\nv_mov_b32_e32 v1, 9"),
                stride=8)[-5:] == [GUARD_IF, "        outputData.Store(tid.x * 8u + 0u, tid.x);", "    }",
                                   "    outputData.Store(tid.x * 8u + 4u, 0x00000009u);", "}"]
+
+
+# The read-compute-write fixture with a scalar chain over the cap word s0 and the bound s3 feeding the min:
+# add, sub, and, or (with a 32-bit literal), xor and a logical shift right, each reading the previous result.
+SCALAR_CHAIN = ("s_add_u32 s16, s0, 7\ns_sub_u32 s17, s16, s3\ns_and_b32 s18, s17, 0xff0\n"
+                "s_or_b32 s19, s18, 0x100000\ns_xor_b32 s20, s19, s0\ns_lshr_b32 s21, s20, 3")
+READ_SCALAR = variant(READ_COMPUTE, ("v_and_b32_e32 v2, 0xffff, v1", SCALAR_CHAIN + "\nv_and_b32_e32 v2, 0xffff, v1"),
+                      ("v_min_u32_e32 v1, s0, v1", "v_min_u32_e32 v1, s21, v1"))
+SCALAR_WORD = ("min(((((((params[0].y + 0x00000007u) - params[0].x) & 0x00000ff0u) | 0x00100000u) ^ params[0].y)"
+               " >> (0x00000003u & 31u)), ")
+
+
+def scalar_alu_controls():
+    """Scalar ALU on known words: exact output, then one rejection per operand or opcode outside the subset."""
+    def scalar(*changes):
+        return aot.lower(variant(READ_SCALAR, *changes), 32, **READ_BINDING).splitlines()
+
+    lines = scalar()
+    assert SCALAR_WORD in lines[-3] and lines[-3].startswith("        outputData.Store(tid.x * 4u + 0u, "), lines
+    # The earliest scalar results stay inline in the chain: the first operand prints before the second.
+    assert scalar(("s_lshr_b32 s21, s20, 3", "s_sub_u32 s21, 100, s20"))[-3].count("(0x00000064u - ") == 1
+    # A scalar result can feed a vector instruction as a source, and a copy of it is the same program.
+    assert scalar(("v_min_u32_e32 v1, s21, v1", "s_mov_b32 s22, s21\nv_min_u32_e32 v1, s22, v1")) == lines
+    unsupported, operand = "Unsupported compute instruction: ", "Unverified scalar ALU operand"
+    for message, changes in (
+        # Opcodes outside the subset: signed, carry-in and 64-bit forms.
+        (unsupported + "s_ashr_i32", (("s_lshr_b32 s21", "s_ashr_i32 s21"),)),
+        (unsupported + "s_addc_u32", (("s_add_u32 s16", "s_addc_u32 s16"),)),
+        (unsupported + "s_and_b64", (("s_and_b32 s18, s17, 0xff0", "s_and_b64 s[18:19], s[16:17], 0xff0"),)),
+        # Sources that are not known words: an unwritten SGPR, a descriptor SGPR, the saved exec mask, and a
+        # constant word still waiting for its s_waitcnt.
+        (operand, (("s_add_u32 s16, s0, 7", "s_add_u32 s16, s30, 7"),)),
+        (operand, (("s_add_u32 s16, s0, 7", "s_add_u32 s16, s8, 7"),)),
+        (operand, (("s_add_u32 s16, s0, 7", "s_add_u32 s16, s2, 7"),)),
+        (operand, (("s_add_u32 s16, s0, 7", "s_buffer_load_dword s23, s[4:7], 0x8\ns_add_u32 s16, s23, 7"),)),
+        # A destination past s105, and a pending destination.
+        (operand, (("s_add_u32 s16, s0, 7", "s_add_u32 s106, s0, 7"),)),
+        (operand, (("s_add_u32 s16, s0, 7", "s_buffer_load_dword s16, s[4:7], 0x8\ns_add_u32 s16, s0, 7"),)),
+        # A source wider than 32 bits.
+        (operand, (("s_add_u32 s16, s0, 7", "s_add_u32 s16, s0, 0x1ffffffff"),)),
+        # A vector register is not a scalar source.
+        (unsupported + "s_add_u32", (("s_add_u32 s16, s0, 7", "s_add_u32 s16, s0, v1"),)),
+        # Overwriting the saved exec mask breaks the guard restore.
+        ("Unverified lane guard restore", (("s_cbranch_execz .LBB0_2", ""), (".LBB0_2:", "s_add_u32 s2, s0, 7"),
+                                           ("s_endpgm", "s_or_b32 exec_lo, exec_lo, s2\ns_endpgm"))),
+        # A scalar result is data only: not an address and not a lane-guard compare operand.
+        ("Unsupported store address", (("v1, v0, s[8:11]", "v1, v21, s[8:11]"),
+                                       ("v_min_u32_e32 v1, s21, v1", "v_min_u32_e32 v1, s21, v1\nv_mov_b32_e32 v21, s21"))),
+        ("Unverified lane guard compare", (("v_min_u32_e32 v1, s21, v1",
+                                            "v_min_u32_e32 v1, s21, v1\nv_cmp_gt_u32_e32 vcc_lo, s21, v1"),)),
+        # Expressions are inline, so a scalar result that keeps doubling is rejected.
+        ("ALU expression too large", (("s_lshr_b32 s21, s20, 3", "s_lshr_b32 s21, s20, 3" + "\ns_add_u32 s21, s21, s21" * 8),)),
+    ):
+        rejects(message, scalar, *changes)
 
 
 def assemble(directory, assembler, objcopy, lines):
@@ -2534,7 +2589,18 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
     return 0
 
 
+def scalar_alu_binary(directory, assembler, objcopy, library):
+    """The assembled scalar chain decodes to the same program as its text."""
+    src, obj, raw = [directory / x for x in ("scalar.s", "scalar.o", "scalar.bin")]
+    src.write_text("\n".join(READ_SCALAR) + "\n", encoding="ascii")
+    subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-filetype=obj", src, "-o", obj], check=True)
+    subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, raw], check=True)
+    decoded = aot.labelled(disassemble(raw.read_bytes(), library, offsets=True))
+    assert aot.lower(decoded, 32, **READ_BINDING) == aot.lower(READ_SCALAR, 32, **READ_BINDING)
+
+
 def binary(directory, assembler, objcopy, library):
+    scalar_alu_binary(directory, assembler, objcopy, library)
     ds_controls()
     lds_controls()
     ds_binary(directory, assembler, objcopy, library)
