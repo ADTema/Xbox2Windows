@@ -26,11 +26,14 @@ Install Python 3.12 and LLVM 15 with Homebrew (both are needed as explicit paths
 brew install python@3.12 llvm@15
 ```
 
-From the repository root, create a virtual environment under `out/pe-env`, install `pefile` at the version pinned in `requirements-dev.txt`, and run the platform-independent checks below:
+From the repository root, create a virtual environment under `out/pe-env`, install `pefile` at the version pinned in `requirements-dev.txt`, and run the platform-independent checks below.
+The block runs in a subshell and returns the first failure:
 
 ```bash
-"$(brew --prefix python@3.12)/bin/python3.12" -m venv out/pe-env
-./out/pe-env/bin/python -m pip install -c requirements-dev.txt pefile
+(
+python_prefix="$(brew --prefix python@3.12)" || exit $?
+"$python_prefix/bin/python3.12" -m venv out/pe-env || exit $?
+./out/pe-env/bin/python -m pip install -c requirements-dev.txt pefile || exit $?
 for t in \
   tests/script_state_check.py \
   tests/resource_root_check.py \
@@ -55,8 +58,9 @@ for t in \
   tests/bidi_controls_check.py \
   tests/hardware_reports_check.py \
   tests/gpu_report_format_check.py; do
-  ./out/pe-env/bin/python -B "$t"
+  ./out/pe-env/bin/python -B "$t" || exit $?
 done
+)
 ```
 
 `tests/form_coverage_check.py` and `tests/xmem_attribute_scan_check.py` import `iced-x86`, which pip builds from source on Apple Silicon, so this list leaves them out. Run them on Linux or Windows.
@@ -86,11 +90,13 @@ sudo apt-get update -q
 sudo apt-get install -y python3-venv
 ```
 
-From the repository root, create `out/pe-env` (Python 3.11 or newer; CI uses 3.12), install dependencies, and run the platform-independent checks below:
+From the repository root, create `out/pe-env` (Python 3.11 or newer; CI uses 3.12), install dependencies, and run the platform-independent checks below.
+The block runs in a subshell and returns the first failure:
 
 ```bash
-python3 -m venv out/pe-env
-./out/pe-env/bin/python -m pip install -r requirements-dev.txt
+(
+python3 -m venv out/pe-env || exit $?
+./out/pe-env/bin/python -m pip install -r requirements-dev.txt || exit $?
 for t in \
   tests/script_state_check.py \
   tests/resource_root_check.py \
@@ -117,8 +123,9 @@ for t in \
   tests/bidi_controls_check.py \
   tests/hardware_reports_check.py \
   tests/gpu_report_format_check.py; do
-  ./out/pe-env/bin/python -B "$t"
+  ./out/pe-env/bin/python -B "$t" || exit $?
 done
+)
 ```
 
 On Debian/Ubuntu, install LLVM 15 and run the three `gfx1013` checks:
