@@ -88,6 +88,22 @@ double sleep_granularity_ms()
     return ticks[samples / 2];
 }
 
+// The tick alone is not the bound: the steady phase takes the worst of 120 wake-ups, and a host with a
+// raised timer resolution has a ~1 ms tick, so a three-tick bound would be a few milliseconds and one
+// deschedule would fail the run. Calibrate the scheduling the fixture actually uses by running the same
+// wait loop, the same number of times, with nothing submitted.
+double calibrate_scheduler_ms(uint32_t block_frames, uint32_t rate, int blocks)
+{
+    double worst = 0;
+    const double begin = now_ms();
+    for (int i = 0; i < blocks; ++i) {
+        const double want = begin + i * (1000.0 * block_frames / rate);
+        while (now_ms() < want) Sleep(1);
+        worst = (std::max)(worst, std::fabs(now_ms() - want));
+    }
+    return worst;
+}
+
 Submit submit_with_wait(AudioSink& sink, const BlockFormat& format, const std::vector<int16_t>& pcm)
 {
     const double end = now_ms() + 500;
@@ -248,10 +264,12 @@ int run()
     // blocks, it cannot speak about the title's stutter either. The steady bound is a few measured timer
     // ticks, because the feed is scheduled with Sleep(1) and cannot beat the host's tick.
     const double tick_ms = sleep_granularity_ms();
-    const double steady_limit_ms = 3.0 * tick_ms;
-    std::printf("timer: Sleep(1) median %.1f ms, steady bound %.1f ms\n", tick_ms, steady_limit_ms);
+    const double jitter_ms = calibrate_scheduler_ms(block_frames, source.rate, total_blocks);
+    const double steady_limit_ms = (std::max)(3.0 * tick_ms, 2.0 * jitter_ms + 5.0);
+    std::printf("timer: Sleep(1) median %.1f ms, scheduler worst %.1f ms over %d wake-ups, steady bound %.1f ms\n",
+                tick_ms, jitter_ms, total_blocks, steady_limit_ms);
     if (steady.pacing_error_max_ms > steady_limit_ms) {
-        std::printf("FAIL: steady feed drifted %.1f ms from the ideal cadence, beyond three timer ticks (%.1f ms)\n",
+        std::printf("FAIL: steady feed drifted %.1f ms from the ideal cadence, beyond the measured scheduler bound (%.1f ms)\n",
                     steady.pacing_error_max_ms, steady_limit_ms);
         return 1;
     }
