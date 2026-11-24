@@ -6634,33 +6634,38 @@ Not covered by this experiment: non-default MXCSR modes (FTZ/DAZ or unmasked exc
 non-temporal cache-bypass hints on `movntps`, control flow, nonvolatile `xmm6`..`xmm15`
 prologues, and title CPU code execution.
 
-## Legacy SSE/MMX conversion, shuffle, and non-temporal store
+## Legacy SSE/MMX conversion, shuffle, and masked/non-temporal stores
 
 [The SSE/MMX leaf translator](../tools/cpu_sse_mmx_aot.py) lifts bounded straight-line
-Windows x64 leaf functions covering five uncovered forms from `docs/coverage/x64_zen2.tsv`
-group `SSE`:
+Windows x64 leaf functions covering seven forms from `docs/coverage/x64_zen2.tsv`
+groups `SSE` and `SSE2`:
 
 - Integer-to-float conversion: `cvtpi2ps` (`mm` and `m64` sources, preserving `xmm[127:64]`)
 - Float-to-integer conversions: `cvtps2pi` (round-to-nearest-even) and `cvttps2pi` (truncate toward zero) on `xmm` and `m64` sources, returning `0x80000000` on NaN, `+/-Inf`, or out-of-`int32_t` range after rounding
 - Word permutation: `pshufw` (`imm8` 16-bit word shuffle on `mm` and `m64` sources)
 - Non-temporal store: `movntq` (`m64` store to `[r8 + disp]`, tested at aligned and unaligned addresses)
+- Conditional byte stores: `maskmovq` (`SSE`, `mm1, mm2` to implicit `[rdi]`, requiring `emms` before `ret`) and `maskmovdqu` (`SSE2`, `xmm1, xmm2` to implicit `[rdi]`), requiring nonvolatile `rdi` save/restore via a volatile scratch GPR around `mov rdi, r8`. For this portable first slice, `[rdi..rdi+7]` (`maskmovq`) or `[rdi..rdi+15]` (`maskmovdqu`) must be writable ordinary memory; the lifted helper writes only bytes with `(mask[i] & 0x80) != 0`
 
 Call with round-to-nearest-even, masked MXCSR exceptions, DAZ and FTZ off, and
 an empty x87 stack with no pending unmasked exceptions or live MMX values.
-The caller owns the buffers and reads the output after return. The `movntq`
-lowering preserves the eight output bytes. Caching hints, inter-thread
-visibility, floating-point status flags and physical x87 tags are outside
-the observed contract.
+The caller owns the buffers and reads the output after return. The `movntq`,
+`maskmovq`, and `maskmovdqu` lowerings preserve the written output bytes;
+caching hints, inter-thread visibility, implementation-dependent partial-page or
+all-zero-mask fault behavior, floating-point status flags, and physical x87 tags
+are outside the observed contract.
 
 Each lifted export uses the leaf ABI `void fn(word rcx, word rdx, word r8)` (`rcx`/`rdx`
 inputs, `r8` output), modeling `xmm0`..`xmm5` (`Vec128`), `mm0`..`mm7` (`std::uint64_t mm[8]`),
-and volatile scratch GPRs `rax`/`r9`/`r10`/`r11` for `movq` bridges alongside `movaps`/`movdqa`
-(16-byte aligned), `movdqu`, `emms`, and terminal `ret`. Touching any `mm` register sets
-`mmx_active`; `emms` clears it and invalidates `mm` definitions unconditionally, and `ret`
-rejects while `mmx_active` is true. Dead-read fault ordering uses `std::atomic_signal_fence`
-with volatile loads. Memory stores are restricted to `r8`-rooted flat `[r8 + disp]` operands,
-and VEX/EVEX encodings, nonvolatile registers, undefined reads/merges, prefixes, and
-unsupported instructions reject.
+and volatile scratch GPRs `rax`/`r9`/`r10`/`r11` for `movq` bridges and `rdi` save/restore
+slots alongside `movaps`/`movdqa` (16-byte aligned), `movdqu`, `emms`, and terminal `ret`.
+Touching any `mm` register sets `mmx_active`; `emms` clears it and invalidates `mm`
+definitions unconditionally, and `ret` rejects while `mmx_active` is true or `rdi` is
+unrestored. Volatile scratch GPRs holding saved `rdi` stay unavailable to `movq` reads
+until overwritten. Dead-read fault ordering uses `std::atomic_signal_fence` with volatile
+loads. Memory stores are restricted to `r8`-rooted flat `[r8 + disp]` operands (and
+`r8`-rooted `[rdi]` for `maskmovq`/`maskmovdqu`), and VEX/EVEX encodings, `67h` `edi`
+targets, nonvolatile registers, undefined reads/merges, prefixes, and unsupported
+instructions reject.
 
 ```powershell
 cmake --build --preset dev --target cpu_sse_mmx_original cpu_sse_mmx_original_lifted cpu_sse_mmx_altered cpu_sse_mmx_altered_lifted
@@ -6669,22 +6674,29 @@ ctest --preset dev --no-tests=error -R '^cpu_aot_sse_mmx$' -V
 
 ### Measured results and open scope
 
-The [MASM fixture](../tests/cpu/sse_mmx.asm) exports 19 functions covering register and
-displaced/unaligned `m64` forms of all five instructions, `movq` GPR bridges, `emms`
-re-entry, a discarded `cvtps2pi` fault-ordering read, and a chained pipeline.
-[The differential check](../tests/cpu/sse_mmx_check.py) verified 237 cases across the 18
+The [MASM fixture](../tests/cpu/sse_mmx.asm) exports 22 functions covering register and
+displaced/unaligned `m64` forms of the conversion/shuffle/non-temporal ops, `maskmovq`
+and `maskmovdqu` with `rdi` save/restore, `movq` GPR bridges, `emms` re-entry, a discarded
+`cvtps2pi` fault-ordering read, and chained pipelines (`op_pipeline`, `op_maskmov_pipeline`).
+[The differential check](../tests/cpu/sse_mmx_check.py) verified 339 cases across the 21
 differential exports bit-for-bit against both the native MASM DLL and an independent Python
-reference model (including `+/-0.0`, subnormals, ties-to-even, `2147483520.0`, `2147483648.0`,
-`-2147483648.0`, `-2147483904.0`, `+/-Inf`, qNaN/sNaN, `xmm[127:64]` preservation, and
-`pshufw` `imm8` edge patterns), plus the discarded-read fault-ordering test on both `dev`
-and `release` (`/O2`) presets. An `ALTER_IMM` variant swaps `cvtps2pi`/`cvttps2pi` and
-changes `pshufw` `imm8` on four exports (diverging on 3, 3, 7, and 7 cases); an
-output-mutation control confirmed single-bit mismatch detection; and rejection controls
-passed 7 alternate-encoding lift checks, 59 unit rejections (7 VEX/EVEX, 12 unsupported
-instructions, 40 ABI/state/addressing/prefix/stream), and 10 PE-patched DLL rejections.
+reference model with 32-byte pre/post buffer guards (including `+/-0.0`, subnormals,
+ties-to-even, `2147483520.0`, `2147483648.0`, `-2147483648.0`, `-2147483904.0`, `+/-Inf`,
+qNaN/sNaN, `xmm[127:64]` preservation, `pshufw` `imm8` edge patterns, and all 16-lane byte
+mask patterns), 24 `k=8`/`k=16` page-abutting writable checks against `PAGE_NOACCESS` and
+`PAGE_READONLY` guard pages, 54 native partial-edge observations (`k<8` and `k<16`), plus
+the discarded-read fault-ordering test on both `dev` and `release` (`/O2`) presets. An
+`ALTER_IMM` variant swaps `cvtps2pi`/`cvttps2pi`, changes `pshufw` `imm8`,
+and swaps `maskmovq`/`maskmovdqu` source and mask on six exports (diverging on 3, 3, 7, 7,
+22, and 30 cases); an output-mutation control confirmed single-bit mismatch detection; and
+rejection controls passed 9 alternate-encoding lift checks, 81 unit rejections (8 VEX/EVEX,
+12 unsupported instructions, 61 ABI/state/addressing/prefix/stream), and 16 PE-patched DLL
+rejections.
 
 Not covered by this experiment: non-default MXCSR rounding modes, non-temporal cache-bypass
-hints on `movntq`, x87/MMX aliasing across calls, control flow, and title CPU code execution.
+hints on `movntq`/`maskmovq`/`maskmovdqu`, implementation-dependent partial-page faults on
+`maskmovq`/`maskmovdqu`, x87/MMX aliasing across calls, control flow, and title CPU code
+execution.
 
 ## AVX quadword and masked-byte moves
 
