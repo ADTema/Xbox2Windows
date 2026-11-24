@@ -67,11 +67,63 @@ u64 complete_async(u64 async_block);
 void* storage_object();
 constexpr unsigned long save_provider_data1 = 0x704c3f58;  // hypothesis: the game-save API (first seen: slot 4 with the user handle)
 
+// X2W_TRACE_API=1: one line per provider call with the return code, whether the answer came from the
+// stand-in or the real runtime, and which declared output argument it wrote. Only declared outputs are
+// read: arguments are not probed as pointers, because a handle or size that happens to look like an
+// address would be read as if it were one. A slot with no declared contract reports "out=?" instead.
+bool trace_api() noexcept
+{
+    static const bool on = x2w_local::env_on("X2W_TRACE_API");
+    return on;
+}
+
+// Declared output arguments, as 0-based argument indices. These follow the answers in user_call and
+// area_call below; anything not listed has no known contract here and is not read back.
+struct DeclaredOut {
+    unsigned long provider;
+    int slot;
+    unsigned char first;   // argument index of the first output
+    unsigned char second;  // second output, or 0xff when the slot has one
+};
+
+constexpr unsigned char no_second = 0xff;
+constexpr DeclaredOut declared_outs[] = {
+    {0x01acd177, 8, 1, no_second},   // user add result: &handle
+    {0x01acd177, 12, 1, no_second},  // user id: &id
+    {0x01acd177, 13, 1, no_second},  // is guest: &flag
+    {0x01acd177, 14, 1, no_second},  // state: &state
+    {0x01acd177, 15, 3, 4},          // gamertag: buffer, &used
+    {0x01acd177, 19, 1, no_second},  // age group: &group
+    {0x01acd177, 20, 3, 4},          // privilege: &has, &deny reason
+    {0x37e56907, 15, 0, no_second},  // connectivity hint: &words
+};
+
+const DeclaredOut* declared_out(unsigned long provider, int slot)
+{
+    for (const DeclaredOut& entry : declared_outs)
+        if (entry.provider == provider && entry.slot == slot) return &entry;
+    return nullptr;
+}
+
 template <int N>
 __declspec(noinline) u64 forward(Proxy* self, u64 a, u64 b, u64 c, u64 s0, u64 s1, u64 s2, u64 s3, u64 s4, u64 s5, u64 s6, u64 s7)
 {
     const bool log_it = N >= 3 && InterlockedIncrement(&call_counts[self->provider][N]) <= 6;
     u64 args[11] = {a, b, c, s0, s1, s2, s3, s4, s5, s6, s7};
+    // Declared outputs are snapshotted so the write is seen rather than assumed; nothing else is read.
+    u64 before[2] = {};
+    bool readable_argument[2] = {};
+    const DeclaredOut* declared = trace_api() ? declared_out(provider_ids[self->provider].Data1, N) : nullptr;
+    if (declared) {
+        const int index = declared->first;
+        readable_argument[0] = args[index] && x2w_local::readable(reinterpret_cast<const void*>(args[index]), 8);
+        if (readable_argument[0]) std::memcpy(&before[0], reinterpret_cast<const void*>(args[index]), 8);
+        if (declared->second != no_second) {
+            const int other = declared->second;
+            readable_argument[1] = args[other] && x2w_local::readable(reinterpret_cast<const void*>(args[other]), 8);
+            if (readable_argument[1]) std::memcpy(&before[1], reinterpret_cast<const void*>(args[other]), 8);
+        }
+    }
     u64 result = 0;
     bool handled = self->provider == user_provider && fake_user() && user_call(N, args, &result);
     if (!handled && self->provider == gamertag_provider && N == 3 && fake_user()) {
@@ -107,6 +159,28 @@ __declspec(noinline) u64 forward(Proxy* self, u64 a, u64 b, u64 c, u64 s0, u64 s
     const bool about_tracked = N >= 3 && (tracked(a) || tracked(b) || tracked(c));
     const u64 raw_result = result;
     if (about_tracked && !handled && fake_user() && (result & 0xffffffffu) == borrowed_failure) result = 0;
+    if (trace_api()) {
+        char out[24] = "?";
+        if (declared) {
+            int written = 0;
+            for (int i = 0; i < 2; ++i) {
+                const int index = i == 0 ? declared->first : declared->second;
+                if (index == no_second || !readable_argument[i]) continue;
+                if (!x2w_local::readable(reinterpret_cast<const void*>(args[index]), 8)) continue;
+                u64 now = 0;
+                std::memcpy(&now, reinterpret_cast<const void*>(args[index]), 8);
+                if (now != before[i] && !written) written = index;
+            }
+            if (written) {
+                std::snprintf(out, sizeof(out), "arg%d", written);
+            } else {
+                const bool any = readable_argument[0] || readable_argument[1];
+                std::snprintf(out, sizeof(out), "%s", any ? "unchanged" : "unreadable");
+            }
+        }
+        x2w_local::logf("x2w-api %08lx::slot%d -> 0x%08x %s out=%s", provider_ids[self->provider].Data1, N,
+                        static_cast<unsigned>(result & 0xffffffffu), handled ? "local" : "real", out);
+    }
     if (log_it || (about_tracked && InterlockedIncrement(&tracked_logged) <= 120))
         x2w_local::logf("x2w-runtime %08lx::slot%d(0x%llx, 0x%llx, 0x%llx | 0x%llx, 0x%llx) -> 0x%llx%s%s from +0x%llx", provider_ids[self->provider].Data1, N,
                         a, b, c, s0, s1, result, handled ? " (local user)" : "",
