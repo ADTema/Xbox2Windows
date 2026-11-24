@@ -22,6 +22,8 @@
 #include "desktop_gpu.h"
 
 void check_spirv_window_atomic(ID3D12Device* device, const char* shader_path);
+void check_spirv_window_qword(ID3D12Device* device, const char* shader_path);
+void check_spirv_window_qword_narrow(ID3D12Device* device, const char* shader_path);
 void check_sampler_index_control(ID3D12Device* device,
                                 const unsigned char* dispatch_bytecode, unsigned int dispatch_size,
                                 const unsigned char* group_bytecode, unsigned int group_size);
@@ -505,6 +507,12 @@ OperationResult run_spirv_sampler_views(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_dynamic_sampler_index(const OperationContext& ctx)
+{
+    check_dynamic_sampler_index(ctx.device);
+    return {OutcomeKind::pass, nullptr};
+}
+
 // Two builds of one shader that differ only in the sampler descriptor index source (#1115). The
 // SV_DispatchThreadID build must match the shared expected words; the SV_GroupID build is printed
 // for the record, because an adapter that folds the index still matches on some drivers.
@@ -533,6 +541,18 @@ OperationResult run_spirv_address_window(const OperationContext& ctx)
 OperationResult run_spirv_address_window_atomic(const OperationContext& ctx)
 {
     check_spirv_window_atomic(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_spirv_address_window_qword(const OperationContext& ctx)
+{
+    check_spirv_window_qword(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_spirv_address_window_qword_narrow(const OperationContext& ctx)
+{
+    check_spirv_window_qword_narrow(ctx.device, ctx.argv[3]);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -902,6 +922,11 @@ OperationResult run_gpu_alias(const OperationContext& ctx)
     return skip_if_false(check_gpu_alias(ctx.device));
 }
 
+OperationResult run_gpu_alias_window(const OperationContext& ctx)
+{
+    return skip_if_false(check_gpu_alias_window(ctx.device));
+}
+
 OperationResult run_gpu_alias_lookup(const OperationContext& ctx)
 {
     return skip_if_false(check_gpu_alias_lookup(ctx.device));
@@ -967,11 +992,39 @@ OperationResult run_wave64_emulate(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// --startup-cb-blend: decoded colour-blend registers match the model in every draw case.
+// --startup-cb-blend-swapped: with source and destination factors exchanged, at least one differs.
+template<bool Swapped>
+OperationResult run_startup_cb_blend(const OperationContext& ctx)
+{
+    const int mismatches = check_startup_cb_blend(ctx.device, Swapped);
+    if (Swapped ? mismatches == 0 : mismatches != 0)
+        return {OutcomeKind::fail, Swapped ? "swapped factors still matched the model" : "blend differs from the register model"};
+    return {OutcomeKind::pass, nullptr};
+}
+
 template<bool Swapped>
 OperationResult run_startup_sampler_x(const OperationContext& ctx)
 {
     return skip_if_false(check_startup_sampler_x(ctx.device, Swapped),
                          "skip: R32_FLOAT does not report filtered sampling with mips");
+}
+
+// --startup-sampler-heap <vs.cso> <ps.cso> <byte offset> <expected red bits>: draws one pixel with a
+// gfx2hlsl pixel shader that indexes its sampler table at run time (tests/startup_sampler_heap.cpp).
+OperationResult run_startup_sampler_heap(const OperationContext& ctx)
+{
+    const auto offset = static_cast<std::uint32_t>(std::stoul(ctx.argv[5], nullptr, 0));
+    const auto expected = static_cast<std::uint32_t>(std::stoul(ctx.argv[6], nullptr, 16));
+    const float red = check_startup_sampler_heap(ctx.device, ctx.argv[3], ctx.argv[4], offset,
+        ctx.argc > 7 ? ctx.argv[7] : nullptr, ctx.argc > 8 ? ctx.argv[8] : nullptr);
+    std::uint32_t bits;
+    std::memcpy(&bits, &red, sizeof(bits));
+    if (bits != expected) {
+        std::fprintf(stderr, "startup_sampler_heap mismatch offset=%u expected=%08x actual=%08x\n", offset, expected, bits);
+        return {OutcomeKind::fail, "sampler heap readback differs"};
+    }
+    return {OutcomeKind::pass, nullptr};
 }
 
 constexpr CapabilityGate kNoGate{};
@@ -1062,13 +1115,17 @@ const OperationSpec kOperations[] = {
     {"--ffx-immediate-conversion", 4, 4, nullptr, kNoGate, run_ffx_immediate_conversion},
     {"--compute-store-case", 5, 5, nullptr, kNoGate, run_compute_store_case},
     {"--spirv-sampler-views", 4, 4, nullptr, kGateSm60SamplerViews, run_spirv_sampler_views},
+    {"--dynamic-sampler-index", 3, 3, nullptr, kGateSm60SamplerViews, run_dynamic_sampler_index},
     // Two builds that differ only in the sampler descriptor index source (#1115): the
     // SV_DispatchThreadID build is asserted, the SV_GroupID build is recorded per swap.
     {"--sampler-index-control", 3, 3, nullptr, kGateSm60SamplerIndexControl, run_sampler_index_control},
+    {"--startup-sampler-heap", 7, 9, nullptr, kNoGate, run_startup_sampler_heap},
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},
     {"--spirv-address-window", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window},
     {"--spirv-address-window-atomic", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_atomic},
+    {"--spirv-address-window-qword", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_qword},
+    {"--spirv-address-window-qword-narrow", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_qword_narrow},
     {"--spirv-compare-sampler", 6, 7, nullptr, kGateSm60CompareSampler, run_spirv_compare_sampler},
     // The SPIR-V ballot fixture compiles cs_6_6; it uses the compute-store readback behind an SM 6.6 gate.
     {"--spirv-ballot", 5, 5, nullptr, kGateSm66Ballot, run_compute_store_case},
@@ -1133,6 +1190,7 @@ const OperationSpec kOperations[] = {
     {"--ray-query", 3, 3, nullptr, kNoGate, run_ray_query},
     {"--dxr-pipeline", 3, 3, nullptr, kNoGate, run_dxr_pipeline},
     {"--gpu-alias", 3, 3, nullptr, kNoGate, run_gpu_alias},
+    {"--gpu-alias-window", 3, 3, nullptr, kNoGate, run_gpu_alias_window},
     {"--gpu-alias-lookup", 3, 3, nullptr, kNoGate, run_gpu_alias_lookup},
     {"--gpu-alias-lookup-writes", 3, 3, nullptr, kNoGate, run_gpu_alias_lookup_writes},
     {"--gpu-alias-atomic-waterfall", 3, 3, nullptr, kGateSm60AtomicWaterfall, run_gpu_alias_atomic_waterfall},
@@ -1142,6 +1200,8 @@ const OperationSpec kOperations[] = {
     {"--descriptor-heap-paging-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_descriptor_heap_paging<true>},
     {"--startup-sampler-x", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<false>},
     {"--startup-sampler-x-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<true>},
+    {"--startup-cb-blend", 3, 3, nullptr, kNoGate, run_startup_cb_blend<false>},
+    {"--startup-cb-blend-swapped", 3, 3, nullptr, kNoGate, run_startup_cb_blend<true>},
     {"--wave-shuffle", 3, 3, nullptr, kGateWaveShuffle, run_wave_shuffle},
     {"--wave64-emulate", 3, 3, nullptr, kNoGate, run_wave64_emulate},
     {"--shader-wave", 3, 3, nullptr, kGateShaderWave, run_shader_wave},
