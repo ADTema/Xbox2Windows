@@ -13,6 +13,9 @@ struct PipelineInfo {
     Translation* stream_translation = nullptr;
     bool has_stream_blend = false;
     D3D12_BLEND_DESC stream_blend{};
+    bool has_stream_depth_stencil = false;
+    D3D12_DEPTH_STENCIL_DESC stream_depth_stencil{};
+    DXGI_FORMAT stream_dsv_format = DXGI_FORMAT_UNKNOWN;
     int path = 0;                    // creating device slot: 57, 67, 55, 86, 62
     Wrapper* base = nullptr;         // slot 55: the pipeline it derives from
     std::vector<unsigned char> desc;
@@ -88,7 +91,9 @@ bool title_backed(u64 title_handle, u64 bytes)
 }
 
 void note_pipeline(Wrapper* w, int path, const void* base, const void* desc, std::size_t bytes,
-                   Translation* translation = nullptr, const D3D12_BLEND_DESC* blend = nullptr)
+                   Translation* translation = nullptr, const D3D12_BLEND_DESC* blend = nullptr,
+                   const D3D12_DEPTH_STENCIL_DESC* depth_stencil = nullptr,
+                   DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN)
 {
     PipelineInfo info;
     info.stream_translation = translation;
@@ -96,6 +101,11 @@ void note_pipeline(Wrapper* w, int path, const void* base, const void* desc, std
         info.stream_blend = *blend;
         info.has_stream_blend = true;
     }
+    if (depth_stencil) {
+        info.stream_depth_stencil = *depth_stencil;
+        info.has_stream_depth_stencil = true;
+    }
+    info.stream_dsv_format = dsv_format;
     info.path = path;
     info.base = as_wrapper(base);
     const std::size_t have = desc ? readable_window(reinterpret_cast<u64>(desc), bytes) : 0;

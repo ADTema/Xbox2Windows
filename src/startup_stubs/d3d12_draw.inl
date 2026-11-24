@@ -31,6 +31,9 @@ struct BoundPipeline {
     Translation* translation = nullptr;
     bool has_blend = false;
     D3D12_BLEND_DESC blend{};
+    bool has_depth_stencil = false;
+    D3D12_DEPTH_STENCIL_DESC depth_stencil{};
+    DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
     std::unordered_map<u64, ID3D12PipelineState*> pipelines;  // by target formats
 };
 
@@ -212,7 +215,8 @@ Translation* cached_translation(const void* a, std::size_t a_bytes, const void* 
 }
 
 // Resolve the shader pointers and wrapped root while the caller still owns the stream.
-Translation* stream_translation(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3D12_BLEND_DESC& blend, bool& has_blend)
+Translation* stream_translation(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3D12_BLEND_DESC& blend, bool& has_blend,
+                                D3D12_DEPTH_STENCIL_DESC& depth_stencil, bool& has_depth_stencil, DXGI_FORMAT& dsv_format)
 {
     const auto* stream = static_cast<const unsigned char*>(desc.pPipelineStateSubobjectStream);
     if (!desc.SizeInBytes || desc.SizeInBytes > 0x2000 || desc.SizeInBytes % 8 ||
@@ -241,6 +245,13 @@ Translation* stream_translation(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3
         } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND) {
             std::memcpy(&blend, stream + at + sizeof(type), sizeof(blend));
             has_blend = true;
+        } else if (type == 11 || type == 21) {  // DEPTH_STENCIL (56B) / DEPTH_STENCIL1 (64B)
+            std::memcpy(&depth_stencil, stream + at + sizeof(type), sizeof(depth_stencil));
+            has_depth_stencil = true;
+        } else if (type == 16) {  // DEPTH_STENCIL_FORMAT (8B)
+            DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+            std::memcpy(&fmt, stream + at + sizeof(type), sizeof(fmt));
+            dsv_format = desktop_format(fmt);
         }
         at += stream_sizes[type];
     }
@@ -314,7 +325,14 @@ BoundPipeline* translation_for(Wrapper* pipeline)
             }
         }
     }
-    if (info && info->path == 86) result = info->stream_translation;
+    if (info && info->path == 86) {
+        result = info->stream_translation;
+        if (info->has_stream_depth_stencil) {
+            bound->depth_stencil = info->stream_depth_stencil;
+            bound->has_depth_stencil = true;
+        }
+        bound->dsv_format = info->stream_dsv_format;
+    }
     if (info && info->path == 57 && info->desc.size() >= 0x60) {
         u64 words[12];
         std::memcpy(words, info->desc.data(), sizeof(words));
@@ -389,20 +407,24 @@ Translation* translation_for_targets(Translation* base, const Pass& pass)
 
 ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const Pass& pass)
 {
+    const DXGI_FORMAT dsv_format = pass.dsv_format != DXGI_FORMAT_UNKNOWN ? pass.dsv_format : bound.dsv_format;
     u64 key = pass.target_count;
     for (UINT i = 0; i < pass.target_count; ++i) key = key * 131 + static_cast<u64>(pass.target_formats[i]);
+    key = fnv_bytes(&dsv_format, sizeof(dsv_format), key);
+    if (bound.has_depth_stencil) key = fnv_bytes(&bound.depth_stencil, sizeof(bound.depth_stencil), key);
     const auto found = bound.pipelines.find(key);
     if (found != bound.pipelines.end()) return found->second;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = tr.root;
     desc.VS = {tr.vs->GetBufferPointer(), tr.vs->GetBufferSize()};
     desc.PS = {tr.ps->GetBufferPointer(), tr.ps->GetBufferSize()};
-    // Blend state as found in the pipeline's state block, else opaque. Raster and depth state are
-    // not decoded yet: no culling, no depth (enough for the 2D start-up screens).
+    // Blend state as found in the pipeline's state block, else opaque. Depth-stencil state and
+    // DSVFormat come from the stream PSO (or bound DSV), else disabled. Raster state: no culling.
     for (auto& target : desc.BlendState.RenderTarget)
         target = {FALSE, FALSE, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_BLEND_ONE, D3D12_BLEND_ZERO,
                   D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP, D3D12_COLOR_WRITE_ENABLE_ALL};
     if (bound.has_blend) desc.BlendState = bound.blend;
+    if (bound.has_depth_stencil) desc.DepthStencilState = bound.depth_stencil;
     desc.SampleMask = ~0u;
     desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
@@ -410,11 +432,13 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     desc.NumRenderTargets = pass.target_count;
     for (UINT i = 0; i < pass.target_count; ++i) desc.RTVFormats[i] = pass.target_formats[i];
+    desc.DSVFormat = dsv_format;
     desc.SampleDesc.Count = 1;
     ID3D12PipelineState* pipeline = nullptr;
     const HRESULT hr = device_of(the_device)->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline));
-    log("x2w-draw desktop pipeline for %016llx, %u targets (format %d) -> 0x%08lx", tr.key, pass.target_count,
-        pass.target_count ? pass.target_formats[0] : 0, static_cast<unsigned long>(hr));
+    log("x2w-draw desktop pipeline for %016llx, %u targets (format %d) -> 0x%08lx (dsv %d, depth %d)", tr.key,
+        pass.target_count, pass.target_count ? pass.target_formats[0] : 0, static_cast<unsigned long>(hr),
+        static_cast<int>(dsv_format), desc.DepthStencilState.DepthEnable ? 1 : 0);
     check_device("translated CreateGraphicsPipelineState", 0);
     bound.pipelines[key] = pipeline;
     return pipeline;

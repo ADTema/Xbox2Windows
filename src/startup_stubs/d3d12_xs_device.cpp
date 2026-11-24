@@ -1632,6 +1632,7 @@ struct Pass {
     PlacedVertexView placed_vb[8] = {};
     D3D12_INDEX_BUFFER_VIEW ib = {};
     DXGI_FORMAT target_formats[8] = {};
+    DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
     UINT target_count = 0;
     ID3D12Resource* target0 = nullptr;  // desktop resource of render target 0 (for per-draw dumps)
     bool heap_set = false;
@@ -1699,32 +1700,63 @@ void __stdcall list_graphics_root(Wrapper* self, void* root)
     if (auto* list = recording(self); list && w && w->own().kind == root_signature_kind && w->own().real)
         list->SetGraphicsRootSignature(static_cast<ID3D12RootSignature*>(w->own().real));
 }
-// List slot 50 (desktop 46 + 4), OMSetRenderTargets(count, handles, single range, depth). Depth is not bound yet.
-void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* handles, BOOL single_range, const void*)
+DXGI_FORMAT view_format_of(u64 desktop_handle, ID3D12Resource* target)
+{
+    DXGI_FORMAT format = target->GetDesc().Format;
+    if (const std::uint32_t id = shadow_id(desktop_handle)) {
+        AcquireSRWLockShared(&note_lock);
+        DXGI_FORMAT view_format = DXGI_FORMAT_UNKNOWN;
+        if (id - 1 < view_records().size() && view_records()[id - 1].desc_bytes >= 4)
+            std::memcpy(&view_format, view_records()[id - 1].desc, 4);
+        ReleaseSRWLockShared(&note_lock);
+        if (view_format != DXGI_FORMAT_UNKNOWN) format = desktop_format(view_format);
+    }
+    return format;
+}
+// List slot 50 (desktop 46 + 4), OMSetRenderTargets(count, handles, single range, depth).
+void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* handles, BOOL single_range,
+                            const D3D12_CPU_DESCRIPTOR_HANDLE* depth)
 {
     auto* list = recording(self);
     Pass& pass = pass_of(self);
     pass.targets_bound = false;
-    if (!list || !count || count > 8 || single_range || !x2w_local::readable(handles, count * sizeof(*handles))) return;
+    pass.target_count = 0;
+    pass.target0 = nullptr;
+    pass.dsv_format = DXGI_FORMAT_UNKNOWN;
+    if (!list || count > 8 || single_range) return;
+    if (count && !x2w_local::readable(handles, count * sizeof(*handles))) return;
     D3D12_CPU_DESCRIPTOR_HANDLE desktop[8];
+    ID3D12Resource* targets[8]{};
+    DXGI_FORMAT formats[8]{};
     for (UINT i = 0; i < count; ++i) {
         desktop[i].ptr = static_cast<SIZE_T>(desktop_cpu_handle(handles[i].ptr));
-        ID3D12Resource* target = view_target(desktop[i].ptr);
-        if (!target) return;
-        use_as_target(self, target);
-        DXGI_FORMAT format = target->GetDesc().Format;
-        if (const std::uint32_t id = shadow_id(desktop[i].ptr)) {
-            AcquireSRWLockShared(&note_lock);
-            DXGI_FORMAT view_format = DXGI_FORMAT_UNKNOWN;
-            if (id - 1 < view_records().size() && view_records()[id - 1].desc_bytes >= 4) std::memcpy(&view_format, view_records()[id - 1].desc, 4);
-            ReleaseSRWLockShared(&note_lock);
-            if (view_format != DXGI_FORMAT_UNKNOWN) format = desktop_format(view_format);
-        }
-        pass.target_formats[i] = format;
-        if (i == 0) pass.target0 = target;
+        targets[i] = view_target(desktop[i].ptr);
+        if (!targets[i]) return;
+        formats[i] = view_format_of(desktop[i].ptr, targets[i]);
     }
+    D3D12_CPU_DESCRIPTOR_HANDLE desktop_dsv{};
+    const D3D12_CPU_DESCRIPTOR_HANDLE* dsv_ptr = nullptr;
+    ID3D12Resource* dsv_target = nullptr;
+    DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
+    if (depth && x2w_local::readable(depth, sizeof(*depth))) {
+        const u64 resolved = desktop_cpu_handle(depth->ptr);
+        dsv_target = resolved ? view_target(resolved) : nullptr;
+        if (dsv_target) {
+            desktop_dsv.ptr = static_cast<SIZE_T>(resolved);
+            dsv_ptr = &desktop_dsv;
+            dsv_format = view_format_of(resolved, dsv_target);
+        }
+    }
+    if (!count && !dsv_ptr) return;
+    for (UINT i = 0; i < count; ++i) {
+        use_as_target(self, targets[i]);
+        pass.target_formats[i] = formats[i];
+        if (i == 0) pass.target0 = targets[i];
+    }
+    if (dsv_target) require_state(self, dsv_target, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     pass.target_count = count;
-    list->OMSetRenderTargets(count, desktop, FALSE, nullptr);
+    pass.dsv_format = dsv_format;
+    list->OMSetRenderTargets(count, count ? desktop : nullptr, FALSE, dsv_ptr);
     pass.targets_bound = true;
 }
 // List slots 21 / 22 / 23, RSSetViewports / RSSetScissorRects / OMSetBlendFactor.
@@ -2210,7 +2242,7 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
             args[1] = reinterpret_cast<u64>(&null_rtv);
     }
     const u64 result = method_of(self->own().real, N)(self->own().real, args[0], args[1], args[2], args[3], 0, 0, 0, 0);
-    if (N == 20 && args[0]) note_view_target(args[D], reinterpret_cast<ID3D12Resource*>(args[0]));
+    if ((N == 20 || N == 21) && args[0]) note_view_target(args[D], reinterpret_cast<ID3D12Resource*>(args[0]));
     check_device("Device view", N);
     static LONG calls;
     if (first_calls(calls))
@@ -2666,9 +2698,12 @@ HRESULT __stdcall device_create_pipeline_stream_x(Wrapper*, const D3D12_PIPELINE
     Translation* translation = nullptr;
     D3D12_BLEND_DESC blend{};
     bool has_blend = false;
+    D3D12_DEPTH_STENCIL_DESC depth_stencil{};
+    bool has_depth_stencil = false;
+    DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
     if (render_mode()) {
         char why[256] = "";
-        translation = stream_translation(*desc, blend, has_blend);
+        translation = stream_translation(*desc, blend, has_blend, depth_stencil, has_depth_stencil, dsv_format);
         if (!translation) real_pipeline = build_stream_pipeline(desc, why, sizeof(why));
         static LONG built;
         if (!translation && first_calls(built, 24))
@@ -2676,7 +2711,9 @@ HRESULT __stdcall device_create_pipeline_stream_x(Wrapper*, const D3D12_PIPELINE
     }
     *out = wrap(real_pipeline, pipeline_kind);
     note_pipeline(static_cast<Wrapper*>(*out), 86, nullptr, desc->pPipelineStateSubobjectStream, desc->SizeInBytes < 0x2000 ? desc->SizeInBytes : 0x2000,
-                  translation, translation && has_blend ? &blend : nullptr);
+                  translation, translation && has_blend ? &blend : nullptr,
+                  translation && has_depth_stencil ? &depth_stencil : nullptr,
+                  translation ? dsv_format : DXGI_FORMAT_UNKNOWN);
     return S_OK;
 }
 
