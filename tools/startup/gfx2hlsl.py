@@ -267,7 +267,9 @@ class Stage:
         r = reg_range(tok)
         s = self.sym.get(r[1]) if r else None
         if s and s[0] == 'desc':
-            return s[1], s[2]
+            # A descriptor can start inside a wider load (s_load_dwordx16 fetches two image
+            # descriptors): its offset is the load's offset plus the first register's dword index.
+            return s[1], (None if s[2] is None else s[2] + 4 * s[3])
         if s and s[0] == 'ptr':
             return s[1], None
         raise Unsupported('descriptor operand %s holds %s' % (tok, s))
@@ -1123,8 +1125,8 @@ def fnv(data, h=1469598103934665603):
 
 
 def pipeline_key(vs_code, ps_code, root_blob):
-    """Must match the runtime: FNV-1a over the three blobs, chained."""
-    return fnv(root_blob, fnv(ps_code, fnv(vs_code)))
+    """Hash the startup translation revision and the three blobs in runtime order."""
+    return fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-srv-2'))))
 
 
 FXC = os.environ.get('X2W_FXC', r'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\fxc.exe')
@@ -1212,7 +1214,7 @@ def main():
             if not a or not b or len(a) != q[6] or len(b) != q[10]:
                 print('pso %x: code not captured' % (w & 0xffffff))
                 continue
-            key = fnv(root, fnv(b, fnv(a)))
+            key = pipeline_key(a, b, root)
             for ext, blob in (('.a', a), ('.b', b), ('.root', root)):
                 open(os.path.join(out_dir, 'req_%016x%s' % (key, ext)), 'wb').write(blob)
             print('pso %x -> request %016x' % (w & 0xffffff, key))
