@@ -530,6 +530,13 @@ These are measured on one executable; treat them as hypotheses for others.
   survives its allocator's Reset, as on the console. If the fence that tracks a submit cannot be
   created or signalled, that submit's allocator is never reset or reused again. Run
   `ctest --preset dev --no-tests=error -R "^startup_list_resubmit_"`.
+- **Upload arena fixture.** The standalone arena allocates 640 writable bytes with 16-byte CPU
+  and GPU alignment, preserves them when a later allocation needs a new page, and translates
+  only byte ranges inside one live allocation. The idle reset retires those ranges. An eventual
+  command-list caller must wait for its recordings and GPU submissions to retire before reset.
+  The fixture exercises allocation and retirement without queue submission or guest slot binding.
+  Run `cmake --build --preset release --target startup_upload_arena` and
+  `ctest --preset release --no-tests=error -R '^startup_upload_arena_' -V`.
 - **Inline samplers.** Pixel shaders build sampler descriptors from constants (`s_movk_i32`,
   `s_bfm_b32`, 64-bit moves); the translator folds those into static samplers. A source-built
   pixel stage checks all four manifest words, rejects a mask width from a root constant, and
