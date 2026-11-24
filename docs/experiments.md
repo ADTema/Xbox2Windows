@@ -3148,8 +3148,9 @@ unsigned geometry words. It checks the native extent and the PSV triangle
 topology, group size and output bounds. It decodes the entry with LLVM in
 wave64 mode, follows two waves of forward control flow and specializes the
 geometry reads and lane masks. The resulting desktop mesh shader reads position
-and transform data from b0 and b1, emits three vertices and one primitive, and
-can record its exports to a diagnostic UAV when compiled with `TRACE_EXPORTS`.
+and transform data from b0 and b1, emits the vertices and primitives of the
+allocation, and can record its exports to a diagnostic UAV when compiled with
+`TRACE_EXPORTS`.
 
 The specialization assumes one 128-thread group, wave ID in bits 24–27 of s3,
 a descriptor table token in s17, and zero for s20, s21 and v5. Table offsets
@@ -3166,6 +3167,41 @@ ctest --preset dev --no-tests=error -R "^mesh_entry_draw_" -V
 ctest --preset dev --no-tests=error -R "^mesh_entry_float_draw_" -V
 ctest --preset dev --no-tests=error -R "^mesh_entry_cvt_minmax_draw_" -V
 ctest --preset dev --no-tests=error -R "^mesh_entry_unary_draw_" -V
+```
+
+The allocation is not limited to one triangle. `MSG_GS_ALLOC_REQ` may declare
+any vertex and primitive counts within the PSV0 output bounds, and each of the
+128 threads exports at most one vertex and one primitive, so a program can
+allocate up to 128 of each. The translation refuses the program unless every
+allocated vertex and primitive is exported exactly once, nothing outside the
+allocation is exported and every index names an allocated vertex. The compute
+fallback below still translates only the single three-vertex triangle and
+refuses any other allocation by name. `tests/mesh_multi_check.py` builds one
+gfx1013 program that reads its allocation word from the geometry binding and
+exports a skewed triangle strip, with vertex i at column i / 2 and row i mod 2
+and primitive (i, i + 1, i + 2). Three allocations are drawn: a quad (4
+vertices, 2 triangles, 320 covered pixels), a strip (12, 10, 400) and a strip
+that spans both waves (128, 126, 481). An exact rational rasterizer,
+independent of the translator, gives the 32×32 image and the export trace;
+every pixel center stays off every edge, and the last primitive of each wave
+owns at least one pixel. The `--mesh-multi` runner takes the trace size from
+the fixture. Plain and instrumented mesh DXIL match on every pixel and trace
+byte. Against the correct draw, a reference that trades the first index of the
+first primitive with the last index of the last one, a reference without the
+last primitive of a wave and a reference with one primitive fewer in the counts
+each fail with the predicted pixel count and first trace byte, and a program
+that swaps two indices of every primitive draws the same pixels but fails the
+trace. Without a GPU the test checks that the translation refuses a missing
+primitive, an allocation one vertex larger than the exports, a vertex exported
+beyond the allocation, an index outside it, counts above the PSV0 bounds, 129
+vertices and the compute fallback. The binary mode assembles the program with
+LLVM 15, translates the machine code of each allocation to the same HLSL as the
+source text and checks the two refusals of the command line.
+
+```text
+python3 -B tests/mesh_multi_check.py
+python3 -B tests/mesh_multi_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+ctest --preset dev --no-tests=error -R "^mesh_multi_draw_" -V
 ```
 
 The per-lane binary32 forms of the translator now also include `v_add_f32_e64`,
