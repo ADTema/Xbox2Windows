@@ -2016,6 +2016,11 @@ void __stdcall list_blend_factor(Wrapper* self, const float* factor)
 {
     if (auto* list = recording(self); list && x2w_local::readable(factor, 16)) list->OMSetBlendFactor(factor);
 }
+// List slot 24, OMSetStencilRef(reference): list state that the stencil test of the next draws compares against.
+void __stdcall list_stencil_ref(Wrapper* self, UINT reference)
+{
+    if (auto* list = recording(self)) list->OMSetStencilRef(reference);
+}
 // List slot 44 (desktop 40 + 4), SetGraphicsRootShaderResourceView(parameter, title GPU address).
 void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
 {
@@ -3428,6 +3433,7 @@ void build_tables()
         list_typed[21] = reinterpret_cast<ListTyped>(&list_viewports);
         list_typed[22] = reinterpret_cast<ListTyped>(&list_scissors);
         list_typed[23] = reinterpret_cast<ListTyped>(&list_blend_factor);
+        list_typed[24] = reinterpret_cast<ListTyped>(&list_stencil_ref);
         list_typed[25] = reinterpret_cast<ListTyped>(&list_pipeline);
         list_typed[32] = reinterpret_cast<ListTyped>(&list_set_descriptor_heaps);
         list_typed[34] = reinterpret_cast<ListTyped>(&list_graphics_root);

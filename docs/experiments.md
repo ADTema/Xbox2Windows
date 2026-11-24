@@ -10702,6 +10702,8 @@ The startup translator emits `SV_Depth` for an uncompressed `exp mrtz vN, off, o
 
 The source-built stream fixture draws green at vertex depth 0.25 and red at 0.75, with a writable DSV and `LESS`. Vertex depth alone leaves all 16 covered pixels green. Adding a pixel export of 0.125 preserves green in all 16, and changing just that export to 0.875 leaves all 16 red. Every variant checks the 16 clear pixels and retains the existing depth-disabled and read-only DSV controls.
 
+The same executable checks `OMSetStencilRef` (command-list slot 24, the desktop slot, named in the ABI notes but not seen in a title log). A pipeline with only an `EQUAL` stencil test draws to a `D24_UNORM_S8_UINT` view whose stencil was cleared to a stored value: reference 0x5A against a stored 0x5A draws all 16 pixels, 0x5B against 0x5A draws none, and 0 against 0 and 0xFF against 0xFF draw all 16. A reference of 0 is also the list's default, so the 0x5A and 0xFF cases are the ones that show the call reached the desktop list. A call on a list that was already closed is made after the first case and must not disturb the others. Limits: verified on WARP (Debug and `/O2`); the hardware variant was not run.
+
 ```powershell
 cmake --build --preset release --target startup_stream_depth
 ctest --preset release --no-tests=error -R '^startup_stream_depth_(warp|hardware)$' -V

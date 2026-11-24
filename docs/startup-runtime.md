@@ -27,6 +27,10 @@ It covers what the draw cannot observe: the logged descriptor offset (4 bytes in
 a byte-for-byte copy of the descriptor, and refusal of a null list or one that is not whole
 records. The control expects the first blend patch to win and must fail.
 
+## Stencil reference
+
+Command-list slot 24 (`OMSetStencilRef`, the desktop slot) passes its reference to the desktop list, as slots 21 to 23 do for viewports, scissors and the blend factor, so a translated draw whose pipeline enables the stencil test compares against it. A closed list ignores the call. The slot number is the desktop one and has not been seen in a title log; `startup_stream_depth_{warp,hardware}` checks the references 0x5A, 0x5B, 0 and 0xFF against a stencil cleared to the matching value.
+
 ## Default viewport and scissor
 
 A desktop command list that never sets a viewport or scissor rectangle draws no pixel. A translated
