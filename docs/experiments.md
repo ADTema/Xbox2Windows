@@ -11635,6 +11635,22 @@ ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_scalar_m0_(controls|wa
 python -B tests/startup_gfx2hlsl_scalar_m0_check.py binary llvm-mc-15
 ```
 
+## Startup translator: uniform sources of v_readfirstlane_b32
+
+The startup shaders are compiled with FXC (shader model 5), which has no wave intrinsics. The translator lowers `v_readfirstlane_b32 sD, vS` to `sD = vS` only when it proves that `vS` holds the same value in every lane. The previous proof covered only a `v_cvt_i32_f32` of a fixed buffer word. An unproven source still produces `v_readfirstlane_b32 requires a proven uniform source` (see [issue #1723](https://github.com/R0Y00/Xbox2Windows/issues/1723)).
+
+In straight-line code with a known `exec`, the proof follows `v_cvt_u32_f32`, `v_cvt_i32_f32`, `v_cvt_f32_ubyte0`, `v_mul_f32`, `v_fma_f32`, `v_fmaak_f32`, `v_rcp_f32`, and `v_mov_b32`, including e32 and e64 forms. Every source must be uniform. The float operations that lower operands as floats accept negation and absolute-value source modifiers. The float-result forms accept the modeled output modifiers `clamp`, `mul:2`, `mul:4`, and `div:2`.
+
+Uniform sources include inline constants and literals, SGPRs holding constants, user data or fixed buffer words, other SGPRs tracked as uniform, and VGPRs with an existing proof. A scalar result is tracked as varying when its expression depends on `vcc`, `exec`, `m0`, a varying scalar register, a VGPR without a proof, or a varying `scc`. Descriptor, pointer, and sampler symbols, and SGPRs holding a lane mask (a compare result, even from uniform operands), are treated as non-uniform sources. A 64-bit move proves its high word only from the source high word as it was before the move, never when the destination overlaps it, and a descriptor-path move carries a high-word symbol only when that symbol does not depend on the register's run-time contents. SCC follows the same dependency tracking, with saveexec and wrexec marking it varying. A scalar write to `m0` that also sets SCC judges SCC from the write's sources, so `s_and_b32 m0, vcc_lo, -1` makes it varying while a write from uniform scalars makes it uniform. Instructions whose SCC result is not modelled (`s_add`, `s_sub`, `s_min` and `s_max`, `s_wqm`, and scalar ops on symbolic descriptor words, which emit nothing) mark SCC varying. Scalar buffer loads track the original offset across every destination word, including when the emitted code saves it in a temporary.
+
+An overwrite clears the destination's old proof unless the new value is proven uniform. This applies to SDWA forms and all three interpolation forms (`v_interp_p1_f32`, `v_interp_p2_f32`, and `v_interp_mov_f32`). Either WQM form, and restoring `exec` from a saved copy, clears all existing VGPR proofs because they can activate helper lanes. The read requires known `exec`, a branch-free program, and no modifiers. It now explicitly checks for a single SGPR destination and a single VGPR source.
+
+`tests/startup_gfx2hlsl_readfirstlane_uniform_check.py` translates short sequences through the stage's dispatch without shader machine code. It checks emitted assignments for the listed operations, supported modifiers, and in-place and cross-register chains. Refusal cases cover varying sources and offsets, overwrites that invalidate a proof, WQM, a restored `exec` copy and other exec writes, lane masks, overlapping and descriptor-path 64-bit moves, branch and operand restrictions, and constructor-less probes with incomplete tracking state. The negative control empties the allowlist and requires every accepted sequence to refuse.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_readfirstlane_uniform$' -V
+```
+
 ## Desktop audio render sink
 
 `startup_audio_output` drives a small WASAPI shared-mode render sink ([`audio_sink.h`](../src/startup_stubs/audio_sink.h)) with generated PCM blocks. It is the first slice of [issue #1145](https://github.com/R0Y00/Xbox2Windows/issues/1145). The sink takes `submit(format, frames, bytes)`, converts the block to the endpoint mix format (32-bit float or 16-bit PCM only) and records the first accepted block, the submitted format, per-block frame counts and peaks, consumed frames (submitted minus `GetCurrentPadding`), the `IAudioClock` position, the drained interval and the recovery. The fixture runs three cases in one process: no submission; eight 40 ms blocks with distinct amplitudes, one of them intentionally silent; and a producer that withholds the next block until the queue is empty, then resumes.
