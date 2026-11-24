@@ -3391,6 +3391,11 @@ def binary(directory, assembler, objcopy, library):
                        [(f"image_atomic_{name}", lines, binding)
                         for name, _, lines, binding in mimg_atomic_cases(suite=suite)],
                        "image_atomic_", group=MIMG_STORE_GROUP)
+    mimg_atomic_counter_controls()
+    gfx1030_binary(directory, assembler, objcopy, library,
+                   [(f"image_atomic_{name}", lines, binding)
+                    for name, _, _, _, lines, binding in mimg_atomic_counter_cases()],
+                   "image_atomic_", group=MIMG_STORE_GROUP)
     mimg_store_controls()
     gfx1030_binary(directory, assembler, objcopy, library,
                    [(name, lines, binding) for name, _, _, lines, binding in mimg_store_cases()],
@@ -4896,6 +4901,7 @@ def mimg_resinfo_draw(directory, compiler, renderer, backend):
 MIMG_ATOMIC_UINT_FLAG = 1 << 25
 MIMG_ATOMIC_MINMAX_FLAGS = {"s": 1 << 26, "u": 1 << 27}
 MIMG_ATOMIC_EXCHANGE_FLAG = 1 << 28
+MIMG_ATOMIC_CAS_FLAG = 1 << 29
 MIMG_ATOMIC_OPS = {"integer": ("add", "sub", "and", "or", "xor"),
                    "minmax": ("smin", "smax", "umin", "umax"), "exchange": ("swap", "cmpswap")}
 MIMG_ATOMIC_BEFORE = (0xfffffff0, 0x7ffffff0, 0x20, 0x80000000)
@@ -4968,7 +4974,7 @@ def mimg_atomic_controls(*, suite="integer"):
         wrong_format = "R32_UINT" if case_binding["image_format"] == "R32_SINT" else "R32_SINT"
         rejects("Unsupported image atomic target or binding", aot.lower, case, MIMG_STORE_GROUP,
                 **(case_binding | {"image_format": wrong_format}))
-    for op in ("inc", "dec", "fcmpswap", "fmin", "fmax"):
+    for op in ("fcmpswap", "fmin", "fmax"):
         rejects("Unsupported compute instruction", aot.lower,
                 variant(lines, ("image_atomic_" + base_op, "image_atomic_" + op)), MIMG_STORE_GROUP, **binding)
     rejects("Unsupported image store target", aot.lower,
@@ -5007,6 +5013,10 @@ def mimg_atomic_reference(op, contended, groups, *, compare_store=(MIMG_ATOMIC_C
         update = {"add": lambda old: old + value, "sub": lambda old: old - value,
                   "and": lambda old: old & value, "or": lambda old: old | value, "xor": lambda old: old ^ value,
                   "swap": lambda old: value}[op]
+    return mimg_atomic_words(before_words, update, contended, groups)
+
+
+def mimg_atomic_words(before_words, update, contended, groups):
     initial, expected = [], []
     for level in range(3):
         for y in range(TEXTURE_HEIGHT >> level):
@@ -5106,6 +5116,98 @@ def mimg_atomic_integer(directory, compiler, renderer=None, backend=None, *, sui
     if record:
         record.parent.mkdir(parents=True, exist_ok=True)
         record.write_text("\n".join(sorted(completed)) + "\n", encoding="utf-8")
+    return 0
+
+
+MIMG_COUNTER_INITIAL = (3, 4, 0, 2, 1, 0xffffffff, 0xfffffffe, 5)
+
+
+def mimg_atomic_counter_cases():
+    # Reuse the independent and contended address patterns of the add cases.
+    for name, contended, template, binding in mimg_atomic_cases():
+        if name not in ("add", "add_contended"):
+            continue
+        limits = (("contended", 3),) if contended else (("limit_3", 3), ("limit_0", 0), ("limit_max", 0xffffffff))
+        for op in ("inc", "dec"):
+            for suffix, limit in limits:
+                literal = "-1" if limit == 0xffffffff else str(limit)
+                lines = variant(template, ("image_atomic_add", f"image_atomic_{op}"),
+                                (f"v_mov_b32_e32 v14, {MIMG_ATOMIC_VALUE:#x}", f"v_mov_b32_e32 v14, {literal}"))
+                yield f"{op}_{suffix}", op, limit, contended, lines, binding
+
+
+def mimg_atomic_counter_controls():
+    for _, _, _, _, lines, binding in mimg_atomic_counter_cases():
+        atomic = lines[-3]
+        for edit, diagnostic in (
+            (atomic + " glc", "Unsupported compute instruction"),
+            (atomic.replace("dmask:0x1", "dmask:0x3"), "Unverified image atomic data range or mask"),
+            (atomic.replace("v14,", "v255,"), "Unverified image atomic data"),
+            (atomic.replace("v[8:9]", "v[8:10]"), "Unverified image atomic coordinates"),
+        ):
+            rejects(diagnostic, aot.lower, variant(lines, (atomic, edit)), MIMG_STORE_GROUP, **binding)
+        rejects("Unverified image atomic descriptor", aot.lower,
+                lines[:-4] + lines[-3:], MIMG_STORE_GROUP, **binding)
+        rejects("Unsupported image atomic target or binding", aot.lower, lines, MIMG_STORE_GROUP,
+                **(binding | {"image_format": "R32_SINT"}))
+
+
+def mimg_counter_reference(op, limit, contended, groups):
+    if op == "inc":
+        update = lambda old: old + 1 if old < limit else 0
+    else:
+        update = lambda old: old - 1 if 0 < old <= limit else limit
+    return mimg_atomic_words(MIMG_COUNTER_INITIAL, update, contended, groups)
+
+
+def mimg_counter_mutation(op, limit, contended):
+    if contended:
+        return ("while (observed != expected)", "while (false)",
+                "mip=0 word=32 expected=00000001 actual=00000003")
+    if limit == 3 and op == "inc":
+        return ("expected >= limit", "expected > limit",
+                "mip=0 word=32 expected=00000000 actual=00000004")
+    if limit == 3:
+        return ("expected > limit", "expected >= limit",
+                "mip=0 word=32 expected=00000002 actual=00000003")
+    return None
+
+
+def mimg_atomic_counter(directory, compiler, renderer=None, backend=None):
+    record_path = os.environ.get("FORM_COVERAGE_RECORD") if renderer else None
+    record = Path(record_path) if record_path else None
+    if record:
+        record.unlink(missing_ok=True)
+    mimg_atomic_counter_controls()
+    for name, op, limit, contended, lines, binding in mimg_atomic_counter_cases():
+        src, cso, case = (directory / f"image_atomic_{name}.{ext}" for ext in ("hlsl", "cso", "case"))
+        code = aot.lower(lines, MIMG_STORE_GROUP, **binding)
+        src.write_text(code, encoding="ascii")
+        compile_shader = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
+        subprocess.run(compile_shader, check=True)
+        for groups in (1, 2):
+            initial, expected = mimg_counter_reference(op, limit, contended, groups)
+            assert len(initial) == len(expected) == 336 and initial != expected
+            if renderer:
+                case.write_bytes(struct.pack("<674I", groups | MIMG_ATOMIC_CAS_FLAG, 0, *initial, *expected))
+                run = [renderer, backend, "--compute-texture-store-case", cso, case]
+                print(f"image_atomic_{name} groups={groups}", flush=True)
+                result = subprocess.run(run)
+                if result.returncode:
+                    return result.returncode
+        if mutation := mimg_counter_mutation(op, limit, contended):
+            correct, wrong, mismatch = mutation
+            assert code.count(correct) == 1
+            src.write_text(code.replace(correct, wrong), encoding="ascii")
+            subprocess.run(compile_shader, check=True)
+            if renderer:
+                bad = subprocess.run(run, capture_output=True, text=True)
+                if bad.returncode != 1 or mismatch not in bad.stderr:
+                    raise AssertionError(f"{name}: image counter mutation escaped detection\n{bad.stderr}")
+                print(f"{name} image counter mutation: {bad.stderr}", end="")
+    if record:
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text("image_atomic_dec\nimage_atomic_inc\n", encoding="utf-8")
     return 0
 
 
@@ -5795,6 +5897,8 @@ if __name__ == "__main__":
                  "draw-mimg-atomic-minmax": lambda d, *a: mimg_atomic_integer(d, *a, suite="minmax"),
                  "compile-mimg-atomic-exchange": lambda d, compiler: mimg_atomic_integer(d, compiler, suite="exchange"),
                  "draw-mimg-atomic-exchange": lambda d, *a: mimg_atomic_integer(d, *a, suite="exchange"),
+                 "compile-mimg-atomic-counter": lambda d, compiler: mimg_atomic_counter(d, compiler),
+                 "draw-mimg-atomic-counter": mimg_atomic_counter,
                  "draw-mimg-packed-store": lambda d, *a: mimg_store_draw(d, *a, packed=True),
                  "draw-ds-route": ds_draw,
                  "draw-lds-qword": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_QWORD_CASES),
