@@ -16242,19 +16242,34 @@ def check_controls(directory, *, parallel=True):
         _check_controls_inline(directory)
         _run_controls_serial()
         return
+    futures = []
     with executor:
-        futures = [(task, executor.submit(_run_control_subcheck, task)) for task in tasks]
+        # Workers start lazily inside submit(), so a refusal to start a process or thread
+        # (for example RLIMIT_NPROC) surfaces here, not in the constructor. submit() runs no
+        # check, so any error from it is a startup failure and takes the serial fallback.
         try:
-            _check_controls_inline(directory)
-            for task, future in futures:
-                try:
-                    ACCEPTED.update(future.result())
-                except Exception as error:
-                    raise RuntimeError(f"Control sub-check {task!r} failed") from error
-        except BaseException:
+            for task in tasks:
+                futures.append((task, executor.submit(_run_control_subcheck, task)))
+        except Exception:
             for _, pending in futures:
                 pending.cancel()
-            raise
+            futures = None
+        if futures is not None:
+            try:
+                _check_controls_inline(directory)
+                for task, future in futures:
+                    try:
+                        ACCEPTED.update(future.result())
+                    except Exception as error:
+                        raise RuntimeError(f"Control sub-check {task!r} failed") from error
+            except BaseException:
+                for _, pending in futures:
+                    pending.cancel()
+                raise
+            return
+    # Leaving the with block waited for any task already started; its result is discarded.
+    _check_controls_inline(directory)
+    _run_controls_serial()
 
 
 def check_program_extent(directory, library):
