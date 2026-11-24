@@ -126,7 +126,7 @@ side of the interface in its native header:
   count is at +0x238.
 
 `gfx2hlsl.py` links each attribute to the vertex parameter whose output register carries the same semantics with the
-same components as the attribute's input register. Raw programs without signatures still pair by number.
+same components as the attribute's input register. Raw programs without signatures still pair by number. A pixel shader that declares no inputs reads no tables, and any attribute read it makes is refused.
 
 The translation is refused when:
 - a record has any other values (these forms pack two signature registers into one parameter or attribute);

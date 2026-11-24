@@ -202,6 +202,9 @@ def stream_interface(vs_container, ps_container):
     from pixel_aot import container_image
     from resource_inventory import parts
     vs, ps = parts(vs_container), parts(ps_container)
+    inputs = [entry for entry in signature_entries(ps[b'ISG1']) if not entry[3]] if b'ISG1' in ps else []
+    if not inputs:
+        return {}  # nothing to link: a read of any attribute is refused in note_attr
     vs_image, ps_image = container_image(vs[b'DXIL'], stage=1), container_image(ps[b'DXIL'], stage=0)
     if (struct.unpack_from('<Q', vs_image, 192)[0] != FETCH_HEADER_BASE or
             struct.unpack_from('<Q', ps_image, 192)[0] != IFACE_PS_HEADER_BASE):
@@ -221,7 +224,6 @@ def stream_interface(vs_container, ps_container):
             raise Unsupported('unverified vertex output record %s' % vs_image[IFACE_VS_RECORDS + 6 * i:IFACE_VS_RECORDS + 6 * i + 6].hex())
         params[register] = param
     outputs = {(name, index): (register, mask) for register, name, index, system, mask in signature_entries(vs[b'OSG1']) if not system}
-    inputs = [entry for entry in signature_entries(ps[b'ISG1']) if not entry[3]]
     mapping = {}
     for attr, register in enumerate(attributes):
         sources = set()
