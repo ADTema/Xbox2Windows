@@ -401,7 +401,7 @@ These are measured on one executable; treat them as hypotheses for others.
   so a fence never completes before the wait ends. Other queue slots that are given a fence are
   still treated as Signals. The slot numbers are inferred from that layout; no title call to slot
   17 has been logged yet. Run
-  `ctest --preset dev --no-tests=error -R "^startup_queue_wait_"`.
+  `ctest --preset dev --no-tests=error -R "^startup_queue_wait_"`. On Windows 11 build 26300.9974 both backends separate the two slots the way this mapping assumes: on the RTX 5080 Laptop (32.0.15.8142) and on the Microsoft Basic Render Driver, routing the wait through slot 15 leaves `G=1` before `F` is signalled because that slot acts as a Signal, while routing it through slot 17 leaves `G=0` until `F` reaches 1 from the CPU.
 - **Resubmitted lists.** In render mode a closed list can be submitted again until its own Reset.
   Each title allocator stands for a pool of desktop allocators. The title's Reset resets the current
   one only if no list holds a recording on it and every queue has passed its last submit; otherwise
