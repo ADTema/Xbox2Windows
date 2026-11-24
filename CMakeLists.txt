@@ -646,6 +646,14 @@ foreach(adapter IN ITEMS warp hardware)
     add_test(NAME startup_plane_size_device_${adapter} COMMAND startup_plane_size_device_check ${adapter})
 endforeach()
 set_tests_properties(startup_plane_size_device_hardware PROPERTIES SKIP_RETURN_CODE 77)
+# Opt-in BC7 4 KiB standard surfaces (src/startup_stubs/bc7_4k_s.h): accepted descriptions, padded
+# sizes, block order and detile; the mutated run (x-first bit order) is the negative control.
+add_executable(startup_bc7_4k_s_check tests/startup_bc7_4k_s_check.cpp)
+target_include_directories(startup_bc7_4k_s_check PRIVATE src)
+target_compile_features(startup_bc7_4k_s_check PRIVATE cxx_std_17)
+add_test(NAME startup_bc7_4k_s COMMAND startup_bc7_4k_s_check)
+add_test(NAME startup_bc7_4k_s_x_first_control COMMAND startup_bc7_4k_s_check --mutate x-first)
+set_tests_properties(startup_bc7_4k_s_x_first_control PROPERTIES WILL_FAIL TRUE)
 # Descriptor heaps whose desktop CPU start is not an address get plain memory as the start the
 # executable sees (src/startup_stubs/title_heap_memory.h); the mutated run is the negative control.
 add_executable(startup_title_heap_check tests/startup_title_heap_check.cpp)
