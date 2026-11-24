@@ -3487,6 +3487,103 @@ ctest --preset dev --no-tests=error -j 1 -R '^pixel_aot_compare_gather_(warp|har
 python3 -B tests/pixel_compare_gather_check.py --binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```
 
+### gfx1030 2D gather instruction bias probe
+
+Table 44 defines `_b` as adding a float bias to the computed LOD. Section
+8.2.5 puts the packed offset, bias, comparison reference and normalized UV
+in that order, omitting operands whose suffix is absent. The offset packs
+signed six-bit X and Y in bits `[5:0]` and `[13:8]`. LLVM 15 round-trips
+these contiguous 2D forms with four result VGPRs.
+[AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+
+| Opcode | ISA opcode | Address roles | LLVM bytes for the probe |
+|---|---|---|---|
+| `image_gather4_b` | `0x45` | bias, U, V | `080414f1 060c4701` |
+| `image_gather4_b_o` | `0x55` | offset, bias, U, V | `080454f1 050c4701` |
+| `image_gather4_c_b` | `0x4d` | bias, reference, U, V | `080134f1 060c4701` |
+| `image_gather4_c_b_o` | `0x5d` | offset, bias, reference, U, V | `080174f1 050c4701` |
+
+The candidate computes `log2(max(length(dx), length(dy)))` with quad
+derivatives in view-mip-zero texel units. It adds the instruction bias
+before clamping and selecting the point mip. The probe uses three visible
+mips of an 8x8 2D view, clamp-to-edge XY, bilinear XY, point mip filtering
+and zero sampler bias. Ordinary gather reads blue. Comparison gather reads
+red with `LESS` and reference `0.5`. Offset cases use `(-1, 1)`. Each UV
+axis is affine in one screen coordinate with a `5/128` phase to keep the
+footprint away from half-texel boundaries.
+
+| Case | Texels per pixel (X, Y) | Candidate base LOD | Instruction bias | Candidate view mip |
+|---|---|---:|---:|---:|
+| `positive` | (1, 2) | 1 | +1 | 2 |
+| `negative` | (2, 1) | 1 | -1 | 0 |
+| `magnify` | (0.5, 0.25) | -1 | +2 | 1 |
+
+The native shaders compute both coordinates inside a wave64 whole-quad
+region, issue the gather, wait for the result and restore the entry EXEC
+before exporting four taps. Each case has an explicit-`_l` control at the
+candidate mip with otherwise identical inputs. The standalone desktop
+HLSL uses `ddx_fine` and `ddy_fine` and four explicit-mip loads. It avoids
+the desktop LOD query whose raw result varied in the earlier experiment.
+[LOD query experiment](https://github.com/R0Y00/Xbox2Windows/pull/1445)
+
+The exact-rational CPU footprint compares all 256 output words and
+distinguishes each of the three mips. The negative-bias case with a lost
+sign changes the ordinary gather at pixel `(0,0)`, tap 0 from `529` to
+`8705`. Clamping the base LOD before the magnification bias changes that
+pixel and tap from `4609` to `8705`. Zero-extending the negative offset
+and reversing the comparison also produce differences.
+
+```sh
+python3 -B tests/pixel_gather_bias_probe.py --binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
+```powershell
+$py = (Get-Command python).Source
+$dxc = (Get-Command dxc).Source
+cmake --build --preset dev --target offscreen_check
+$renderer = (Resolve-Path out/build/dev/offscreen_check.exe).Path
+& $py -B tests/pixel_gather_bias_probe.py --dxc $dxc --draw $renderer warp
+& $py -B tests/pixel_gather_bias_probe.py --dxc $dxc --draw $renderer hardware
+```
+
+The desktop runs compare all 64 RGBA pixels for each of the twelve cases.
+They also draw a mutated shader for each case, verify its full wrong-mip
+prediction, and require a mismatch against the original prediction at the
+CPU model's first differing pixel. The mutations drop the bias in the two
+minification cases or clamp the base LOD before bias in the magnification case.
+Use `--dxc` without `--draw` to compile offline.
+
+`--emit` writes the sources and synthetic inputs without LLVM or DXC.
+`--binary` also writes ELF objects and raw `.text`. Find the generated
+files under `out/gfx1030-gather-bias-probe/`. Its manifest gives sampler
+words and the expected mip per case. The `.case` files pair the texture
+levels with the expected output for `offscreen_check --check-pixel-gather`.
+
+With a native gfx1030 graphics runner, draw the two raw programs separately
+with identical pipeline state. Use an 8x8 single-sample viewport covered
+by one triangle with `attr0.xy = pixel_center.xy / 8` before the shader
+applies scale and phase. Configure an RGBA32F export, perspective center
+barycentrics in `v0:v1`, the interpolation base in `s24` and a pointer to
+an eight-DWORD 2D image descriptor in `s[20:21]`. Upload the row-major
+`.mipN.rgba32f` files as native 8x8, 4x4 and 2x2 RGBA32F levels with base
+level 0, last level 2 and identity swizzle. The runner handles native
+layout and pitch. The shader loads the sampler words from literals.
+Check each draw as tightly packed, row-major little-endian RGBA32F.
+
+```sh
+python3 -B tests/pixel_gather_bias_probe.py --readback image_gather4_b-magnify out/native-magnify.rgba32f
+```
+
+The native runner and pipeline setup are external to the probe. Start
+with the ordinary magnification pair. If the explicit control matches
+mip 1 and the biased shader matches mip 2, the native result rejects the
+candidate clamp order. If the explicit control differs, first resolve
+the resource, quad or tap mismatch. Run the remaining pairs before using
+the candidate for lowering. Native and desktop execution evidence is
+pending. The four opcodes remain unsupported by the AOT translator.
+Fractional mip thresholds, non-affine or entry-only coordinates, dynamic
+bias, alternate view shapes and `_cl` are outside the probe.
+
 ### gfx1030 2D image stores
 
 `image_store`, `image_store_mip`, `image_store_pck` and `image_store_mip_pck`
