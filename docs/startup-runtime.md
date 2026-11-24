@@ -44,6 +44,80 @@ Run `ctest --preset dev --no-tests=error -R "^startup_stream_viewport_(hardware|
 `startup_stream_consumer`. On an 8×4 target the cases draw with neither call, inside a 4×2 rectangle (the
 rest keeps the clear color), and on a reset list that follows the rectangle (all pixels drawn again).
 
+## Stream vertex fetch from the input layout
+
+A vertex shader in a slot-86 stream can take its inputs from a fetch routine that the console driver builds
+from the stream's input layout. Such a shader starts with `s_swappc_b64 s[4:5], s[4:5]` and only then reads
+the registers the routine loaded. The routine's code is not in the shader container.
+
+The stand-in reads the `INPUT_LAYOUT` subobject and publishes it next to the request as `req_<key>.ia`, before
+`.a`. The file holds `ia1 <count>` and then one line per element: semantic, index, format, slot, offset, class
+and step rate. A stream with a non-empty layout includes that text in its cache key; other keys are unchanged.
+One log line per stream gives the element count and, for each element, format, slot, offset and class:
+`x2w-draw stream input layout: 2 elements (format/slot/offset/class) 6/0/0/0 6/0/4294967295/0`.
+
+`gfx2hlsl.py` translates the call as the loads it stands for, through the vertex-buffer path the other
+translations use (`srv buf vb <slot>` with a `stride` entry value). The registers come from a table in the
+container's native header. From +0x138 it holds one 5-byte record per fetched input: kind (6), input-signature
+register, component mask, first VGPR and component count minus one. Each record is matched to a layout element
+through the semantic name and index that the input signature gives for its register.
+
+The table was checked offline against the input signatures of every readable vertex program in one title's shader
+archive (local files only, not in the repository). 628 programs start with the call. All of them have a header of
+0x2f8 bytes and records of kind 6. Each of their 1,417 records names a signature register, and its mask equals
+that input's read mask. Records follow register order. The first record starts at v4, and each next one starts 4
+VGPRs later. The count reaches the highest component read: five records read only z or only w (mask 0x4 with
+count 3, mask 0x8 with count 4), and all components up to that one are loaded. None of the 1,355 programs without
+the call has a record. In all 1,983 programs the header's u32 at +0x1d8 equals the number of records.
+
+Refused: a header of any other size, a record of another kind, a mask whose highest bit is not its count,
+overlapping registers, a record reaching past v255, and a record count that disagrees with +0x1d8. A fetched element is also refused when it is
+per-instance, sits in a vertex-buffer slot above 7 (the stand-in binds slots 0 to 7), has an unknown format, or is
+appended (`D3D12_APPEND_ALIGNED_ELEMENT`) after an element of unknown size or one that ends off a 4-byte boundary,
+because the packing there is not measured. Elements that no record fetches are not checked. An unreadable layout
+is logged, and the translation is requested without it. Components a format lacks read
+as 0, 0, 0 and 1, as in the existing vertex-fetch table; that default is not measured for this path.
+
+A shader that starts with the call and has no layout is refused.
+
+After the call, every vertex register the shader reads must be defined on all paths. The translator proves this only
+for the entry block: the straight-line code from the call to the first branch or branch target. A register counts as
+defined when it is v0, a fetched register, or written in the entry block before the read by an instruction that
+runs with the entry exec mask. A write after exec was changed, or in any block after the entry block, does not
+count, even when it would run on every path. A read of any other register is refused. Programs whose later
+blocks only read registers defined this way still translate. After the call, any exec write ends the
+unconditional region, whatever instruction makes it. `s_wqm` of exec into itself only adds lanes and stays a
+no-op. Other `s_wqm` forms, writes to exec_hi, and exec writes by an instruction the translator does not model are
+refused.
+
+Before this change the call was cut off with the header and every input read as zero. The draw then had zero area
+and wrote no pixel. Programs without the call translate as before.
+
+Run `ctest --preset release --no-tests=error -R "^startup_stream_fetch_(warp|hardware)$" -V` after building
+`startup_stream_consumer`. The source-built shader declares POSITION and TEXCOORD. The stream lists them in the
+other order, TEXCOORD in slot 0 and POSITION in slot 1 at `D3D12_APPEND_ALIGNED_ELEMENT`. Two draws go to an 8×4
+target: one from start vertex 3, and one indexed with indices 4 to 9 and base vertex 5. Exactly the two position
+rectangles are drawn. Two mutations of the generated fetch must fail the exact check and draw the TEXCOORD
+rectangles instead: the records' registers exchanged, and both elements read from slot 0. Leaving the base vertex
+out of the fetch index also fails it. A shader without its layout is refused and not drawn.
+
+The translator cases need no device: `python -B tests/startup_stream_fetch_check.py`, or
+`ctest --preset release --no-tests=error -R "^startup_stream_fetch_translate$"`. They check the generated loads and
+manifest entries for both slots, and that a fetch behind `s_wqm_b64 exec, exec` still translates. They also check
+these refusals:
+- no layout;
+- an export of v12 that nothing defines;
+- v12 written only after exec was set to 0;
+- v12 written only in code a branch jumps over;
+- v12 written after `s_wqm_b32 exec_lo, 0`, or after a write to exec_hi;
+- a z-only record whose count stops below z (a count of 3 translates);
+- an element in slot 8, a per-instance element, or an element of format 10;
+- a record of kind 7, or one that reaches past v255;
+- a header record count that disagrees with the table.
+
+The pixel stage still reads attribute N from vertex output N. It does not yet pair the two by semantic, so a
+pixel shader that reads only some of the vertex outputs can receive the wrong one. That is a separate problem.
+
 ## Output window and fallback diagnostics
 
 The desktop swap chain has its own top-level window, class `X2WOutputWindow`.
