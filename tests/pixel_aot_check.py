@@ -839,7 +839,7 @@ def check_region_body_controls():
     for body in ("v_rcp_f32_e64 v13, s46", "v_fmac_f32_e64 v13, s45, v20", "v_mac_f32_e64 v13, s45, v20",
                  "v_cvt_f32_ubyte0_e64 v13, s47", "v_exp_f32_e32 v13, s46", "v_log_f32_e32 v13, s46",
                  "v_cvt_f32_f16_e64 v13, v20", "v_fma_mix_f32 v13, s45, v20, 1.0", "v_max3_f32 v13, s45, v20, 1.0",
-                 "s_mov_b32 s62, 0", "v_cvt_pkrtz_f16_f32_e32 v13, v20, v20"):
+                 "s_mov_b32 m0, 0", "v_cvt_pkrtz_f16_f32_e32 v13, v20, v20"):
         for opener in ("cmpx", "saveexec"):
             expect_value_error(translate, region_body_program(body, False, opener),
                                "Instruction cannot run in a masked region")
@@ -865,6 +865,45 @@ REGION_WAIT_OPENERS = {
     "cmpx": ([CMPX_SAVE, CMPX_COMPARE], CMPX_MOV_RESTORE),
     "saveexec": (["v_cmp_lt_f32_e64 vcc_lo, v12, s44", "s_and_saveexec_b64 s[60:61], vcc"], CMPX_OR_RESTORE),
 }
+
+REGION_SALU_BODY = (
+    "s_mov_b32 s52, 2",
+    "s_movk_i32 s53, 0x3",
+    "s_add_i32 s54, s52, s53",
+    "s_mul_i32 s55, s54, 2",
+    "s_cmp_gt_i32 s55, 9",
+    "s_cselect_b32 s56, s62, s63",
+    "v_mov_b32_e32 v13, s56",
+    "s_cmp_lt_i32 s52, s53",
+    "s_cselect_b32 s57, s64, s65",
+    "v_mov_b32_e32 v14, s57",
+)
+
+
+def region_scalar_alu_program(body=REGION_SALU_BODY, opener="cmpx", skip=False, after=()):
+    """Use modeled scalar ALU results for vector writes inside either masked-region opener."""
+    save, restore = REGION_WAIT_OPENERS[opener]
+    constants = ["s_mov_b32 s62, 0x3f400000", "s_mov_b32 s63, 0x3e800000",
+                 "s_movk_i32 s64, 0x3f80", "s_lshl_b32 s64, s64, 16",
+                 "s_movk_i32 s65, 0x3f00", "s_lshl_b32 s65, s65, 16"]
+    program = uncompressed_export(["s_mov_b32 s52, 0xdeadbeef", *constants, *save, *body, restore, *after])
+    if not skip:
+        return program
+    branch = program.index(save[-1]) + 1
+    program.insert(branch, "s_cbranch_execz 0")
+    pairs = offset_pairs(program)
+    target = program.index(restore)
+    program[branch] = f"s_cbranch_execz {(pairs[target][0] - pairs[branch][0] - 4) // 4}"
+    return offset_pairs(program)
+
+
+def region_scalar_alu_skip_asm(opener):
+    restore = REGION_WAIT_OPENERS[opener][1]
+    program = [line for _, line in region_scalar_alu_program(opener=opener, skip=True)]
+    branch = next(i for i, line in enumerate(program) if line.startswith("s_cbranch_execz"))
+    program[branch] = "s_cbranch_execz .Lscalar_restore"
+    program.insert(program.index(restore), ".Lscalar_restore:")
+    return program
 
 
 def region_wait_program(forms, opener="cmpx", skip=False):
@@ -994,6 +1033,78 @@ def check_region_wait_draw(directory, compiler, renderer, backend):
                 run_pixel_batch(renderer, backend, shader, cases)
             except AssertionError as error:
                 error.add_note(f"Region wait draw on {backend}: {label}")
+                raise
+    return 0
+
+
+def check_region_scalar_alu_controls():
+    """Issue #987's bounded scalar-ALU stage: values are visible inside, not after, the mask."""
+    for opener in REGION_WAIT_OPENERS:
+        for skip in (False, True):
+            source = translate(region_scalar_alu_program(opener=opener, skip=skip))
+            assert "salu" in source and "scc" in source and "precise float alu" in source
+            # A preexisting SGPR is overwritten only on the masked path and cannot be read after restore.
+            expect_value_error(
+                translate,
+                region_scalar_alu_program(opener=opener, skip=skip, after=("v_mov_b32_e32 v18, s52",)),
+                "Read of a register defined only on the masked path")
+            expect_value_error(
+                translate,
+                region_scalar_alu_program(
+                    opener=opener, skip=skip, after=("s_cselect_b32 s58, 1, 0",)),
+                "Select condition is not a tracked scalar result")
+            # An unconditional SGPR write and SCC compare re-establish usable values.
+            translate(region_scalar_alu_program(
+                opener=opener, skip=skip,
+                after=("s_mov_b32 s52, 0x3f800000", "v_mov_b32_e32 v18, s52",
+                       "s_cmp_gt_i32 s52, 0", "s_cselect_b32 s58, 1, 0")))
+        for register in ("s60", "s61"):
+            expect_value_error(
+                translate,
+                region_scalar_alu_program(
+                    opener=opener, body=(f"s_mov_b32 {register}, 0",)),
+                "overwrites the saved execution pair")
+        # Unknown source values, loads, and modeled-but-out-of-slice scalar forms stay refused.
+        must_reject(translate, region_scalar_alu_program(
+            opener=opener, body=("s_add_i32 s54, s70, 1",)))
+        for body in ("s_abs_i32 s52, s53", "s_add_u32 s52, s53, 1",
+                     "s_buffer_load_dword s70, s[44:47], 0x10"):
+            expect_value_error(
+                translate,
+                region_scalar_alu_program(opener=opener, body=(body,)),
+                "Instruction cannot run in a masked region")
+
+
+def region_scalar_alu_pixels(threshold):
+    return masked_pixels(threshold, (0.75, 1.0), False)
+
+
+def check_region_scalar_alu_draw(directory, compiler, renderer, backend):
+    """Draw scalar results consumed by vector writes under mixed, full, and empty masks."""
+    source = directory / "region-scalar-alu.hlsl"
+    shader = directory / "region-scalar-alu.cso"
+    constants = bytearray(256)
+    for opener in REGION_WAIT_OPENERS:
+        for skip in (False, True):
+            label = f"{opener}-{'skip' if skip else 'plain'}"
+            source.write_text(
+                translate(region_scalar_alu_program(opener=opener, skip=skip)), encoding="ascii")
+            compile_shader(compiler, source, shader)
+            cases = []
+            for threshold in (0.5, 10.0, -1.0):
+                struct.pack_into("<4f", constants, 12, threshold, 0.25, 0.75, 0.0)
+                case = directory / f"region-scalar-alu-{label}-{len(cases)}.case"
+                write_case(case, constants, region_scalar_alu_pixels(threshold))
+                cases.append((case, "pass"))
+            # Deliberately expect the region writes on every lane as a negative control.
+            struct.pack_into("<4f", constants, 12, 0.5, 0.25, 0.75, 0.0)
+            case = directory / f"region-scalar-alu-{label}-unmasked.case"
+            write_case(case, constants, region_scalar_alu_pixels(10.0))
+            cases.append((case, "mismatch"))
+            try:
+                run_pixel_batch(renderer, backend, shader, cases)
+            except AssertionError as error:
+                error.add_note(f"Region scalar ALU draw on {backend}: {label}")
                 raise
     return 0
 
@@ -9509,7 +9620,7 @@ def check_masked_controls():
     must_reject(translate, [line for _, line in masked_skip()])
     # Waits whose counters are drained are admitted since #987; check_region_wait_controls covers which stay refused.
     for extra in (
-            "s_mov_b32 s62, 1", "s_inst_prefetch 0x3", "s_and_saveexec_b64 s[58:59], vcc",
+            "s_mov_b32 m0, 1", "s_inst_prefetch 0x3", "s_and_saveexec_b64 s[58:59], vcc",
             "s_buffer_load_dword s70, s[44:47], 0x10", "exp mrt0 v12, v13, v14, v15 done vm",
             "image_sample v[16:19], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
             "v_cmp_eq_f32_e64 vcc_lo, v12, v13", "v_interp_p1_f32_e32 v17, v0, attr0.x",
@@ -11248,6 +11359,7 @@ def check_controls(directory):
     check_shift64_controls()
     check_region_body_controls()
     check_region_wait_controls()
+    check_region_scalar_alu_controls()
     check_pk_fmac_controls()
     check_title_load_controls()
     check_ds_swizzle_controls()
@@ -13266,6 +13378,9 @@ def check_binary(directory, assembler, objcopy, library):
         fixtures.append((region_wait_program(REGION_WAIT_FORMS, opener), translate))
         fixtures.append((region_wait_skip_asm(REGION_WAIT_FORMS, opener), translate, "gfx1013", "",
                          region_wait_program(REGION_WAIT_FORMS, opener, skip=True)))
+        fixtures.append((region_scalar_alu_program(opener=opener), translate))
+        fixtures.append((region_scalar_alu_skip_asm(opener), translate, "gfx1013", "",
+                         region_scalar_alu_program(opener=opener, skip=True)))
     fixtures.append((uncompressed_export(flat_scratch_ops_group1()), translate_int))
     fixtures.append((uncompressed_export(flat_scratch_ops_group2()), translate_int))
     for index, entry in enumerate(fixtures):
@@ -18090,7 +18205,9 @@ def main():
                     "draw-sad",
                     "draw-int16-vop3", "draw-int16-ternary", "draw-compressed-export", "draw-uncompressed-export",
                     "draw-uncompressed-integer-export",
-                    "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-cmpx-regions", "draw-region-body", "draw-region-waits", "draw-div-fmas", "draw-cmp64", "draw-shift64",
+                    "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-cmpx-regions",
+                    "draw-region-body", "draw-region-waits", "draw-region-scalar-alu", "draw-div-fmas",
+                    "draw-cmp64", "draw-shift64",
                     "draw-f16-arith", "draw-f16-round", "draw-f16-cvt-int16", "draw-flat-scratch", "draw-smem-pointers",
                     "draw-dpp-cvt", "draw-dpp-movrel", "draw-dpp-f16", "draw-dpp-extra", "draw-pk-fmac"):
             try:
@@ -18128,6 +18245,7 @@ def main():
                         "draw-cmpx-regions": check_cmpx_draw,
                         "draw-region-body": check_region_body_draw,
                         "draw-region-waits": check_region_wait_draw,
+                        "draw-region-scalar-alu": check_region_scalar_alu_draw,
                         "draw-div-fmas": check_valu_div_fmas_draw,
                         "draw-cmp64": check_cmp64_draw,
                         "draw-shift64": check_shift64_draw,
