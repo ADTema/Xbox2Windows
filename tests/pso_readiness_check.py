@@ -163,6 +163,11 @@ def check_mesh():
                 scan.assert_called_once_with(
                     code, "test-llvm", offsets=True, features=b"+wavefrontsize64,-wavefrontsize32"
                 )
+        with patch("pixel_aot.disassemble", return_value=[(0, "s_getpc_b64 s[0:1]")]):
+            row, unknown = report(manifest, pipelines, root, "test-llvm")["pipelines"]
+        assert row["shaders"]["mesh"]["status"] == "mesh_lowering_rejected", row
+        assert row["shaders"]["mesh"]["detail"].startswith("lowering failed unexpectedly"), row
+        assert row["status"] == "blocked" and unknown["status"] == "blocked", (row, unknown)
         untested = report(manifest, pipelines, root)["pipelines"][0]
         assert untested["shaders"]["mesh"]["status"] == "mesh_scan_untested", untested
         assert untested["status"] == "needs_evidence", untested

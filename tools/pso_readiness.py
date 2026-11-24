@@ -43,6 +43,8 @@ def scan_shader(root, record, stage, digest, llvm):
             lower(instructions, [0x1003], (3, 1))
         except (ValueError, KeyError) as exc:
             return "mesh_lowering_rejected", str(exc)
+        except Exception as exc:  # Unsupported operand shapes must not abort the whole report.
+            return "mesh_lowering_rejected", f"lowering failed unexpectedly: {type(exc).__name__}"
         return "mesh_lowering_passed", None
     return assess_pixel(digest, instructions)
 
