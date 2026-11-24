@@ -839,6 +839,12 @@ OperationResult run_mesh_amplified(const OperationContext& ctx)
                                                    ctx.argv[6]));
 }
 
+OperationResult run_mesh_multi(const OperationContext& ctx)
+{
+    return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], false,
+                                               MeshConstantBinding::root, MeshDrawMode::multi_primitive));
+}
+
 OperationResult run_mesh_indexed(const OperationContext& ctx)
 {
     return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], true));
@@ -1354,6 +1360,7 @@ const OperationSpec kOperations[] = {
     {"--mesh-entry", 6, 7, validate_mesh_entry_args, kNoGate, run_mesh_entry},
     {"--mesh-amplified", 7, 7, nullptr, kNoGate, run_mesh_amplified},
     {"--mesh-indexed", 6, 6, nullptr, kNoGate, run_mesh_indexed},
+    {"--mesh-multi", 6, 6, nullptr, kNoGate, run_mesh_multi},
     {"--mesh-indexed-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_indexed_fallback},
     {"--mesh-textured-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_textured_fallback},
     {"--mesh-entry-table", 6, 7, validate_mesh_entry_table_args, kNoGate, run_mesh_entry_table},
