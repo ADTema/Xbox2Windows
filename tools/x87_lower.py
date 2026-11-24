@@ -385,8 +385,9 @@ def depths(body, exits, checked=None):
     return depth
 
 
-# Instructions that put a function under the flag and status-word rules.
-GATED = frozenset({*FCMOV, M.FNSTSW, M.SAHF, M.JP, M.JNP})
+# Instructions that put a function under the flag and status-word rules. SETP, SETNP, CMOVP and CMOVNP read PF as
+# JP and JNP do (ffx_version_query.PF_CONSUMERS).
+GATED = frozenset({*FCMOV, M.FNSTSW, M.SAHF, M.JP, M.JNP, M.SETP, M.SETNP, M.CMOVP, M.CMOVNP})
 
 
 # The six status flags. FCMOV reads ZF and CF; DF is not tracked, because the Windows x64 calling
@@ -439,9 +440,9 @@ _INFO = InstructionInfoFactory()
 
 
 def assigns_parity(i):
-    """Whether the integer lowering sets PF for i: SAHF, the FCOMI family, and TEST and AND with an 8-bit
-    destination."""
-    if i.mnemonic == M.SAHF or i.mnemonic in COMPARES:
+    """Whether the integer lowering sets PF for i: SAHF, the FCOMI family, the VEX scalar compares, and TEST and
+    AND with an 8-bit destination."""
+    if i.mnemonic in (M.SAHF, M.VCOMISS, M.VUCOMISS, M.VCOMISD, M.VUCOMISD) or i.mnemonic in COMPARES:
         return True
     if i.mnemonic not in (M.TEST, M.AND):
         return False
