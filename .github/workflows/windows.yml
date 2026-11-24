@@ -213,6 +213,7 @@ jobs:
             tests/startup_buffer_address_check.py \
             tests/startup_smem_address_check.py \
             tests/startup_stream_fetch_check.py \
+            tests/startup_stream_interface_check.py \
             tests/compute_entry_layout_check.py \
             tests/startup_ngg_slice_check.py \
             tests/run_checks_parallel_check.py

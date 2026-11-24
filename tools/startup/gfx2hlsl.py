@@ -178,6 +178,64 @@ def stream_fetch(vs_container, layout_text):
     return fetch
 
 
+# The interface between the two stages of a stream pipeline, as both containers state it in their native headers.
+# Vertex: from +0x1dc one 6-byte record per exported parameter (kind 6, output-signature register, parameter index,
+# 0, 0, 0), count at +0x29c. Pixel (header 0xef8 bytes): from +0x138 one 8-byte record per attribute (kind 6,
+# input-signature register, component mask, attribute index, 0, 0, the register again, interpolation 1 or 2), count
+# at +0x238. Records with other values pack two signature registers into one parameter or attribute; that form is
+# refused here.
+IFACE_VS_RECORDS, IFACE_VS_COUNT, IFACE_PS_HEADER_BASE, IFACE_PS_RECORDS, IFACE_PS_COUNT = 0x1dc, 0x29c, 0xef8, 0x138, 0x238
+
+
+def signature_entries(part):
+    """ISG1/OSG1 part -> [(register, semantic name, semantic index, system value, mask)]."""
+    count, first = struct.unpack_from('<II', part, 0)
+    out = []
+    for i in range(count):
+        _, name_at, index, system, _, register, mask = struct.unpack_from('<6IB', part, first + 32 * i)
+        out.append((register, part[name_at:part.index(b'\0', name_at)].decode('ascii').upper(), index, system, mask))
+    return out
+
+
+def stream_interface(vs_container, ps_container):
+    """{pixel attribute: vertex parameter}, matched by semantic through both containers' interface tables."""
+    from pixel_aot import container_image
+    from resource_inventory import parts
+    vs, ps = parts(vs_container), parts(ps_container)
+    vs_image, ps_image = container_image(vs[b'DXIL'], stage=1), container_image(ps[b'DXIL'], stage=0)
+    if (struct.unpack_from('<Q', vs_image, 192)[0] != FETCH_HEADER_BASE or
+            struct.unpack_from('<Q', ps_image, 192)[0] != IFACE_PS_HEADER_BASE):
+        raise Unsupported('unverified FSSM header for the stage interface')
+    attributes = []
+    for i in range(struct.unpack_from('<I', ps_image, IFACE_PS_COUNT)[0]):
+        kind, register, mask, attr, b4, b5, again, interp = ps_image[IFACE_PS_RECORDS + 8 * i:IFACE_PS_RECORDS + 8 * i + 8]
+        if kind != 6 or attr != i or b4 or b5 or again != register or interp not in (1, 2) or not mask:
+            raise Unsupported('unverified pixel input record %s' % ps_image[IFACE_PS_RECORDS + 8 * i:IFACE_PS_RECORDS + 8 * i + 8].hex())
+        attributes.append(register)
+    if not attributes:
+        return {}
+    params = {}
+    for i in range(struct.unpack_from('<I', vs_image, IFACE_VS_COUNT)[0]):
+        kind, register, param, *rest = vs_image[IFACE_VS_RECORDS + 6 * i:IFACE_VS_RECORDS + 6 * i + 6]
+        if kind != 6 or param != i or any(rest) or register in params:
+            raise Unsupported('unverified vertex output record %s' % vs_image[IFACE_VS_RECORDS + 6 * i:IFACE_VS_RECORDS + 6 * i + 6].hex())
+        params[register] = param
+    outputs = {(name, index): (register, mask) for register, name, index, system, mask in signature_entries(vs[b'OSG1']) if not system}
+    inputs = [entry for entry in signature_entries(ps[b'ISG1']) if not entry[3]]
+    mapping = {}
+    for attr, register in enumerate(attributes):
+        sources = set()
+        for _, name, index, _, mask in (e for e in inputs if e[0] == register):
+            output = outputs.get((name, index))
+            if not output or output[1] != mask:
+                raise Unsupported('pixel input %s%d has no vertex output with the same components' % (name, index))
+            sources.add(output[0])
+        if len(sources) != 1 or next(iter(sources)) not in params:
+            raise Unsupported('pixel attribute %d does not come from exactly one exported vertex register' % attr)
+        mapping[attr] = params[next(iter(sources))]
+    return mapping
+
+
 # Binary32 words for inline source encodings 240 through 248, in encoding order.
 CNDMASK_INLINE_FLOAT_BITS = (0x3f000000, 0xbf000000, 0x3f800000, 0xbf800000,
                             0x40000000, 0xc0000000, 0x40800000, 0xc0800000,
@@ -1301,6 +1359,11 @@ class Stage:
     def note_attr(self, tok, how):
         m = re.fullmatch(r'attr(\d+)\.([xyzw])', tok)
         attr = int(m.group(1))
+        links = getattr(self.pipe, 'ps_attr_map', None)
+        if links is not None:  # stream pipelines: the vertex parameter the attribute is linked to
+            if attr not in links:
+                raise Unsupported('pixel stage reads attribute %d, which its interface table does not list' % attr)
+            attr = links[attr]
         self.attrs.setdefault(attr, set()).add(how)
         return attr, m.group(2)
 
@@ -1729,8 +1792,10 @@ FLOAT32_RTVS = frozenset((2, 6, 16, 41))
 
 
 class Pipeline:
-    def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None, vs_fetch=None):
+    def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None, vs_fetch=None,
+                 ps_attr_map=None):
         self.root = parse_root(root_blob)
+        self.ps_attr_map = ps_attr_map  # stream_interface(): pixel attribute -> vertex parameter; None pairs by number
         self.vs_fetch = vs_fetch  # stream_fetch(): the loads the vertex stage's entry call stands for
         self.packed_position_vgpr = None
         if ps_hw_inputs is not None:
@@ -1937,7 +2002,7 @@ def fnv(data, h=1469598103934665603):
 
 def pipeline_key(vs_code, ps_code, root_blob, layout=b''):
     """Hash the startup translation revision and the three blobs in runtime order, then a stream's input layout."""
-    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-5'))))
+    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-6'))))
     return fnv(layout, key) if layout else key
 
 
@@ -1971,14 +2036,15 @@ def find_fxc():
     return shutil.which('fxc.exe')
 
 
-def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_formats=(), rtv_request='', vs_fetch=None):
+def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_formats=(), rtv_request='', vs_fetch=None,
+                 ps_attr_map=None):
     """Writes <key>.vs.hlsl, <key>.ps.hlsl and <key>.txt (last), or <key>.fail with the reason.
 
     With check, the pair is compiled to .vs.cso and .ps.cso first and a missing fxc is a failure.
     check=False, or X2W_FXC set to the empty string, publishes the manifest without bytecode."""
     name = os.path.join(out_dir, '%016x' % key)
     try:
-        pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats, vs_fetch=vs_fetch)
+        pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats, vs_fetch=vs_fetch, ps_attr_map=ps_attr_map)
         vs, ps, manifest = pipe.hlsl_vs(), pipe.hlsl_ps(), pipe.manifest()
         if rtv_request:
             manifest += rtv_request + '\n'
@@ -2033,7 +2099,7 @@ def translate_request(out_dir, key):
         layout = open(name + '.ia', 'rb').read() if os.path.isfile(name + '.ia') else b''
         if request and pipeline_key(a, b, root, layout) != base:
             raise Unsupported('RTV variant source key mismatch')
-        fetch = None
+        fetch = attr_map = None
         if a.startswith(b'DXBC') or b.startswith(b'DXBC'):
             # Slot 86 records complete containers in canonical (VS, PS) order.
             # Keep the container bytes in the cache key; translate only the bounded native code.
@@ -2041,9 +2107,10 @@ def translate_request(out_dir, key):
             from pixel_aot import container_code
             from resource_inventory import parts
             try:
-                container = a
+                container, ps_container = a, b
                 a, b = (container_code(parts(blob)[b'DXIL'], stage=stage)
                         for blob, stage in ((a, 1), (b, 0)))
+                attr_map = stream_interface(container, ps_container)
                 if starts_with_fetch_call(a):
                     fetch = stream_fetch(container, layout.decode('ascii') if layout else None)
             except (KeyError, ValueError, IndexError, struct.error, zlib.error) as error:
@@ -2059,7 +2126,8 @@ def translate_request(out_dir, key):
     if set(kinds) != {'vs', 'ps'}:
         open(os.path.join(out_dir, '%016x.fail' % key), 'w').write('stages %s\n' % sorted(kinds))
         return 'stages %s' % sorted(kinds)
-    return translate_to(out_dir, key, kinds['vs'], kinds['ps'], root, rtv_formats=formats, rtv_request=request, vs_fetch=fetch)
+    return translate_to(out_dir, key, kinds['vs'], kinds['ps'], root, rtv_formats=formats, rtv_request=request, vs_fetch=fetch,
+                        ps_attr_map=attr_map)
 
 
 def main():

@@ -115,8 +115,42 @@ these refusals:
 - a record of kind 7, or one that reaches past v255;
 - a header record count that disagrees with the table.
 
-The pixel stage still reads attribute N from vertex output N. It does not yet pair the two by semantic, so a
-pixel shader that reads only some of the vertex outputs can receive the wrong one. That is a separate problem.
+## Stream stage interface by semantic
+
+In a slot-86 stream pipeline, the pixel shader's attribute N is not vertex parameter N. Each container states its
+side of the interface in its native header:
+- **Vertex shader:** from +0x1dc, one 6-byte record per exported parameter: kind 6, output-signature register,
+  parameter index, then three zero bytes. The count is at +0x29c.
+- **Pixel shader** (a header of 0xef8 bytes): from +0x138, one 8-byte record per attribute: kind 6, input-signature
+  register, component mask, attribute index, two zero bytes, the register again, and interpolation 1 or 2. The
+  count is at +0x238.
+
+`gfx2hlsl.py` links each attribute to the vertex parameter whose output register carries the same semantics with the
+same components as the attribute's input register. Raw programs without signatures still pair by number.
+
+The translation is refused when:
+- a record has any other values (these forms pack two signature registers into one parameter or attribute);
+- a semantic of the attribute's register has no vertex output with the same components, or the attribute's semantics
+  come from more than one vertex register;
+- a pixel header has another size;
+- the code reads an attribute the table does not list.
+
+The shader cache revision is `x2w-startup-shader-6`, so translations paired by number are not reused.
+
+The record layouts were checked offline against the signatures of one title's shader archive (local files only, not
+in the repository):
+- **Vertex shaders:** 1,496 of 1,983 readable programs have only the simple records, and they match the output
+  signature register for register, with parameters in register order. The other 487 use packed records.
+- **Pixel shaders:** 3,657 readable programs have only simple records that match the input signature. 2,255 use packed
+  records or records that disagree with the signature.
+
+The translator-only cases need no device: `python -B tests/startup_stream_interface_check.py`, or
+`ctest --preset release --no-tests=error -R "^startup_stream_interface_translate$"`. They check that attribute 0
+reads the TEXCOORD parameter, and they check each refusal. The draw is
+`ctest --preset release --no-tests=error -R "^startup_stream_interface_(warp|hardware)$" -V`, after building
+`startup_stream_consumer`. The vertex shader exports a constant COLOR as parameter 0 and a varying TEXCOORD as
+parameter 1. The pixel shader reads only TEXCOORD, as attribute 0. On an 8×4 target, red follows TEXCOORD column by
+column. The same pipeline translated with pairing by number reads COLOR and fails the check.
 
 ## Output window and fallback diagnostics
 
