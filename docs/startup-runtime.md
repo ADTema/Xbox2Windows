@@ -349,7 +349,11 @@ flush; stored blocks of 0, 1 and 300 bytes at each of the eight bit positions af
 one stored block of 65535 bytes. Status, size and bytes must equal the bit-at-a-time build and
 CPython's zlib. The exception is a truncated stored block that would not fit either: the decoder
 checks the block's length against the input first and reports `corrupt_stream` where zlib reports
-insufficient output (809 cases). In every case the probe ends both the stream and the destination
+insufficient output (809 cases). A window case decodes 5 streams of 96 to 160 KiB whose matches
+reach the 32 KiB window: zlib's encoder keeps 262 bytes of lookahead out of its window and never reaches distance 32768, so three are fixed blocks written by
+hand with matches at distance 32768 and lengths up to 258, the last match ending at the end of the
+output. Each runs at exact capacity, one byte short, at the end of inner 32768-distance matches and
+truncated: 52 cases, all equal to the bit-at-a-time build and to zlib. In every case the probe ends both the stream and the destination
 at a no-access page, so a read past the input or a write past the capacity faults.
 
 While at least 8 input bytes and 258 output bytes (the longest match) remain, the decoder takes whole

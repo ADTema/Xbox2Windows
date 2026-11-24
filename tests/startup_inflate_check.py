@@ -22,8 +22,10 @@ one wrong table entry, which must differ on some case.
 
 A boundary case runs small streams at every capacity up to one past their size and truncated to every
 length: matches at distances 1 to 16 around the decoder's copy widths, stored blocks of 0 and 65535
-bytes and stored blocks at every bit position. tests/startup_inflate_probe.cpp runs the decoder; no GPU
-and no game files are involved.
+bytes and stored blocks at every bit position. A window case runs streams of 96 to 160 KiB with matches
+up to the 32 KiB window (hand-built ones at distance 32768 and length 258) at exact capacity, one byte
+short and truncated. tests/startup_inflate_probe.cpp runs the decoder; no GPU and no game files are
+involved.
 
 With --bench and one or more probe builds, it instead prints decoded MiB/s for 16 MiB seeded streams
 of four kinds (stored, fixed Huffman copies, dynamic Huffman word text, dynamic Huffman bytes of about
@@ -415,6 +417,95 @@ def expect_boundaries(probe, bitwise, work, rng):
     return cases, slow
 
 
+LENGTH_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163,
+               195, 227, 258]
+LENGTH_EXTRA = [0] * 8 + [1] * 4 + [2] * 4 + [3] * 4 + [4] * 4 + [5] * 4 + [0]
+DISTANCE_BASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049,
+                 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+
+
+def fixed_tokens(tokens):
+    # One final fixed block from literals (ints) and (length, distance) matches, wrapped as zlib with its data.
+    bits, data = Bits(), bytearray()
+    bits.put(1, 1)
+    bits.put(1, 2)
+
+    def symbol(value):
+        if value < 144:
+            bits.code(0x30 + value, 8)
+        elif value < 256:
+            bits.code(0x190 + value - 144, 9)
+        elif value < 280:
+            bits.code(value - 256, 7)
+        else:
+            bits.code(0xC0 + value - 280, 8)
+
+    for token in tokens:
+        if isinstance(token, int):
+            symbol(token)
+            data.append(token)
+            continue
+        length, distance = token
+        code = max(i for i, base in enumerate(LENGTH_BASE) if base <= length) if length < 258 else 28
+        symbol(257 + code)
+        bits.put(length - LENGTH_BASE[code], LENGTH_EXTRA[code])
+        code = max(i for i, base in enumerate(DISTANCE_BASE) if base <= distance)
+        bits.code(code, 5)
+        bits.put(distance - DISTANCE_BASE[code], max(0, code // 2 - 1))
+        for _ in range(length):
+            data.append(data[-distance])
+    symbol(256)
+    return zlib_wrap(bits.to_bytes(), bytes(data)), bytes(data)
+
+
+def window_cases(rng):
+    # Streams of 96 to 160 KiB whose matches reach far back. zlib's encoder never reaches distance 32768
+    # (it keeps 262 bytes of lookahead out of its window), so three are written by hand as fixed blocks with matches at
+    # the maximum distance 32768 and lengths up to 258, the last one ending at the end of the output; two
+    # more are zlib's dynamic blocks over data that repeats runs from 24 to 32.5 KiB back. Each runs at
+    # exact capacity, one byte short, at the end of an inner 32768-byte-distance match, and truncated.
+    streams = []
+    for _ in range(3):
+        tokens, size, ends = [rng.randrange(256) for _ in range(33000)], 33000, []
+        target = rng.randint(96, 160) * 1024
+        while size < target:
+            if rng.random() < 0.3:
+                run = [rng.randrange(256) for _ in range(rng.randint(1, 20))]
+                tokens += run
+                size += len(run)
+                continue
+            distance = rng.choice([32768, 32768, 32767, rng.randint(24577, 32768), rng.randint(1, 32768)])
+            length = rng.choice([258, 258, 257, rng.randint(3, 258)])
+            tokens.append((length, distance))
+            size += length
+            if distance == 32768:
+                ends.append(size)
+        tokens.append((258, 32768))
+        stream, data = fixed_tokens(tokens)
+        streams.append((stream, data, rng.sample(ends, 4)))
+    for _ in range(2):
+        data, target = bytearray(rng.randbytes(33000)), rng.randint(96, 160) * 1024
+        while len(data) < target:
+            start = len(data) - rng.randint(24 * 1024, 32506)
+            data += data[start:start + rng.randint(3, 258)] + rng.randbytes(rng.randint(0, 3))
+        streams.append((compress(bytes(data)), bytes(data), []))
+    cases = []
+    for stream, data, ends in streams:
+        assert reference(stream, "zlib") == data
+        cases += [(stream, len(data)), (stream, len(data) - 1)] + [(stream, end) for end in ends]
+        cases += [(stream[:cut], len(data)) for cut in sorted(rng.sample(range(len(stream)), 6))]
+    return cases, len(streams)
+
+
+def expect_window(probe, bitwise, work, rng):
+    cases, streams = window_cases(rng)
+    fast, slow = run_batch(probe, work, "window", cases), run_batch(bitwise, work, "window_bitwise", cases)
+    compared, lenient, counts = compare("window", cases, fast, slow)
+    assert not lenient, "window: %d cases decoded where zlib rejects a code set" % lenient
+    print("%d window streams as %d cases: equal to bit-at-a-time decoding and to zlib in all; %s" % (
+        streams, len(cases), counts))
+
+
 def expect_faulty_caught(faulty, work, cases, reference):
     got = run_batch(faulty, work, "random_faulty", cases)
     wrong = sum(1 for a, b in zip(got, reference) if a != b)
@@ -505,6 +596,8 @@ def main(probe, bitwise, faulty, faulty_margin, faulty_input_margin, faulty_dist
         cases, _ = expect_boundaries(probe, bitwise, work, random.Random(1149 + 1))
         expect_overrun_caught("faulty-margin", faulty_margin, work, "boundary", cases)
         expect_distance_caught(faulty_distance, work)
+        # Its own seed as well: long streams with matches up to the 32 KiB window.
+        expect_window(probe, bitwise, work, random.Random(1149 + 2))
     print("inflate.h matches zlib %s in 11 cases and rejects 4 controls" % zlib.ZLIB_RUNTIME_VERSION)
 
 
