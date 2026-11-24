@@ -109,6 +109,46 @@ def check_redaction_helper(failures: list[str]) -> None:
             failures.append(f"redact({raw!r}) = {got!r}, expected {want!r}")
 
 
+def check_review_regressions(failures: list[str]) -> None:
+    # Paths with spaces are redacted whole, in a shader .fail line and in plain text.
+    for raw, want in [
+        (r"fxc ps: C:\Users\Alice Smith\PrivateTitle\shader.hlsl(1,1): error X3000",
+         "fxc ps: <path> error X3000"),
+        (r"open C:\Program Files\My App\shader.hlsl failed", "open <path> failed"),
+        ("read /home/Alice Smith/cache/x.bin: denied", "read <path> denied"),
+    ]:
+        got = triage_run.redact(raw)
+        if got != want or "Smith" in got or "Program" in got:
+            failures.append(f"redact({raw!r}) = {got!r}, expected {want!r}")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        logdir = root / "run"
+        logdir.mkdir()
+        fail_line = "x2w-dstorage   options=0x1 dest=0x1 dest_size=0x1000 source=0x1 offset=0x0 size=0x100 -> zlib failed\n"
+        (logdir / "stderr.txt").write_text(fail_line, encoding="utf-8")
+        (logdir / "trap.log").write_text(fail_line, encoding="utf-8")
+        report = triage_run.triage_run(logdir)
+        if "| 1 | zlib failed |" not in report:
+            failures.append("mirrored stderr.txt/trap.log line counted other than once:\n" + report)
+        # A genuine repeat (second occurrence only in trap.log) still counts.
+        (logdir / "trap.log").write_text(fail_line * 2, encoding="utf-8")
+        report = triage_run.triage_run(logdir)
+        if "| 2 | zlib failed |" not in report:
+            failures.append("repeated trap.log occurrence beyond stderr.txt was dropped:\n" + report)
+    # Successful forwarded slots are not "unhandled"; failed ones and untraced calls still are.
+    lines = [
+        "x2w-d3d12 Device::slot13(0x1, 0x2, 0x3, 0x4, 0x5) -> 0x0\n",
+        "x2w-d3d12 Device::slot41(0x1, 0x2, 0x3, 0x4, 0x5) -> 0x0\n",
+        "x2w-d3d12 Device::slot14(0x1, 0x2, 0x3, 0x4, 0x5) -> 0x80070057\n",
+        "x2w-d3d12 Device::slot15 not implemented\n",
+    ]
+    unhandled = triage_run.summarize_lines(lines)["d3d12_unhandled"]
+    if "Device::slot13" in unhandled or "Device::slot41" in unhandled:
+        failures.append(f"successful forwarded slots counted as unhandled: {dict(unhandled)}")
+    if "Device::slot14" not in unhandled or "Device::slot15" not in unhandled:
+        failures.append(f"failed/untraced slots missing from unhandled: {dict(unhandled)}")
+
+
 def check_empty_and_missing_dirs(failures: list[str]) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -148,6 +188,7 @@ def main() -> int:
     failures: list[str] = []
     check_aggregation_and_redaction(failures)
     check_redaction_helper(failures)
+    check_review_regressions(failures)
     check_empty_and_missing_dirs(failures)
     check_cli_invocation(failures)
     for item in failures:

@@ -31,12 +31,17 @@ DSTORAGE_OK_OUTCOMES = {
 
 # Redaction patterns (applied in order from most specific/broadest path to tokens).
 RE_QUOTED_WIN_PATH = re.compile(r'"([A-Za-z]:\\[^"\r\n]+|[A-Za-z]:/[^"\r\n]+|\\\\[^\\"\r\n]+\\[^"\r\n]+)"')
-RE_WIN_PATH = re.compile(r'(?:[A-Za-z]:\\[^\s"\'<>|]+|[A-Za-z]:/[^\s"\'<>|]+|\\\\[^\s"\'<>|\\]+\\[^\s"\'<>|]+)')
+# Unquoted paths: directory components may contain single spaces ("Alice Smith"), the final component may not.
+_DIR_COMPONENT = r'(?:[^\\/:"\'<>|\r\n=,()]{1,64}[\\/]+)*'
+_LAST_COMPONENT = r'[^\s"\'<>|]*'
+RE_WIN_PATH = re.compile(
+    r'(?:[A-Za-z]:[\\/]+|\\\\[^\\\s"\'<>|]+\\+)' + _DIR_COMPONENT + _LAST_COMPONENT
+)
 RE_QUOTED_POSIX_PATH = re.compile(
     r'"(/(?:home|Users|mnt|tmp|var|opt|root|srv|private|Volumes)/[^"\r\n]+)"'
 )
 RE_POSIX_PATH = re.compile(
-    r'/(?:home|Users|mnt|tmp|var|opt|root|srv|private|Volumes)(?:/[^\s"\'<>|]+)+'
+    r'/(?:home|Users|mnt|tmp|var|opt|root|srv|private|Volumes)/' + _DIR_COMPONENT + r'[^\s"\'<>|]+'
 )
 RE_EXE_NAME = re.compile(r'\b[A-Za-z0-9_.\-]+\.exe\b', re.IGNORECASE)
 RE_ADDR64 = re.compile(r'\b0x[0-9a-fA-F]{9,}\b')
@@ -53,6 +58,7 @@ RE_D3D12_PIPELINE_TRAP = re.compile(
 )
 RE_D3D12_IID_PASS = re.compile(r'x2w-d3d12\s+Device::slot(\d+)\s+passes an IID:')
 RE_D3D12_VIEW_SKIPPED = re.compile(r'x2w-d3d12\s+Device::slot(\d+)\s+view skipped:\s+(.+)$')
+RE_D3D12_FORWARDED_RESULT = re.compile(r'::slot\d+\(.*\)\s*->\s*(0x[0-9a-fA-F]+)\s*$')
 RE_D3D12_SLOT_CALL = re.compile(r'x2w-d3d12\s+([A-Za-z0-9_]+::slot\d+)\b')
 RE_D3D12_REMOVED = re.compile(
     r'x2w-d3d12\s+DEVICE REMOVED,\s+reason\s+(0x[0-9a-fA-F]+),\s+first noticed after\s+(.+)$'
@@ -195,6 +201,9 @@ def summarize_lines(lines: Iterable[str]) -> dict[str, Counter]:
             if m:
                 d3d12_unhandled[f"Device::slot{m.group(1)} view skipped: {redact(m.group(2))}"] += 1
                 continue
+            m = RE_D3D12_FORWARDED_RESULT.search(line)
+            if m and not _is_failed_hresult(m.group(1))[0]:
+                continue  # forward_slot()/create_slot() telemetry of a call the desktop device implemented
             m = RE_D3D12_SLOT_CALL.search(line)
             if m:
                 d3d12_unhandled[m.group(1)] += 1
@@ -452,11 +461,29 @@ def triage_run(
     """Scan logdir (and optional shader_cache) and return a redacted Markdown summary."""
     log_files = iter_log_files(logdir)
 
+    # run.ps1 / debug_launch.py capture stderr.txt while X2W_TRAP_LOG appends the same lines to trap.log:
+    # each trap.log line already present in the sibling stderr.txt is skipped once, so repeats still count.
+    mirrored: dict[Path, Counter[str]] = {}
+    for path in log_files:
+        if path.name.lower() == "trap.log" and (path.parent / "stderr.txt") in log_files:
+            seen: Counter[str] = Counter()
+            try:
+                with (path.parent / "stderr.txt").open("r", encoding="utf-8", errors="replace") as handle:
+                    seen.update(line.rstrip("\r\n") for line in handle)
+            except OSError:
+                pass
+            mirrored[path] = seen
+
     def _line_stream() -> Iterable[str]:
         for path in log_files:
+            budget = mirrored.get(path)
             try:
                 with path.open("r", encoding="utf-8", errors="replace") as handle:
-                    yield from handle
+                    for line in handle:
+                        if budget is not None and budget[line.rstrip("\r\n")] > 0:
+                            budget[line.rstrip("\r\n")] -= 1
+                            continue
+                        yield line
             except OSError:
                 continue
 
