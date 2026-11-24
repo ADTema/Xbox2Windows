@@ -461,6 +461,49 @@ These are measured on one executable; treat them as hypotheses for others.
   entire page detects the wrong stream. Moving the second request by the same distance reaches
   EOF and leaves the destination untouched. A subsequent request using its directory offset succeeds.
   Reproduce with `ctest --preset release --no-tests=error -R '^startup_storage_directory_batch$' -V`.
+- **DirectStorage allocation failure (#1199, item 3).** A queue worker runs each entry inside
+  a handler that turns any exception, including `std::bad_alloc` from a buffer sized by a request
+  field, into a failed request: the next status entry reports `E_FAIL`, the destination is
+  untouched and the worker serves the following entries. The handler only copies a short reason
+  into a fixed buffer; the log line is written after the handler has left and after the request's
+  buffers were freed, so no formatting or allocation runs while the exception is in flight. The
+  worker is a `CreateThread` thread whose stack is committed at creation (1 MiB, `worker_stack_commit`)
+  instead of growing on demand, because when the system is out of commit an untouched stack page
+  cannot be committed either. The original `0xc00000fd` (stack overflow) was not reproduced here,
+  and the stack-commit cause is a hypothesis from reading the code, not a measurement. The
+  `startup_storage_alloc_failure` check puts its own process under a job commit limit, submits
+  a request that declares a 1.5 GiB inflated size, expects a failure status within a timeout and
+  then a correct result for a normal request on the same queue. It returns 77 where the limit is
+  not enforced.
+  Reproduce with `ctest --preset release --no-tests=error -R '^startup_storage_alloc_failure$' -V`.
+  A queue builds its work (three `std::deque`s, whose constructors allocate and can throw
+  `std::bad_alloc` even under `new (std::nothrow)`) and starts its worker separately. Enqueue
+  only records an entry, in the work when it exists, otherwise in a small record that needs no
+  queue storage; it never completes a status entry or signals a fence. Submit retries the
+  construction and the worker start (a committed-stack attempt, then a default-stack one). If the
+  worker runs, the entries proceed as usual. If it cannot start, every recorded entry fails there:
+  its status entry takes the pending failure (`E_OUTOFMEMORY` when nothing worse is pending) and
+  its fence is signaled, so nothing is left at `E_PENDING`. An entry that could not even be
+  recorded loses its request bytes, so it fails at Submit even if the worker starts then; only when
+  the small record itself cannot be allocated is the entry failed inside Enqueue. No exception
+  leaves Enqueue or Submit: a request whose page tokens cannot be copied is recorded the same way,
+  and if Submit cannot grow the worker's list the entries still waiting fail there.
+  Entry order is kept: once an entry has been deferred, every later entry until the next Submit is
+  deferred too, so the stored entries are an in-order prefix and the deferred ones the in-order
+  suffix. Submit handles the prefix first (worker or failure), then fails the suffix, so a failure
+  reaches the next status entry after it and never stays pending behind a status entry that
+  completed. Limits: when the prefix runs on the worker, a suffix status entry fails synchronously
+  inside Submit and cannot see a failure the worker finds later in the prefix (a later status entry
+  will); after the first allocation failure the rest of the batch fails with `E_OUTOFMEMORY` even if
+  memory recovered, which is preferable to reordering.
+  `startup_storage_worker_start` compiles the stand-in into the test, redirects `CreateThread`
+  and replaces `operator new` with one that fails the N-th allocation once and then behaves
+  normally. It sweeps N over Enqueue and Submit, and checks pending status and an unsignaled fence
+  before Submit, then a request that completed with correct data or a failure, a fence signaled
+  once, and a correct request on the same queue afterwards. A second control fails the N-th allocation
+  of Enqueue and the M-th of Submit for 1 to 9 requests with the status entry before or after them
+  and checks that a failure is reported by one status entry only and that a later clean request and
+  status entry complete correctly. A crash names the stage it was in.
 
 ## Shortcuts that are known to be wrong
 
