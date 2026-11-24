@@ -132,6 +132,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/shader_corpus_report_check.py
 ./out/pe-env/bin/python -B tests/dxil_retarget_check.py
 ./out/pe-env/bin/python -B tests/rdna2_tools_check.py
+./out/pe-env/bin/python -B tests/mesh_dynamic_geometry_check.py
 ./out/pe-env/bin/python -B tests/pso_readiness_check.py
 ./out/pe-env/bin/python -B tests/xmem_attribute_scan_check.py
 ./out/pe-env/bin/python -B tests/xgameruntime_table_check.py
@@ -145,6 +146,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_image_3d_check.py
 ./out/pe-env/bin/python -B tests/startup_image_load_mip_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_operand_count_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_mad_check.py
 ./out/pe-env/bin/python -B tests/startup_image_2d_array_check.py
 ./out/pe-env/bin/python -B tests/startup_host_cpu_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_capture_check.py
@@ -152,6 +154,9 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_smem_offset_check.py
 ./out/pe-env/bin/python -B tests/startup_flat_param_check.py
 ./out/pe-env/bin/python -B tests/startup_inline_sampler_check.py
+./out/pe-env/bin/python -B tests/startup_buffer_address_check.py
+./out/pe-env/bin/python -B tests/startup_smem_address_check.py
+./out/pe-env/bin/python -B tests/startup_stream_fetch_check.py
 ./out/pe-env/bin/python -B tests/compute_entry_layout_check.py
 ```
 
