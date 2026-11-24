@@ -472,7 +472,8 @@ longer exhausts the heap. While nothing has been freed the offsets are the ones 
 
 - A block is aligned in address (a power of two, 16 at least; 0 means 16). Size and alignment are 32 bits.
 - Null output is `E_POINTER`; size 0 or an alignment that is not a power of two is `E_INVALIDARG`; no
-  room, or a full extent table, is `E_OUTOFMEMORY`. A refused call leaves the heap and its outputs as they were.
+  room, or a full extent table, is `E_OUTOFMEMORY`. A refused call leaves the heap and the optional
+  APU-address output as they were, and writes null to the virtual-address output when non-null.
 - A block that is reused is zeroed, as fresh heap memory is.
 - `ApuFree(NULL)` is `S_OK`. An address that does not start a live block (never allocated, inside a block,
   already freed) is `E_INVALIDARG` and changes nothing.

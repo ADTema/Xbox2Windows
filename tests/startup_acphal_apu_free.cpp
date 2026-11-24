@@ -143,7 +143,21 @@ void bad_requests()
     check(take(&out, 0x100000000ull, 16, &apu) == invalid && !out, "size 2^32 is size 0");
     check(take(&out, 64, 24, &apu) == invalid && !out && apu == 0xDEADBEEF, "alignment 24");
     check(take(&out, 64, 0xFFFFFFFFull, &apu) == invalid && !out, "alignment 2^32-1");
-    check(take(&out, 64, 0x80000000ull, &apu) == no_memory && !out, "alignment 2 GiB cannot be met");
+    void* probe = take_ok(16);
+    const auto probe_addr = reinterpret_cast<std::uintptr_t>(probe);
+    check(free_fn(probe) == ok, "free probe");
+    const std::uint64_t big_align = 0x80000000ull;
+    const std::uintptr_t aligned_addr = (probe_addr + big_align - 1) & ~(big_align - 1);
+    const bool big_align_fits = aligned_addr >= probe_addr && (aligned_addr - probe_addr) + 64 <= usable;
+    out = const_cast<void*>(sentinel);
+    const long big_hr = take(&out, 64, big_align, &apu);
+    if (big_align_fits) {
+        check(big_hr == ok && out && reinterpret_cast<std::uintptr_t>(out) == aligned_addr,
+              "alignment 2 GiB succeeds when heap straddles boundary");
+        check(free_fn(out) == ok, "free 2 GiB aligned block");
+    } else {
+        check(big_hr == no_memory && !out && apu == 0xDEADBEEF, "alignment 2 GiB cannot be met");
+    }
     check_empty("refused requests");
 
     void* p = take_ok(0x40, 0);  // 0 means the default of 16
