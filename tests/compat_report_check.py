@@ -10,7 +10,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "tools" / "compat_report.py"
 sys.path.insert(0, str(ROOT / "tools"))
-from compat_report import POLICY_VERSION, classify  # noqa: E402
+from import_routing import POLICY_VERSION, classify  # noqa: E402
 
 
 SECTION_RVA = 0x1000
@@ -167,7 +167,7 @@ def check_policy():
     assert classify("XMem.DLL")[0] == "hle"
     assert classify("d3d12_xs.dll")[0] == "hle"
     assert classify("xgameruntime.dll") == (
-        "stub", "GDK runtime module; no Xbox2Windows shim in this tree")
+        "stub", "GDK runtime module; no implemented Xbox2Windows provider in this tree")
     assert classify("xg_xs.dll") == (
         "stub", "GDK console GPU module; no Xbox2Windows shim in this tree")
     assert classify("xaudio2_8.dll") == ("windows", "Windows system DLL")
