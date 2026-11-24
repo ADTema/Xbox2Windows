@@ -295,6 +295,7 @@ endforeach()
 # link the shims statically so they never use its runtime (constexpr std::mutex layout).
 target_link_libraries(startup_stub_xg_xs PRIVATE d3d12 dxguid)
 target_link_libraries(startup_stub_gameinput PRIVATE user32)
+target_link_libraries(startup_stub_xapu PRIVATE winmm)
 # The DirectStorage heartbeat reports this process's peak commit (#1199).
 target_link_libraries(startup_stub_xcrdapi PRIVATE psapi)
 target_sources(startup_stub_gameinput PRIVATE src/startup_stubs/runtime_proxy.cpp)
