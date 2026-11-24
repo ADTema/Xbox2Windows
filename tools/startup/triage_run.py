@@ -47,8 +47,9 @@ DSTORAGE_FAIL_OUTCOMES = {
 }
 TRAP_TAGS = {"x2w-trap", "x2w-noop", "x2w-continue", "x2w-fail"}
 OTHER = "other (text omitted)"
-RE_DEC = re.compile(r"\d{1,10}\Z")
+RE_DEC = re.compile(r"[0-9]{1,10}\Z")
 RE_HEX = re.compile(r"0x[0-9a-fA-F]{1,8}\Z")
+RE_SIGN_EXTENDED_HRESULT = re.compile(r"0xffffffff([89a-f][0-9a-f]{7})\Z", re.IGNORECASE)
 RE_SLOT = re.compile(r"(?:[A-Za-z0-9_]+!)?(?:([A-Za-z0-9_]+)::)?slot(\d{1,4})\b")
 RE_OPENFILE_FAIL = re.compile(r"fail(?: \(err (\d{1,10})\))?\Z")
 MNEMONIC_FAMILY = r"(v|s|ds|buffer|tbuffer|image|flat|global|scratch|exp|lds)_[a-z0-9_]{1,40}"
@@ -96,9 +97,9 @@ RE_KV = re.compile(r'(\w+)=([^\s}]+)')
 
 RE_TRAP_TAG = re.compile(r'^(x2w-(?:trap|noop|continue|fail))\s+(\S+)')
 RE_D3D12_PIPELINE_TRAP = re.compile(
-    r'x2w-d3d12\s+Device::slot(\d+)\((Create(?:Graphics|Compute)PipelineState)\)'
+    r'x2w-d3d12\s+Device::slot([0-9]{1,4})\((Create(?:Graphics|Compute)PipelineState)\)'
 )
-RE_D3D12_IID_PASS = re.compile(r'x2w-d3d12\s+Device::slot(\d+)\s+passes an IID:')
+RE_D3D12_IID_PASS = re.compile(r'x2w-d3d12\s+Device::slot([0-9]{1,4})\s+passes an IID:')
 RE_D3D12_VIEW_SKIPPED = re.compile(r'x2w-d3d12\s+Device::slot(\d+)\s+view skipped:\s+(.+)$')
 RE_D3D12_FORWARDED_RESULT = re.compile(r'::slot\d+\(.*\)\s*->\s*(0x[0-9a-fA-F]+)\s*$')
 RE_D3D12_SLOT_CALL = re.compile(r'x2w-d3d12\s+([A-Za-z0-9_]+::slot\d+)\b')
@@ -121,7 +122,7 @@ RE_DSTORAGE_SIGNAL = re.compile(
 )
 
 RE_RUNTIME_CALL = re.compile(
-    r'x2w-(?:runtime|api)\s+[0-9a-fA-F]+::slot(\d+)(?:\([^)]*\))?\s+->\s+(0x[0-9a-fA-F]+)'
+    r'x2w-(?:runtime|api)\s+[0-9a-fA-F]+::slot([0-9]{1,4})(?:\([^)]*\))?\s+->\s+(0x[0-9a-fA-F]+)'
 )
 RE_RUNTIME_STORAGE = re.compile(
     r'x2w-runtime\s+persistent local storage:\s+local object instead of\s+(0x[0-9a-fA-F]+)'
@@ -148,7 +149,13 @@ def _parse_kv_block(block: str) -> dict[str, str]:
 
 
 def _is_failed_hresult(hex_text: str) -> tuple[bool, str]:
-    val = int(hex_text, 16) & 0xFFFFFFFF
+    extended = RE_SIGN_EXTENDED_HRESULT.fullmatch(hex_text)
+    if extended:
+        val = int(extended.group(1), 16)
+    elif RE_HEX.fullmatch(hex_text):
+        val = int(hex_text, 16)
+    else:
+        return False, "?"
     return (val & 0x80000000) != 0, f"0x{val:08x}"
 
 

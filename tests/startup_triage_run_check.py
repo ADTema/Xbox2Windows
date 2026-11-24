@@ -107,6 +107,8 @@ x2w-dstorage   options=0x1 dest=0x1 dest_size=0x1 source=0x1 offset=0x0 size=0x1
 x2w-dstorage entry type 3 failed: AcmeTitle bad [secret](https://acme.example/leak)
 x2w-dstorage Factory::OpenFile path="x" riid={1} -> fail acme_widget_7f3a
 x2w-runtime 0000018012345678::slot9(0x1) -> 0x80004005 from +0x1
+x2w-runtime 0000018012345678::slot5555555555555555(0x1) -> 0x80004005
+x2w-runtime 0000018012345678::slot9(0x1) -> 0x00000180DEADBEEF
 """
 PRIVATE_SHADER_FAILS = [
     "AcmeModule: 0000018012345678 acme_widget_7f3a [secret](https://acme.example/leak)",
@@ -118,7 +120,7 @@ PRIVATE_SHADER_FAILS = [
 ]
 PRIVATE_NEEDLES = [
     "Acme", "acme", "ACME", "Private", "secret", "leak", "widget", "7f3a", "exploded",
-    "0000018012345678", "12345678", "[", "](", "http", ".dll", "Opaque",
+    "0000018012345678", "12345678", "5555555555555555", "deadbeef", "[", "](", "http", ".dll", "Opaque",
 ]
 
 
