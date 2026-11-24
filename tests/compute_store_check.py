@@ -176,7 +176,12 @@ INDEX_BINDING = dict(table_reg=7, group_reg=11, descriptor_offset=48, stride=12)
 # kernel reads FLAT_SCR_LO or touches scratch memory, so the write is a no-op and the readback must match the
 # untouched fixture word for word, guards included.
 SCRATCH_BASE_WRITE_LINES = ["s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 0"] + INDEXED
-SCRATCH_BASE_WRITE_CASES = [("indexed", SCRATCH_BASE_WRITE_LINES, 32, INDEX_BINDING)]
+# LLVM spells an immediate whose bit pattern looks like a float as an inline float, and that spelling is the
+# one the disassembler hands to lower(). Both spellings must lower identically and read back identically.
+SCRATCH_BASE_WRITE_SPELLINGS = ["s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 1.0",
+                                "s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_HI), 0.15915494"]
+SCRATCH_BASE_WRITE_CASES = [("indexed", [spelling] + INDEXED, 32, INDEX_BINDING)
+                            for spelling in [SCRATCH_BASE_WRITE_LINES[0]] + SCRATCH_BASE_WRITE_SPELLINGS]
 FIXED_BINDING = dict(table_reg=8, descriptor_offset=0)
 RUNTIME_BINDING = dict(FIXED_BINDING, constant_descriptor=32)
 TILE_BINDING = dict(FIXED_BINDING, group_reg=10, group_reg_y=11, stride=72)
@@ -264,6 +269,9 @@ def controls():
     must_reject(lambda: aot.lower(["s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_HI), 0x400"] + INDEXED, 32,
                                  **dict(INDEX_BINDING, stride=8)))
     must_reject(lambda: aot.lower(["s_setreg_imm32_b32 hwreg(HW_REG_MODE), 0"] + INDEXED, 32,
+                                 **INDEX_BINDING))
+    must_reject(lambda: aot.lower(["s_setreg_imm32_b32 hwreg(4), 0x41"] + INDEXED, 32, **INDEX_BINDING))
+    must_reject(lambda: aot.lower(["s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), s9"] + INDEXED, 32,
                                  **INDEX_BINDING))
 
     # Read a constant word directly into v10 before the constant-load wait.
@@ -5848,9 +5856,10 @@ def draw_scratch_base_write(directory, compiler, renderer, backend):
     """The scratch-base write must leave the generated HLSL byte for byte identical to the untouched kernel,"
     then run on the GPU so the readback and the untouched guards are checked as for the original case."""
     control = aot.lower(INDEXED, 32, **INDEX_BINDING)
-    written = aot.lower(SCRATCH_BASE_WRITE_LINES, 32, **INDEX_BINDING)
-    if control != written:
-        raise AssertionError("the scratch-base write changed the generated HLSL")
+    for name, lines, width, binding in SCRATCH_BASE_WRITE_CASES:
+        written = aot.lower(lines, width, **binding)
+        if control != written:
+            raise AssertionError("the scratch-base write changed the generated HLSL: " + lines[0])
     return draw(directory, compiler, renderer, backend, cases=SCRATCH_BASE_WRITE_CASES)
 
 def draw(directory, compiler, renderer, backend, cases=None):
