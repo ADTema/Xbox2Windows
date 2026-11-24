@@ -429,7 +429,14 @@ cmake --build --preset dev --target pso_root_check
 ctest --preset dev --no-tests=error -R '^pso_(readiness_check|root_signature_warp)$' -V
 ```
 
-Add `--llvm <AMDGPU LLVM library>` to disassemble referenced native pixel code and run the existing pixel scanner and lowering probe. Each unique stage/hash pair is assessed once. A known missing root signature takes precedence over shader diagnostics. Missing references, unassessed stages and unknown signature status require more evidence. Passing the pixel probe leaves the pipeline awaiting PSO validation, since the scanner uses synthetic bindings.
+Add `--llvm <AMDGPU LLVM library>` to disassemble referenced native pixel and mesh code. The pixel stage uses the existing scanner and lowering probe. The mesh stage retains byte offsets for wave64 branches and runs the mesh entry lowerer with the synthetic triangle profile: 128 threads, geometry word `0x1003` and output limits of three vertices and one primitive. A mesh rejection describes the limits of that profile. The native code manifest supplies neither the real dispatch declaration nor the geometry bindings.
+
+Each unique stage/hash pair is assessed once. A known missing root signature takes precedence over shader diagnostics. Missing references, unassessed stages and unknown signature status require more evidence. A pipeline with all stage probes passed and a present root signature still awaits PSO validation.
+
+```sh
+python3 -B tools/pso_readiness.py out/shaders/manifest.json out/pipelines.json --llvm libLLVM-15.so.1
+python3 -B tests/pso_readiness_check.py
+```
 
 The WARP control compiles the source-built compute shader with its root signature stripped. D3D12 rejects creation without a root signature. The same shader creates a PSO when given the matching signature from the embedded build. The control measures PSO creation on the source-built fixture.
 
@@ -711,6 +718,10 @@ ctest --preset dev --no-tests=error -R '^spirv_address_window_' -V
 ```
 
 With SPIRV-Tools on Linux, run `python3 -B tests/spirv_window/check.py` to assemble and validate the fixture and exercise the rejection paths. This also validates a combined fixture where a lowered ballot bit controls the value stored through the address window. The adapter reserves `%x2w_` identifiers in the input and gives address and ballot temporaries separate prefixes. To use WSL tools for the GPU check, generate a logical module with `python3 tools/spirv_address_window.py tests/spirv_window/subtract.spvasm out/window.spv`, then generate HLSL with `spirv-cross out/window.spv --hlsl --shader-model 60 --output out/window.hlsl`. Compile it on Windows with `dxc -T cs_6_0 -E main -Fo out/window.dxil out/window.hlsl` and run `out/build/dev/offscreen_check.exe hardware --spirv-address-window out/window.dxil`, then repeat with `warp`.
+
+The same Linux check validates eight unsigned DWORD atomics in Vulkan 1.2 SPIR-V: `OpAtomicIAdd`, `OpAtomicExchange`, `OpAtomicUMin`, `OpAtomicUMax`, `OpAtomicAnd`, `OpAtomicOr`, `OpAtomicXor` and `OpAtomicCompareExchange`. The synthetic variant exercises a direct word cast and an indexed physical address. Each atomic is lowered into a branch taken only for an aligned, in-window address, so an invalid address issues no atomic at all (the substitute index of the plain loads and stores is never used for an atomic); the atomic keeps its operands, scope and semantics, and its result is a phi of the old value and zero. This Linux check measures SPIR-V validation and the shape of the lowering. The GPU behavior of the valid and invalid cases requires the separate readback evidence.
+
+Run `ctest --preset dev --no-tests=error -R '^spirv_address_window_atomic_' -V` to check the atomic add's returned old value and full 16-DWORD readback for valid, misaligned, out-of-window and index-wrap addresses, with the fixture mapping the substitute index to the last bound DWORD.
 
 ### SPIR-V subgroup compaction across lane widths
 
@@ -2445,8 +2456,23 @@ primitive index order and guard bytes.
 ```text
 python3 -B tests/mesh_entry_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ctest --preset dev --no-tests=error -R "^mesh_entry_draw_" -V
+ctest --preset dev --no-tests=error -R "^mesh_entry_float_draw_" -V
 ctest --preset dev --no-tests=error -R "^mesh_entry_cvt_minmax_draw_" -V
 ```
+
+The per-lane binary32 forms of the translator now also include `v_add_f32_e64`,
+`v_sub_f32`, `v_subrev_f32` and `v_mul_f32` (`_e32` and `_e64`; `v_subrev` is
+source 1 minus source 0). They lower to plain `precise float` expressions, so
+an IEEE multiply, unlike `v_mul_legacy_f32`, does not turn zero times infinity
+into zero. Source modifiers, `clamp` and output modifiers are refused. One
+program chains all seven encodings on binary32 values that are exact; the binary
+mode evaluates the emitted expressions in binary32 and compares the depth with
+an independent hand calculation (0.28125), and each sibling opcode (sub for
+subrev, add for mul and so on) must give a different depth. The draw
+`mesh_entry_float_draw_*` (`draw-float`) compares the exported depth word
+with that reference, and a depth one unit in the last place off, or any sibling
+opcode, must report `Mesh export trace mismatch`. The draw is written for
+Windows and has not been run on Linux; denormal handling is not exercised.
 
 The per-lane binary32 forms of the translator also include `v_cvt_f32_u32`,
 `v_cvt_f32_i32`, `v_min_f32` and `v_max_f32` (`_e32` and `_e64`). A
@@ -3202,6 +3228,21 @@ in v2, v3 and v4. The supported exits export depth for surviving lanes or discar
 them. Unknown table addresses, outstanding reads, changed EXEC provenance and
 unrecognized exit sequences reject translation.
 
+The program may also apply `v_add_f32_e32`, `v_sub_f32_e32`,
+`v_subrev_f32_e32`, `v_mul_f32_e32`, `v_min_f32_e32` and `v_max_f32_e32`
+(VGPR destination, constant, scalar word or VGPR first source, VGPR second
+source). `subrev` subtracts the first source from the second. Reading a VGPR
+no earlier instruction wrote rejects translation. Operands are assumed finite
+and normal: NaN and subnormal handling of the original instructions is not
+claimed. Each form has its own fixture in `tests/depth_mask_check.py` that
+computes `op(0.5, v7)` for the discard compare. `depth_mask_ops_draw_*` draws
+each one at two seeds and thresholds against a CPU reference written with
+Python operators and requires every other form's reference to fail on exactly the
+pixels where the two differ. LLVM CI also assembles each fixture, translates it
+through the CLI and pins the lowered line, and changing that one instruction word
+to another form must change the line. On a Linux host only the LLVM part and the
+reference arithmetic were run; no WARP or GPU readback of these six forms exists yet.
+
 The Windows fixture binds distinct seeds and thresholds, changes each separately,
 then exchanges the two root CBV addresses. It checks all 1,024 D32_FLOAT
 pixels and requires comparison against the old reference to fail after the
@@ -3210,7 +3251,7 @@ synthetic container through the CLI.
 
 ```text
 python3 -B tests/depth_mask_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
-ctest --preset dev --no-tests=error -R "^depth_mask_draw_" -V
+ctest --preset dev --no-tests=error -R "^depth_mask_(ops_)?draw_" -V
 ```
 
 In a local inventory based on main `933cbad`, 354 of 12,101 PS records
@@ -4619,6 +4660,8 @@ Measured at commit `f847956`, Windows 11 build 26300, debug layer enabled:
 - The stop-at-first-failure mutant failed 20 of 20 runs on each adapter ("two of three aliased"). All eight mutants were first measured at `d52905d`, on the RTX 3070 with the debug layer unavailable.
 
 Before `f847956`, the interior block's search tried only the 256 MB directly below the first allocation. That search found no free block in about 1 of 40 hardware runs, and the test failed in setup ("region below the first allocation").
+
+With bottom-up ASLR off, `VirtualAlloc(nullptr, ...)` places each allocation in the lowest free range that fits, so no 64 KB block remained below `first`, and both `gpu_alias_registry` tests failed on every run (Windows 10 build 19045, RTX 3080 and WARP). The test now commits its 64 KB block before `first`. First-fit placement then always puts `first` above it; when randomized placement puts it higher, the test releases it and searches below `first` as before.
 
 Measured at commit `21a65e5`, Windows 11 build 26300, debug layer enabled:
 - The full suite passed: 149 tests, with the same 3 capability skips.
@@ -6585,6 +6628,8 @@ interface is rejected. The negative case supplies an unsupported IID after
 adapter selection. It checks the cleared device output, release of the adapter
 and factory references, zero frame bytes and exit code 20 on all three runners.
 
+The `pe_map` run's host process is `python.exe`, so DXGI does not find an app-local WARP (`OFFSCREEN_WARP_DIR`) beside the native EXE. When `d3d10warp.dll` sits beside the EXE, `shim_startup_check.py --map` now loads that copy first, and the mapped run uses the same WARP as the native and AOT runs. With the Windows 10 app-local setup, `cpu_shim_shadow_warp` previously failed (the mapped run created the device and closed it without recording a frame: `shadow close surfaces=0 device=1`) and `cpu_shim_chain_warp` skipped; both now pass. Builds without an app-local WARP are unchanged.
+
 ## First-active-lane vector broadcast readback
 
 The `pixel_aot_warp` and `pixel_aot_hardware` fixtures include a dedicated
@@ -7088,3 +7133,20 @@ with backface culling enabled (`D3D12_CULL_MODE_BACK`):
 
 Not covered by this experiment: geometry or tessellation shader stages preceding the
 input assembler, primitive ID generation in pixel shaders, runtime driver hooking, and title CPU code execution.
+
+## gfx1013 SOPK and SOPP decoding
+
+`tools/disasm_rdna2.py` decodes 29 more scalar forms: the nine `s_cmpk_*` compare-immediate ops
+(`s_cmpk_ge_i32` through `s_cmpk_le_u32`), `s_call_b64`, and 19 SOPP ops (`s_wakeup`, `s_setkill`,
+`s_sethalt`, `s_sleep`, `s_setprio`, `s_sendmsg`, `s_sendmsghalt`, `s_trap`, `s_icache_inv`,
+`s_incperflevel`, `s_decperflevel`, `s_ttracedata`, `s_ttracedata_imm`, `s_endpgm_saved`,
+`s_endpgm_ordered_ps_done`, `s_wait_idle`, `s_waitcnt_depctr`, `s_round_mode`, `s_denorm_mode`).
+The immediate operand of the SOPP ops with one is printed as the raw 16-bit value, not as a named field.
+`tools/scan_unsupported_shaders.py` recognizes the same mnemonics so they are not reported as unknown.
+
+```sh
+python3 -B tests/rdna2_tools_check.py
+```
+
+Scope: decoding and scanner recognition only. None of these forms is lowered by a translator, and no
+measurement on hardware or in a Windows run backs the descriptions.

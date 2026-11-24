@@ -258,6 +258,13 @@ class Wave:
             "v_fmac_f32_e32",
             "v_fmac_f32_e64",
             "v_add_f32_e32",
+            "v_add_f32_e64",
+            "v_sub_f32_e32",
+            "v_sub_f32_e64",
+            "v_subrev_f32_e32",
+            "v_subrev_f32_e64",
+            "v_mul_f32_e32",
+            "v_mul_f32_e64",
             "v_fma_f32",
             "v_cvt_f32_u32_e32",
             "v_cvt_f32_u32_e64",
@@ -328,6 +335,12 @@ class Wave:
                     expr = f"mad({x}, {y}, {fp(vals[2])})"
                 elif op.startswith("v_fmac_f32_"):
                     expr = f"mad({x}, {y}, {fp(self.lane_value(d, lane))})"
+                elif op.startswith("v_mul_f32_"):
+                    expr = f"({x} * {y})"
+                elif op.startswith("v_sub_f32_"):
+                    expr = f"({x} - {y})"
+                elif op.startswith("v_subrev_f32_"):
+                    expr = f"({y} - {x})"
                 elif op.startswith("v_cvt_f32_"):
                     # The source is an integer word, never a float expression.
                     if not isinstance(a, int):

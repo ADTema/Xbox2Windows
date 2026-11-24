@@ -16,7 +16,21 @@ float4 main(uint id : SV_VertexID) : SV_Position {
 """
 
 
-def program(extended=False):
+# One binary32 VOP2 form per fixture: v6 = op(0.5, v7) feeds the discard compare.
+# Each tuple is the opcode, the CPU reference and the exact HLSL line it must lower to,
+# with {a} the result register of v_fract and {n} the instruction's own index.
+OPS = {
+    "v_add_f32_e32": (lambda c, v: c + v, "precise float value{n} = (0.5f + value{a});"),
+    "v_sub_f32_e32": (lambda c, v: c - v, "precise float value{n} = (0.5f - value{a});"),
+    "v_subrev_f32_e32": (lambda c, v: v - c, "precise float value{n} = (value{a} - 0.5f);"),
+    "v_mul_f32_e32": (lambda c, v: c * v, "precise float value{n} = (0.5f * value{a});"),
+    "v_min_f32_e32": (lambda c, v: min(c, v), "precise float value{n} = min(0.5f, value{a});"),
+    "v_max_f32_e32": (lambda c, v: max(c, v), "precise float value{n} = max(0.5f, value{a});"),
+}
+
+
+def program(extended=False, op=None):
+    extended = extended or op is not None
     # Original fixture. The offsets here are instruction addresses in a decoded stream.
     prefix = [
         "s_mov_b32 s7, 0",
@@ -40,8 +54,10 @@ def program(extended=False):
         f"v_fmac_f32_e32 v7, {scale}, v5",
         "v_fract_f32_e32 v7, v7",
     ]
+    if op:
+        prefix.append(f"{op} v6, 0.5, v7")
     exits = [
-        "v_cmpx_lt_f32_e32 s31, v7",
+        f"v_cmpx_lt_f32_e32 s31, {'v6' if op else 'v7'}",
         "s_andn2_b64 s[22:23], s[22:23], exec",
         "s_cbranch_scc0 4",
         "s_and_b64 exec, s[24:25], s[22:23]",
@@ -54,15 +70,56 @@ def program(extended=False):
     return prefix + exits
 
 
-def source(extended=False):
-    lines = program(extended)
+TABLES = [(6, 32), (10, 16)]
+
+
+def decoded_stream(lines):
     sizes = [
         8 if line.startswith(("s_load_", "s_buffer_load_", "exp ")) else 4
         for line in lines
     ]
-    offsets = [sum(sizes[:i]) for i in range(len(sizes))]
-    decoded = list(zip(offsets, lines))
-    tables = [(6, 32), (10, 16)]
+    return [(sum(sizes[:i]), line) for i, line in enumerate(lines)]
+
+
+def op_source(op):
+    """Lower one binary32 form and pin the line it becomes, then change that one word."""
+    lines = program(op=op)
+    word = lines.index(f"{op} v6, 0.5, v7")
+
+    def hlsl(name):
+        return "    " + OPS[name][1].format(n=word, a=word - 1)
+
+    def lowered(replacement):
+        changed = decoded_stream(lines)
+        changed[word] = (changed[word][0], replacement)
+        return lower(changed, TABLES)
+
+    text = source(op=op)
+    assert hlsl(op) in text.splitlines()
+    for other in OPS:
+        if other != op:
+            wrong = lowered(f"{other} v6, 0.5, v7")
+            assert hlsl(other) in wrong.splitlines() and hlsl(op) not in wrong, other
+    for bad in (
+        f"{op} v6, 0.5, v9",  # vsrc1 was never written
+        f"{op} v6, 0.5, s30",  # vsrc1 is a VGPR in every e32 form
+        f"{op} v6, 0.5",  # missing operand
+        op.replace("_e32", "_e64") + " v6, 0.5, v7",  # other encoding
+    ):
+        try:
+            lowered(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"Invalid binary32 form accepted: {bad}")
+    return text
+
+
+def source(extended=False, op=None):
+    extended = extended or op is not None
+    lines = program(extended, op)
+    decoded = decoded_stream(lines)
+    offsets = [pc for pc, _ in decoded]
+    tables = TABLES
     for bad in ([(6, 16), (10, 32)], [(10, 32), (6, 16)]):
         try:
             lower(decoded, bad)
@@ -123,14 +180,83 @@ def source(extended=False):
     return lower(decoded, tables)
 
 
-def draw(dxc, renderer, adapter, tmp, shader, word_offset, noise, *, thresholds=()):
-    vs, ps = tmp / "vertex.dxil", tmp / "pixel.dxil"
-    for name, profile, text, binary in [("v", "vs", VS, vs), ("p", "ps", shader, ps)]:
+def compile_pair(dxc, tmp, shader, stem="pixel"):
+    vs, ps = tmp / "vertex.dxil", tmp / (stem + ".dxil")
+    for name, profile, text, binary in [("v", "vs", VS, vs), (stem, "ps", shader, ps)]:
         path = tmp / (name + ".hlsl")
         path.write_text(text)
         subprocess.run(
             [dxc, "-T", profile + "_6_0", "-E", "main", "-Fo", binary, path], check=True
         )
+    return vs, ps
+
+
+def op_picture(op, seed, threshold):
+    """Independent CPU reference: the 32x32 depth the lowered program must leave."""
+    function = OPS[op][0]
+    values = bytearray()
+    for row in range(32):
+        # The fixture's v7 is the fractional part of (row + 0.5 + (seed + 12) mod 32) / 32.
+        v7 = ((row + 0.5 + ((seed + 12) & 31)) % 32) / 32
+        depth = 0.75 if function(0.5, v7) <= threshold else 0.9375
+        values += struct.pack("<f", depth) * 32
+    return bytes(values)
+
+
+def run_depth_mask(renderer, adapter, tmp, vs, ps, seed, threshold, reference):
+    a, b = bytearray(2048), bytearray(2048)
+    struct.pack_into("<I", a, 0x18, seed)
+    struct.pack_into("<f", b, 0, threshold)
+    fixture = tmp / "draw.bin"
+    fixture.write_bytes(a + b + reference)
+    result = subprocess.run(
+        [renderer, adapter, "--depth-mask", vs, ps, fixture], capture_output=True, text=True
+    )
+    print(result.stdout, result.stderr)
+    return result
+
+
+def draw_ops(dxc, renderer, adapter, tmp):
+    """Each binary32 form against its CPU reference, then against every other form's."""
+    cases = ((7, 0.25), (29, 0.75))
+    pictures = {op: [op_picture(op, *case) for case in cases] for op in OPS}
+    # Every form must be visible: no other form may leave the same two pictures.
+    for op, shown in pictures.items():
+        assert all(shown != pictures[other] for other in OPS if other != op), op
+    for op in OPS:
+        vs, ps = compile_pair(dxc, tmp, op_source(op))
+        for (seed, threshold), reference in zip(cases, pictures[op]):
+            result = run_depth_mask(renderer, adapter, tmp, vs, ps, seed, threshold, reference)
+            if result.returncode == 77:
+                return 77
+            result.check_returncode()
+        # A reference from another form must fail with exactly the pixels where they differ.
+        for other in OPS:
+            if other == op:
+                continue
+            for (seed, threshold), right, wrong in zip(
+                cases, pictures[op], pictures[other]
+            ):
+                if right == wrong:
+                    continue
+                count = sum(
+                    right[i : i + 4] != wrong[i : i + 4] for i in range(0, 4096, 4)
+                )
+                result = run_depth_mask(renderer, adapter, tmp, vs, ps, seed, threshold, wrong)
+                if (
+                    result.returncode != 1
+                    or "Draw reference mismatch" not in result.stderr
+                    or f"pixels=1024 mismatches={count}\n" not in result.stdout
+                    or "debug_errors=0" not in result.stdout
+                    and "debug_layer=unavailable" not in result.stdout
+                ):
+                    raise AssertionError(f"{op} must not match the {other} reference")
+                break
+    return 0
+
+
+def draw(dxc, renderer, adapter, tmp, shader, word_offset, noise, *, thresholds=()):
+    vs, ps = compile_pair(dxc, tmp, shader)
     a, b = bytearray(2048), bytearray(2048)
     for buf, threshold, seed in ((a, 0.25, 7), (b, 0.625, 29)):
         struct.pack_into("<f", buf, 0, threshold)
@@ -187,11 +313,16 @@ def draw(dxc, renderer, adapter, tmp, shader, word_offset, noise, *, thresholds=
 
 
 def binary(tmp, assembler, objcopy, library):
+    translate(tmp, assembler, objcopy, library, program(), source())
+    for op in OPS:
+        translate(tmp, assembler, objcopy, library, program(op=op), op_source(op))
+
+
+def translate(tmp, assembler, objcopy, library, lines, expected):
     from pixel_aot_check import envelope
     from pixel_aot import _read_named_container
 
     src, obj, raw = (tmp / name for name in ("fixture.s", "fixture.o", "fixture.bin"))
-    lines = program()
     src.write_text(
         "\n".join(
             s.replace("mrtz,", "mrtz")
@@ -239,7 +370,7 @@ def binary(tmp, assembler, objcopy, library):
         ],
         check=True,
     )
-    assert translated.read_text() == source()
+    assert translated.read_text() == expected
 
 
 if __name__ == "__main__":
@@ -247,6 +378,8 @@ if __name__ == "__main__":
         if sys.argv[1] == "binary":
             binary(Path(directory), *sys.argv[2:])
             sys.exit(0)
+        if sys.argv[1] == "ops":
+            sys.exit(draw_ops(*sys.argv[2:], Path(directory)))
         draw_args = (*sys.argv[1:], Path(directory))
         result = draw(*draw_args, source(), 4, lambda x, y, seed: ((x + seed) / 8) % 1)
         if result:

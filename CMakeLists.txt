@@ -786,7 +786,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Registered unconditionally: without the tools the wrapper reports a skip (77) rather than the
     # tests silently disappearing. Hosted CI sets X2W_REQUIRE_SPIRV_TOOLS=1 to turn skips into failures.
     foreach(adapter IN ITEMS hardware warp)
-        foreach(bridge IN ITEMS address_window:draw sampler_views:sampler ballot_extract:ballot
+        foreach(bridge IN ITEMS address_window:draw address_window_atomic:atomic
+                                sampler_views:sampler ballot_extract:ballot
                                 compaction:compaction compare_sampler:compare_sampler minlod:minlod
                                 minlod_exact:minlod_exact minlod_levels:minlod_levels
                                 minlod_fractional:minlod_fractional)
@@ -4090,6 +4091,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/mesh_entry_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(mesh_entry_draw_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME mesh_entry_float_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/mesh_entry_check.py" draw-float "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(mesh_entry_float_draw_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME mesh_entry_cvt_minmax_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/mesh_entry_check.py" draw-cvt-minmax "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -4237,6 +4242,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/depth_mask_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(depth_mask_draw_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME depth_mask_ops_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/depth_mask_check.py" ops "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(depth_mask_ops_draw_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         add_test(NAME pixel_cb_read_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_cb_read_check.py" "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
