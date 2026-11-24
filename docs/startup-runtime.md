@@ -699,6 +699,24 @@ These are measured on one executable; treat them as hypotheses for others.
   expects every failure under one cause and must fail. The counts cover the run as a whole; they do
   not say which failure came first or what the title expects for a refused request.
   Reproduce with `ctest --preset release --no-tests=error -R '^startup_storage_failure_counts' -V`.
+- **DirectStorage page-request ends (#1198).** After the failure causes, the heartbeat prints
+  `x2w-dstorage heartbeat <n> s: page requests by end against the first 64 KiB page` with
+  `inside-completed`, `inside-failed`, `at-page-end-completed`, `at-page-end-failed`,
+  `past-completed` and `past-failed`. It covers requests with a page destination (option bit 21)
+  and classifies each by `page_offset + destination_size`, formed in 64 bits so it cannot wrap:
+  below 0x10000 is inside the first page, 0x10000 is at its end, above is past it. A destination
+  size of 0 ends at its offset, so inside. A request is counted once, when it runs: completed when
+  it is written, failed under the same rule that sets `failed=` on the totals line, including a page
+  array unreadable at run and an entry that threw. An `empty` request (source size 0) is neither, and
+  an entry that never started is not counted. Outcomes, statuses and the per-request text are
+  unchanged. The `startup_storage_page_end_counts` fixture compiles the stand-in into itself, loads
+  the xmem shim for page writes, submits page requests of every end that complete and that fail at
+  each failure site, plus an `empty` and two linear-destination requests, and checks each count, that
+  the page counts match the totals less the linear requests, the logged outcome of every failure, the
+  heartbeat line text and edge ends where a 32-bit sum would wrap. Its `one_bucket_control` expects
+  every page request at the page end and must fail. The counts describe a run's request shapes; they
+  do not say why a request of one shape fails or what the title expects for it.
+  Reproduce with `ctest --preset release --no-tests=error -R '^startup_storage_page_end_counts' -V`.
 - **DirectStorage allocation failure (#1199, item 3).** A queue worker runs each entry inside
   a handler that turns any exception, including `std::bad_alloc` from a buffer sized by a request
   field, into a failed request: the next status entry reports `E_FAIL`, the destination is
@@ -997,7 +1015,8 @@ elapsed time. A physical-page section exists from a page's first use (a mapping 
 write) until its grant is released; `xmem.dll` publishes that count through the experimental
 `x2w_xmem_page_stats` export. The heartbeat also prints while the request counters are unchanged
 when either memory value changed, so the cost of a stalled load is visible. Each report is followed
-by a line of failed requests by cause (see DirectStorage failure causes under Findings).
+by a line of failed requests by cause and a line of page-destination requests by end (see
+DirectStorage failure causes and DirectStorage page-request ends under Findings).
 
 ```powershell
 cmake --build --preset release --target xmem_shim startup_stub_xcrdapi
