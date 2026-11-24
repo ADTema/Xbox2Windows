@@ -2859,6 +2859,94 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
     return 0
 
 
+MUBUF_STORE_VALUE = 0x12345678
+MUBUF_SUBWORD_STORES = {
+    "buffer_store_byte": (1, 0, 5),
+    "buffer_store_byte_d16_hi": (1, 2, 7),
+    "buffer_store_short": (2, 0, 4),
+    "buffer_store_short_d16_hi": (2, 2, 6),
+}
+
+
+def mubuf_subword_store_cases():
+    for op, (_, _, offset) in MUBUF_SUBWORD_STORES.items():
+        yield op, [
+            "s_mov_b32 s12, s7", "s_mov_b32 s13, 0",
+            "s_load_dwordx4 s[20:23], s[12:13], 0x30", "v_lshl_add_u32 v8, s11, 5, v0",
+            "s_waitcnt lgkmcnt(0)", f"v_xor_b32_e32 v10, {MUBUF_STORE_VALUE:#x}, v8",
+            "v_mul_lo_u32 v12, 0x10000, v8", "v_xor_b32_e32 v10, v12, v10",
+            f"{op} v10, v8, s[20:23], 0 idxen offset:{offset}", "s_endpgm",
+        ], DS_BINDING | {"stride": 12}
+
+
+def mubuf_subword_store_controls():
+    _, lines, binding = next(mubuf_subword_store_cases())
+    store = lines[-2]
+    for replacement, diagnostic in (
+        (store.replace("idxen", "offen"), "Unsupported subword buffer store target or address mode"),
+        (store.replace("idxen", "idxen offen"), "Unsupported subword buffer store target or address mode"),
+        (store.replace("offset:5", "offset:12"), "Unsupported store address"),
+        (store.replace("buffer_store_byte", "buffer_store_short"), "Unverified raw UAV store"),
+        (store.replace("v10,", "v[10:11],"), "Unverified raw UAV store"),
+        (store + " glc", "Unsupported compute instruction"),
+        (store + "\n" + store.replace("offset:5", "offset:7"), "Overlapping raw UAV stores"),
+        (store + "\nbuffer_store_dword v10, v8, s[20:23], 0 idxen offset:4", "Overlapping raw UAV stores"),
+    ):
+        rejects(diagnostic, aot.lower, variant(lines, (store, replacement)), 32, **binding)
+    rejects("Unsupported subword buffer store target or address mode", aot.lower, lines, 32,
+            **(binding | {"cpu": "gfx1013"}))
+    rejects("Unverified raw UAV store", aot.lower, variant(lines, ("s_waitcnt lgkmcnt(0)", "")), 32, **binding)
+    rejects("Store address does not separate every invocation", aot.lower, lines, (32, 2, 1),
+            **(binding | {"group_reg_y": 9}))
+
+
+def mubuf_subword_store_expected(op, groups, *, wrong_half=False):
+    width, source_byte, offset = MUBUF_SUBWORD_STORES[op]
+    if wrong_half:
+        source_byte = 2 - source_byte
+    data = bytearray(SENTINEL.to_bytes(4, "little") * 320)
+    for gid in range(groups * 32):
+        base = gid * 12 + offset
+        source = (MUBUF_STORE_VALUE ^ gid ^ (gid << 16)).to_bytes(4, "little")
+        data[base:base + width] = source[source_byte:source_byte + width]
+    return struct.unpack("<320I", data)
+
+
+def mubuf_subword_store_draw(directory, compiler, renderer, backend):
+    src, cso, case = (directory / f"mubuf-subword-store.{ext}" for ext in ("hlsl", "cso", "case"))
+    compile_shader = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
+    run = [renderer, backend, "--compute-store-case", cso, case]
+    for op, lines, binding in mubuf_subword_store_cases():
+        print(f"{op}: CPU reference", flush=True)
+        src.write_text(aot.lower(lines, 32, **binding), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        for groups in (1, 3):
+            words = mubuf_subword_store_expected(op, groups)
+            case.write_bytes(struct.pack("<321I", groups, *words))
+            result = subprocess.run(run)
+            if result.returncode:
+                return result.returncode
+        other = op.removesuffix("_d16_hi") if op.endswith("_hi") else op + "_d16_hi"
+        full_word = "buffer_store_dword v10, v8, s[20:23], 0 idxen offset:4"
+        controls = [("select the wrong VGPR half", lines[-2].replace(op, other, 1),
+                     mubuf_subword_store_expected(op, groups, wrong_half=True)[1]),
+                    ("overwrite the containing DWORD", full_word, MUBUF_STORE_VALUE)]
+        for label, store, actual in controls:
+            print(f"{op}: {label}", flush=True)
+            src.write_text(aot.lower(variant(lines, (lines[-2], store)), 32, **binding), encoding="ascii")
+            subprocess.run(compile_shader, check=True)
+            result = subprocess.run(run, capture_output=True, text=True)
+            if result.returncode != 1 or f"word=1 expected={words[1]:08x} actual={actual:08x}" not in result.stderr:
+                raise AssertionError(f"{op}: {label} escaped detection\n{result.stderr}")
+            print(result.stderr, end="")
+    mubuf_subword_store_controls()
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(f"{op}\n" for op in MUBUF_SUBWORD_STORES), encoding="utf-8")
+    return 0
+
+
 MTBUF_STORE_WORDS = (0x01234567, 0x89abcdef, 0x76543210, 0xfedcba98)
 
 
@@ -2983,6 +3071,8 @@ def binary(directory, assembler, objcopy, library):
     gfx1030_binary(directory, assembler, objcopy, library, mubuf_d16_cases(), "buffer_load_")
     mtbuf_store_binary(directory, assembler, objcopy, library)
     scalar_alu_binary(directory, assembler, objcopy, library)
+    mubuf_subword_store_controls()
+    gfx1030_binary(directory, assembler, objcopy, library, mubuf_subword_store_cases(), "buffer_store_")
     ds_controls()
     lds_controls()
     ds_binary(directory, assembler, objcopy, library)
@@ -4365,5 +4455,6 @@ if __name__ == "__main__":
                  "draw-lds-replacement": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_REPLACEMENT_CASES),
                  "draw-f32": lambda d, *a: draw(d, *a, cases=F32_CASES),
                  "draw-mtbuf-store": mtbuf_store_draw,
+                 "draw-mubuf-subword-store": mubuf_subword_store_draw,
                  "draw-guard-read": lambda d, *a: draw(d, *a, cases=GUARD_CASES + READ_CASES + ALU_CASES + SCALAR_CASES)}
         sys.exit(modes[mode](Path(tmp), *args))
