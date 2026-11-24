@@ -19,6 +19,8 @@
 #include "ffx_provider_loop.h"
 #include "desktop_gpu.h"
 
+void check_spirv_window_atomic(ID3D12Device* device, const char* shader_path);
+
 #ifdef OFFSCREEN_AGILITY_620
 extern "C" {
 __declspec(dllexport) extern const UINT D3D12SDKVersion = 620;
@@ -507,6 +509,12 @@ OperationResult run_raw_uav_dump(const OperationContext& ctx)
 OperationResult run_spirv_address_window(const OperationContext& ctx)
 {
     check_spirv_window(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_spirv_address_window_atomic(const OperationContext& ctx)
+{
+    check_spirv_window_atomic(ctx.device, ctx.argv[3]);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -999,6 +1007,7 @@ const OperationSpec kOperations[] = {
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},
     {"--spirv-address-window", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window},
+    {"--spirv-address-window-atomic", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_atomic},
     {"--spirv-compare-sampler", 6, 7, nullptr, kGateSm60CompareSampler, run_spirv_compare_sampler},
     // The SPIR-V ballot fixture compiles cs_6_6; it uses the compute-store readback behind an SM 6.6 gate.
     {"--spirv-ballot", 5, 5, nullptr, kGateSm66Ballot, run_compute_store_case},
