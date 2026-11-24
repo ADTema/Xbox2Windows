@@ -803,6 +803,35 @@ def cmpx64_group(kind, group):
     return cmp64_program(body)
 
 
+# v_cmpx_class_f32 regions: the class of the raw binary32 src0 in the class mask in VSRC1 opens the region.
+# v20 = s44 - sample.x is a positive normal value exactly where s44 > sample.x: the ramp never equals the thresholds
+# and no difference is subnormal, so under the +normal mask (0x100) the region selects the lanes masked_pixels expects.
+CMPX_CLASS_COMPARE = "v_cmpx_class_f32_e32 v20, v21"
+CMPX_CLASS_POSITIVE_NORMAL = 0x100
+
+
+def cmpx_class_region(restore=CMPX_MOV_RESTORE, classes=CMPX_CLASS_POSITIVE_NORMAL, compare=CMPX_CLASS_COMPARE):
+    """The v_cmpx region with a class opener: while s44 - sample.x is in `classes`, overwrite v13 and v14."""
+    return uncompressed_export(["v_sub_f32_e64 v20, s44, v12", f"v_mov_b32_e32 v21, {classes:#x}", CMPX_SAVE,
+                                compare, "v_mov_b32_e32 v13, s45", "v_mov_b32_e32 v14, s46", restore])
+
+
+# Four uniform class regions on CLASS_BITS, as in the v_cmp_class_f32 draw: +inf against its own bit, a quiet NaN
+# against both NaN bits, -0 against the +0 bit and a positive denormal against its bit. The class mask is a VGPR
+# (VSRC1 of VOPC e32), and the regions alternate the two restores.
+CMPX_CLASS_MASKS = (0x200, 3, 0x40, 0x80)
+
+
+def cmpx_class_group(masks=CMPX_CLASS_MASKS):
+    """Four v_cmpx_class_f32 regions, each setting one channel to 1.0 when s44+channel is in its class mask."""
+    body = ["v_mov_b32_e32 v19, 1.0"] + [f"v_mov_b32_e32 v{12 + channel}, 0" for channel in range(4)]
+    for channel, classes in enumerate(masks):
+        body += [f"v_mov_b32_e32 v18, {classes if classes <= 64 else hex(classes)}", CMPX_SAVE,
+                 f"v_cmpx_class_f32_e32 s{44 + channel}, v18", f"v_mov_b32_e32 v{12 + channel}, v19",
+                 CMPX_MOV_RESTORE if channel % 2 == 0 else CMPX_OR_RESTORE]
+    return with_constants(body)
+
+
 def cmpx_observables():
     """VCC and SCC written before a v_cmpx region keep their values after the s_mov_b64 restore.
 
@@ -857,6 +886,45 @@ def check_cmpx_draw(directory, compiler, renderer, backend):
         case = directory / f"cmpx-{label}.case"
         write_case(case, constants, expected)
         run_pixel_batch(renderer, backend, shader, [(case, "mismatch")])
+    # v_cmpx_class_f32 openers: the +normal class of s44 - sample.x on mixed, full and empty masks through both
+    # restores. The -normal mask (the reversed region) and a mask-free body must mismatch on the mixed mask.
+    for label, program in (("class-mov", cmpx_class_region()), ("class-or", cmpx_class_region(CMPX_OR_RESTORE))):
+        source.write_text(translate(program), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        cases = []
+        for threshold in (0.5, 10.0, -1.0):
+            struct.pack_into("<4f", constants, 12, threshold, 0.25, 0.75, 0.0)
+            case = directory / f"cmpx-{label}-{len(cases)}.case"
+            write_case(case, constants, masked_pixels(threshold, (0.25, 0.75), False))
+            cases.append((case, "pass"))
+        run_pixel_batch(renderer, backend, shader, cases)
+    struct.pack_into("<4f", constants, 12, 0.5, 0.25, 0.75, 0.0)
+    class_unmasked = [line for line in cmpx_class_region() if line not in (CMPX_SAVE, CMPX_CLASS_COMPARE,
+                                                                           CMPX_MOV_RESTORE)]
+    for label, mutant in (("class-negative-normal", cmpx_class_region(classes=0x8)),
+                          ("class-unmasked", class_unmasked)):
+        source.write_text(translate(mutant), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        case = directory / f"cmpx-{label}.case"
+        write_case(case, constants, expected)
+        run_pixel_batch(renderer, backend, shader, [(case, "mismatch")])
+    # Uniform class regions on +inf, a quiet NaN, -0 and a positive denormal: each channel's wrong result mismatches.
+    source.write_text(translate(cmpx_class_group()), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    class_constants = bytearray(256)
+    struct.pack_into("<4I", class_constants, 12, *CLASS_BITS)
+    class_expected = [1.0, 1.0, 0.0, 1.0]
+    cases = []
+    for k in range(4):
+        wrong = list(class_expected)
+        wrong[k] = 1.0 - wrong[k]
+        case = directory / f"cmpx-class-group-wrong-{k}.case"
+        case.write_bytes(class_constants + struct.pack("<4f", *wrong) * 64)
+        cases.append((case, "mismatch"))
+    case = directory / "cmpx-class-group.case"
+    case.write_bytes(class_constants + struct.pack("<4f", *class_expected) * 64)
+    cases.append((case, "pass"))
+    run_pixel_batch(renderer, backend, shader, cases)
     # VCC and SCC from before the region, on mixed, full and empty masks; SCC is 1 only for 0.5.
     source.write_text(translate(cmpx_observables()), encoding="ascii")
     compile_shader(compiler, source, shader)
@@ -10880,13 +10948,19 @@ def check_cmpx_controls():
     for kind in ("i64", "u64"):
         for group in (0, 1):
             assert selects(cmpx64_group(kind, group)) == 4
+    for restore in (CMPX_MOV_RESTORE, CMPX_OR_RESTORE):
+        assert selects(cmpx_class_region(restore)) == 2
+    assert selects(cmpx_class_group()) == 4
+    assert translate(cmpx_class_group()).count("(class32(") == 4
     # Each accepted comparison kind lowers like the v_cmp of the same kind.
     for compare, plain in (("v_cmpx_lt_f32_e32 s44, v12", "v_cmp_lt_f32_e32 vcc_lo, s44, v12"),
                            ("v_cmpx_ge_i32_e32 v13, v12", "v_cmp_ge_i32_e32 vcc_lo, v13, v12"),
                            ("v_cmpx_ne_u32_e32 0x3f000000, v12", "v_cmp_ne_u32_e32 vcc_lo, 0x3f000000, v12"),
                            ("v_cmpx_nlg_f32_e32 -1.0, v12", "v_cmp_nlg_f32_e32 vcc_lo, -1.0, v12"),
                            ("v_cmpx_gt_i16_e32 v13, v12", "v_cmp_gt_i16_e32 vcc_lo, v13, v12"),
-                           ("v_cmpx_le_u16_e32 0x8000, v12", "v_cmp_le_u16_e32 vcc_lo, 0x8000, v12")):
+                           ("v_cmpx_le_u16_e32 0x8000, v12", "v_cmp_le_u16_e32 vcc_lo, 0x8000, v12"),
+                           ("v_cmpx_class_f32_e32 s44, v12", "v_cmp_class_f32_e32 vcc_lo, s44, v12"),
+                           ("v_cmpx_class_f32_e32 0x200, v12", "v_cmp_class_f32_e32 vcc_lo, 0x200, v12")):
         expr = next(line for line in translate(cmpx_region(compare=compare)).splitlines() if "bool cmp" in line)
         reference = next(line for line in translate(uncompressed_export([plain])).splitlines() if "bool cmp" in line)
         assert expr.split(" = ", 1)[1] == reference.split(" = ", 1)[1], (compare, expr, reference)
@@ -10936,13 +11010,17 @@ def check_cmpx_controls():
     expect_value_error(translate, [CMPX_MOV_RESTORE.replace("60:61", "58:59") if line == "s_or_b64 exec, exec, s[60:61]"
                                    else line for line in masked_region()], "Unexpected execution mask restore")
     must_reject(translate, [line for line in region if line != CMPX_MOV_RESTORE])
-    # Out of scope for this stage: e64, SDWA, f16/f64 and class, VSRC1 not a VGPR (a VGPR pair at 64 bits),
+    # Out of scope for this stage: e64, SDWA, f16/f64 and their class forms, VSRC1 not a VGPR (a pair at 64 bits),
     # the 16-bit f/t forms gfx10 lacks, a float token on a 16-bit integer, and source modifiers.
     for compare in ("v_cmpx_gt_f32_e64 s44, v12", "v_cmpx_gt_f32_sdwa s44, v12 src0_sel:DWORD src1_sel:DWORD",
                     "v_cmpx_gt_f16_e32 s44, v12", "v_cmpx_gt_f64_e32 s[44:45], v[12:13]",
                     "v_cmpx_t_i16_e32 s44, v12", "v_cmpx_gt_i16_e32 1.0, v12", "v_cmpx_gt_u64_e32 s[44:45], v12",
                     "v_cmpx_gt_i64_e32 v[12:13], s[44:45]", "v_cmpx_gt_u16_e64 s44, v12",
-                    "v_cmpx_class_f32_e32 s44, v12", "v_cmpx_gt_f32_e32 v12, s44",
+                    "v_cmpx_class_f32_e64 s44, v12", "v_cmpx_class_f32_e32 v12, s44",
+                    "v_cmpx_class_f32_e32 -v13, v12", "v_cmpx_class_f32_e32 |v13|, v12",
+                    "v_cmpx_class_f32_sdwa s44, v12 src0_sel:DWORD src1_sel:DWORD",
+                    "v_cmpx_class_f16_e32 s44, v12", "v_cmpx_class_f64_e32 s[44:45], v12",
+                    "v_cmpx_gt_f32_e32 v12, s44",
                     "v_cmpx_gt_f32_e32 -v13, v12", "v_cmpx_gt_f32_e32 |v13|, v12",
                     "v_cmpx_gt_f32 s44, v12", "v_cmpx_gt_f32_e32 s44"):
         must_reject(translate, cmpx_region(compare=compare))
@@ -15498,6 +15576,8 @@ def check_binary(directory, assembler, objcopy, library):
         *(cmpx_predicate_group(kind, first) for kind, first in CMPX_PREDICATE_GROUPS)))
     fixtures.extend((cmpx64_group(kind, group), translate_int) for kind in ("i64", "u64") for group in (0, 1))
     fixtures.append((cmpx_skip_asm(), translate, "gfx1013", "", cmpx_skip()))
+    fixtures.extend((program, translate) for program in (cmpx_class_region(), cmpx_class_region(CMPX_OR_RESTORE),
+                                                         cmpx_class_group()))
     fixtures.extend((program, translate_int) for op in SHIFT64_OPS for program in shift64_programs(op).values())
     fixtures.extend((region_body_program(body, approximate), translate)
                     for _, body, _, approximate in REGION_BODY_FORMS)
