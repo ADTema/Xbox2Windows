@@ -555,6 +555,7 @@ def compile_o2_and_verify(original_path, cxx_path):
              f"/Fo{tmp / 'seg_inspect_o2.obj'}", f"/Fe{dll_path}"],
             capture_output=True,
             text=True,
+            errors="replace",
         )
         if proc.returncode != 0:
             raise AssertionError(f"/O2 compile failed:\n{proc.stdout}\n{proc.stderr}")

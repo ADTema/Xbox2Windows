@@ -659,7 +659,11 @@ def translate(image, names):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(
+        description=__doc__.splitlines()[0],
+        epilog=("Use only for the fixed Windows x64 CPL=3 GDT profile. The generated code "
+                "does not read the live GDT/LDT or model other selector layouts."),
+    )
     parser.add_argument("image", type=Path)
     parser.add_argument("exports", help="comma-separated export names")
     parser.add_argument("output", type=Path)
