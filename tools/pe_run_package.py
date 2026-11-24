@@ -53,6 +53,13 @@ def plan(report, *, allow_external=True):
     return order, routes
 
 
+def is_host_create_thread(dll, symbol):
+    """A host CreateThread import: kernel32, kernelbase or a processthreads API-set contract."""
+    dll = dll.casefold()
+    return symbol == "CreateThread" and (dll in ("kernel32.dll", "kernelbase.dll")
+                                         or dll.startswith("api-ms-win-core-processthreads-"))
+
+
 def prototype(lib, name, args, result):
     function = getattr(lib, name)
     function.argtypes, function.restype = args, result
@@ -130,7 +137,14 @@ def run(root, report, mapper, shims, system, *, preflight_only=False, pin_shims=
                               [W.LPCWSTR, callback, C.POINTER(C.c_uint32), C.c_char_p, C.c_size_t], C.c_void_p)
         export = prototype(lib, "pe_map_export", [C.c_void_p, C.c_char_p], C.c_void_p)
         unmap = prototype(lib, "pe_map_release", [C.c_void_p], C.c_int)
-        start = prototype(lib, "pe_map_run", [C.c_void_p, C.POINTER(C.c_uint32)], C.c_int)
+        # The entry is the package's main executable, as under a Windows launch: pe_map_run_main gives
+        # its TLS block slot 0 on the participating threads (code built with /GA reads slot 0 directly),
+        # and its host CreateThread imports go to pe_map_main_create_thread so its workers participate.
+        try:
+            start = prototype(lib, "pe_map_run_main", [C.c_void_p, C.POINTER(C.c_uint32)], C.c_int)
+            enroll = C.cast(lib.pe_map_main_create_thread, C.c_void_p).value
+        except AttributeError as exc:
+            raise ValueError("the entry EXE requires a mapper with pe_map_run_main") from exc
         mapped = {}
         for image in order:
             imports = {}
@@ -143,6 +157,10 @@ def run(root, report, mapper, shims, system, *, preflight_only=False, pin_shims=
                                     export(mapped[provider], symbol.encode("ascii")))
                     if not imports[key]:
                         raise ValueError(f"{image}: mapped export {provider}!{symbol} unavailable")
+                elif (image == report["entry"]
+                      and terminal["dll"].casefold() not in shims
+                      and is_host_create_thread(terminal["dll"], symbol)):
+                    imports[key] = enroll
                 else:
                     imports[key] = addresses[terminal["dll"].casefold(), symbol]
 
