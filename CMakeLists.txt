@@ -4077,12 +4077,13 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:cpu_${part}_lifted>" ${host_cpu_extras})
         set_tests_properties(cpu_aot_${part} PROPERTIES SKIP_RETURN_CODE 77)
     endforeach()
-    # INT3 and UD2: the lifted DLL, the drop, swap and nostore controls that must break a rule, an /O2 build,
+    # INT3, UD2 and UD1: the lifted DLL, the drop, swap, nostore, udonedrop and udoneload controls that must break
+    # a rule, an /O2 build,
     # and the native SEH boundary that the check's child processes call through.
     cpu_asm_fixture(cpu_trap trap)
     add_library(cpu_trap_harness SHARED tests/cpu/trap_harness.cpp)
     set(trap_controls)
-    foreach(variant IN ITEMS lifted drop swap nostore)
+    foreach(variant IN ITEMS lifted drop swap nostore udonedrop udoneload)
         set(trap_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_trap_${variant}.cpp")
         add_custom_command(OUTPUT "${trap_fixture}"
             COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/trap.py"
@@ -4103,6 +4104,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_trap COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/trap.py"
         check "$<TARGET_FILE:cpu_trap_harness>" "$<TARGET_FILE:cpu_trap>" "$<TARGET_FILE:cpu_trap_lifted>"
         ${trap_controls} "${trap_o2}")
+    # UD1 is written as bytes, so the check records the decoded forms for tools/form_coverage.py.
+    set_tests_properties(cpu_aot_trap PROPERTIES
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_trap.txt")
     # The opt-in host-MXCSR profile: the lifted DLL, the noload and fixed controls that must break a rule, and
     # an /O2 build of the translation.
     cpu_asm_fixture(cpu_mxcsr_harness mxcsr_harness)

@@ -990,8 +990,18 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
             # encodings stay refused.
             stmt = "__debugbreak();"
         elif i.code == C.UD2:
-            # UD2 (0F 0B) raises the host's STATUS_ILLEGAL_INSTRUCTION; UD0 and UD1 stay refused.
+            # UD2 (0F 0B) raises the host's STATUS_ILLEGAL_INSTRUCTION.
             stmt = "__ud2();"
+        elif i.code in (C.UD1_R16_RM16, C.UD1_R32_RM32, C.UD1_R64_RM64):
+            # UD1 (0F B9 /r) raises #UD as UD2 does (AMD64 APM Vol. 3 rev. 3.39, "UD0, UD1, UD2"). The lowering
+            # does not evaluate the ModRM operand; cpu_aot_trap measures that a memory form with an inaccessible
+            # address raises STATUS_ILLEGAL_INSTRUCTION natively too.
+            stmt = "__ud2();  // ud1"
+        elif op == M.UD0:
+            # The AMD64 APM encodes UD0 as 0F FF without a ModRM byte; iced's default decoding reads one, so the
+            # length, and every instruction after it, depends on the target vendor.
+            raise ValueError(f"unsupported query operation at {i.ip:#x}: {i}; UD0's decoded length depends on "
+                             "the target vendor (0F FF without a ModRM byte on AMD)")
         elif op in (M.LDMXCSR, M.VLDMXCSR) and host_mxcsr is not None and i.op0_kind == K.MEMORY:
             # VLDMXCSR (VEX.128, vvvv 1111; iced decodes every other VEX form as invalid) behaves the same.
             # The opt-in host-MXCSR profile: the requested word is checked before it reaches the host register,
