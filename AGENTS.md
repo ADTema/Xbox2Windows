@@ -128,6 +128,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/xgameruntime_table_check.py
 ./out/pe-env/bin/python -B tests/docs_links_check.py
 ./out/pe-env/bin/python -B tests/bidi_controls_check.py
+./out/pe-env/bin/python -B tests/gpu_report_format_check.py
 ./out/pe-env/bin/python -B tests/hardware_reports_check.py
 ```
 
