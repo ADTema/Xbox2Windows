@@ -169,6 +169,22 @@ dumpbin /imports .\out\build\dev\d3d12_sdk_check.exe
 
 Build outputs and downloaded tool sources live under `out/`. [Microsoft xbdepends documentation](https://learn.microsoft.com/en-us/samples/microsoft/xbox-gdk-samples/xbdepends/)
 
+## Recovering a failed startup command-list recording
+
+The source-built `startup_list_resubmit` fixture keeps a valid compute submission behind a
+queue wait, then calls `RSSetViewports` on a second recording of the same list. Desktop
+`Close` fails and the shim drops that recording. A `Reset` with a direct allocator must
+fail. An immediately following `Reset` with a compute allocator must create a usable
+recording on the same shim handle. The test closes it, signals the wait, and checks queue
+completion, device removal status, and debug-layer errors after the deliberate failures.
+The normal and forced submit-fence failure variants also retain the previous render-target
+and allocator-reuse checks. [D3D12 command-list recording and allocator lifetimes](https://learn.microsoft.com/windows/win32/direct3d12/recording-command-lists-and-bundles)
+
+```powershell
+cmake --build --preset dev --target startup_list_resubmit
+ctest --preset dev --no-tests=error -R '^startup_list_resubmit_' -V
+```
+
 **Optional compiler cache:** set `X2W_USE_SCCACHE=1` before `.\tools\dev.ps1` to cache compiles with [sccache](https://github.com/mozilla/sccache). When `sccache` is on `PATH`, the script fills `$X2wSccacheCmakeArgs` with four definitions: the C and C++ compiler launchers, `CMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded` (so `/Zi` PDB files do not block the cache) and `CMAKE_POLICY_DEFAULT_CMP0141=NEW` (CMake ignores the format variable otherwise). The embedded Debug format in this opt-in requires CMake 3.25 or newer; the ordinary build minimum is unchanged. Pass them when configuring. If `sccache` is missing the script warns and sets the variable to two empty definitions, `-DCMAKE_C_COMPILER_LAUNCHER=` and `-DCMAKE_CXX_COMPILER_LAUNCHER=`, so that a build directory configured earlier with `sccache` stops calling it (`-D` updates cache entries but never deletes them). Without `X2W_USE_SCCACHE=1` the variable is removed and the script and the `cmake` commands are exactly as before; a launcher left in the cache by an earlier opt-in run is not touched, so reset the cache entries by hand or opt in once without `sccache` to clear them.
 
 ```powershell

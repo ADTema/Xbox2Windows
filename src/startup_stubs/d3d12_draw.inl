@@ -479,10 +479,10 @@ struct SubmittedDrawSamplerHeaps {
 };
 std::vector<SubmittedDrawSamplerHeaps> submitted_draw_sampler_heaps;
 
-void discard_draw_sampler_heaps(Wrapper* self)
+void discard_draw_sampler_heaps(ID3D12CommandList* list)
 {
     AcquireSRWLockExclusive(&draw_lock);
-    recorded_draw_sampler_heaps.erase(static_cast<ID3D12GraphicsCommandList*>(self->own().real));
+    recorded_draw_sampler_heaps.erase(list);
     ReleaseSRWLockExclusive(&draw_lock);
 }
 
