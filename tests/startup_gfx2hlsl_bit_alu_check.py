@@ -14,7 +14,10 @@ inputs in the parameters, so the pixel stage cannot fold them.
 Every result is compared with a reference written from the ISA description with plain integer arithmetic, string
 reversal and bit loops, not with the lowering's own expressions. The translated text is evaluated on the CPU by a
 small HLSL integer evaluator over a grid that includes every bfe offset and width. Each lowering also has a mutation
-(no 31 minus, unsigned shift, no addend, wrong zero result, no reversal) that must read a wrong word.
+(no 31 minus, unsigned shift, subtracted addend, wrong zero result, no reversal) that must read a wrong word. The words
+the mutated draw must read come from MUTATION_REF, a plain integer definition of each mutation, and the evaluator on
+the mutated text must agree with it. A mutation that keeps the same inputs read as the correct lowering is used so
+the pixel stage has the same interface in both draws.
 """
 import re
 import struct
@@ -55,11 +58,21 @@ OPS = {
 # mnemonic -> (pattern in the translated text, replacement): a wrong lowering of the same operation
 MUTATIONS = {
     'v_bfe_i32': (r'asuint\(asint\(', 'asuint(('),                              # the field is not sign-extended
-    'v_bcnt_u32_b32': (r'countbits\((v\d+)\) \+ v\d+', r'countbits(\1)'),    # the addend is dropped
+    'v_bcnt_u32_b32': (r'countbits\((v\d+)\) \+ (v\d+)', r'countbits(\1) - \2'),  # the addend is subtracted
     'v_ffbl_b32': (r'firstbitlow\((v\d+)\)', r'(\1 == 0u ? 0u : firstbitlow(\1))'),  # zero reads 0
     'v_ffbh_u32': (r'31u - firstbithigh', 'firstbithigh'),                    # counts from the low end
     'v_ffbh_i32': (r'asint\((v\d+)\) < 0 \? ~v\d+ : v\d+', r'\1'),            # negative values scanned as is
     'v_bfrev_b32': (r'reversebits\((v\d+)\)', r'\1'),                         # not reversed
+}
+# mnemonic -> the word the mutated lowering must produce, defined from the mutation and the inputs with plain integer
+# arithmetic (not from the evaluator and not from a readback)
+MUTATION_REF = {
+    'v_bfe_i32': lambda x, off, w: 0 if w & 31 == 0 else (x >> (off & 31)) & ((1 << (w & 31)) - 1),
+    'v_bcnt_u32_b32': lambda x, y: (bin(x).count('1') - y) & MASK,
+    'v_ffbl_b32': lambda x: 0 if x == 0 else (x & -x).bit_length() - 1,
+    'v_ffbh_u32': lambda x: MASK if x == 0 else x.bit_length() - 1,
+    'v_ffbh_i32': lambda x: MASK if x in (0, MASK) else 32 - x.bit_length(),
+    'v_bfrev_b32': lambda x: x,
 }
 SPECIAL = [0, 1, 2, 3, 0x7f, 0x80, 0xff, 0x7fffffff, 0x80000000, 0x80000001, 0xfffffffe, MASK, 0x55555555,
            0xaaaaaaaa, 0x12345678, 0xdeadbeef, 0x00ff0000]
@@ -311,12 +324,19 @@ def controls():
         pipe, text = translate(op)
         check('%s: %d inputs match the reference (e32 and e64 lanes)' % (op, len(GRID[op])),
               first_mismatch(op, text) is None)
-        found = first_mismatch(op, translate(op, True)[1])
+        mutated = translate(op, True)[1]
+        found = first_mismatch(op, mutated)
         check('%s: mutation reads a wrong word %s' % (op, found), found is not None)
+        arity, mutated_exprs = OPS[op][0], lane_expressions(mutated)
+        check('%s: the mutated text equals the mutation definition on all %d inputs' % (op, len(GRID[op])),
+              all(mutated_exprs[i % 4].run({'v%d' % (4 * s + i % 4): x[s] for s in range(3)})[0]
+                  == MUTATION_REF[op](*x[:arity]) for i, x in enumerate(GRID[op])))
         first = DRAW[op][:4]
-        wrong = lane_results(lane_expressions(translate(op, True)[1]), first)
-        check('%s: draw set 0 exposes the mutation' % op,
-              wrong != [OPS[op][2](*x[:OPS[op][0]]) for x in first])
+        wrong = [MUTATION_REF[op](*x[:arity]) for x in first]
+        check('%s: draw set 0 mutated words %s differ from the reference and are not all zero' % (op, words_text(wrong)),
+              wrong != [OPS[op][2](*x[:arity]) for x in first] and any(wrong))
+        check('%s: evaluator on the mutated text reads the same words' % op,
+              lane_results(mutated_exprs, first) == wrong)
     # Source-built shader texts name the operands the evaluator reads: v_bfe_i32 field values by hand.
     exprs = lane_expressions(translate('v_bfe_i32')[1])
     check('bfe: offset 0 width 8 of 0x80 is -128, width 0 is 0, offset+width above 32 follows bit 31',
@@ -373,7 +393,7 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                         continue
                     # The same draw with the mutated lowering must read the mutated words, not the reference.
                     text = translate(op, True)[1]
-                    wrong = words_text(lane_results(lane_expressions(text), chunk))
+                    wrong = words_text(MUTATION_REF[op](*x[:OPS[op][0]]) for x in chunk)
                     bad_ps = compile_hlsl(compiler, kind, text, 'mutated_%s_%s' % (op, kind), ps_profile, directory)
                     run = draw(renderer, adapter, vs, bad_ps, expected)
                     if run.returncode == 0 or 'actual=%s' % wrong not in run.stderr:
