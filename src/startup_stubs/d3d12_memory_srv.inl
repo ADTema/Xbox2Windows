@@ -1,6 +1,4 @@
 // Included after the resource creation and descriptor handlers.
-#include "memory_srv_buffer.h"
-
 struct MemoryShaderResourceView {
     D3D12_SHADER_RESOURCE_VIEW_DESC view;
     u64 address;
