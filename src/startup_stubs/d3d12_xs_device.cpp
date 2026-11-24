@@ -14,8 +14,10 @@
 #define X2W_TRAP_MODULE_ID 7
 #include "startup_stubs/trap.h"
 #include "startup_stubs/local_log.h"
+#include "startup_stubs/overlay_window.h"
 #include "startup_stubs/draw_bmp.h"
 #include "startup_stubs/draw_dump_tracking.h"
+#include "startup_stubs/translated_sampler_bindings.h"
 
 #include "startup_stubs/slice_footprints.h"
 
@@ -25,11 +27,13 @@
 #include <d3dcompiler.h>
 #include <dxgi1_4.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -98,6 +102,8 @@ struct DescriptorRange {
     std::uint64_t title;
     std::uint64_t bytes;
     std::uint64_t desktop;
+    UINT title_stride;
+    UINT desktop_stride;
 };
 SRWLOCK descriptor_lock = SRWLOCK_INIT;
 std::vector<DescriptorRange> descriptor_ranges;
@@ -106,8 +112,21 @@ std::uint64_t desktop_cpu_handle(std::uint64_t handle)
 {
     AcquireSRWLockShared(&descriptor_lock);
     std::uint64_t result = handle;
-    for (const auto& r : descriptor_ranges)
-        if (handle >= r.title && handle < r.title + r.bytes) result = r.desktop + (handle - r.title);
+    for (const auto& r : descriptor_ranges) {
+        if (handle < r.title || handle - r.title >= r.bytes) continue;
+        const auto offset = handle - r.title;
+        result = r.desktop + offset / r.title_stride * r.desktop_stride + offset % r.title_stride;
+    }
+    ReleaseSRWLockShared(&descriptor_lock);
+    return result;
+}
+
+UINT title_descriptor_stride(u64 handle, UINT desktop_stride)
+{
+    AcquireSRWLockShared(&descriptor_lock);
+    UINT result = desktop_stride;
+    for (const auto& range : descriptor_ranges)
+        if (handle >= range.title && handle - range.title < range.bytes) result = range.title_stride;
     ReleaseSRWLockShared(&descriptor_lock);
     return result;
 }
@@ -810,6 +829,7 @@ HRESULT __stdcall device_residency(Wrapper* self, UINT count, void* const* objec
 // when the desktop GPU finishes, and the presented surface is read back and shown in the window.
 // Everything else on a list is still dropped.
 void release_targets(Wrapper* self);
+void discard_draw_sampler_heaps(Wrapper* self);
 void use_as_target(Wrapper* self, ID3D12Resource* resource);
 bool is_container(const void* p);
 bool shader_dump_dir(wchar_t* out, DWORD size);
@@ -874,6 +894,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
         hr = static_cast<ID3D12GraphicsCommandList*>(self->own().real)->Reset(static_cast<ID3D12CommandAllocator*>(a->own().real), nullptr);
     if (SUCCEEDED(hr)) {
         self->own().list_ready = false;
+        discard_draw_sampler_heaps(self);
         if (draw_dump_frame()) draw_dumps().discard(static_cast<ID3D12CommandList*>(self->own().real));
     }
     self->own().list_open = SUCCEEDED(hr);
@@ -892,6 +913,7 @@ HRESULT __stdcall list_close(Wrapper* self)
         const HRESULT hr = static_cast<ID3D12GraphicsCommandList*>(self->own().real)->Close();
         self->own().list_open = false;
         self->own().list_ready = SUCCEEDED(hr);
+        if (FAILED(hr)) discard_draw_sampler_heaps(self);
         if (FAILED(hr) && draw_dump_frame()) draw_dumps().discard(static_cast<ID3D12CommandList*>(self->own().real));
         InterlockedIncrement(&render_closes);
         static LONG failures;
@@ -1308,6 +1330,10 @@ struct Pass {
     UINT target_count = 0;
     ID3D12Resource* target0 = nullptr;  // desktop resource of render target 0 (for per-draw dumps)
     bool heap_set = false;
+    x2w_startup::SamplerSource title_samplers;
+    std::unique_ptr<x2w_startup::SamplerSnapshot> sampler_snapshot;
+    x2w_startup::ComPtr<ID3D12DescriptorHeap> sampler_heap;
+    ID3D12DescriptorHeap* bound_sampler_heap = nullptr;
 };
 LONG render_draws, render_draws_skipped, render_pipelines_real, render_pipelines_missing;
 
@@ -1475,12 +1501,15 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         if (!ready.empty()) {
             auto* queue = static_cast<ID3D12CommandQueue*>(self->own().real);
             const UINT ready_count = static_cast<UINT>(ready.size());
+            AcquireSRWLockExclusive(&draw_lock);
             if (draw_dump_frame()) {
                 const HRESULT hr = draw_dumps().execute(queue, ready_count, ready.data());
                 if (FAILED(hr)) log("x2w-draw readback fence failed 0x%08lx", static_cast<unsigned long>(hr));
             } else {
                 queue->ExecuteCommandLists(ready_count, ready.data());
             }
+            retire_draw_sampler_heaps(queue, ready);
+            ReleaseSRWLockExclusive(&draw_lock);
             InterlockedIncrement(&render_executes);
         }
         check_device("CommandQueue execute", 35);
@@ -1702,8 +1731,11 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
             text, static_cast<unsigned long>(hr), desktop);
     if (FAILED(hr)) return hr;
     Wrapper* w = wrap(heap, descriptor_heap_kind);
-    const std::uint64_t bytes = static_cast<std::uint64_t>(desc->NumDescriptors) *
-                                device_of(self)->GetDescriptorHandleIncrementSize(desc->Type);
+    const UINT desktop_stride = device_of(self)->GetDescriptorHandleIncrementSize(desc->Type);
+    const bool raw_samplers = desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER &&
+        extra[1] == u64{desc->NumDescriptors} * x2w_startup::title_sampler_stride;
+    const UINT title_stride = raw_samplers ? x2w_startup::title_sampler_stride : desktop_stride;
+    const u64 bytes = u64{desc->NumDescriptors} * title_stride;
     // Some callers pass the 16-byte desktop descriptor; the words after it are then unrelated stack
     // data. The extension is taken only when it holds a pointer and exactly the heap's size.
     std::uint64_t title_memory = extra[0] >= 0x10000 && extra[1] == bytes ? extra[0] : 0;
@@ -1715,12 +1747,14 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
     if (title_memory) {
         w->own().title_cpu = title_memory;
         AcquireSRWLockExclusive(&descriptor_lock);
-        descriptor_ranges.push_back({title_memory, bytes, desktop});
+        descriptor_ranges.push_back({title_memory, bytes, desktop, title_stride, desktop_stride});
         ReleaseSRWLockExclusive(&descriptor_lock);
     }
-    note_heap(w, desc->Type, desc->NumDescriptors, device_of(self)->GetDescriptorHandleIncrementSize(desc->Type),
+    const u64 sampler_cpu = raw_samplers ? title_memory : 0;
+    note_heap(w, desc->Type, desc->NumDescriptors, desktop_stride,
               title_memory, desktop,
-              (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) ? heap->GetGPUDescriptorHandleForHeapStart().ptr : 0);
+              (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) ? heap->GetGPUDescriptorHandleForHeapStart().ptr : 0,
+              sampler_cpu);
     *out = w;
     return S_OK;
 }
@@ -1824,7 +1858,8 @@ void __stdcall device_copy_descriptors(Wrapper* self, UINT dest_count, const D3D
         while (di < dest_count && si < src_count) {
             const UINT dsize = dest_sizes ? dest_sizes[di] : 1, ssize = src_sizes ? src_sizes[si] : 1;
             const UINT run = (dsize - doff) < (ssize - soff) ? (dsize - doff) : (ssize - soff);
-            if (run) note_copy(dest_starts[di].ptr + u64{doff} * increment, src_starts[si].ptr + u64{soff} * increment,
+            if (run) note_copy(dest_starts[di].ptr + u64{doff} * title_descriptor_stride(dest_starts[di].ptr, increment),
+                               src_starts[si].ptr + u64{soff} * title_descriptor_stride(src_starts[si].ptr, increment),
                                dest[di].ptr + u64{doff} * increment, src[si].ptr + u64{soff} * increment, run, increment);
             doff += run; soff += run;
             if (doff >= dsize) { ++di; doff = 0; }
@@ -2339,26 +2374,9 @@ HRESULT __stdcall device_wait_frame_event(Wrapper*, UINT type, UINT timeout, voi
 // Diagnostic overlay: while nothing is rendered, the title window would stay blank. Every few
 // presents a status text is drawn into it with GDI so the state is visible. This is not game output.
 LONG draw_calls_seen;
-HWND title_window()
-{
-    static HWND window = nullptr;
-    if (window && IsWindow(window)) return window;
-    window = nullptr;
-    EnumWindows([](HWND candidate, LPARAM out) -> BOOL {
-        DWORD process = 0;
-        GetWindowThreadProcessId(candidate, &process);
-        if (process == GetCurrentProcessId() && IsWindowVisible(candidate) && !GetWindow(candidate, GW_OWNER)) {
-            *reinterpret_cast<HWND*>(out) = candidate;
-            return FALSE;
-        }
-        return TRUE;
-    }, reinterpret_cast<LPARAM>(&window));
-    return window;
-}
-
 void draw_overlay(LONG frame, double seconds)
 {
-    HWND window = title_window();
+    HWND window = x2w_startup::overlay_window();
     if (!window) return;
     HDC dc = GetDC(window);
     if (!dc) return;
@@ -2615,6 +2633,7 @@ void build_tables()
         list_typed[22] = reinterpret_cast<ListTyped>(&list_scissors);
         list_typed[23] = reinterpret_cast<ListTyped>(&list_blend_factor);
         list_typed[25] = reinterpret_cast<ListTyped>(&list_pipeline);
+        list_typed[32] = reinterpret_cast<ListTyped>(&list_set_descriptor_heaps);
         list_typed[34] = reinterpret_cast<ListTyped>(&list_graphics_root);
         list_typed[44] = reinterpret_cast<ListTyped>(&list_root_srv);
         list_typed[50] = reinterpret_cast<ListTyped>(&list_targets);

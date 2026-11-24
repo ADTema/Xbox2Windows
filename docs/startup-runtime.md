@@ -8,6 +8,15 @@ This is not a port and not an emulator. No executable is playable. Every stand-i
 most answers are shortcuts that are logged as such. The open problems are tracked in the issues
 whose titles start with `startup-runtime:`.
 
+## Output window and fallback diagnostics
+
+The desktop swap chain has its own top-level window, class `X2WOutputWindow`.
+When a present cannot show its surface, the GDI fallback selects a visible,
+unowned guest window in the same process. If only the presenter is visible,
+the fallback leaves it alone. To exercise both z-orders with source-built
+windows, build `startup_overlay_window` and run
+`ctest --preset release --no-tests=error -R '^startup_overlay_window$' -V`.
+
 ## Null Texture2D descriptors
 
 When the adapter lacks typed UAV support for B5G5R5A1_UNORM or render-target support for
@@ -86,9 +95,9 @@ adds memory dumps to the stop report.
 | `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user |
 | `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return |
 | `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses (0x4 = A); keyboard and XInput pad 0 also work |
-| `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into a bounded table, `SamplerState qh[2048] : register(s0, space1)`, and writes `smpheap 2048 1 fallback 2047` to the manifest. Entries 0 to 2046 are the title's sampler-heap entries (entry n at byte offset 16 n); entry 2047 is reserved for a fallback sampler. The generated shader reads the fallback for an offset that is not a multiple of 16 or is at or past 2047 × 16, because the host cannot check an offset the shader computes. The stand-in does not bind that table yet, so leave this off for startup runs ([#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143)) |
+| `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into `SamplerState qh[2048] : register(s0, space1)` and writes `smpheap 2048 1 fallback 2047`. The stand-in uses entries 0 to 2046 for the bound heap and reserves entry 2047 for unaligned or out-of-range offsets. It also accepts the original `smpheap 2048 1` manifest with all 2,048 entries available. [#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143) |
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
-  | `X2W_XG_BC7_4K_S_LAYOUT=1` | opts into the BC7 layout-query diagnostic when `X2W_D3D12_PERMISSIVE=1` |
+| `X2W_XG_BC7_4K_S_LAYOUT=1` | opts into the BC7 layout-query diagnostic when `X2W_D3D12_PERMISSIVE=1` |
 | `X2W_TRAP_CONTINUE=<exports>` | lets listed trap exports return 0 instead of ending the process |
 
 ## Findings
@@ -115,6 +124,11 @@ These are measured on one executable; treat them as hypotheses for others.
   the one on the calling thread's stack is the return buffer.
 - **Inline samplers.** Pixel shaders build sampler descriptors from constants (`s_movk_i32`,
   `s_bfm_b32`, 64-bit moves); the translator folds those into static samplers.
+- **Stream-cache identity.** A cached zlib stream is served only to the exact queued
+  continuation entries in the same DirectStorage queue. The lookup checks the enqueued request
+  id, the source, the compressed size and the destination chunk size. A later independent
+  request at a matching offset still decodes its own bytes or fails without touching its
+  destination.
 
 ## Shortcuts that are known to be wrong
 
@@ -126,10 +140,14 @@ These are measured on one executable; treat them as hypotheses for others.
   independent evidence. `CopyIntoSubresource` returns `E_NOTIMPL` for this profile because
   the copy and upload paths still use desktop footprints. The reported pitch describes the
   padded block-row extent of the surface.
-- Dynamically indexed sampler-heap loads become a default sampler. `X2W_SAMPLER_HEAP=1`
-  translates them into an indexed table instead (`tests/startup_sampler_heap_check.py`).
-  Binding that table in the stand-in is the remaining step. Constant sampler-heap offsets
-  are still refused.
+- The default translator uses a static default sampler for a dynamically indexed sampler-heap load.
+  With the sampler-heap opt-in, translated draws snapshot the bound heap's 16-byte sampler entries and
+  bind a private desktop table beside the static samplers. Missing, out-of-range, or unreadable entries
+  use a transparent-black border sampler and have separate counters. The runtime keeps recorded tables
+  alive through queue completion. Constant sampler-heap offsets still report an unsupported operation.
+  Wrapped sampler heaps keep the 16-byte title stride separate from the desktop descriptor increment
+  for CPU handles and descriptor copies.
+  The source-built readback uses `ctest --preset dev --no-tests=error -R '^startup_sampler_heap_' -V`.
 - Slot 86 graphics streams can submit VS/PS requests to the offline cache. The fixture sends
   complete shader containers and a wrapped root through WARP, runs `gfx2hlsl.py --pending`, and
   reloads the compiled stages. A second fixture draws a clipped triangle through the translated
@@ -137,8 +155,8 @@ These are measured on one executable; treat them as hypotheses for others.
   hardware. Swapping the red/green shader changes the 16 covered pixels. Reproduce with
   `ctest --preset release --no-tests=error -R "^startup_stream_(request|draw)_"`.
   Other stage combinations and full stream rasterizer/depth state remain open.
-- Translated pipelines are created without a blend state: the captured state blocks hold console
-  colour-blend register values, not a desktop `D3D12_BLEND_DESC` (#1216). `src/startup_stubs/cb_blend.h`
+- Translating the captured console colour-blend register state blocks remains open (#1216).
+  A graphics stream can supply a desktop `D3D12_BLEND_DESC` directly. `src/startup_stubs/cb_blend.h`
   decodes `CB_BLENDn_CONTROL` and a `CB_TARGET_MASK` nibble into `D3D12_RENDER_TARGET_BLEND_DESC`. It
   refuses forms D3D12 can't express (`BOTH_SRC_ALPHA`, constant alpha without alpha blend factor
   support, MIN/MAX with factors other than ONE). Its draws match a CPU model of the register fields
@@ -146,6 +164,12 @@ These are measured on one executable; treat them as hypotheses for others.
   state block is not measured yet, so the draw path doesn't call it.
 - Audio produces no output.
 
+## Uniform first-lane reads
+
+The startup shader translator accepts `v_readfirstlane_b32` in straight-line code with the
+entry mask when its active VGPR holds an integer conversion of a fixed-offset scalar buffer
+value. Run `python -B tests/startup_uniform_lane_check.py` to check the producer and the
+varying-source, register-clobber, mask and branch controls.
 
 ## NV12 plane upload
 

@@ -5,7 +5,7 @@
 // X2W_SHADER_CACHE: <key>.txt (manifest), <key>.vs.cso and <key>.ps.cso, produced offline by
 // out/gamerun/gfx2hlsl.py. A miss writes req_<key>.{a,b,root} there for the next offline pass.
 // The translated shaders use their own root signature: [0] 32-bit constants ("entry" values such
-// as the base vertex), [1] one table of SRVs. Each draw copies what the title bound (vertex streams,
+// as the base vertex), an optional SRV table and an optional sampler table. Each draw copies what the title bound (vertex streams,
 // buffers named by the hardware descriptors in its tables, textures behind view tokens) into an
 // upload ring / a private descriptor heap.
 
@@ -15,7 +15,7 @@ struct Translation {
     int state = 0;                           // 1 ready, 2 unavailable
     std::vector<Srv> srvs;
     std::vector<Ud> uds;
-    std::vector<std::array<std::uint32_t, 4>> samplers;
+    x2w_startup::TranslatedSamplers samplers;
     ID3DBlob* vs = nullptr;
     ID3DBlob* ps = nullptr;
     ID3D12RootSignature* root = nullptr;
@@ -88,29 +88,6 @@ bool read_text(const wchar_t* path, std::string& out)
     return true;
 }
 
-D3D12_STATIC_SAMPLER_DESC decode_sampler(const std::array<std::uint32_t, 4>& words, UINT shader_register)
-{
-    static const D3D12_TEXTURE_ADDRESS_MODE modes[8] = {
-        D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_MIRROR, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-        D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE,
-        D3D12_TEXTURE_ADDRESS_MODE_BORDER, D3D12_TEXTURE_ADDRESS_MODE_BORDER};
-    const UINT mag = (words[2] >> 20) & 3, min = (words[2] >> 22) & 3, mip = (words[2] >> 26) & 3;
-    D3D12_STATIC_SAMPLER_DESC s{};
-    s.Filter = (mag >= 2 || min >= 2) ? D3D12_FILTER_ANISOTROPIC
-        : D3D12_ENCODE_BASIC_FILTER(min & 1, mag & 1, mip == 2 ? 1 : 0, D3D12_FILTER_REDUCTION_TYPE_STANDARD);
-    s.AddressU = modes[words[0] & 7];
-    s.AddressV = modes[(words[0] >> 3) & 7];
-    s.AddressW = modes[(words[0] >> 6) & 7];
-    s.MaxAnisotropy = 1u << ((words[0] >> 9) & 7);
-    if (s.MaxAnisotropy > 16) s.MaxAnisotropy = 16;
-    s.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-    s.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
-    s.MaxLOD = D3D12_FLOAT32_MAX;
-    s.ShaderRegister = shader_register;
-    s.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    return s;
-}
-
 void load_translation(Translation& tr, const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes,
                       const std::vector<unsigned char>& root_blob)
 {
@@ -138,7 +115,6 @@ void load_translation(Translation& tr, const void* a, std::size_t a_bytes, const
         at = end + 1;
         int i = 0, x = 0, y = 0;
         char kind[16] = "", source[16] = "";
-        unsigned w[4] = {};
         if (std::sscanf(line.c_str(), "udsrc %d %15s %d %d", &i, source, &x, &y) >= 2) {
             Translation::Ud ud{-1, x, y};
             if (!std::strcmp(source, "rect")) ud.kind = 0;
@@ -150,37 +126,24 @@ void load_translation(Translation& tr, const void* a, std::size_t a_bytes, const
         } else if (std::sscanf(line.c_str(), "srv %d %15s %15s %d %d", &i, kind, source, &x, &y) >= 4) {
             Translation::Srv srv{!std::strcmp(kind, "tex2d") ? 1 : !std::strcmp(kind, "tex3d") ? 3 : 0, !std::strcmp(source, "vb") ? 1 : !std::strcmp(source, "root") ? 2 : 0, x, y};
             if (static_cast<std::size_t>(i) == tr.srvs.size()) tr.srvs.push_back(srv);
-        } else if (std::sscanf(line.c_str(), "smp %d %x %x %x %x", &i, &w[0], &w[1], &w[2], &w[3]) == 5) {
-            tr.samplers.push_back({w[0], w[1], w[2], w[3]});
+        } else if (!tr.samplers.read_manifest_line(line.c_str())) {
+            log("x2w-draw invalid sampler heap manifest for %016llx", tr.key);
+            return;
         }
     }
     if (tr.uds.empty() || tr.uds.size() > 32 || tr.srvs.size() > 32) return;
     if (!cache_path(path, L"", tr.key, L".vs.cso") || FAILED(D3DReadFileToBlob(path, &tr.vs))) return;
     if (!cache_path(path, L"", tr.key, L".ps.cso") || FAILED(D3DReadFileToBlob(path, &tr.ps))) return;
-    D3D12_ROOT_PARAMETER parameters[2]{};
-    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    parameters[0].Constants.Num32BitValues = static_cast<UINT>(tr.uds.size());
-    D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, static_cast<UINT>(tr.srvs.size()), 0, 0, 0};
-    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    parameters[1].DescriptorTable = {1, &range};
-    std::vector<D3D12_STATIC_SAMPLER_DESC> samplers;
-    for (std::size_t i = 0; i < tr.samplers.size(); ++i) samplers.push_back(decode_sampler(tr.samplers[i], static_cast<UINT>(i)));
-    D3D12_ROOT_SIGNATURE_DESC desc{tr.srvs.empty() ? 1u : 2u, parameters, static_cast<UINT>(samplers.size()), samplers.data(),
-                                   D3D12_ROOT_SIGNATURE_FLAG_NONE};
-    ID3DBlob* blob = nullptr;
-    ID3DBlob* errors = nullptr;
-    HRESULT hr = D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &blob, &errors);
-    if (SUCCEEDED(hr)) hr = device_of(the_device)->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&tr.root));
-    if (blob) blob->Release();
-    if (errors) errors->Release();
+    const HRESULT hr = x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.size()),
+        static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root);
     if (FAILED(hr)) {
         log("x2w-draw root signature for %016llx failed 0x%08lx", tr.key, static_cast<unsigned long>(hr));
         return;
     }
     tr.state = 1;
     InterlockedIncrement(&translation_ready);
-    log("x2w-draw pipeline %016llx translated: %zu entry values, %zu resources, %zu samplers", tr.key, tr.uds.size(), tr.srvs.size(),
-        tr.samplers.size());
+    log("x2w-draw pipeline %016llx translated: %zu entry values, %zu resources, %zu static samplers, sampler_heap=%u",
+        tr.key, tr.uds.size(), tr.srvs.size(), tr.samplers.statics.size(), tr.samplers.heap ? 1u : 0u);
 }
 
 // draw_lock held. Both pipeline forms use the same request writer and shader cache.
@@ -356,6 +319,90 @@ bool ensure_draw_heap()
     const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, draw_heap_size, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     if (FAILED(device_of(the_device)->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&draw_heap)))) return false;
     draw_heap_increment = device_of(the_device)->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    return true;
+}
+
+// A recorded table is immutable. Keep it alive until its submission completes,
+// including when the title resets the command list with a different allocator.
+using DrawSamplerHeap = x2w_startup::ComPtr<ID3D12DescriptorHeap>;
+std::unordered_map<ID3D12CommandList*, std::vector<DrawSamplerHeap>> recorded_draw_sampler_heaps;
+struct SubmittedDrawSamplerHeaps {
+    x2w_startup::ComPtr<ID3D12Fence> fence;
+    std::vector<DrawSamplerHeap> heaps;
+};
+std::vector<SubmittedDrawSamplerHeaps> submitted_draw_sampler_heaps;
+
+void discard_draw_sampler_heaps(Wrapper* self)
+{
+    AcquireSRWLockExclusive(&draw_lock);
+    recorded_draw_sampler_heaps.erase(static_cast<ID3D12GraphicsCommandList*>(self->own().real));
+    ReleaseSRWLockExclusive(&draw_lock);
+}
+
+// draw_lock held. The lists have already been executed on this queue.
+void retire_draw_sampler_heaps(ID3D12CommandQueue* queue, const std::vector<ID3D12CommandList*>& lists)
+{
+    submitted_draw_sampler_heaps.erase(std::remove_if(submitted_draw_sampler_heaps.begin(),
+        submitted_draw_sampler_heaps.end(), [](const SubmittedDrawSamplerHeaps& batch) {
+            return batch.fence && batch.fence->GetCompletedValue() != 0;
+        }), submitted_draw_sampler_heaps.end());
+    SubmittedDrawSamplerHeaps batch;
+    for (auto* list : lists) {
+        auto it = recorded_draw_sampler_heaps.find(list);
+        if (it == recorded_draw_sampler_heaps.end()) continue;
+        for (auto& heap : it->second) batch.heaps.push_back(std::move(heap));
+        recorded_draw_sampler_heaps.erase(it);
+    }
+    if (batch.heaps.empty()) return;
+    x2w_startup::ComPtr<ID3D12Device> device;
+    HRESULT hr = queue->GetDevice(IID_PPV_ARGS(&device));
+    if (SUCCEEDED(hr)) hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&batch.fence));
+    if (SUCCEEDED(hr)) hr = queue->Signal(batch.fence.Get(), 1);
+    if (FAILED(hr)) {
+        // Without a completion point the submitted descriptors still belong
+        // to the queue. Retain them instead of reclaiming them early.
+        batch.fence.Reset();
+        log("x2w-draw sampler heap retirement fence failed 0x%08lx", static_cast<unsigned long>(hr));
+    }
+    submitted_draw_sampler_heaps.push_back(std::move(batch));
+}
+
+bool resolve_draw_sampler(const x2w_startup::SamplerWords& words, D3D12_SAMPLER_DESC& sampler)
+{
+    if (words[0] != view_token_magic) {
+        sampler = x2w_startup::dynamic_sampler(words);
+        return true;
+    }
+    AcquireSRWLockShared(&note_lock);
+    const auto& records = view_records();
+    const bool valid = words[2] == 22 && words[1] < records.size() && records[words[1]].slot == 22 &&
+                       records[words[1]].desc_bytes == sizeof(sampler);
+    if (valid) std::memcpy(&sampler, records[words[1]].desc, sizeof(sampler));
+    ReleaseSRWLockShared(&note_lock);
+    return valid;
+}
+
+// draw_lock held.
+bool prepare_draw_sampler_heap(Pass& pass, ID3D12GraphicsCommandList* list, bool reserved_fallback)
+{
+    auto snapshot = x2w_startup::snapshot_samplers(pass.title_samplers, reserved_fallback);
+    if (pass.sampler_snapshot && *pass.sampler_snapshot == snapshot) return true;
+    x2w_startup::NullSamplerCounts counts;
+    DrawSamplerHeap heap;
+    const HRESULT hr = x2w_startup::create_sampler_snapshot_heap(device_of(the_device), snapshot,
+        resolve_draw_sampler, heap.GetAddressOf(), counts);
+    if (FAILED(hr)) {
+        log("x2w-draw sampler heap creation failed 0x%08lx", static_cast<unsigned long>(hr));
+        return false;
+    }
+    static LONG reports;
+    if (first_calls(reports, 12))
+        log("x2w-draw sampler heap: null_sampler_unbound=%u null_sampler_out_of_range=%u "
+            "null_sampler_unreadable=%u null_sampler_invalid_token=%u",
+            counts.unbound, counts.out_of_range, counts.unreadable, counts.invalid_token);
+    recorded_draw_sampler_heaps[list].push_back(heap);
+    pass.sampler_heap = std::move(heap);
+    pass.sampler_snapshot = std::make_unique<x2w_startup::SamplerSnapshot>(std::move(snapshot));
     return true;
 }
 
@@ -570,7 +617,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     BoundPipeline* bound = translation_for(pass.pipeline);
     Translation* tr = bound ? bound->translation : nullptr;
     ID3D12PipelineState* pipeline = tr && tr->state == 1 && ensure_draw_heap() ? pipeline_for(*bound, pass) : nullptr;
-    if (!pipeline) {
+    if (!pipeline || (tr->samplers.heap && !prepare_draw_sampler_heap(pass, list, tr->samplers.reserved_fallback))) {
         ReleaseSRWLockExclusive(&draw_lock);
         return false;
     }
@@ -729,12 +776,15 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
     }
     list->SetPipelineState(pipeline);
     list->SetGraphicsRootSignature(tr->root);
-    if (!pass.heap_set) {
-        list->SetDescriptorHeaps(1, &draw_heap);
+    ID3D12DescriptorHeap* samplers = tr->samplers.heap ? pass.sampler_heap.Get() : nullptr;
+    if (!pass.heap_set || pass.bound_sampler_heap != samplers) {
+        x2w_startup::bind_translated_heaps(list, draw_heap, samplers);
         pass.heap_set = true;
+        pass.bound_sampler_heap = samplers;
     }
     list->SetGraphicsRoot32BitConstants(0, static_cast<UINT>(tr->uds.size()), values, 0);
     if (n) list->SetGraphicsRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{draw_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first} * draw_heap_increment});
+    if (samplers) list->SetGraphicsRootDescriptorTable(x2w_startup::sampler_root_parameter(n), samplers->GetGPUDescriptorHandleForHeapStart());
     list->IASetPrimitiveTopology(pass.topology == 5 ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     bool drawn = false;
     if (indexed) {
@@ -764,6 +814,25 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             pass.target_count);
     }
     return drawn;
+}
+
+// List slot 32, SetDescriptorHeaps. Track the title's shader-visible sampler
+// source while translated draws use their own physical descriptor heaps.
+void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const* heaps)
+{
+    x2w_startup::SamplerSource source;
+    if (count && count <= 4 && x2w_local::readable(heaps, std::size_t{count} * sizeof(*heaps))) {
+        AcquireSRWLockShared(&note_lock);
+        for (UINT i = 0; i < count; ++i) {
+            for (const HeapInfo& heap : heap_infos()) {
+                if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
+                    heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER && heap.desktop_gpu)
+                    source = {static_cast<std::uintptr_t>(heap.title_sampler_cpu), heap.count};
+            }
+        }
+        ReleaseSRWLockShared(&note_lock);
+    }
+    pass_of(self).title_samplers = source;
 }
 
 // List slot 36 (desktop 32 + 4), SetGraphicsRootDescriptorTable(parameter, GPU handle): the table's

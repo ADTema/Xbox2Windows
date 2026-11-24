@@ -1016,7 +1016,8 @@ OperationResult run_startup_sampler_heap(const OperationContext& ctx)
 {
     const auto offset = static_cast<std::uint32_t>(std::stoul(ctx.argv[5], nullptr, 0));
     const auto expected = static_cast<std::uint32_t>(std::stoul(ctx.argv[6], nullptr, 16));
-    const float red = check_startup_sampler_heap(ctx.device, ctx.argv[3], ctx.argv[4], offset);
+    const float red = check_startup_sampler_heap(ctx.device, ctx.argv[3], ctx.argv[4], offset,
+        ctx.argc > 7 ? ctx.argv[7] : nullptr, ctx.argc > 8 ? ctx.argv[8] : nullptr);
     std::uint32_t bits;
     std::memcpy(&bits, &red, sizeof(bits));
     if (bits != expected) {
@@ -1118,7 +1119,7 @@ const OperationSpec kOperations[] = {
     // Two builds that differ only in the sampler descriptor index source (#1115): the
     // SV_DispatchThreadID build is asserted, the SV_GroupID build is recorded per swap.
     {"--sampler-index-control", 3, 3, nullptr, kGateSm60SamplerIndexControl, run_sampler_index_control},
-    {"--startup-sampler-heap", 7, 7, nullptr, kNoGate, run_startup_sampler_heap},
+    {"--startup-sampler-heap", 7, 9, nullptr, kNoGate, run_startup_sampler_heap},
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},
     {"--spirv-address-window", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window},

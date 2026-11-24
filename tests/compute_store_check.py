@@ -328,6 +328,7 @@ def controls():
     guard_controls()
     read_controls()
     alu_controls()
+    f32_controls()
     scalar_alu_controls()
 
 
@@ -777,6 +778,22 @@ READ_VOP2 = variant(
     ("v_min_u32_e32 v1, s0, v1", "v_add_nc_u32_e32 v2, s0, v1\nv_or_b32_e32 v2, 0x80000010, v2\n"
                                  "v_xor_b32_e32 v2, 0x80000001, v2\nv_max_u32_e32 v1, v1, v2"),
 )
+# Binary32 add, sub, subrev and mul, chained so each result feeds the next. The source word w gives two operands that
+# are always finite and normal, x = 1.5 + (w & 0x3fffff) / 2^23 in [1.5, 2) and y = 3.0 + (w >> 10) / 2^22 in [3, 4);
+# the cap word is the float 20.0. Every result stays in [1.5, 30], so no operation overflows or goes denormal. The
+# exponent constants 0x3fc00000 and 0x40400000 are not inline constants, which LLVM would print as floats:
+#   a = x + y; b = cap - a; c = b - pi; d = x * c; e = 1.0 + d; out = e - (-4.0)
+# The sources cover a VGPR, an SGPR, a literal and the inline constants 1.0 and -4.0.
+READ_F32 = variant(
+    READ_COMPUTE,
+    ("v_and_b32_e32 v2, 0xffff, v1", "v_and_b32_e32 v2, 0x3fffff, v1\nv_or_b32_e32 v2, 0x3fc00000, v2\n"
+                                     "v_lshrrev_b32_e32 v3, 10, v1\nv_or_b32_e32 v3, 0x40400000, v3"),
+    ("v_lshrrev_b32_e32 v1, 16, v1", "v_add_f32_e32 v4, v2, v3\nv_sub_f32_e32 v5, s0, v4\n"
+                                     "v_subrev_f32_e32 v6, 0x40490fdb, v5\nv_mul_f32_e32 v6, v2, v6\n"
+                                     "v_add_f32_e32 v1, 1.0, v6"),
+    ("v_mad_u32_u24 v1, v2, v1, v0", "v_subrev_f32_e32 v1, -4.0, v1"),
+    ("v_min_u32_e32 v1, s0, v1", ""),
+)
 # The shift and subtract operations of the subset on a computed word: the product is shifted left until its
 # bit 14 is the sign bit, shifted right arithmetically, subtracted from the cap (src0 - src1), and the literal
 # 0x1234 is reverse-subtracted (src1 - src0).
@@ -792,6 +809,7 @@ ALU_CASES = [
     ("read_vop2", READ_VOP2, 32, READ_BINDING),
     ("read_shift_sub", READ_SHIFT_SUB, 32, READ_BINDING),
 ]
+F32_CASES = [("read_f32", READ_F32, 32, READ_BINDING)]
 
 
 def guard_controls():
@@ -1084,6 +1102,79 @@ def alu_controls():
     assert alu(*restored, ("s_or_b32 exec_lo, exec_lo, s2", "s_or_b32 exec_lo, exec_lo, s2\nv_mov_b32_e32 v1, 9"),
                stride=8)[-5:] == [GUARD_IF, "        outputData.Store(tid.x * 8u + 0u, tid.x);", "    }",
                                   "    outputData.Store(tid.x * 8u + 4u, 0x00000009u);", "}"]
+
+
+F32_CAP = 0x41a00000  # the float 20.0
+F32_STORE = ("        outputData.Store(tid.x * 4u + 0u, f32_sub(f32_add(0x3f800000u, f32_mul((0x3fc00000u | (0x003fffffu & {0})), "
+             "f32_sub(f32_sub(params[0].y, f32_add((0x3fc00000u | (0x003fffffu & {0})), (0x40400000u | ({0} >> "
+             "(0x0000000au & 31u))))), 0x40490fdbu))), 0xc0800000u));")
+
+
+def f32_controls():
+    """Binary32 ALU: exact output, then one rejection per form, operand or value outside the subset."""
+    def f32(*changes):
+        return aot.lower(variant(READ_F32, *changes), 32, **READ_BINDING).splitlines()
+
+    lines = f32()
+    helpers = [line.split("(")[0] for line in lines if line.startswith("uint f32_")]
+    assert helpers == ["uint f32_add", "uint f32_sub", "uint f32_mul"], helpers
+    assert all("precise float r = asfloat(a)" in line for line in lines if line.startswith("uint f32_")), lines
+    assert lines[-4:] == [GUARD_IF, F32_STORE.format(READ_LOADS["read_copy"]), "    }", "}"], lines
+    # A program that uses one operation carries only that helper.
+    only_mul = f32(("v_add_f32_e32 v4, v2, v3", "v_mul_f32_e32 v4, v2, v3"), ("v_sub_f32_e32 v5, s0, v4", "v_mul_f32_e32 v5, s0, v4"),
+                   ("v_subrev_f32_e32 v6, 0x40490fdb, v5", "v_mul_f32_e32 v6, 0x40490fdb, v5"),
+                   ("v_add_f32_e32 v1, 1.0, v6", "v_mul_f32_e32 v1, 1.0, v6"), ("v_subrev_f32_e32 v1, -4.0, v1", "v_mul_f32_e32 v1, -4.0, v1"))
+    assert [line.split("(")[0] for line in only_mul if line.startswith("uint f32_")] == ["uint f32_mul"]
+    # A helper used only inside an LDS statement is still defined.
+    in_lds = aot.lower(variant(lds_f32_program("ds_add_f32"), ("ds_add_f32 v5, v7", "v_mul_f32_e32 v7, 2.0, v7\nds_add_f32 v5, v7")),
+                       32, **LDS_F32_BINDING).splitlines()
+    assert any(line.startswith("uint f32_mul(") for line in in_lds), in_lds
+    # v_sub_f32 is src0 - src1 and v_subrev_f32 is src1 - src0. A bare sign flip or an exchange is another program.
+    assert f32(("v_sub_f32_e32 v5, s0, v4", "v_subrev_f32_e32 v5, s0, v4")) != lines
+    assert f32(("v_subrev_f32_e32 v6, 0x40490fdb, v5", "v_sub_f32_e32 v6, 0x40490fdb, v5")) != lines
+    # A copy of a result is the same program, and so is the float zero spelled as the inline integer 0.
+    assert f32(("v_add_f32_e32 v1, 1.0, v6", "v_add_f32_e32 v7, 1.0, v6\nv_mov_b32_e32 v1, v7")) == lines
+    assert f32(("v_add_f32_e32 v1, 1.0, v6", "v_add_f32_e32 v1, 0, v6"))[-3].count("0x00000000u") == 1
+    unsupported, operand = "Unsupported compute instruction: ", "Unverified float operand"
+    for message, changes in (
+        # Fused multiply-add has no binary32 form in DXIL, so both stay refused, as do the other binary32 forms.
+        (unsupported + "v_fmac_f32_e32", (("v_mul_f32_e32 v6, v2, v6", "v_fmac_f32_e32 v6, v2, v5"),)),
+        (unsupported + "v_fma_f32", (("v_mul_f32_e32 v6, v2, v6", "v_fma_f32 v6, v2, v6, v5"),)),
+        (unsupported + "v_mac_f32_e32", (("v_mul_f32_e32 v6, v2, v6", "v_mac_f32_e32 v6, v2, v5"),)),
+        (unsupported + "v_max_f32_e32", (("v_mul_f32_e32 v6, v2, v6", "v_max_f32_e32 v6, v2, v6"),)),
+        (unsupported + "v_mul_legacy_f32_e32", (("v_mul_f32_e32 v6, v2, v6", "v_mul_legacy_f32_e32 v6, v2, v6"),)),
+        # The VOP3 spelling, output and input modifiers, an SGPR as the second source and a register range.
+        (unsupported + "v_add_f32_e64", (("v_add_f32_e32 v4, v2, v3", "v_add_f32_e64 v4, v2, v3"),)),
+        (unsupported + "v_add_f32_e32", (("v_add_f32_e32 v4, v2, v3", "v_add_f32_e32 v4, v2, v3 clamp"),)),
+        (unsupported + "v_add_f32_e32", (("v_add_f32_e32 v4, v2, v3", "v_add_f32_e32 v4, -v2, v3"),)),
+        (unsupported + "v_add_f32_e32", (("v_add_f32_e32 v4, v2, v3", "v_add_f32_e32 v4, |v2|, v3"),)),
+        (unsupported + "v_mul_f32_e32", (("v_mul_f32_e32 v6, v2, v6", "v_mul_f32_e32 v6, v6, s0"),)),
+        (unsupported + "v_sub_f32_e32", (("v_sub_f32_e32 v5, s0, v4", "v_sub_f32_e32 v5, s0, v[4:5]"),)),
+        # A constant that is NaN, infinite or denormal, as a literal, a negative or positive inline integer and a scalar move.
+        (operand, (("0x40490fdb", "0x7fc00000"),)),
+        (operand, (("0x40490fdb", "0xff800000"),)),
+        (operand, (("0x40490fdb", "0x00000001"),)),
+        (operand, (("0x40490fdb", "0x807fffff"),)),
+        (operand, (("0x40490fdb", "-1"),)),
+        (operand, (("0x40490fdb", "5"),)),
+        (operand, (("0x40490fdb", "1.5"),)),
+        (operand, (("0x40490fdb", "0x1ffffffff"),)),
+        (operand, (("v_subrev_f32_e32 v6, 0x40490fdb, v5", "s_mov_b32 s20, 0x7fc00000\nv_subrev_f32_e32 v6, s20, v5"),)),
+        (operand, (("v_subrev_f32_e32 v6, 0x40490fdb, v5", "s_mov_b32 s20, 0x00400000\nv_subrev_f32_e32 v6, s20, v5"),)),
+        # Sources that are not known words, and a destination past v255.
+        (operand, (("s0, v4", "s20, v4"),)),
+        (operand, (("s0, v4", "s8, v4"),)),
+        (operand, (("v2, v3", "v2, v7"),)),
+        (operand, (("v_add_f32_e32 v4, v2, v3", "v_add_f32_e32 v256, v2, v3"),)),
+        (operand, (("v_subrev_f32_e32 v1, -4.0, v1", "v_subrev_f32_e32 v1, -4.0, v8"),)),
+        ("Vector load result used or overwritten before s_waitcnt vmcnt(0)", (("s_waitcnt vmcnt(0)", ""),)),
+        # A result is data only: not an address, not a lane-guard operand, and a long chain is refused.
+        ("Unsupported store address", (("v1, v0, s[8:11]", "v0, v1, s[8:11]"),)),
+        ("Unverified lane guard compare", (("v_add_f32_e32 v1, 1.0, v6",
+                                            "v_add_f32_e32 v1, 1.0, v6\nv_cmp_gt_u32_e32 vcc_lo, s3, v1"),)),
+        ("ALU expression too large", (("v_add_f32_e32 v1, 1.0, v6", "v_add_f32_e32 v1, 1.0, v6" + "\nv_add_f32_e32 v1, v1, v1" * 4),)),
+    ):
+        rejects(message, f32, *changes)
 
 
 # The read-compute-write fixture with a scalar chain over the cap word s0 and the bound s3 feeding the min:
@@ -2771,10 +2862,13 @@ MTBUF_STORE_WORDS = (0x01234567, 0x89abcdef, 0x76543210, 0xfedcba98)
 
 
 def mtbuf_store_cases():
-    for count in range(1, 5):
-        op = "tbuffer_store_format_" + "xyzw"[:count]
+    shapes = [(components, packed) for packed in (False, True) for components in range(1, 5)]
+    for components, packed in shapes:
+        count = (components + 1) // 2 if packed else components
+        op = "tbuffer_store_format_" + ("d16_" if packed else "") + "xyzw"[:components]
         data = "v10" if count == 1 else f"v[10:{9 + count}]"
-        fmt = f"BUF_FMT_{'32_' * count}UINT"
+        format_components = 4 if packed and components == 3 else components
+        fmt = f"BUF_FMT_{('16_' if packed else '32_') * format_components}UINT"
         store = f"{op} {data}, v8, s[20:23], 0 format:[{fmt}] idxen offset:4"
         lines = ["s_mov_b32 s12, s7", "s_mov_b32 s13, 0", "s_load_dwordx4 s[20:23], s[12:13], 0x30",
                  "v_lshl_add_u32 v8, s11, 5, v0", "s_waitcnt lgkmcnt(0)"]
@@ -2803,36 +2897,53 @@ def mtbuf_store_draw(directory, compiler, renderer, backend):
     for count, lines, binding in mtbuf_store_cases():
         store = lines[-2]
         op = store.split()[0]
+        packed = "_d16_" in op
+        partial = packed and op.endswith(("_x", "_xyz"))
         rejects("Unsupported typed buffer store", aot.lower, lines, 32, **(binding | {"cpu": "gfx1013"}))
         rejects("Unsupported typed buffer store", aot.lower, variant(lines, ("idxen", "offen")), 32, **binding)
-        wrong_format = "32_32_UINT" if count == 1 else "32_UINT"
+        fmt = store.split("format:[")[1].split("]")[0]
+        wrong_format = "BUF_FMT_32_32_UINT" if fmt == "BUF_FMT_32_UINT" else "BUF_FMT_32_UINT"
         rejects("Unsupported typed buffer store", aot.lower,
-                variant(lines, (f"{'32_' * count}UINT", wrong_format)), 32, **binding)
+                variant(lines, (fmt, wrong_format)), 32, **binding)
         rejects("Unverified raw UAV store", aot.lower,
                 variant(lines, ("s_waitcnt lgkmcnt(0)", "")), 32, **binding)
         rejects("Unsupported store address", aot.lower, lines, 32, **(binding | {"stride": 4 * count}))
         rejects("Overlapping raw UAV stores", aot.lower,
-                variant(lines, (store, store + "\nbuffer_store_dword v10, v8, s[20:23], 0 idxen offset:4")),
+                variant(lines, (store, store + f"\nbuffer_store_dword v10, v8, s[20:23], 0 idxen offset:{4 * count}")),
                 32, **binding)
-        src.write_text(aot.lower(lines, 32, **binding), encoding="ascii")
+        source = aot.lower(lines, 32, **binding)
+        src.write_text(source, encoding="ascii")
         subprocess.run(compile, check=True)
         for groups in (1, 2):
             words = [SENTINEL] * 320
             for gid in range(groups * 32):
                 start = gid * (count + 1) + 1
                 words[start:start + count] = [word ^ gid for word in MTBUF_STORE_WORDS[:count]]
+                if partial:
+                    last = start + count - 1
+                    words[last] = (SENTINEL & 0xffff0000) | (words[last] & 0xffff)
             case.write_bytes(struct.pack("<321I", groups, *words))
             result = subprocess.run(run)
             if result.returncode:
                 return result.returncode
-        # A legal translation shifted one DWORD early must clobber the record padding.
-        src.write_text(aot.lower(variant(lines, (store, store.removesuffix(" offset:4"))), 32, **binding),
-                       encoding="ascii")
-        subprocess.run(compile, check=True)
-        bad = subprocess.run(run, capture_output=True, text=True)
-        if bad.returncode != 1 or "word=0 expected=" not in bad.stderr:
-            raise AssertionError(f"{op}: incorrect store offset escaped detection\n{bad.stderr}")
-        print(bad.stderr, end="")
+        if packed:
+            # Swap the low and high channel in the first VGPR only.
+            swapped = "v_lshlrev_b32_e32 v22, 16, v10\nv_lshrrev_b32_e32 v23, 16, v10\nv_or_b32_e32 v10, v22, v23"
+            mutant, mismatch = variant(lines, (store, swapped + "\n" + store)), 1
+        else:
+            # A legal translation shifted one DWORD early must clobber the record padding.
+            mutant, mismatch = variant(lines, (store, store.removesuffix(" offset:4"))), 0
+        mutants = [(aot.lower(mutant, 32, **binding), mismatch)]
+        if partial:
+            mutants.append((source.replace("& 0xffff0000u", "& 0u"), count))
+        for changed, mismatch in mutants:
+            assert changed != source
+            src.write_text(changed, encoding="ascii")
+            subprocess.run(compile, check=True)
+            bad = subprocess.run(run, capture_output=True, text=True)
+            if bad.returncode != 1 or f"word={mismatch} expected=" not in bad.stderr:
+                raise AssertionError(f"{op}: incorrect store escaped detection\n{bad.stderr}")
+            print(bad.stderr, end="")
         accepted.append(op)
     if record := os.environ.get("FORM_COVERAGE_RECORD"):
         path = Path(record)
@@ -2860,7 +2971,7 @@ def binary(directory, assembler, objcopy, library):
     mtbuf_load_controls()
     gfx1030_binary(directory, assembler, objcopy, library, MTBUF_LOAD_CASES, "tbuffer_")
     two_exits(directory, assembler, objcopy, library)
-    for name, lines, width, binding in CASES + GUARD_CASES + READ_CASES + ALU_CASES:
+    for name, lines, width, binding in CASES + GUARD_CASES + READ_CASES + ALU_CASES + F32_CASES:
         src, obj, raw = [directory / x for x in ("test.s", "test.o", "test.bin")]
         src.write_text("\n".join(lines) + "\n", encoding="ascii")
         subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-filetype=obj", src, "-o", obj], check=True)
@@ -3081,6 +3192,19 @@ for count in range(2, 5):
     stride = 4 * (count + 1)
     MTBUF_LOAD_CASES.append((f"mtbuf_load_{channels}", [*single[:6], load, single[7], store, single[-1]],
                              binding | {"stride": stride, "source_stride": stride}))
+for components in range(1, 5):
+    channels = "xyzw"[:components]
+    count = (components + 1) // 2
+    data = "v10" if count == 1 else "v[10:11]"
+    fmt = f"BUF_FMT_{'16_' * (4 if components == 3 else components)}UINT"
+    load = (f"tbuffer_load_format_d16_{channels} {data}, v8, s[16:19], 0 "
+            f"format:[{fmt}] idxen offset:4")
+    _, single, binding = MTBUF_LOAD_CASES[0]
+    store = single[8] if count == 1 else "buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen offset:4"
+    last = 9 + count
+    mask = [f"v_and_b32_e32 v{last}, 0xffff, v{last}"] if components % 2 else []
+    MTBUF_LOAD_CASES.append((f"mtbuf_load_d16_{channels}", [*single[:6], load, single[7], *mask, store, single[-1]],
+                             binding | {"stride": 4 * (count + 1), "source_stride": 12}))
 
 
 def mtbuf_load_controls():
@@ -3103,7 +3227,7 @@ def mtbuf_load_controls():
             variant(lines, ("s_waitcnt lgkmcnt(0)", "")), 32, **binding)
     rejects("Unsupported read address", aot.lower, lines, 32, **(binding | {"source_stride": None}))
     rejects("Unsupported typed buffer read target", aot.lower, lines, 32, **(binding | {"cpu": "gfx1013"}))
-    for _, lines, binding in MTBUF_LOAD_CASES[1:]:
+    for _, lines, binding in MTBUF_LOAD_CASES[1:4]:
         load = lines[6]
         rejects("Unverified buffer read destination", aot.lower,
                 variant(lines, (load, load.replace(load.split()[1], "v10,"))), 32, **binding)
@@ -3114,6 +3238,19 @@ def mtbuf_load_controls():
                 variant(lines, (load, load + "\nv_mov_b32_e32 v12, v11")), 32, **binding)
         rejects("Read leaves its source element", aot.lower, lines, 32,
                 **(binding | {"source_stride": binding["source_stride"] - 4}))
+    for _, lines, binding in MTBUF_LOAD_CASES[4:]:
+        load = lines[6]
+        fmt = load.split("format:[")[1].split("]")[0]
+        rejects("Unsupported typed buffer read format", aot.lower,
+                variant(lines, (fmt, "BUF_FMT_32_UINT")), 32, **binding)
+        rejects("before s_waitcnt vmcnt(0)", aot.lower, variant(lines, ("s_waitcnt vmcnt(0)", "")), 32, **binding)
+        rejects("Unverified read offset", aot.lower,
+                variant(lines, (load, load.replace("offset:4", "offset:2"))), 32, **binding)
+        if load.split()[0].endswith(("_x", "_xyz")):
+            mask = lines[8]
+            rejects("Store data is not a known word", aot.lower, variant(lines, (mask, "")), 32, **binding)
+            rejects("Unverified ALU operand", aot.lower,
+                    variant(lines, (mask, mask.replace("0xffff", "0x1ffff"))), 32, **binding)
 
 
 def mtbuf_load_draw(directory, compiler, renderer, backend):
@@ -3122,7 +3259,9 @@ def mtbuf_load_draw(directory, compiler, renderer, backend):
     for name, lines, binding in MTBUF_LOAD_CASES:
         load = lines[6]
         op = load.split()[0]
-        count = len(op.rsplit("_", 1)[-1])
+        packed = "_d16_" in op
+        components = len(op.rsplit("_", 1)[-1])
+        count = (components + 1) // 2 if packed else components
         src, cso, case = (directory / f"{name}.{ext}" for ext in ("hlsl", "cso", "case"))
         src.write_text(aot.lower(lines, 32, **binding), encoding="ascii")
         compile = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
@@ -3132,13 +3271,20 @@ def mtbuf_load_draw(directory, compiler, renderer, backend):
             words = [SENTINEL] * 320
             for gid in range(32 * groups):
                 output = gid * (count + 1) + 1
-                first = gid * (3 if count == 1 else count + 1) + 1
+                first = gid * (3 if count == 1 or packed else count + 1) + 1
                 words[output:output + count] = [source_word(first + i) for i in range(count)]
+                if packed and components % 2:
+                    words[output + count - 1] &= 0xffff
             case.write_bytes(struct.pack("<321I", groups, *words))
             result = subprocess.run(run)
             if result.returncode:
                 return result.returncode
-        if count == 1:
+        if packed:
+            swapped = "v_lshlrev_b32_e32 v22, 16, v10\nv_lshrrev_b32_e32 v23, 16, v10\nv_or_b32_e32 v10, v22, v23"
+            store = lines[-2]
+            mutant = aot.lower(variant(lines, (store, swapped + "\n" + store)), 32, **binding)
+            mismatch = 1
+        elif count == 1:
             # Stride 8 still admits the aligned read. Only lanes after lane 0 expose the error.
             mutant = aot.lower(lines, 32, **(binding | {"source_stride": 8}))
             mismatch = 3
@@ -3149,7 +3295,7 @@ def mtbuf_load_draw(directory, compiler, renderer, backend):
         subprocess.run(compile, check=True)
         bad = subprocess.run(run, capture_output=True, text=True)
         if bad.returncode != 1 or f"word={mismatch} expected=" not in bad.stderr:
-            raise AssertionError(f"{name}: incorrect source address escaped detection\n{bad.stderr}")
+            raise AssertionError(f"{name}: incorrect load escaped detection\n{bad.stderr}")
         print(bad.stderr, end="")
         accepted.append(op)
     if record := os.environ.get("FORM_COVERAGE_RECORD"):
@@ -3435,6 +3581,106 @@ def draw_vop2(directory, compiler, cmd, case, name):
     return 0
 
 
+def f32_value(bits):
+    return struct.unpack("<f", struct.pack("<I", bits))[0]
+
+
+def f32_round(value):
+    """Round a Python double to binary32, to nearest even. For add, subtract and multiply of two binary32 values
+    the double result is rounded once more, which is exact: a double carries more than 2 * 24 + 2 bits."""
+    return struct.unpack("<f", struct.pack("<f", value))[0]
+
+
+def f32_bits(value):
+    return struct.unpack("<I", struct.pack("<f", value))[0]
+
+
+F32_PI = 0x40490fdb
+
+
+def f32_steps(gid, wrong=()):
+    """Independent CPU model of read_f32 for one lane, every intermediate value. wrong names one operation to swap."""
+    word = source_word(gid)
+    x = f32_value(0x3fc00000 | word & 0x3fffff)
+    y = f32_value(0x40400000 | word >> 10)
+    cap, pi = f32_value(F32_CAP), f32_value(F32_PI)
+    a = f32_round(x + y)
+    b = f32_round(a - cap if "sub" in wrong else cap - a)
+    c = f32_round(pi - b if "subrev" in wrong else b - pi)
+    d = f32_round(x + c if "mul" in wrong else x * c)
+    e = f32_round(1.0 - d if "add" in wrong else 1.0 + d)
+    return x, y, a, b, c, d, e, f32_round(e - 4.0 if "inline" in wrong else e - (-4.0))
+
+
+def f32_words(groups, bound, **reference):
+    words = [SENTINEL] * 320
+    for gid in range(min(32 * groups, bound)):
+        words[gid] = f32_bits(f32_steps(gid, **reference)[-1])
+    return words
+
+
+def draw_f32(directory, compiler, cmd, case, name):
+    """Binary32 add, sub, subrev and mul against f32_steps, from the 320-word case format."""
+    constants = [0x5eed0000 + i for i in range(16)]
+    constants[1] = F32_CAP
+    groups, bound = READ_RUNS[-1]
+
+    def write(words):
+        case.write_bytes(struct.pack("<337I", groups, *words, bound, *constants[1:]))
+
+    # Every operand and result of an active lane is finite and normal, which the translation does not model otherwise,
+    # and at least one multiply is inexact, so the single rounding is observed.
+    for gid in range(bound):
+        for value in f32_steps(gid):
+            assert 0x00800000 <= f32_bits(value) & 0x7fffffff < 0x7f800000, (gid, value)
+    assert any(f32_round(x * c) != x * c for x, _, _, _, c, _, _, _ in map(f32_steps, range(bound))), "every multiply exact"
+    expected = f32_words(groups, bound)
+    for run_groups, run_bound in READ_RUNS:
+        case.write_bytes(struct.pack("<337I", run_groups, *f32_words(run_groups, run_bound), run_bound, *constants[1:]))
+        result = subprocess.run(cmd)
+        if result.returncode:
+            return result.returncode
+    # Each reference with one operation swapped must fail the run at the first word where it differs.
+    for label, reference in (("sub and subrev exchanged", f32_words(groups, bound, wrong=("sub",))),
+                             ("subrev exchanged", f32_words(groups, bound, wrong=("subrev",))),
+                             ("add for mul", f32_words(groups, bound, wrong=("mul",))),
+                             ("sub for add", f32_words(groups, bound, wrong=("add",))),
+                             ("inline sign dropped", f32_words(groups, bound, wrong=("inline",)))):
+        word = next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b)
+        write(reference)
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected={reference[word]:08x}" not in bad.stderr:
+            raise AssertionError(f"{name}: reference '{label}' escaped detection\n{bad.stderr}")
+    # A lane past the bound that writes, and a word past every lane that changes, both fail at their own word.
+    for word in (bound, 319):
+        stale = expected.copy()
+        stale[word] ^= 1
+        write(stale)
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected={stale[word]:08x} actual={SENTINEL:08x}" not in bad.stderr:
+            raise AssertionError(f"{name}: sentinel word {word} escaped detection\n{bad.stderr}")
+    write(expected)
+    source = (directory / "store.hlsl").read_text(encoding="ascii")
+    for label, old, new in (("add as sub", "asfloat(a) + asfloat(b)", "asfloat(a) - asfloat(b)"),
+                            ("sub operands exchanged", "asfloat(a) - asfloat(b)", "asfloat(b) - asfloat(a)"),
+                            ("mul as add", "asfloat(a) * asfloat(b)", "asfloat(a) + asfloat(b)"),
+                            ("cap from the next constant", "f32_sub(params[0].y", "f32_sub(params[0].z"),
+                            ("literal off by one bit", "0x40490fdbu", "0x40490fdau"),
+                            ("inline constant sign", "0xc0800000u", "0x40800000u"),
+                            ("inline one for two", "f32_add(0x3f800000u,", "f32_add(0x40000000u,"),
+                            ("lane at the bound writes", "if (params[0].x > tid.x)", "if (params[0].x >= tid.x)")):
+        mutated = source.replace(old, new)
+        if mutated == source:
+            raise AssertionError(f"{name}: mutation '{label}' did not change the source")
+        src, cso = directory / "mutated.hlsl", directory / "mutated.cso"
+        src.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+        bad = subprocess.run([*cmd[:3], cso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"{name}: mutation '{label}' escaped detection")
+    return 0
+
+
 SHIFT_SUB_CAP = 0x0badf00d
 
 
@@ -3589,8 +3835,8 @@ def draw(directory, compiler, renderer, backend, cases=None):
             continue
         if name.startswith(("guard_", "read_")):
             result = (draw_guard if name.startswith("guard_") else draw_alu if name == "read_compute"
-                      else draw_vop2 if name == "read_vop2" else draw_shift_sub if name == "read_shift_sub"
-                      else draw_read)(directory, compiler, cmd, case, name)
+                      else draw_vop2 if name == "read_vop2" else draw_f32 if name == "read_f32"
+                      else draw_shift_sub if name == "read_shift_sub" else draw_read)(directory, compiler, cmd, case, name)
             if result:
                 return result
             continue
@@ -3651,6 +3897,7 @@ if __name__ == "__main__":
                  "draw-lds-packed": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_PACKED_CASES),
                  "draw-lds-arithmetic": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_ARITHMETIC_CASES),
                  "draw-lds-replacement": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_REPLACEMENT_CASES),
+                 "draw-f32": lambda d, *a: draw(d, *a, cases=F32_CASES),
                  "draw-mtbuf-store": mtbuf_store_draw,
                  "draw-guard-read": lambda d, *a: draw(d, *a, cases=GUARD_CASES + READ_CASES + ALU_CASES + SCALAR_CASES)}
         sys.exit(modes[mode](Path(tmp), *args))

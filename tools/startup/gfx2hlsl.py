@@ -145,7 +145,7 @@ class Stage:
                 return '0x%08xu' % (s[1] & 0xffffffff)
             if s[0] == 'ud':
                 return 'ud%d' % s[1]
-            if s[0] == 'execcopy':
+            if s[0] in ('execcopy', 'fixed_buffer_word'):
                 self.used_s.add(n)
                 return 's%d' % n
             raise Unsupported('numeric use of s%d holding %s' % (n, s[0]))
@@ -199,6 +199,7 @@ class Stage:
         self.lines.append(text)
 
     def set_v(self, n, expr):
+        self.uniform_v.discard(n)
         self.used_v.add(n)
         self.emit('v%d = %s;' % (n, expr) if self.exec_known else 'if (exec & 1) v%d = %s;' % (n, expr))
 
@@ -266,6 +267,8 @@ class Stage:
             if name.startswith('s_cbranch') or name == 's_branch':
                 targets.add(int(parse(asm)[1][0].split('_')[1], 16))
         self.blocks = []          # (offset, [lines], terminator)
+        self.uniform_v = set()
+        self.has_branches = bool(targets)
         start = 0
         for off, n, name, asm in self.ins:
             if off in targets and off != start:
@@ -283,7 +286,7 @@ class Stage:
         _, ops, mods = parse(asm)
         base = re.sub(r'_e(32|64)$', '', name)
         if base in ('s_inst_prefetch', 's_waitcnt', 's_nop', 'v_nop', 's_clause', 's_sopp_0f', 's_wqm_b64', 's_wqm_b32',
-                    's_setreg_imm32_b32', 's_code_end'):
+                    's_setreg_imm32_b32', 's_code_end', 's_setprio'):
             return None
         if base == 's_endpgm':
             return ('end',)
@@ -510,6 +513,8 @@ class Stage:
         offset = self.u(ops[2])
         for i in range(count):
             self.set_s(dst[1] + i, '%s.Load(%s + %d)' % (buf, offset, 4 * i))
+            if not mods and re.fullmatch(r'0x[0-9a-f]+|\d+', ops[2]):
+                self.sym[dst[1] + i] = ('fixed_buffer_word',)
 
     def op_s_buffer_load_dwordx2(self, ops, mods):
         self.op_s_buffer_load_dword(ops, mods, 2)
@@ -565,6 +570,7 @@ class Stage:
         table = {'BUF_FMT_8_8_8_8_UNORM': ('ldu({0}, a)', ['U((w & 255) / 255.0)', 'U(((w >> 8) & 255) / 255.0)', 'U(((w >> 16) & 255) / 255.0)', 'U((w >> 24) / 255.0)']),
                  'BUF_FMT_8_8_UNORM': ('ldu({0}, a)', ['U((w & 255) / 255.0)', 'U(((w >> 8) & 255) / 255.0)', '0u', 'U(1.0)']),
                  'BUF_FMT_8_UNORM': ('ldu({0}, a)', ['U((w & 255) / 255.0)', '0u', '0u', 'U(1.0)']),
+                 'BUF_FMT_8_UINT': ('{0}.Load(a & ~3u) >> ((a & 3u) * 8u)', ['w & 255u', '0u', '0u', '1u']),
                  'BUF_FMT_16_16_UNORM': ('ldu({0}, a)', ['U((w & 65535) / 65535.0)', 'U((w >> 16) / 65535.0)', '0u', 'U(1.0)']),
                  'BUF_FMT_16_16_FLOAT': ('ldu({0}, a)', ['U(f16tof32(w))', 'U(f16tof32(w >> 16))', '0u', 'U(1.0)']),
                  'BUF_FMT_32_32_32_32_FLOAT': (None, ['{0}.Load(a)', '{0}.Load(a + 4)', '{0}.Load(a + 8)', '{0}.Load(a + 12)']),
@@ -635,6 +641,22 @@ class Stage:
 
     def op_image_load(self, ops, mods):
         self.image(ops, mods, 'load')
+
+    def op_v_cvt_i32_f32(self, ops, mods):
+        if mods:
+            raise Unsupported('v_cvt_i32_f32 with modifiers')
+        dst = reg_range(ops[0])[1]
+        self.set_v(dst, 'uint(int(F(%s)))' % self.u(ops[1]))
+        src = reg_range(ops[1])
+        if self.exec_known and src and src[0] == 's' and self.sym.get(src[1]) == ('fixed_buffer_word',):
+            self.uniform_v.add(dst)
+
+    def op_v_readfirstlane_b32(self, ops, mods):
+        src, dst = reg_range(ops[1]), reg_range(ops[0])
+        if (mods or self.has_branches or not self.exec_known or not dst or dst[0] != 's' or
+                not src or src[0] != 'v' or src[1] not in self.uniform_v):
+            raise Unsupported('v_readfirstlane_b32 requires a proven uniform source')
+        self.set_s(reg_range(ops[0])[1], self.u(ops[1]))
 
     def op_v_mov_b32(self, ops, mods):
         self.set_v(reg_range(ops[0])[1], self.u(ops[1]))
@@ -809,7 +831,7 @@ VEC_U = {
     'v_ashrrev_i32': (2, 'uint(int({1}) >> ({0} & 31))'), 'v_min_u32': (2, 'min({0}, {1})'), 'v_max_u32': (2, 'max({0}, {1})'),
     'v_min_i32': (2, 'uint(min(int({0}), int({1})))'), 'v_max_i32': (2, 'uint(max(int({0}), int({1})))'),
     'v_cvt_f32_u32': (1, 'U(float({0}))'), 'v_cvt_f32_i32': (1, 'U(float(int({0})))'),
-    'v_cvt_u32_f32': (1, 'uint(max(F({0}), 0.0))'), 'v_cvt_i32_f32': (1, 'uint(int(F({0})))'),
+    'v_cvt_u32_f32': (1, 'uint(max(F({0}), 0.0))'),
     'v_cvt_f32_ubyte0': (1, 'U(float({0} & 255))'), 'v_cvt_f32_ubyte1': (1, 'U(float(({0} >> 8) & 255))'),
     'v_cvt_f32_ubyte2': (1, 'U(float(({0} >> 16) & 255))'), 'v_cvt_f32_ubyte3': (1, 'U(float({0} >> 24))'),
     'v_cvt_f32_f16': (1, 'U(f16tof32({0}))'), 'v_cvt_f16_f32': (1, 'f32tof16(F({0}))'),
