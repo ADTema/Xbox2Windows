@@ -14,7 +14,7 @@ import unittest
 import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-from disasm_rdna2 import disasm_rdna2, decode_instruction, disassemble_binary
+from disasm_rdna2 import VOP1_OPS, VOP2_OPS, disasm_rdna2, decode_instruction, disassemble_binary
 from extract_shaders import extract_shaders, extract_native_rdna2_code, sanitize_filename
 from pixel_aot import VOP3_INT16, VOP3_INT16_TERNARY, fma_mix_operand, lower, native_program, parse_fma_mix
 from scan_unsupported_shaders import (
@@ -3048,6 +3048,15 @@ class TestRdna2Extractor(unittest.TestCase):
 
 class TestRdna2Scanner(unittest.TestCase):
     """Test scanner instruction recognition vs full shader translator acceptance."""
+
+    def test_decoded_binary16_vop1_vop2_forms_are_recognized(self):
+        """Every binary16 VOP1/VOP2 mnemonic the decoder prints is recognized by the scanner, decoding only."""
+        vop1 = (0x50, 0x51, 0x52, 0x53, 0x5b, 0x5c, 0x5d, 0x5e, 0x5f, 0x63, 0x64)
+        vop2 = (0x32, 0x33, 0x34, 0x35, 0x36, 0x39, 0x3a, 0x3b, 0x3c)
+        names = [VOP1_OPS[op][0] for op in vop1] + [VOP2_OPS[op][0] for op in vop2]
+        self.assertEqual(sorted(name for name in names if not is_opcode_recognized(name)), [])
+        # The nonexistent VOP3 form of the packed fused multiply-accumulate stays unrecognized.
+        self.assertFalse(is_opcode_recognized("v_pk_fmac_f16_unsupported"))
 
     def test_accepted_full_shader(self):
         """Canonical straight-line pixel shader accepted by pixel_aot translator."""

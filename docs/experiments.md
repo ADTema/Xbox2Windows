@@ -7019,3 +7019,16 @@ with backface culling enabled (`D3D12_CULL_MODE_BACK`):
 
 Not covered by this experiment: geometry or tessellation shader stages preceding the
 input assembler, primitive ID generation in pixel shaders, runtime driver hooking, and title CPU code execution.
+
+## gfx1013 binary16 VOP1 and VOP2 scanner recognition
+
+`tools/scan_unsupported_shaders.py` recognizes the binary16 VOP1 and VOP2 mnemonics that `tools/disasm_rdna2.py` decodes
+(`v_cvt_u16_f16`, `v_cvt_i16_f16`, `v_fract_f16`, `v_cvt_norm_i16_f16`, `v_cvt_norm_u16_f16`, `v_fmac_f16`, `v_max_f16`,
+`v_min_f16`, `v_ldexp_f16` and `v_pk_fmac_f16`), so they are not reported as unknown. The rejected VOP3 spelling of
+`v_pk_fmac_f16` (`v_pk_fmac_f16_unsupported`) stays unrecognized.
+
+```sh
+python3 -B tests/rdna2_tools_check.py
+```
+
+Scope: recognition only. No translator lowers these forms through this change, and no hardware or Windows run backs them.

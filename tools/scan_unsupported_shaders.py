@@ -351,6 +351,12 @@ KNOWN_RDNA2_BASE_OPCODES |= (
     | {f"v_{name}" for name in PIXEL_VOP3_INT16_TERNARY}
     | {f"v_{name}_f16" for name in PIXEL_VOP2_F16 + PIXEL_VOP1_F16_ROUND}
     | {"v_cvt_f16_i16", "v_cvt_f16_u16"}
+    | {
+        # Decoding only: no translator lowers these binary16 VOP1/VOP2 forms.
+        "v_cvt_u16_f16", "v_cvt_i16_f16", "v_fract_f16",
+        "v_cvt_norm_i16_f16", "v_cvt_norm_u16_f16",
+        "v_fmac_f16", "v_max_f16", "v_min_f16", "v_ldexp_f16", "v_pk_fmac_f16",
+    }
     | {name for name, _, _ in MUBUF_OPS.values()}
     | {name for name, _, _ in MTBUF_OPS.values()}
     | {entry[0] for entry in FLAT_OPS.values()}
