@@ -145,8 +145,10 @@ target_link_libraries(windows_placeholder_partition_check PRIVATE OneCore)
 add_test(NAME windows_placeholder_partition COMMAND windows_placeholder_partition_check)
 
 # Desktop d3d12_xs.dll for the package DLLs' two named d3d12_xs root-signature imports.
-add_library(d3d12_xs_shim SHARED src/d3d12_xs_shim.cpp src/d3d12x_device_slots.cpp src/d3d12_xs_shim.def)
+add_library(d3d12_xs_shim SHARED src/d3d12_xs_shim.cpp src/d3d12x_device_slots.cpp src/d3d12_xs_shim.def
+    src/startup_stubs/d3d12_xs_device.cpp)
 set_target_properties(d3d12_xs_shim PROPERTIES OUTPUT_NAME d3d12_xs)
+target_include_directories(d3d12_xs_shim PRIVATE src)
 target_compile_features(d3d12_xs_shim PRIVATE cxx_std_17)
 target_link_libraries(d3d12_xs_shim PRIVATE d3d12)
 
@@ -212,6 +214,38 @@ foreach(target IN ITEMS trap_missing_exe trap_missing_data_exe)
         /SUBSYSTEM:CONSOLE /DYNAMICBASE /INCREMENTAL:NO)
 endforeach()
 target_compile_definitions(trap_missing_data_exe PRIVATE TRAP_DATA_IMPORT)
+
+# Experimental startup stand-ins (docs/startup-runtime.md): trap-by-default desktop DLLs for imports
+# without a public ABI yet (src/startup_stubs/trap.h), plus opt-in permissive paths for startup runs.
+set(startup_stub_targets)
+foreach(stub IN ITEMS acphal:AcpHal chad:chad xapu:xapu xcrdapi:XCRDAPI xg_xs:xg_xs gameinput:GameInput)
+    string(REPLACE ":" ";" stub_parts "${stub}")
+    list(GET stub_parts 0 stub_stem)
+    list(GET stub_parts 1 stub_output)
+    add_library(startup_stub_${stub_stem} SHARED src/startup_stubs/${stub_stem}.cpp src/startup_stubs/${stub_stem}.def)
+    set_target_properties(startup_stub_${stub_stem} PROPERTIES OUTPUT_NAME ${stub_output})
+    target_include_directories(startup_stub_${stub_stem} PRIVATE src)
+    target_compile_features(startup_stub_${stub_stem} PRIVATE cxx_std_17)
+    list(APPEND startup_stub_targets startup_stub_${stub_stem})
+endforeach()
+# A package may ship an older MSVCP140.dll that the loader picks from the application directory;
+# link the shims statically so they never use its runtime (constexpr std::mutex layout).
+target_link_libraries(startup_stub_xg_xs PRIVATE d3d12 dxguid)
+target_link_libraries(startup_stub_gameinput PRIVATE user32)
+target_sources(startup_stub_gameinput PRIVATE src/startup_stubs/runtime_proxy.cpp)
+target_link_libraries(d3d12_xs_shim PRIVATE user32 gdi32 d3dcompiler dxgi)
+target_compile_options(d3d12_xs_shim PRIVATE /bigobj)
+set_target_properties(xmem_shim d3d12_xs_shim ${startup_stub_targets} PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+add_executable(startup_stub_consumer tests/startup_stub_consumer.cpp)
+target_compile_features(startup_stub_consumer PRIVATE cxx_std_17)
+target_link_libraries(startup_stub_consumer PRIVATE startup_stub_chad startup_stub_xg_xs xmem_shim d3d12_xs_shim)
+add_test(NAME startup_stubs COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stub_check.py"
+    "$<TARGET_FILE:startup_stub_consumer>" "${CMAKE_CURRENT_SOURCE_DIR}/src/startup_stubs"
+    "$<TARGET_FILE:startup_stub_acphal>" "$<TARGET_FILE:startup_stub_chad>" "$<TARGET_FILE:startup_stub_xapu>"
+    "$<TARGET_FILE:startup_stub_xcrdapi>" "$<TARGET_FILE:startup_stub_xg_xs>" "$<TARGET_FILE:startup_stub_gameinput>"
+    "$<TARGET_FILE:xmem_shim>" "$<TARGET_FILE:d3d12_xs_shim>")
+set_tests_properties(startup_stubs PROPERTIES TIMEOUT 120)
 
 find_program(DXC_EXECUTABLE dxc REQUIRED)
 get_filename_component(DXC_BIN_DIR "${DXC_EXECUTABLE}" DIRECTORY)
