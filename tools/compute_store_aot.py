@@ -320,8 +320,11 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         raise ValueError("The R32_UINT MSAA image binding requires gfx1030")
     image_atomic_type = IMAGE_ATOMIC_TYPES.get(image_format) if image_output else None
     rgba32_float_image = cpu == "gfx1013" and image_format == RGBA32_FLOAT
+    # gfx1013 takes the shared image atomic lowering on an R32_UINT UAV only (add, umax, cmpswap; see lower()).
+    gfx1013_image_atomic = cpu == "gfx1013" and image_atomic_type is not None and image_format == "R32_UINT"
     if image_output:
-        if ((cpu != "gfx1030" and not rgba32_float_image) or descriptor_offset is not None or stride is not None
+        if ((cpu != "gfx1030" and not rgba32_float_image and not gfx1013_image_atomic)
+                or descriptor_offset is not None or stride is not None
                 or image_descriptor is None
                 or (image_format not in IMAGE_FORMATS and not image_atomic_type and not rgba32_float_image)
                 or (image_atomic_type and image_uav_mip != 0)
@@ -1529,6 +1532,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                                r"dmask:0x(?P<mask>[0-9a-f]+) dim:SQ_RSRC_IMG_2D(?: unorm)?", line):
             op = m["op"]
             signed = op in ("smin", "smax")
+            # gfx1013 is limited to the forms its draws cover; the lowering itself is the gfx1030 one.
+            if cpu == "gfx1013" and op not in ("add", "umax", "cmpswap"):
+                raise ValueError("gfx1013 image atomics require add, umax or cmpswap")
             if (image_atomic_type != ("int" if signed else "uint") or image_float != (op in IMAGE_FLOAT_ATOMIC_OPS)
                     or guard_span is not None or stores):
                 raise ValueError("Unsupported image atomic target or binding")
