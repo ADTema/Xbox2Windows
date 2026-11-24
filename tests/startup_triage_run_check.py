@@ -63,14 +63,16 @@ def check_aggregation_and_redaction(failures: list[str]) -> None:
             "| 2 | unsupported_description | 1 | 0 | 11 | 0 | 0x1 | 0x0 |",
             "| 1 | destination_outside_view_heaps | 3 | 98 | 5 | 98 | 0x105 | 0x300000 |",
             "| 1 | unreadable_resource | unreadable | unreadable | unreadable | unreadable | unreadable | unreadable |",
-            "| 1 | `x2w-noop d3d12_xs!Device::slot44` |",
+            "| 1 | `x2w-noop Device::slot44` |",
             "| 1 | `Device::slot10(CreateGraphicsPipelineState)` |",
             "| 2 | zlib failed |",
+            "| 1 | 2 | 999 |",
             "| 1 | OpenFile: fail (err 2) |",
             "| 1 | `0x80004005` |",
-            "| 2 | `12345678::slot5` | `0x80004005` |",
+            "| 2 | `slot5` | `0x80004005` |",
             "| 1 | `persistent_local_storage` | `0x80070005` |",
             "| 2 | `image_load_mip tfe` |",
+            f"| 1 | `{triage_run.OTHER}` |",
         ]
         for snippet in expected_snippets:
             if snippet not in report:
@@ -94,32 +96,67 @@ def check_aggregation_and_redaction(failures: list[str]) -> None:
                 failures.append(f"negative control failed: leaked {secret!r} in report")
 
 
-def check_redaction_helper(failures: list[str]) -> None:
-    cases = [
-        (r'C:\Users\alice\secret\game.exe', "<path>"),
-        (r'"C:\Program Files\My App\title.exe"', '"<path>"'),
-        ("/home/alice/dumps/run1/stderr.txt", "<path>"),
-        ("/Users/alice/Desktop/tool.exe", "<path>"),
-        ("ret=sample_app.exe+0x1234", "ret=<exe>+0x1234"),
-        ("ptr=0x00007ff712345678 hr=0x80004005", "ptr=0x<addr> hr=0x80004005"),
-    ]
-    for raw, want in cases:
-        got = triage_run.redact(raw)
-        if got != want:
-            failures.append(f"redact({raw!r}) = {got!r}, expected {want!r}")
+PRIVATE_LINES = """\
+x2w-d3d12 Device::slot70 unsupported memory SRV arguments: reason=ACMEPrivateReason res{dim=PrivateDim fmt=acme_fmt layout=0xZZ flags=acmeflag} view{dim=x fmt=y} dest=0x1
+x2w-trap acmegame_private!Device::slot31 rcx=0x1 ret=acmegame+0x10
+x2w-noop ACMEOpaqueObject rcx=0x1
+x2w-d3d12-debug [AcmeContext 7] sev=2 id=1234 loading AcmeTitle shader [secret](https://acme.example/leak) 0000018012345678 acme_widget_7f3a
+x2w-d3d12 Device::slot44 view skipped: acme_widget_7f3a in AcmeModule.dll
+x2w-d3d12 DEVICE REMOVED, reason 0x887a0005, first noticed after acme_widget_7f3a
+x2w-dstorage   options=0x1 dest=0x1 dest_size=0x1 source=0x1 offset=0x0 size=0x1 -> acme_widget_7f3a exploded
+x2w-dstorage entry type 3 failed: AcmeTitle bad [secret](https://acme.example/leak)
+x2w-dstorage Factory::OpenFile path="x" riid={1} -> fail acme_widget_7f3a
+x2w-runtime 0000018012345678::slot9(0x1) -> 0x80004005 from +0x1
+"""
+PRIVATE_SHADER_FAILS = [
+    "AcmeModule: 0000018012345678 acme_widget_7f3a [secret](https://acme.example/leak)",
+    "v_acme_widget_7f3a_private with AcmeTitle",
+    "acmegame_private",
+    "undecodable word at +0x10: AcmeTitle shader text",
+    "image_load_mip tfe AcmeTitle",
+    "image_load_mip tfe",
+]
+PRIVATE_NEEDLES = [
+    "Acme", "acme", "ACME", "Private", "secret", "leak", "widget", "7f3a", "exploded",
+    "0000018012345678", "12345678", "[", "](", "http", ".dll", "Opaque",
+]
+
+
+def check_private_text_never_echoed(failures: list[str]) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        logdir = root / "logs"
+        logdir.mkdir()
+        (logdir / "stderr.txt").write_text(PRIVATE_LINES, encoding="utf-8")
+        cache_dir = root / "cache"
+        cache_dir.mkdir()
+        for index, text in enumerate(PRIVATE_SHADER_FAILS):
+            (cache_dir / f"{index:016x}.fail").write_text(text + "\n", encoding="utf-8")
+        report = triage_run.triage_run(logdir, shader_cache=cache_dir)
+        for needle in PRIVATE_NEEDLES:
+            if needle in report:
+                failures.append(f"free-form text leaked into report: {needle!r}\n{report}")
+        for want in [
+            "| 1 | 2 | 1234 |",
+            "`DEVICE REMOVED 0x887a0005`",
+            "`x2w-trap Device::slot31`",
+            "`x2w-noop other (text omitted)`",
+            "`Device::slot44 view skipped`",
+            "| 1 | OpenFile: fail (other) |",
+            "| 1 | entry failed |",
+            "`slot9` | `0x80004005`",
+            "`undecodable word`",
+            "`image_load_mip tfe`",
+            "`v_* with modifier`",
+            "`other (text omitted)`",
+        ]:
+            if want not in report:
+                failures.append(f"missing grouped allowlist row: {want!r}")
+        if "| 1 | other (text omitted) | ? | ? | ? | ? | ? | ? |" not in report:
+            failures.append("unknown slot70 reason/values were not grouped as other/?")
 
 
 def check_review_regressions(failures: list[str]) -> None:
-    # Paths with spaces are redacted whole, in a shader .fail line and in plain text.
-    for raw, want in [
-        (r"fxc ps: C:\Users\Alice Smith\PrivateTitle\shader.hlsl(1,1): error X3000",
-         "fxc ps: <path> error X3000"),
-        (r"open C:\Program Files\My App\shader.hlsl failed", "open <path> failed"),
-        ("read /home/Alice Smith/cache/x.bin: denied", "read <path> denied"),
-    ]:
-        got = triage_run.redact(raw)
-        if got != want or "Smith" in got or "Program" in got:
-            failures.append(f"redact({raw!r}) = {got!r}, expected {want!r}")
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         logdir = root / "run"
@@ -187,7 +224,7 @@ def check_cli_invocation(failures: list[str]) -> None:
 def main() -> int:
     failures: list[str] = []
     check_aggregation_and_redaction(failures)
-    check_redaction_helper(failures)
+    check_private_text_never_echoed(failures)
     check_review_regressions(failures)
     check_empty_and_missing_dirs(failures)
     check_cli_invocation(failures)

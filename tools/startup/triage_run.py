@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Summarize a startup log directory (and optional shader cache) into redacted Markdown.
+"""Summarize a startup log directory (and optional shader cache) into Markdown.
 
-Reads raw logs produced by tools/startup/run.ps1 / debug_launch.py and emits a
-title-neutral, path-redacted, address-redacted Markdown summary suitable for a
-GitHub issue. Uses only the Python 3 standard library.
+Reads raw logs produced by tools/startup/run.ps1 / debug_launch.py. The report is
+built only from allowlisted structured values: known reason/outcome tokens, decimal
+IDs and counts, hexadecimal HRESULT/format/flag codes, slot numbers and known
+gfx2hlsl mnemonic categories. Any other text (free-form debug messages, shader
+failure lines, module/object names, paths, addresses, links) is never copied; it is
+grouped under a fixed "other" label. Raw snippets stay in the local log files.
+Uses only the Python 3 standard library.
 """
 
 from __future__ import annotations
@@ -29,22 +33,60 @@ DSTORAGE_OK_OUTCOMES = {
     "inflated + bcpack decoded",
 }
 
-# Redaction patterns (applied in order from most specific/broadest path to tokens).
-RE_QUOTED_WIN_PATH = re.compile(r'"([A-Za-z]:\\[^"\r\n]+|[A-Za-z]:/[^"\r\n]+|\\\\[^\\"\r\n]+\\[^"\r\n]+)"')
-# Unquoted paths: directory components may contain single spaces ("Alice Smith"), the final component may not.
-_DIR_COMPONENT = r'(?:[^\\/:"\'<>|\r\n=,()]{1,64}[\\/]+)*'
-_LAST_COMPONENT = r'[^\s"\'<>|]*'
-RE_WIN_PATH = re.compile(
-    r'(?:[A-Za-z]:[\\/]+|\\\\[^\\\s"\'<>|]+\\+)' + _DIR_COMPONENT + _LAST_COMPONENT
-)
-RE_QUOTED_POSIX_PATH = re.compile(
-    r'"(/(?:home|Users|mnt|tmp|var|opt|root|srv|private|Volumes)/[^"\r\n]+)"'
-)
-RE_POSIX_PATH = re.compile(
-    r'/(?:home|Users|mnt|tmp|var|opt|root|srv|private|Volumes)/' + _DIR_COMPONENT + r'[^\s"\'<>|]+'
-)
-RE_EXE_NAME = re.compile(r'\b[A-Za-z0-9_.\-]+\.exe\b', re.IGNORECASE)
-RE_ADDR64 = re.compile(r'\b0x[0-9a-fA-F]{9,}\b')
+# Allowlists: the only values that may be copied from a log into the report.
+SLOT70_REASONS = {"unsupported_description", "destination_outside_view_heaps", "unreadable_resource"}
+DSTORAGE_FAIL_OUTCOMES = {
+    "bcpack failed",
+    "destination capacity exceeded",
+    "insufficient page grants",
+    "missing page grant token",
+    "missing page tokens",
+    "page destination write failed",
+    "read failed",
+    "zlib failed",
+}
+TRAP_TAGS = {"x2w-trap", "x2w-noop", "x2w-continue", "x2w-fail"}
+OTHER = "other (text omitted)"
+RE_DEC = re.compile(r"\d{1,10}\Z")
+RE_HEX = re.compile(r"0x[0-9a-fA-F]{1,8}\Z")
+RE_SLOT = re.compile(r"(?:[A-Za-z0-9_]+!)?(?:([A-Za-z0-9_]+)::)?slot(\d{1,4})\b")
+RE_OPENFILE_FAIL = re.compile(r"fail(?: \(err (\d{1,10})\))?\Z")
+MNEMONIC_FAMILY = r"(v|s|ds|buffer|tbuffer|image|flat|global|scratch|exp|lds)_[a-z0-9_]{1,40}"
+SHADER_REASONS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"(image_load_mip) (tfe|a16)\Z"), r"\1 \2"),
+    (re.compile(r"SDWA UNUSED_SEXT\Z"), "SDWA UNUSED_SEXT"),
+    (re.compile(r"SDWA dst_unused\b"), "SDWA dst_unused"),
+    (re.compile(r"undecodable word\b"), "undecodable word"),
+    (re.compile(r"numeric use of s\d+ holding\b"), "numeric use of scalar register"),
+    (re.compile(r"operand\b"), "unsupported operand"),
+    (re.compile(r"modifier\b"), "unsupported modifier"),
+    (re.compile(r"descriptor operand\b"), "descriptor operand"),
+    (re.compile(r"sampler operand\b"), "sampler operand"),
+    (re.compile(r"mask from descriptor data\Z"), "mask from descriptor data"),
+    (re.compile(r"s_load\b"), "s_load form"),
+    # Mnemonics are free text, so only the instruction family prefix is reported.
+    (re.compile(MNEMONIC_FAMILY + r" SDWA\b"), r"\1_* SDWA form"),
+    (re.compile(MNEMONIC_FAMILY + r" with\b"), r"\1_* with modifier"),
+    (re.compile(MNEMONIC_FAMILY + r"\Z"), r"\1_* instruction"),
+]
+
+
+def _dec(text: str | None) -> str:
+    return text if text is not None and RE_DEC.match(text) else "?"
+
+
+def _hexcode(text: str | None) -> str:
+    return text.lower() if text is not None and RE_HEX.match(text) else "?"
+
+
+def classify_shader_reason(line: str) -> str:
+    """Map a .fail first line to a known category token; never copies unknown text."""
+    for pattern, label in SHADER_REASONS:
+        m = pattern.match(line)
+        if m:
+            return m.expand(label)
+    return OTHER
+
 
 # Log line patterns matching src/startup_stubs/*.
 RE_SLOT70 = re.compile(
@@ -79,7 +121,7 @@ RE_DSTORAGE_SIGNAL = re.compile(
 )
 
 RE_RUNTIME_CALL = re.compile(
-    r'x2w-(?:runtime|api)\s+([0-9a-fA-F]+::slot\d+)(?:\([^)]*\))?\s+->\s+(0x[0-9a-fA-F]+)'
+    r'x2w-(?:runtime|api)\s+[0-9a-fA-F]+::slot(\d+)(?:\([^)]*\))?\s+->\s+(0x[0-9a-fA-F]+)'
 )
 RE_RUNTIME_STORAGE = re.compile(
     r'x2w-runtime\s+persistent local storage:\s+local object instead of\s+(0x[0-9a-fA-F]+)'
@@ -89,15 +131,10 @@ RE_RUNTIME_GAMESAVE = re.compile(
 )
 
 
-def redact(text: str) -> str:
-    """Strip local paths, executable names, and 64-bit addresses from a log snippet."""
-    out = RE_QUOTED_WIN_PATH.sub('"<path>"', text)
-    out = RE_WIN_PATH.sub("<path>", out)
-    out = RE_QUOTED_POSIX_PATH.sub('"<path>"', out)
-    out = RE_POSIX_PATH.sub("<path>", out)
-    out = RE_EXE_NAME.sub("<exe>", out)
-    out = RE_ADDR64.sub("0x<addr>", out)
-    return out
+def _slot_label(m: re.Match[str] | None) -> str:
+    if m is None:
+        return OTHER
+    return f"{'Device' if m.group(1) == 'Device' else 'other'}::slot{m.group(2)}"
 
 
 def _md_cell(value: object) -> str:
@@ -136,7 +173,7 @@ def summarize_lines(lines: Iterable[str]) -> dict[str, Counter]:
     """Aggregate startup telemetry counters from an iterable of log lines."""
     slot70_refusals: Counter[tuple[str, str, str, str, str, str, str]] = Counter()
     d3d12_unhandled: Counter[str] = Counter()
-    d3d12_debug: Counter[tuple[str, str, str, str]] = Counter()
+    d3d12_debug: Counter[tuple[str, str]] = Counter()
     dstorage_failures: Counter[str] = Counter()
     dstorage_hresults: Counter[str] = Counter()
     runtime_failures: Counter[tuple[str, str]] = Counter()
@@ -150,44 +187,44 @@ def summarize_lines(lines: Iterable[str]) -> dict[str, Counter]:
         m = RE_SLOT70.search(line)
         if m:
             reason, res_raw, view_raw = m.group(1), m.group(2), m.group(3)
+            if reason not in SLOT70_REASONS:
+                reason = OTHER
             res = _parse_kv_block(res_raw)
             view = _parse_kv_block(view_raw)
             if "_unreadable" in res:
                 dim = fmt = layout = flags = "unreadable"
             else:
-                dim = res.get("dim", "?")
-                fmt = res.get("fmt", "?")
-                layout = res.get("layout", "?")
-                flags = res.get("flags", "?")
+                dim = _dec(res.get("dim"))
+                fmt = _dec(res.get("fmt"))
+                layout = _hexcode(res.get("layout"))
+                flags = _hexcode(res.get("flags"))
             if "_unreadable" in view:
                 view_dim = view_fmt = "unreadable"
             else:
-                view_dim = view.get("dim", "?")
-                view_fmt = view.get("fmt", "?")
+                view_dim = _dec(view.get("dim"))
+                view_fmt = _dec(view.get("fmt"))
             slot70_refusals[(reason, dim, fmt, view_dim, view_fmt, layout, flags)] += 1
             continue
 
         # 2. x2w-trap / x2w-noop / x2w-continue / x2w-fail
         m = RE_TRAP_TAG.match(line)
         if m:
-            tag, target = m.group(1), redact(m.group(2))
-            d3d12_unhandled[f"{tag} {target}"] += 1
+            tag = m.group(1) if m.group(1) in TRAP_TAGS else OTHER
+            sm = RE_SLOT.search(m.group(2))
+            d3d12_unhandled[f"{tag} {_slot_label(sm)}"] += 1
             continue
 
         # 3. x2w-d3d12-debug
         m = RE_D3D12_DEBUG.search(line)
         if m:
-            ctx, sev, msg_id, msg = m.group(1), m.group(2), m.group(3), redact(m.group(4))
-            if len(msg) > 120:
-                msg = msg[:117] + "..."
-            d3d12_debug[(redact(ctx), sev, msg_id, msg)] += 1
+            d3d12_debug[(_dec(m.group(2)), _dec(m.group(3)))] += 1  # message text is never copied
             continue
 
         # 4. x2w-d3d12 unhandled/trapped/skipped slots & device removed
         if "x2w-d3d12" in line:
             m = RE_D3D12_REMOVED.search(line)
             if m:
-                d3d12_unhandled[f"DEVICE REMOVED {m.group(1)} after {redact(m.group(2))}"] += 1
+                d3d12_unhandled[f"DEVICE REMOVED {_hexcode(m.group(1))}"] += 1
                 continue
             m = RE_D3D12_PIPELINE_TRAP.search(line)
             if m:
@@ -199,14 +236,14 @@ def summarize_lines(lines: Iterable[str]) -> dict[str, Counter]:
                 continue
             m = RE_D3D12_VIEW_SKIPPED.search(line)
             if m:
-                d3d12_unhandled[f"Device::slot{m.group(1)} view skipped: {redact(m.group(2))}"] += 1
+                d3d12_unhandled[f"Device::slot{_dec(m.group(1))} view skipped"] += 1
                 continue
             m = RE_D3D12_FORWARDED_RESULT.search(line)
             if m and not _is_failed_hresult(m.group(1))[0]:
                 continue  # forward_slot()/create_slot() telemetry of a call the desktop device implemented
             m = RE_D3D12_SLOT_CALL.search(line)
             if m:
-                d3d12_unhandled[m.group(1)] += 1
+                d3d12_unhandled[_slot_label(RE_SLOT.search(m.group(1)))] += 1
                 continue
 
         # 5. x2w-dstorage failures & status HRESULTs
@@ -214,12 +251,14 @@ def summarize_lines(lines: Iterable[str]) -> dict[str, Counter]:
             m = RE_DSTORAGE_OUTCOME.search(line)
             if m:
                 outcome = m.group(1).strip()
-                if outcome not in DSTORAGE_OK_OUTCOMES:
-                    dstorage_failures[redact(outcome)] += 1
+                if outcome in DSTORAGE_FAIL_OUTCOMES:
+                    dstorage_failures[outcome] += 1
+                elif outcome not in DSTORAGE_OK_OUTCOMES:
+                    dstorage_failures[OTHER] += 1
                 continue
             m = RE_DSTORAGE_ENTRY_FAIL.search(line)
             if m:
-                dstorage_failures[f"entry failed: {redact(m.group(1))}"] += 1
+                dstorage_failures["entry failed"] += 1
                 continue
             m = RE_DSTORAGE_ZLIB_FAIL.search(line)
             if m:
@@ -227,7 +266,8 @@ def summarize_lines(lines: Iterable[str]) -> dict[str, Counter]:
                 continue
             m = RE_DSTORAGE_OPENFILE_FAIL.search(line)
             if m:
-                dstorage_failures[f"OpenFile: {redact(m.group(1))}"] += 1
+                fm = RE_OPENFILE_FAIL.match(m.group(1).strip())
+                dstorage_failures["OpenFile: fail" + (f" (err {fm.group(1)})" if fm and fm.group(1) else "" if fm else " (other)")] += 1
                 continue
             m = RE_DSTORAGE_HRESULT.search(line)
             if m:
@@ -247,7 +287,7 @@ def summarize_lines(lines: Iterable[str]) -> dict[str, Counter]:
             if m:
                 failed, norm_hr = _is_failed_hresult(m.group(2))
                 if failed:
-                    runtime_failures[(m.group(1), norm_hr)] += 1
+                    runtime_failures[(f"slot{m.group(1)}", norm_hr)] += 1
                 continue
             m = RE_RUNTIME_STORAGE.search(line)
             if m:
@@ -256,7 +296,7 @@ def summarize_lines(lines: Iterable[str]) -> dict[str, Counter]:
                 continue
             m = RE_RUNTIME_GAMESAVE.search(line)
             if m:
-                runtime_failures[("game_save_update", f"status {m.group(1)}")] += 1
+                runtime_failures[("game_save_update", f"status {_dec(m.group(1).lstrip('-')) if m.group(1).lstrip('-').isdigit() else '?'}")] += 1
                 continue
 
     return {
@@ -287,10 +327,7 @@ def summarize_shader_cache(cache_dir: Path | None) -> Counter[str]:
                 break
         if not first_line:
             first_line = "(empty .fail)"
-        cleaned = redact(first_line)
-        if len(cleaned) > 120:
-            cleaned = cleaned[:117] + "..."
-        reasons[cleaned] += 1
+        reasons["(empty .fail)" if first_line == "(empty .fail)" else classify_shader_reason(first_line)] += 1
     return reasons
 
 
@@ -324,7 +361,7 @@ def format_markdown(
     shader_cache_provided: bool,
     max_items: int,
 ) -> str:
-    """Render aggregated counters as clean-room Markdown."""
+    """Render aggregated counters as allowlisted Markdown."""
     out: list[str] = [
         "## Startup Run Triage Summary",
         "",
@@ -382,13 +419,10 @@ def format_markdown(
     dbg = summary["d3d12_debug"]
     if dbg:
         out.extend(["### `x2w-d3d12-debug` Messages", ""])
-        dbg_rows = [
-            [count, ctx, sev, msg_id, msg]
-            for (ctx, sev, msg_id, msg), count in dbg.most_common()
-        ]
+        dbg_rows = [[count, sev, msg_id] for (sev, msg_id), count in dbg.most_common()]
         out.extend(
             _format_table(
-                ["Count", "Context", "Sev", "ID", "Message (redacted)"],
+                ["Count", "Sev", "ID"],
                 dbg_rows,
                 len(dbg),
                 sum(dbg.values()),
@@ -458,7 +492,7 @@ def triage_run(
     shader_cache: Path | None = None,
     max_items: int = 16,
 ) -> str:
-    """Scan logdir (and optional shader_cache) and return a redacted Markdown summary."""
+    """Scan logdir (and optional shader_cache) and return an allowlisted Markdown summary."""
     log_files = iter_log_files(logdir)
 
     # run.ps1 / debug_launch.py capture stderr.txt while X2W_TRAP_LOG appends the same lines to trap.log:
@@ -500,7 +534,7 @@ def triage_run(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Summarize startup logs and optional shader cache into redacted Markdown."
+        description="Summarize startup logs and optional shader cache into allowlisted Markdown."
     )
     parser.add_argument("logdir", type=Path, help="Startup log directory or single log file")
     parser.add_argument(

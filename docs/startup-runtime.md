@@ -173,9 +173,12 @@ socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do no
 adds memory dumps to the stop report.
 
 `tools/startup/triage_run.py` summarizes a log directory (and optional `--shader-cache <dir>`)
-into a path-redacted, address-redacted Markdown report (`Device::slot70` refusals, unhandled
-`x2w-d3d12` / trap slots, `x2w-dstorage` failures and status HRESULTs, `x2w-runtime` failing calls,
-and `.fail` shader reasons). Check with `python3 -B tests/startup_triage_run_check.py` (ctest
+into an allowlist-only Markdown report: known reason and outcome tokens, decimal IDs and counts,
+hex HRESULT/format/flag codes, slot numbers and known shader-failure categories (`Device::slot70`
+refusals, unhandled `x2w-d3d12` / trap slots, `x2w-d3d12-debug` severity/ID counts, `x2w-dstorage`
+failures and status HRESULTs, `x2w-runtime` failing slots, and `.fail` shader categories). Any other
+text is grouped as `other (text omitted)` and never copied; raw snippets stay in the local logs.
+Check with `python3 -B tests/startup_triage_run_check.py` (ctest
 `startup_triage_run`).
 
 ## Launcher check
