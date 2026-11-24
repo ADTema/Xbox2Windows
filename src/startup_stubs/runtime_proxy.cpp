@@ -50,7 +50,7 @@ constexpr unsigned long user_provider_data1 = 0x01acd177;
 constexpr u64 local_user_handle = 0x58325755'00000001ull;  // not a pointer the runtime knows
 constexpr u64 local_user_id = 0x0009000012345678ull;
 // XStoreImpl. Method 3 is XStoreCreateContext; the handle below is the offline context it writes.
-constexpr unsigned long store_provider_data1 = 0x0dd112ac;
+constexpr GUID store_provider_id{0x0dd112ac, 0x7c24, 0x448c, {0xb9, 0x2b, 0x39, 0x60, 0xfb, 0x5b, 0xd3, 0x0c}};
 constexpr u64 store_context_handle = 0x58325753'00000001ull;  // not a pointer the runtime knows
 bool fake_user() noexcept { return x2w_local::env_on("X2W_FAKE_USER"); }
 int user_provider = -1, save_provider = -1;
@@ -73,7 +73,7 @@ bool tracked(u64 value)
 }
 bool user_call(int slot, u64* args, u64* result);
 bool save_call(int slot, u64* args, u64* result);
-bool area_call(unsigned long provider, int slot, u64* args, u64* result);
+bool area_call(const GUID& provider_id, int slot, u64* args, u64* result);
 u64 complete_async(u64 async_block);
 void* storage_object();
 const char* storage_path();
@@ -150,7 +150,7 @@ __declspec(noinline) u64 forward(Proxy* self, u64 a, u64 b, u64 c, u64 s0, u64 s
         }
     }
     if (!handled && self->provider == save_provider && N >= 3 && fake_user()) handled = save_call(N, args, &result);
-    if (!handled && N >= 3 && fake_user()) handled = area_call(provider_ids[self->provider].Data1, N, args, &result);
+    if (!handled && N >= 3 && fake_user()) handled = area_call(provider_ids[self->provider], N, args, &result);
     if (!handled && self->provider != user_provider && N >= 3 && fake_user()) {
         // Other API families cannot resolve the local user's handle: fail the call instead of passing it on.
         for (int i = 0; i < 4 && !handled; ++i) {
@@ -799,8 +799,9 @@ unsigned env_number(const char* name, unsigned fallback, int base)
     char text[32]{};
     return GetEnvironmentVariableA(name, text, sizeof(text)) ? static_cast<unsigned>(std::strtoul(text, nullptr, base)) : fallback;
 }
-bool area_call(unsigned long provider, int slot, u64* args, u64* result)
+bool area_call(const GUID& provider_id, int slot, u64* args, u64* result)
 {
+    const unsigned long provider = provider_id.Data1;
     const auto out = [](u64 pointer, std::size_t bytes) { return pointer && x2w_local::writable(reinterpret_cast<void*>(pointer), bytes); };
     if (provider == 0x973a344e && slot == 3) {  // title id (a 32-bit value from the title's manifest: X2W_TITLE_ID, hex)
         const unsigned id = env_number("X2W_TITLE_ID", 0, 16);
@@ -886,7 +887,7 @@ bool area_call(unsigned long provider, int slot, u64* args, u64* result)
         *result = 0;
         return true;
     }
-    if (provider == store_provider_data1 && slot == 3) {
+    if (slot == 3 && IsEqualGUID(provider_id, store_provider_id)) {
         // XStoreCreateContext(user, &context). Vtable slot 3 of XStoreImpl
         // (0dd112ac-7c24-448c-b92b-3960fb5bd30c): QueryInterface, AddRef, Release, then this.
         // The public GDK takes the console user and writes an XStoreContextHandle. The VIctory
@@ -918,8 +919,7 @@ int store_method3_check()
     if (!x2w_local::env_on("X2W_RUNTIME_PROXY") || !fake_user()) return 2;
     if (provider_count >= max_providers) return 3;
     const int index = provider_count++;
-    provider_ids[index] = {};
-    provider_ids[index].Data1 = store_provider_data1;
+    provider_ids[index] = store_provider_id;
     Proxy proxy{nullptr, nullptr, index};
 
     u64 context = 0;
@@ -927,10 +927,10 @@ int store_method3_check()
     if (answered != 0 || context != store_context_handle) return 4;
 
     u64 untouched = 0x1111111111111111ull;
-    provider_ids[index].Data1 = store_provider_data1 ^ 1u;  // not the store provider
+    provider_ids[index].Data4[7] ^= 1;  // same first word, different provider
     const u64 refused = forward<3>(&proxy, local_user_handle, reinterpret_cast<u64>(&untouched), 0, 0, 0, 0, 0, 0, 0, 0, 0);
     if (refused != 0x80004005 || untouched != 0x1111111111111111ull) return 5;
-    provider_ids[index].Data1 = store_provider_data1;
+    provider_ids[index] = store_provider_id;
 
     u64 foreign_out = 0x1111111111111111ull;
     const u64 foreign_user = local_user_handle ^ 1ull;
