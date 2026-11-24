@@ -28,6 +28,7 @@
 #include "startup_stubs/slice_footprints.h"
 
 #include <d3d12.h>
+#include "console_plane_size.h"
 #include "null_binding_cause.h"
 #include "null_texture_view.h"
 #include "state_block_blend.h"
@@ -379,8 +380,11 @@ Kind kind_for(REFIID iid)
     if (iid == __uuidof(ID3D12Device) || iid == __uuidof(ID3D12Device1) || iid == __uuidof(ID3D12Device2) ||
         iid == __uuidof(ID3D12Device3) || iid == __uuidof(ID3D12Device4) || iid == __uuidof(ID3D12Device5) ||
         iid == __uuidof(ID3D12Device6) || iid == __uuidof(ID3D12Device7) || iid == __uuidof(ID3D12Device8) ||
-        iid == __uuidof(ID3D12Device9) || iid == __uuidof(ID3D12Device10) || iid == __uuidof(ID3D12Device11))
+        iid == __uuidof(ID3D12Device9) || iid == __uuidof(ID3D12Device10))
         return device_kind;
+    // ID3D12Device11 arrived after the 10.0.22621 SDK headers; match its IID literally.
+    static const GUID device11 = {0x5405c344, 0xd457, 0x444e, {0xb4, 0xdd, 0x23, 0x66, 0xe4, 0x5a, 0xee, 0x39}};
+    if (iid == device11) return device_kind;
     if (iid == __uuidof(ID3D12CommandQueue)) return queue_kind;
     if (iid == __uuidof(ID3D12Fence) || iid == __uuidof(ID3D12Fence1)) return fence_kind;
     if (iid == __uuidof(ID3D12CommandAllocator)) return allocator_kind;
@@ -812,6 +816,14 @@ HRESULT __stdcall device_create_pipeline(Wrapper*, const void* desc, const GUID*
     return E_NOTIMPL;
 }
 
+void note_console_size(const D3D12_RESOURCE_DESC& desc, const D3D12_RESOURCE_ALLOCATION_INFO& info)
+{
+    static LONG calls;
+    if (first_calls(calls, 8))
+        log("x2w-d3d12 allocation info: console size 0x%llx for %llux%u format %d samples %u (shortcut: desktop is larger)",
+            info.SizeInBytes, desc.Width, desc.Height, desc.Format, desc.SampleDesc.Count);
+}
+
 // Device slot 25, desktop GetResourceAllocationInfo(visibleMask, count, descs), returned by value.
 void* __stdcall device_resource_allocation_info(void* a, void* b, UINT mask, UINT count, const D3D12_RESOURCE_DESC* descs)
 {
@@ -819,7 +831,9 @@ void* __stdcall device_resource_allocation_info(void* a, void* b, UINT mask, UIN
     Wrapper* self = receiver(a, b, &result, "Device::GetResourceAllocationInfo(no receiver)");
     std::vector<D3D12_RESOURCE_DESC> copies(count);
     for (UINT i = 0; i < count; ++i) copies[i] = sanitized(descs[i]);
-    const D3D12_RESOURCE_ALLOCATION_INFO info = device_of(self)->GetResourceAllocationInfo(mask, count, copies.data());
+    D3D12_RESOURCE_ALLOCATION_INFO info = device_of(self)->GetResourceAllocationInfo(mask, count, copies.data());
+    // A single description of a family that is larger on desktop gets its console size (console_plane_size.h).
+    if (count == 1 && x2w_startup::console_plane_size(descs[0], info)) note_console_size(descs[0], info);
     *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(result) = info;
     static LONG calls, invalid;
     if (first_calls(calls))
@@ -888,6 +902,10 @@ void* __stdcall device_resource_allocation_info1(void* a, void* b, UINT mask, UI
     if (SUCCEEDED(device_of(self)->QueryInterface(IID_PPV_ARGS(&device4)))) {
         info = device4->GetResourceAllocationInfo1(mask, count, copies.data(), info1);
         device4->Release();
+    }
+    if (count == 1 && x2w_startup::console_plane_size(descs[0], info)) {
+        if (info1) *info1 = {0, info.Alignment, info.SizeInBytes};
+        note_console_size(descs[0], info);
     }
     *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(result) = info;
     static LONG calls, invalid;
@@ -991,13 +1009,163 @@ x2w_startup::DrawReadbacks& draw_dumps()
 
 LONG render_resets, render_closes, render_clears, render_executes, render_reset_failures;
 
+// A console recording survives its allocator's Reset; a desktop one is discarded with it, and
+// resetting an allocator whose lists the GPU still runs is invalid. Each title allocator therefore
+// stands for a pool of desktop allocators. A list records on the pool's current one. In render
+// mode the title's Reset resets the current one only when no list holds a recording on it and
+// every queue has passed its last submit; otherwise the title continues on an idle allocator from
+// the pool, or a new one, and the busy one keeps its recordings. Wrappers are never freed, so
+// their addresses are stable keys.
+struct DesktopAllocator {
+    ID3D12CommandAllocator* real;
+    LONG lists;                                             // lists whose recording is on this allocator
+    std::vector<std::pair<ID3D12Fence*, UINT64>> submits;  // per queue fence: the last submit's value
+    // A submit whose completion fence could not be created or signalled: the GPU may still run it
+    // and nothing would say when it ends, so the allocator is never reset or reused again.
+    bool untracked;
+};
+struct TitleAllocator {
+    std::vector<DesktopAllocator*> pool;
+    DesktopAllocator* current = nullptr;
+    D3D12_COMMAND_LIST_TYPE type = D3D12_COMMAND_LIST_TYPE_DIRECT;  // from the lists recorded on it
+};
+SRWLOCK allocator_lock = SRWLOCK_INIT;
+std::unordered_map<Wrapper*, TitleAllocator> title_allocators;
+std::unordered_map<Wrapper*, DesktopAllocator*> list_recordings;  // list -> allocator holding its recording
+std::unordered_map<ID3D12CommandQueue*, std::pair<ID3D12Fence*, UINT64>> queue_submits;
+LONG allocator_swaps, allocator_creates;
+
+// allocator_lock held.
+TitleAllocator& title_allocator(Wrapper* allocator)
+{
+    TitleAllocator& title = title_allocators[allocator];
+    if (!title.current) {
+        title.current = new DesktopAllocator{static_cast<ID3D12CommandAllocator*>(allocator->own().real), 0, {}, false};
+        title.pool.push_back(title.current);
+    }
+    return title;
+}
+
+// allocator_lock held.
+bool allocator_idle(const DesktopAllocator* allocator)
+{
+    if (allocator->lists || allocator->untracked) return false;
+    for (const auto& submit : allocator->submits)
+        if (submit.first->GetCompletedValue() < submit.second) return false;
+    return true;
+}
+
+// Allocator slot 8, desktop Reset().
+HRESULT __stdcall allocator_reset(Wrapper* self)
+{
+    if (!render_mode()) return static_cast<ID3D12CommandAllocator*>(self->own().real)->Reset();
+    AcquireSRWLockExclusive(&allocator_lock);
+    TitleAllocator& title = title_allocator(self);
+    DesktopAllocator* next = nullptr;
+    HRESULT hr = S_OK;
+    if (allocator_idle(title.current)) {
+        next = title.current;
+    } else {
+        for (DesktopAllocator* spare : title.pool)
+            if (spare != title.current && allocator_idle(spare)) { next = spare; break; }
+        if (!next) {
+            ID3D12CommandAllocator* created = nullptr;
+            hr = device_of(the_device)->CreateCommandAllocator(title.type, IID_PPV_ARGS(&created));
+            if (SUCCEEDED(hr)) {
+                next = new DesktopAllocator{created, 0, {}, false};
+                title.pool.push_back(next);
+                InterlockedIncrement(&allocator_creates);
+            }
+        }
+    }
+    if (next) {
+        hr = next->real->Reset();
+        if (SUCCEEDED(hr)) {
+            next->submits.clear();
+            if (next != title.current) InterlockedIncrement(&allocator_swaps);
+            title.current = next;
+        }
+    }
+    const auto pool = title.pool.size();
+    ReleaseSRWLockExclusive(&allocator_lock);
+    static LONG calls;
+    if ((FAILED(hr) || pool > 1) && first_calls(calls, 4))
+        log("x2w-render allocator %p Reset -> 0x%08lx, %zu desktop allocators", static_cast<void*>(self),
+            static_cast<unsigned long>(hr), pool);
+    return hr;
+}
+
+// X2W_TEST_SUBMIT_FENCE_FAIL=1 (fixtures only): treat every submit fence as failed.
+bool submit_fence_fails()
+{
+    static const bool on = GetEnvironmentVariableW(L"X2W_TEST_SUBMIT_FENCE_FAIL", nullptr, 0) != 0;
+    return on;
+}
+
+// draw_lock held, after the lists were executed on queue. Each list's allocator holds a fence value
+// the queue must pass before the allocator can be reset. If that fence cannot be created or
+// signalled, the work is on the GPU all the same: the allocators are marked untracked instead.
+void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
+{
+    AcquireSRWLockExclusive(&allocator_lock);
+    auto& [fence, value] = queue_submits[queue];
+    if (!fence && !submit_fence_fails()) {
+        ID3D12Device* device = nullptr;
+        if (SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&device)))) {
+            if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) fence = nullptr;
+            device->Release();
+        }
+    }
+    if (fence && SUCCEEDED(queue->Signal(fence, value + 1))) {
+        ++value;
+        for (Wrapper* list : lists) {
+            const auto found = list_recordings.find(list);
+            if (found == list_recordings.end()) continue;
+            auto& submits = found->second->submits;
+            const auto same = std::find_if(submits.begin(), submits.end(), [&](const auto& s) { return s.first == fence; });
+            if (same == submits.end()) submits.emplace_back(fence, value);
+            else same->second = value;
+        }
+    } else {
+        for (Wrapper* list : lists)
+            if (const auto found = list_recordings.find(list); found != list_recordings.end()) found->second->untracked = true;
+        static LONG failures;
+        if (first_calls(failures, 2)) log("x2w-render submit fence for allocator reuse failed; the allocators are not reused");
+    }
+    ReleaseSRWLockExclusive(&allocator_lock);
+}
+
+// Fixtures: the number of desktop allocators a title allocator stands for (0 if it has none yet).
+extern "C" __declspec(dllexport) unsigned x2w_d3d12_allocator_pool_size(void* allocator)
+{
+    Wrapper* a = as_wrapper(allocator);
+    if (!a || a->own().kind != allocator_kind) return 0;
+    AcquireSRWLockShared(&allocator_lock);
+    const auto found = title_allocators.find(a);
+    const unsigned size = found == title_allocators.end() ? 0 : static_cast<unsigned>(found->second.pool.size());
+    ReleaseSRWLockShared(&allocator_lock);
+    return size;
+}
+
 // List slot 139 (Xbox order): (allocator, 0, 0), the per-frame reset.
 HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
 {
     Wrapper* a = as_wrapper(allocator);
     HRESULT hr = E_INVALIDARG;
-    if (a && a->own().kind == allocator_kind && self->own().real)
-        hr = static_cast<ID3D12GraphicsCommandList*>(self->own().real)->Reset(static_cast<ID3D12CommandAllocator*>(a->own().real), nullptr);
+    if (a && a->own().kind == allocator_kind && self->own().real) {
+        auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
+        AcquireSRWLockExclusive(&allocator_lock);
+        TitleAllocator& title = title_allocator(a);
+        title.type = list->GetType();
+        hr = list->Reset(title.current->real, nullptr);
+        if (SUCCEEDED(hr)) {
+            DesktopAllocator*& on = list_recordings[self];
+            if (on) --on->lists;
+            on = title.current;
+            ++on->lists;
+        }
+        ReleaseSRWLockExclusive(&allocator_lock);
+    }
     if (SUCCEEDED(hr)) {
         self->own().list_ready = false;
         discard_draw_sampler_heaps(self);
@@ -1610,12 +1778,14 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
 {
     static LONG calls;
     if (render_mode()) {
+        // A closed list stays submittable until its next Reset, as on the desktop.
         std::vector<ID3D12CommandList*> ready;
+        std::vector<Wrapper*> submitted;
         for (UINT i = 0; i < count; ++i) {
             Wrapper* w = as_wrapper(lists[i]);
             if (w && w->own().kind == list_kind && w->own().list_ready) {
-                w->own().list_ready = false;
                 ready.push_back(static_cast<ID3D12CommandList*>(w->own().real));
+                submitted.push_back(w);
             }
         }
         if (!ready.empty()) {
@@ -1629,6 +1799,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
                 queue->ExecuteCommandLists(ready_count, ready.data());
             }
             retire_draw_sampler_heaps(queue, ready);
+            note_submits(queue, submitted);
             ReleaseSRWLockExclusive(&draw_lock);
             InterlockedIncrement(&render_executes);
         }
@@ -2100,10 +2271,18 @@ HRESULT __stdcall device_create_command_list_x(Wrapper* self, const void* desc, 
     if (!out || !iid) return E_POINTER;
     *out = nullptr;
     ID3D12GraphicsCommandList* list = nullptr;
+    // Create on the allocator the title's allocator currently stands for: after a Reset that moved
+    // it to another desktop allocator, the first one may still be in use.
+    auto* desktop_allocator = reinterpret_cast<ID3D12CommandAllocator*>(unwrap(reinterpret_cast<u64>(allocator)));
+    if (Wrapper* a = as_wrapper(allocator); a && a->own().kind == allocator_kind) {
+        AcquireSRWLockExclusive(&allocator_lock);
+        desktop_allocator = title_allocator(a).current->real;
+        ReleaseSRWLockExclusive(&allocator_lock);
+    }
     HRESULT hr = kind_for(*iid) == list_kind
         ? device_of(self)->CreateCommandList(0, desc ? *static_cast<const D3D12_COMMAND_LIST_TYPE*>(desc)
                                                      : D3D12_COMMAND_LIST_TYPE_DIRECT,
-              reinterpret_cast<ID3D12CommandAllocator*>(unwrap(reinterpret_cast<u64>(allocator))),
+              desktop_allocator,
               reinterpret_cast<ID3D12PipelineState*>(unwrap(reinterpret_cast<u64>(pso))), IID_PPV_ARGS(&list))
         : E_NOINTERFACE;
     if (SUCCEEDED(hr)) list->Close();
@@ -2903,7 +3082,7 @@ void build_tables()
     tables[fence_kind][10] = reinterpret_cast<void*>(&fence_signal);
     tables[fence_kind][12] = reinterpret_cast<void*>(&fence_completed_address);
 
-    enable_forward<allocator_kind, 8>();                 // Reset
+    tables[allocator_kind][8] = reinterpret_cast<void*>(&allocator_reset);  // Reset
 
     // Resource: Map, Unmap, GetDesc, GetGPUVirtualAddress, Write/ReadFromSubresource, GetHeapProperties.
     tables[resource_kind][8] = reinterpret_cast<void*>(&resource_map);

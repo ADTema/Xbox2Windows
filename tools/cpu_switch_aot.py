@@ -26,7 +26,7 @@ fifth and later) and floating-point arguments are not supported.
 Flags are modeled only between a producer and its consumers (Jcc, SETcc,
 CMOVcc) in one straight-line run that no edge enters. Overflow and low-byte
 parity conditions use the producer operand width, including narrow arithmetic.
-Instructions that leave the flags unchanged (moves, LEA, NOT, SETcc, CMOVcc, and
+Instructions that leave the flags unchanged (moves, LEA, NOT, BSWAP, SETcc, CMOVcc, and
 CBW, CWDE, CDQE, CDQ and CQO) may sit between them.
 
 SHL, SHR and SAR produce flags only with an immediate count whose masked value
@@ -64,6 +64,11 @@ a zero source does not clear bits 63:32. A nonzero source zero-extends a 32-bit
 result and keeps bits 63:16 of a 16-bit destination. CF, OF, SF, PF and AF are
 undefined, so only the E and NE conditions may read them and every other
 condition is refused. The destination is read, so it must be defined.
+
+BSWAP takes a 32- or 64-bit register and reverses its bytes in place; no flag changes.
+A 32-bit BSWAP zero-extends its result into the 64-bit register like any other 32-bit
+write. The 16-bit form (operand-size prefix) is refused: the Intel SDM leaves its
+result undefined.
 
 One-operand MUL, IMUL, DIV and IDIV and the sign extensions read and write RAX
 and RDX without naming them. Products of up to 32-bit factors are computed in
@@ -242,7 +247,7 @@ STRING_TRANSFERS = {
 }
 # Instructions that neither read nor write the arithmetic flags, besides SETcc and CMOVcc,
 # which only read them.
-FLAG_NEUTRAL = {M.CLZERO, M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC, *SIGN_EXTENSIONS,
+FLAG_NEUTRAL = {M.CLZERO, M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, M.BSWAP, *SETCC, *CMOVCC, *SIGN_EXTENSIONS,
                 M.MOVSB, M.MOVSW, M.MOVSD, M.MOVSQ, M.STOSB, M.STOSW, M.STOSD, M.STOSQ, M.CLD, M.STD, M.LEAVE}
 FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC, M.NEG, *SHIFTS, *BIT_TESTS, *BIT_COUNTS, *BIT_SCANS}
 MAX_FLAG_DISTANCE = 16
@@ -1227,6 +1232,11 @@ class Lifter:
             else:
                 lines.append(self.write(ins, width, f"{a} {BIT_TESTS[mnemonic]}(1ull << {offset})"))
             return " ".join(lines), reads, writes
+        if mnemonic == M.BSWAP:
+            if width not in (4, 8) or ins.op0_kind != OpKind.REGISTER:
+                raise ValueError(f"unsupported BSWAP operands at RVA {ins.ip:#x}: the 16-bit form is undefined")
+            note(0)
+            return self.write(ins, width, f"byte_swap<{unsigned(width)}>({self.operand(ins, 0, width)})"), reads, writes
         if mnemonic in BIT_SCANS:
             if width not in (2, 4, 8) or ins.op0_kind != OpKind.REGISTER or ins.op1_kind not in (OpKind.REGISTER, OpKind.MEMORY):
                 raise ValueError(f"unsupported {str(ins).split()[0].upper()} operands at RVA {ins.ip:#x}")
@@ -2085,6 +2095,12 @@ template <class T> static inline T trailing_zeros(T value) {
 // BSR of a nonzero value: the index of its highest set bit.
 template <class T> static inline T highest_bit(T value) {
     return static_cast<T>(sizeof(T) * 8 - 1 - leading_zeros<T>(value));
+}
+// BSWAP: reverse the bytes of a 32- or 64-bit value.
+template <class T> static inline T byte_swap(T value) {
+    T result = 0;
+    for (unsigned i = 0; i < sizeof(T); ++i) result = static_cast<T>((result << 8) | ((static_cast<word>(value) >> (8 * i)) & 0xffu));
+    return result;
 }
 // A read of the function's own frame array, which cannot fault.
 template <class T> static T load(word address) {

@@ -6,10 +6,12 @@ and rdx are inputs, r8 is the output). XMM0..XMM5 are modeled as portable
 128-bit value structs (two 64-bit lanes). Only legacy encodings are accepted;
 VEX, EVEX and other non-legacy forms reject.
 
-Supported SSE instructions (12 forms from docs/coverage/x64_zen2.tsv group SSE):
+Supported SSE and SSE2 instructions (19 forms from docs/coverage/x64_zen2.tsv groups SSE, SSE2):
   - Packed float arithmetic: addps, subps, mulps, divps, minps, maxps (xmm and
     aligned m128 source, destination read and replaced) and sqrtps (xmm and
     aligned m128 source, destination only written)
+  - Packed double arithmetic: addpd, subpd, mulpd, divpd, minpd, maxpd and sqrtpd,
+    with the same operand rules (two 64-bit lanes)
   - Packed float compare: cmpps (imm8 predicates 0..7, xmm and aligned m128)
   - Scalar float compare: cmpss (imm8 predicates 0..7, xmm and m32; bits 127:32 preserved)
   - Half-qword float moves: movlps, movhps (m64 load-merge preserving the other
@@ -20,8 +22,8 @@ Arithmetic runs under the host MXCSR: the generated code executes the same
 SSE operation at run time, so the rounding mode, DAZ and FTZ are the host's
 and the translator never folds a result at translation time. A guest MXCSR
 write (ldmxcsr, vldmxcsr) is not lifted, exception flags are not observed and
-the packed double forms (addpd and its siblings), the scalar forms, rcpps and
-rsqrtps stay rejected. NaN operands are resolved in software (the first
+the scalar forms, the other packed double forms (compares, logic, conversions),
+rcpps and rsqrtps stay rejected. NaN operands are resolved in software (the first
 source operand that is a NaN, made quiet, else the second) so that a compiler
 which commutes an addition cannot change a payload.
 
@@ -56,6 +58,12 @@ BINARY_ARITH_FUNCTIONS = {
     Code.DIVPS_XMM_XMMM128: "op_divps",
     Code.MINPS_XMM_XMMM128: "op_minps",
     Code.MAXPS_XMM_XMMM128: "op_maxps",
+    Code.ADDPD_XMM_XMMM128: "op_addpd",
+    Code.SUBPD_XMM_XMMM128: "op_subpd",
+    Code.MULPD_XMM_XMMM128: "op_mulpd",
+    Code.DIVPD_XMM_XMMM128: "op_divpd",
+    Code.MINPD_XMM_XMMM128: "op_minpd",
+    Code.MAXPD_XMM_XMMM128: "op_maxpd",
 }
 
 LOAD_ALIGNED_VEC_CODES = {Code.MOVAPS_XMM_XMMM128, Code.MOVDQA_XMM_XMMM128}
@@ -65,6 +73,7 @@ ALLOWED_CODES = {
     Code.RETNQ,
     *BINARY_ARITH_FUNCTIONS,
     Code.SQRTPS_XMM_XMMM128,
+    Code.SQRTPD_XMM_XMMM128,
     Code.CMPPS_XMM_XMMM128_IMM8,
     Code.CMPSS_XMM_XMMM32_IMM8,
     Code.MOVLPS_XMM_M64,
@@ -83,7 +92,7 @@ ALLOWED_CODES = {
 PRELUDE = """#include <atomic>
 #include <cstdint>
 #include <cstring>
-#include <xmmintrin.h>
+#include <emmintrin.h>
 
 using word = std::uint64_t;
 
@@ -237,6 +246,73 @@ static inline Vec128 op_sqrtps(const Vec128& src) {
     return result;
 }
 
+static inline __m128d to_m128d(const Vec128& v) {
+    __m128d out;
+    std::memcpy(&out, v.q, sizeof(out));
+    return out;
+}
+
+static inline Vec128 from_m128d(__m128d v) {
+    Vec128 out;
+    std::memcpy(out.q, &v, sizeof(out.q));
+    return out;
+}
+
+static inline bool is_nan64_bits(std::uint64_t bits) {
+    return (bits & 0x7fffffffffffffffull) > 0x7ff0000000000000ull;
+}
+
+// The double lanes follow the single rule: the first NaN source, made quiet, else the second.
+// The host instruction supplies every other lane, so rounding, DAZ and FTZ stay the host's.
+static inline Vec128 with_nan_sources_pd(const Vec128& a, const Vec128& b, Vec128 result) {
+    for (unsigned i = 0; i < 2u; ++i) {
+        if (is_nan64_bits(a.q[i])) {
+            result.q[i] = a.q[i] | 0x0008000000000000ull;
+        } else if (is_nan64_bits(b.q[i])) {
+            result.q[i] = b.q[i] | 0x0008000000000000ull;
+        }
+    }
+    return result;
+}
+
+static inline Vec128 op_addpd(const Vec128& a, const Vec128& b) {
+    return with_nan_sources_pd(a, b, from_m128d(_mm_add_pd(to_m128d(a), to_m128d(b))));
+}
+
+static inline Vec128 op_subpd(const Vec128& a, const Vec128& b) {
+    return with_nan_sources_pd(a, b, from_m128d(_mm_sub_pd(to_m128d(a), to_m128d(b))));
+}
+
+static inline Vec128 op_mulpd(const Vec128& a, const Vec128& b) {
+    return with_nan_sources_pd(a, b, from_m128d(_mm_mul_pd(to_m128d(a), to_m128d(b))));
+}
+
+static inline Vec128 op_divpd(const Vec128& a, const Vec128& b) {
+    return with_nan_sources_pd(a, b, from_m128d(_mm_div_pd(to_m128d(a), to_m128d(b))));
+}
+
+// MINPD and MAXPD return the second source operand for equal values and for any NaN, as the
+// single forms do; the host instruction is used as is.
+static inline Vec128 op_minpd(const Vec128& a, const Vec128& b) {
+    return from_m128d(_mm_min_pd(to_m128d(a), to_m128d(b)));
+}
+
+static inline Vec128 op_maxpd(const Vec128& a, const Vec128& b) {
+    return from_m128d(_mm_max_pd(to_m128d(a), to_m128d(b)));
+}
+
+// The root comes from the host instruction on a run-time operand (never the C library, which
+// can disagree with the hardware on denormal inputs under DAZ). A NaN lane comes back quiet.
+static inline Vec128 op_sqrtpd(const Vec128& src) {
+    Vec128 result = from_m128d(_mm_sqrt_pd(to_m128d(src)));
+    for (unsigned i = 0; i < 2u; ++i) {
+        if (is_nan64_bits(src.q[i])) {
+            result.q[i] = src.q[i] | 0x0008000000000000ull;
+        }
+    }
+    return result;
+}
+
 static inline std::uint32_t op_cmpss_d(std::uint32_t a, std::uint32_t b, std::uint8_t imm8) {
     return cmp_f32(d_as_float(a), d_as_float(b), imm8);
 }
@@ -329,6 +405,11 @@ def lift_code(name, start, raw):
             src = vec_src128(1, ins, alignment=16)
             dst_idx, dst_name = write_vec(0, ins)
             statements.append(f"{dst_name} = op_sqrtps({src});")
+            defined.add(dst_idx)
+        elif ins.code == Code.SQRTPD_XMM_XMMM128:
+            src = vec_src128(1, ins, alignment=16)
+            dst_idx, dst_name = write_vec(0, ins)
+            statements.append(f"{dst_name} = op_sqrtpd({src});")
             defined.add(dst_idx)
         elif ins.code == Code.CMPPS_XMM_XMMM128_IMM8:
             imm = ins.immediate8 & 0xff

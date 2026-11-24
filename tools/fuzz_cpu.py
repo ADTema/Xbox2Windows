@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import random
 import re
+import struct
 import sys
 
 WIDTHS = {
@@ -32,6 +33,8 @@ class Function:
     export: bool = True
     # Only AL is defined in RAX when it returns, so a caller widens it and no tail jump reaches it.
     narrow: bool = False
+    # A scalar float export: '<ret>:<slots>' as cpu_sse_aot names it, for example 'd:ffq'. None for three 64-bit integer slots.
+    signature: str | None = None
 
     def asm(self):
         head = [f"    {line}" for line in self.prolog]
@@ -732,12 +735,359 @@ def generate_switches(seed, count):
     return [*functions, *(switch_control(f"fuzz_switch_refused_{kind}", kind) for kind in SWITCH_CONTROLS)]
 
 
+# Scalar float and double shapes: random leaf functions over the scalar SSE and SSE2 instructions that
+# cpu_sse_aot lifts. Each export is fn(x, y, out) with the slots numbered as in the Windows x64 convention: x and
+# y are a float (f), a double (d) or a 64-bit integer (q), in XMM0 and XMM1 or in RCX and RDX by slot number, and
+# the output buffer is the third slot, in R8. The Function's signature is the descriptor '<ret>:<slots>' that
+# names its export for cpu_sse_aot, such as 'd:fdq'. Float and double results are compared bit for bit, with every
+# NaN payload, because the translator models those bits; a float result is its low dword.
+FP_WIDTH = {"f": 4, "d": 8}
+FP_OPERAND = {4: "DWORD PTR", 8: "QWORD PTR"}
+FP_REGISTERS = tuple(f"xmm{number}" for number in range(6))
+FP_INTEGER_REGISTERS = ("rax", "rcx", "rdx", "r9", "r10", "r11")
+FP_ARITHMETIC = ("add", "sub", "mul", "div")
+FP_EXTREMA = ("min", "max")
+# Only the conditional jumps that cpu_sse_aot accepts after a float compare: the unordered result sets ZF, PF and CF.
+FP_CONDITIONS = ("e", "ne", "b", "ae", "be", "a")
+# Every argument combination, then the combinations that have at least one floating-point slot.
+FP_KINDS = tuple(a + b for a in "fdq" for b in "fdq")
+FP_COMPARE_KINDS = tuple(kinds for kinds in FP_KINDS if kinds != "qq")
+FP_COUNT_OPERATIONS = (4, 9)
+FP_SINGLES = (0x00000000, 0x80000000, 0x3f800000, 0xbf800000, 0x3fc00000, 0x00000001, 0x007fffff, 0x00800000,
+              0x7f7fffff, 0x7f800000, 0xff800000, 0x7fc00000, 0xffc12345, 0x7f800001, 0x4f000000, 0xcf000000,
+              0x5f000000)
+FP_DOUBLES = (0x0000000000000000, 0x8000000000000000, 0x3ff0000000000000, 0xbff0000000000000, 0x3ff8000000000000,
+              0x0000000000000001, 0x000fffffffffffff, 0x0010000000000000, 0x7fefffffffffffff, 0x7ff0000000000000,
+              0xfff0000000000000, 0x7ff8000000000000, 0xfff8000012345678, 0x7ff0000000000001, 0x41e0000000000000,
+              0xc1e0000000000000, 0x43e0000000000000)
+FP_INTEGERS = (0, 1, 2, 3, 0xFFFFFFFFFFFFFFFF, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF, 0x100000000,
+               0x7FFFFFFFFFFFFFFF, 0x8000000000000000, 0xFFFFFFFF80000000, (1 << 53) + 1, 0x1000001, 0xDEADBEEF,
+               0x12345678, 0xA5A5A5A5A5A5A5A5)
+# Values around the edges of the conversions that the full cross of the lists above leaves out.
+FP_EXTRA = {"f": (0x4effffff, 0xcf000001, 0x5effffff, 0xdf000000, 0x3dcccccd, 0x33800000, 0x4b800001, 0xffa00000,
+                  0xff7fffff, 0x807fffff),
+            "d": (0x41dfffffffe00000, 0xc1e0000000200000, 0x43dfffffffffffff, 0xc3e0000000000000, 0x3fb999999999999a,
+                  0x800fffffffffffff, 0xffefffffffffffff, 0xfff7ffffffffffff),
+            "q": (0x100000001, 0xFFFFFFFE, 0x7FFFFFFE, 0x8000000000000001)}
+FP_POOLS = {"f": FP_SINGLES, "d": FP_DOUBLES, "q": FP_INTEGERS}
+FP_JUNK = 0xDEADBEEF << 32
+# Each profile: the argument combinations, the result kinds and the weight of every operation.
+FP_PROFILES = (
+    ("single", ("ff",), "ffq", {"arith4": 6, "extrema4": 2, "root4": 2, "copy": 2, "store": 1, "load": 1, "zero": 1,
+                                "compare": 1}, ()),
+    ("double", ("dd",), "ddq", {"arith8": 6, "extrema8": 2, "root8": 2, "copy": 2, "store": 1, "load": 1, "zero": 1,
+                                "compare": 1}, ()),
+    ("extrema", ("ff", "dd", "fd", "df"), "fdq", {"extrema4": 3, "extrema8": 3, "root4": 1, "root8": 1, "arith4": 1,
+                                                  "arith8": 1, "resize": 2, "copy": 1, "compare": 1}, ("extrema4",)),
+    ("compare", FP_COMPARE_KINDS, "fdq", {"compare": 4, "arith4": 1, "arith8": 1, "resize": 1, "constant": 1,
+                                          "to_int": 1}, ("compare",)),
+    ("convert", FP_KINDS, "fdq", {"from_int": 4, "to_int": 4, "resize": 3, "constant": 2, "movd": 2, "copy": 1,
+                                  "arith4": 1, "arith8": 1, "root4": 1, "root8": 1, "spill": 1, "compare": 1},
+     ("from_int", "to_int")),
+    ("mixed", FP_KINDS, "fdq", {"arith4": 2, "arith8": 2, "extrema4": 1, "extrema8": 1, "root4": 1, "root8": 1,
+                                "copy": 2, "load": 1, "store": 1, "zero": 1, "resize": 2, "from_int": 2, "to_int": 2,
+                                "constant": 1, "movd": 1, "spill": 1, "compare": 2}, ()),
+)
+# Negative controls: the shape that the translator must refuse, the signature and the reason it must give.
+FP_CONTROLS = {
+    "setcc": ("q:ffq", ["ucomiss xmm0, xmm1", "seta al", "movzx eax, al", "ret"], "unsupported flag producer"),
+    "condition": ("q:ffq", ["ucomiss xmm0, xmm1", "jle {name}_le", "mov eax, 1", "ret", "{name}_le:", "xor eax, eax",
+                            "ret"], "unsupported condition after a float compare"),
+    "unwritten": ("f:ffq", ["addss xmm0, xmm2", "ret"], "undefined register xmm2"),
+    "narrow": ("d:ffq", ["addsd xmm0, xmm1", "ret"], "undefined register xmm0[63:32]"),
+}
+
+
+class FpBuilder:
+    """Emits one scalar float function and follows which low bytes of each XMM register and which general
+    registers hold a defined value, so that it reads only what cpu_sse_aot accepts: the lifter refuses a read
+    of a register that is undefined on some path, and the upper dword of a float argument is not part of it."""
+
+    def __init__(self, name, rng, kinds, result, weights):
+        self.name, self.rng, self.kinds, self.result, self.weights = name, rng, kinds, result, weights
+        self.lines = []
+        self.labels = 0
+        self.defined = {register: 0 for register in FP_REGISTERS}
+        self.ints = set()
+        for number, kind in enumerate(kinds):
+            if kind == "q":
+                self.ints.add(("rcx", "rdx")[number])
+            else:
+                self.defined[f"xmm{number}"] = FP_WIDTH[kind]
+
+    def emit(self, line):
+        self.lines.append(line)
+
+    def state(self):
+        return dict(self.defined), set(self.ints)
+
+    def restore(self, state):
+        self.defined, self.ints = dict(state[0]), set(state[1])
+
+    def live(self, least):
+        return [register for register in FP_REGISTERS if self.defined[register] >= least]
+
+    def memory(self, size, low=0, high=0xE0):
+        """An operand in the output buffer, at a multiple of 4 that also straddles earlier stores."""
+        return f"{FP_OPERAND[size]} [r8+{self.rng.randrange(low, high - size + 1, 4)}]"
+
+    def source(self, width):
+        """A register that holds at least width bytes, or a memory operand of that size. Memory often reads
+        the arguments that the function stored first, so edge values reach it without a register."""
+        registers = self.live(width)
+        if registers and self.rng.random() < 0.65:
+            return self.rng.choice(registers)
+        if self.rng.random() < 0.5:
+            return f"{FP_OPERAND[width]} [r8+{self.rng.choice((0, 8) if width == 8 else (0, 4, 8, 12))}]"
+        return self.memory(width)
+
+    def store_arguments(self):
+        for number, kind in enumerate(self.kinds):
+            target = f"[r8+{8 * number}]"
+            if kind == "q":
+                self.emit(f"mov QWORD PTR {target}, {('rcx', 'rdx')[number]}")
+            else:
+                self.emit(f"{'movss' if kind == 'f' else 'movsd'} {FP_OPERAND[FP_WIDTH[kind]]} {target}, xmm{number}")
+
+    def arithmetic(self, width, names):
+        destinations = self.live(width)
+        if not destinations:
+            return False
+        suffix = "ss" if width == 4 else "sd"
+        self.emit(f"{self.rng.choice(names)}{suffix} {self.rng.choice(destinations)}, {self.source(width)}")
+        return True
+
+    def root(self, width):
+        destination = self.rng.choice(FP_REGISTERS)
+        self.emit(f"sqrt{'ss' if width == 4 else 'sd'} {destination}, {self.source(width)}")
+        self.defined[destination] = max(self.defined[destination], width)
+        return True
+
+    def copy(self):
+        form = self.rng.choice(("movaps", "movss", "movsd", "movq"))
+        sources = self.live(4 if form in ("movaps", "movss") else 8)
+        if not sources:
+            return False
+        source, destination = self.rng.choice(sources), self.rng.choice(FP_REGISTERS)
+        self.emit(f"{form} {destination}, {source}")
+        # A register copy keeps what is defined; MOVSS between registers writes the low dword only.
+        written = {"movaps": self.defined[source], "movss": max(self.defined[destination], 4)}.get(form, 8)
+        self.defined[destination] = written
+        return True
+
+    def load(self):
+        form, width = self.rng.choice((("movss", 4), ("movsd", 8), ("movq", 8)))
+        destination = self.rng.choice(FP_REGISTERS)
+        self.emit(f"{form} {destination}, {self.memory(width)}")
+        self.defined[destination] = 8  # a load clears the rest of the register
+        return True
+
+    def store(self):
+        form, width = self.rng.choice((("movss", 4), ("movsd", 8), ("movd", 4), ("movq", 8)))
+        sources = self.live(width)
+        if not sources:
+            return False
+        self.emit(f"{form} {self.memory(width, 0x10, 0x80)}, {self.rng.choice(sources)}")
+        return True
+
+    def zero(self):
+        destination = self.rng.choice(FP_REGISTERS)
+        self.emit(f"{self.rng.choice(('xorps', 'xorpd', 'pxor'))} {destination}, {destination}")
+        self.defined[destination] = 8
+        return True
+
+    def resize(self):
+        narrow = self.rng.random() < 0.5
+        destination = self.rng.choice(FP_REGISTERS)
+        width = 8 if narrow else 4
+        self.emit(f"{'cvtsd2ss' if narrow else 'cvtss2sd'} {destination}, {self.source(width)}")
+        self.defined[destination] = max(self.defined[destination], 12 - width)
+        return True
+
+    def from_integer(self):
+        suffix, size = self.rng.choice(("ss", "sd")), self.rng.choice((4, 8))
+        if self.ints and self.rng.random() < 0.7:
+            source = part(self.rng.choice(sorted(self.ints)), size)
+        else:
+            source = self.memory(size)
+        destination = self.rng.choice(FP_REGISTERS)
+        self.emit(f"cvtsi2{suffix} {destination}, {source}")
+        self.defined[destination] = max(self.defined[destination], 4 if suffix == "ss" else 8)
+        return True
+
+    def to_integer(self):
+        form, width = self.rng.choice((("cvttss2si", 4), ("cvttsd2si", 8)))
+        sources = self.live(width)
+        source = self.rng.choice(sources) if sources and self.rng.random() < 0.65 else self.memory(width)
+        destination = self.rng.choice(FP_INTEGER_REGISTERS)
+        self.emit(f"{form} {part(destination, self.rng.choice((4, 8)))}, {source}")
+        self.ints.add(destination)
+        return True
+
+    def constant(self):
+        destination = self.rng.choice(FP_INTEGER_REGISTERS)
+        value = self.rng.choice((0, 1, 5, 0x7FFFFFFF, -0x80000000, -1, 0x12345678))
+        self.emit(f"mov {part(destination, 4)}, {value}")
+        self.ints.add(destination)
+        return True
+
+    def spill(self):
+        if not self.ints:
+            return False
+        size = self.rng.choice((4, 8))
+        register = part(self.rng.choice(sorted(self.ints)), size)
+        self.emit(f"mov {self.memory(size, 0x10, 0x80)}, {register}")
+        return True
+
+    def movd(self):
+        if self.ints and self.rng.random() < 0.5:
+            destination = self.rng.choice(FP_REGISTERS)
+            self.emit(f"movd {destination}, {part(self.rng.choice(sorted(self.ints)), 4)}")
+            self.defined[destination] = 8
+            return True
+        sources = self.live(4)
+        if not sources:
+            return False
+        destination = self.rng.choice(FP_INTEGER_REGISTERS)
+        self.emit(f"movd {part(destination, 4)}, {self.rng.choice(sources)}")
+        self.ints.add(destination)
+        return True
+
+    def compare(self):
+        """A float compare, one or two conditional jumps and an arm for each outcome, joined afterwards. A
+        value that only some arms define is undefined after the join."""
+        width = self.rng.choice((4, 8))
+        registers = self.live(width)
+        if not registers:
+            return False
+        kind = f"{self.rng.choice(('ucomis', 'comis'))}{'s' if width == 4 else 'd'}"
+        self.emit(f"{kind} {self.rng.choice(registers)}, {self.source(width)}")
+        self.labels += 1
+        stem = f"{self.name}_{self.labels}"
+        taken, unordered, join = f"{stem}_t", f"{stem}_u", f"{stem}_j"
+        if self.rng.random() < 0.4:
+            # The idiom of a compiler's equality test: the parity jump first, then the ordered condition.
+            self.emit(f"j{self.rng.choice(('p', 'np'))} {unordered}")
+            self.emit(f"j{self.rng.choice(FP_CONDITIONS)} {taken}")
+            arms = [None, unordered, taken]
+        else:
+            self.emit(f"j{self.rng.choice(FP_CONDITIONS + ('p', 'np'))} {taken}")
+            arms = [None, taken]
+        start, outcomes = self.state(), []
+        for position, label in enumerate(arms):
+            self.restore(start)
+            if label:
+                self.emit(f"{label}:")
+            for _ in range(self.rng.randint(1, 3)):
+                self.straight()
+            if self.result == "q":
+                self.emit(f"mov eax, {self.rng.randrange(1, 1000)}")
+                self.ints.add("rax")
+            outcomes.append(self.state())
+            if position < len(arms) - 1:
+                self.emit(f"jmp {join}")
+        self.emit(f"{join}:")
+        self.defined = {register: min(state[0][register] for state in outcomes) for register in FP_REGISTERS}
+        self.ints = set.intersection(*(state[1] for state in outcomes))
+        return True
+
+    def operation(self, name):
+        table = {"arith4": lambda: self.arithmetic(4, FP_ARITHMETIC), "arith8": lambda: self.arithmetic(8, FP_ARITHMETIC),
+                 "extrema4": lambda: self.arithmetic(4, FP_EXTREMA), "extrema8": lambda: self.arithmetic(8, FP_EXTREMA),
+                 "root4": lambda: self.root(4), "root8": lambda: self.root(8), "copy": self.copy, "load": self.load,
+                 "store": self.store, "zero": self.zero, "resize": self.resize, "from_int": self.from_integer,
+                 "to_int": self.to_integer, "constant": self.constant, "spill": self.spill, "movd": self.movd,
+                 "compare": self.compare}
+        return table[name]()
+
+    def straight(self):
+        """One operation that is not a compare, tried again with another choice when it has no operands."""
+        names = [name for name in self.weights if name != "compare"]
+        for _ in range(12):
+            if self.operation(self.rng.choices(names, [self.weights[name] for name in names])[0]):
+                return
+
+    def finish(self):
+        """Show every live register in the buffer, then put the result in XMM0 or RAX."""
+        rng = self.rng
+        for slot, register in enumerate(FP_REGISTERS):
+            if self.defined[register] and rng.random() < 0.85:
+                form, width = ("movsd", 8) if self.defined[register] == 8 and rng.random() < 0.7 else ("movss", 4)
+                self.emit(f"{form} {FP_OPERAND[width]} [r8+{0x80 + 8 * slot}], {register}")
+        for slot, register in enumerate(sorted(self.ints)):
+            self.emit(f"mov QWORD PTR [r8+{0xC0 + 8 * slot}], {register}")
+        if self.result == "q":
+            if "rax" not in self.ints or (len(self.ints) > 1 and rng.random() < 0.4):
+                others = sorted(self.ints - {"rax"})
+                self.emit(f"mov rax, {rng.choice(others)}" if others else f"mov eax, {rng.randrange(1, 1000)}")
+        else:
+            width = FP_WIDTH[self.result]
+            sources = self.live(width)
+            if not sources:
+                self.emit(f"{'movss' if width == 4 else 'movsd'} xmm0, {self.memory(width)}")
+            elif (source := rng.choice(sources)) != "xmm0":
+                self.emit(f"{rng.choice(('movaps', 'movss' if width == 4 else 'movsd'))} xmm0, {source}")
+        self.emit("ret")
+
+
+def scalar_fp_function(name, rng, profile):
+    _, kinds, results, weights, required = profile
+    kinds, result = rng.choice(kinds), rng.choice(results)
+    builder = FpBuilder(name, rng, kinds, result, weights)
+    builder.store_arguments()
+    for operation in required:
+        builder.operation(operation)
+    for _ in range(rng.randint(*FP_COUNT_OPERATIONS)):
+        for _ in range(12):
+            if builder.operation(rng.choices(list(weights), list(weights.values()))[0]):
+                break
+    builder.finish()
+    return Function(name, builder.lines, signature=f"{result}:{kinds}q")
+
+
+def scalar_fp_control(name, kind):
+    """A negative control: a function with one construct that cpu_sse_aot must refuse."""
+    signature, lines, reason = FP_CONTROLS[kind]
+    return Function(name, [line.format(name=name) for line in lines], signature=signature, refused=reason)
+
+
+def generate_scalar_fp(seed, count):
+    """Exports over scalar float and double arithmetic, then four refused controls.
+
+    The exports cycle through six profiles (float arithmetic, double arithmetic, MIN and MAX, compares with
+    jumps, conversions, and a mixture), each with its own argument kinds and operation weights.
+    """
+    rng = random.Random(seed)
+    functions = [scalar_fp_function(f"fuzz_fp_{index}", rng, FP_PROFILES[index % len(FP_PROFILES)])
+                 for index in range(count)]
+    return [*functions, *(scalar_fp_control(f"fuzz_fp_refused_{kind}", kind) for kind in FP_CONTROLS)]
+
+
+def fp_inputs(seed, kinds):
+    """313 pairs for the first two slots of kinds: every combination of 17 edge values (zeros, ones, the
+    smallest and largest denormals and normals, infinities, quiet and signalling NaNs with payloads, and the
+    values at the integer conversion limits), then 24 pairs of extra edges and random bits."""
+    first, second = FP_POOLS[kinds[0]], FP_POOLS[kinds[1]]
+    values = [(a, b) for a in first for b in second]
+    rng = random.Random(seed ^ 0xF10A7)
+    while len(values) < 313:
+        pair = []
+        for kind in kinds:
+            pool = FP_POOLS[kind] + FP_EXTRA[kind]
+            pair.append(rng.choice(pool) if rng.random() < 0.6 else rng.getrandbits(32 if kind == "f" else 64))
+        values.append(tuple(pair))
+    return values
+
+
 AREAS = {"leaf": (generate, "cpu_fuzz"), "frames": (generate_frames, "cpu_fuzz_frames"),
          "calls": (generate_calls, "cpu_fuzz_calls"), "chains": (generate_chains, "cpu_fuzz_chains"),
-         "switches": (generate_switches, "cpu_fuzz_switches")}
+         "switches": (generate_switches, "cpu_fuzz_switches"),
+         "scalar_fp": (generate_scalar_fp, "cpu_fuzz_scalar_fp")}
 
 
-def inputs_for(seed, area="leaf"):
+def inputs_for(seed, area="leaf", signature=None):
+    if area == "scalar_fp":
+        return fp_inputs(seed, signature.split(":")[1][:2])
     boundary = [
         0, 1, 2, 3, 7, 0x0F, 0x10, 0x1F, 0x20, 0x3F, 0x40, 0x7F, 0x80, 0x81, 0xFF, 0x100,
         0x7FFF, 0x8000, 0xFFFF, 0x10000, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF, 0x100000000,
@@ -756,6 +1106,48 @@ def inputs_for(seed, area="leaf"):
                   + [(upper | selector, rng.getrandbits(64)) for selector in range(4)
                      for upper in (1 << 32, 0x80000000, 0xFFFFFFFF00000000)] + values)
     return values[:313]
+
+
+def bind_symbol(symbol, function):
+    """Declare a loaded export's prototype: three 64-bit integer slots, or the function's own signature,
+    where a float or double slot is passed as a double so that every bit pattern reaches the XMM register."""
+    result, kinds = function.signature.split(":") if function.signature else ("q", "qqq")
+    symbol.argtypes = [ctypes.c_uint64 if kind == "q" else ctypes.c_double for kind in kinds]
+    symbol.restype = ctypes.c_uint64 if result == "q" else ctypes.c_double
+
+
+def call_symbol(symbol, function, x, y, out):
+    """Call an export on x, y and the output pointer. A float takes the low 32 bits of its value, with the high
+    half set to a pattern that the function must ignore; a float result is its low 32 bits."""
+    if function.signature is None:
+        return symbol(x, y, out)
+    result, kinds = function.signature.split(":")
+    slots = []
+    for kind, value in zip(kinds, (x, y, out)):
+        bits = (value & 0xFFFFFFFF | FP_JUNK) if kind == "f" else value
+        slots.append(value if kind == "q" else struct.unpack("<d", struct.pack("<Q", bits))[0])
+    answer = symbol(*slots)
+    if result == "q":
+        return answer
+    bits = struct.unpack("<Q", struct.pack("<d", answer))[0]
+    return bits & 0xFFFFFFFF if result == "f" else bits
+
+
+def translator_module(area):
+    """The module that lifts the functions of an area: the scalar SSE lifter, or the shared one."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    if area == "scalar_fp":
+        import cpu_sse_aot
+
+        return cpu_sse_aot
+    import cpu_switch_aot
+
+    return cpu_switch_aot
+
+
+def export_name(function):
+    """The name a translator takes for an export: with its signature when it has one."""
+    return f"{function.name}={function.signature}" if function.signature else function.name
 
 
 def first_difference(left, right):
@@ -780,7 +1172,6 @@ def run_check(seed, count, native, lifted, o2, only=None, input_index=None, area
     functions = AREAS[area][0](seed, count)
     controls = [function for function in functions if function.refused]
     functions = [function for function in functions if not function.refused and function.export]
-    inputs = inputs_for(seed, area)
     libraries = [(native, ""), (lifted, "lifted_"), (o2, "lifted_")]
     if mutant is not None:
         libraries.append((mutant, "lifted_"))
@@ -789,31 +1180,35 @@ def run_check(seed, count, native, lifted, o2, only=None, input_index=None, area
         library = ctypes.CDLL(str(path))
         for function in functions:
             symbol = getattr(library, prefix + function.name)
-            symbol.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64]
-            symbol.restype = ctypes.c_uint64
+            bind_symbol(symbol, function)
         loaded.append((library, prefix))
 
     native_library, lifted_library, o2_library = (item[0] for item in loaded[:3])
     if count <= 0:
         raise SystemExit("CPU_FUZZ_FUNCTIONS must be positive")
     selected = [function for function in functions if only is None or function.name == only]
-    selected_inputs = [(index, value) for index, value in enumerate(inputs) if input_index is None or index == input_index]
+
+    def function_inputs(function):
+        return [(index, value) for index, value in enumerate(inputs_for(seed, area, function.signature))
+                if input_index is None or index == input_index]
+
     if not selected:
         raise SystemExit(f"no generated function matches --only {only!r}")
-    if not selected_inputs:
+    if not function_inputs(selected[0]):
         raise SystemExit(f"no input matches --input {input_index}")
     checks = 0
     for function in selected:
         native_symbol = getattr(native_library, function.name)
+        cases = function_inputs(function)
         for variant, library in (("default", lifted_library), ("/O2", o2_library)):
             lifted_symbol = getattr(library, "lifted_" + function.name)
-            for index, (x, y) in selected_inputs:
+            for index, (x, y) in cases:
                 native_buffer = ctypes.create_string_buffer(288)
                 lifted_buffer = ctypes.create_string_buffer(288)
                 ctypes.memset(native_buffer, 0x5A, len(native_buffer))
                 ctypes.memset(lifted_buffer, 0x5A, len(lifted_buffer))
-                native_return = native_symbol(x, y, ctypes.addressof(native_buffer) + 16)
-                lifted_return = lifted_symbol(x, y, ctypes.addressof(lifted_buffer) + 16)
+                native_return = call_symbol(native_symbol, function, x, y, ctypes.addressof(native_buffer) + 16)
+                lifted_return = call_symbol(lifted_symbol, function, x, y, ctypes.addressof(lifted_buffer) + 16)
                 checks += 1
                 difference = first_difference(native_buffer.raw, lifted_buffer.raw)
                 if native_return != lifted_return or difference is not None:
@@ -833,15 +1228,13 @@ def run_check(seed, count, native, lifted, o2, only=None, input_index=None, area
                     print(f"reproduce: {command}", file=sys.stderr)
                     return 1
     prefix = "" if area == "leaf" else f"area={area} "
-    print(f"{prefix}seed={seed:#x} functions={len(selected)} inputs={len(selected_inputs)} "
+    print(f"{prefix}seed={seed:#x} functions={len(selected)} inputs={len(function_inputs(selected[0]))} "
           f"comparisons={checks} default and /O2 matched")
     if controls and only is None:
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        import cpu_switch_aot
-
+        lifter = translator_module(area)
         for control in controls:
             try:
-                cpu_switch_aot.translate(Path(native), [control.name])
+                lifter.translate(Path(native), [export_name(control)])
             except ValueError as error:
                 if control.refused not in str(error):
                     print(f"{control.name} refused for another reason: {error}", file=sys.stderr)
@@ -858,13 +1251,13 @@ def run_check(seed, count, native, lifted, o2, only=None, input_index=None, area
         for function in selected:
             native_symbol = getattr(native_library, function.name)
             mutant_symbol = getattr(mutant_library, "lifted_" + function.name)
-            for _, (x, y) in selected_inputs:
+            for _, (x, y) in function_inputs(function):
                 native_buffer = ctypes.create_string_buffer(288)
                 mutant_buffer = ctypes.create_string_buffer(288)
                 ctypes.memset(native_buffer, 0x5A, len(native_buffer))
                 ctypes.memset(mutant_buffer, 0x5A, len(mutant_buffer))
-                native_return = native_symbol(x, y, ctypes.addressof(native_buffer) + 16)
-                mutant_return = mutant_symbol(x, y, ctypes.addressof(mutant_buffer) + 16)
+                native_return = call_symbol(native_symbol, function, x, y, ctypes.addressof(native_buffer) + 16)
+                mutant_return = call_symbol(mutant_symbol, function, x, y, ctypes.addressof(mutant_buffer) + 16)
                 total += 1
                 if native_return != mutant_return or native_buffer.raw != mutant_buffer.raw:
                     mismatches += 1
@@ -971,30 +1364,42 @@ def plant_table_rotate(cpu_switch_aot, image, functions):
     cpu_switch_aot.Function.dispatch = dispatch
 
 
+def plant_minmax_swap(cpu_sse_aot, image, functions):
+    """Make MINSS and MINSD keep the larger operand and MAXSS and MAXSD the smaller one.
+
+    This is a planted translator fault for the negative control: only a compare that ends in the
+    destination or the source operand changes, so equal operands and NaNs still agree and every other
+    instruction is untouched.
+    """
+    from iced_x86 import Mnemonic as M
+
+    extrema = cpu_sse_aot.EXTREMA
+    for low, high in ((M.MINSS, M.MAXSS), (M.MINSD, M.MAXSD)):
+        extrema[low], extrema[high] = extrema[high], extrema[low]
+
+
 MUTANTS = {"frames": ("reload_shift", plant_reload_shift), "calls": ("call_retarget", plant_call_retarget),
            "chains": ("swapped_arguments", plant_swapped_arguments),
-           "switches": ("table_rotate", plant_table_rotate)}
+           "switches": ("table_rotate", plant_table_rotate), "scalar_fp": ("minmax_swap", plant_minmax_swap)}
 
 
 def translate(seed, count, image, output, area="leaf", mutant=False):
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import cpu_switch_aot
-
+    lifter = translator_module(area)
     functions = AREAS[area][0](seed, count)
     if mutant:
         if area not in MUTANTS:
             raise SystemExit(f"no planted translator fault for --area {area}")
-        MUTANTS[area][1](cpu_switch_aot, image, functions)
+        MUTANTS[area][1](lifter, image, functions)
     # Negative controls stay in the image for the check to translate on their own.
     functions = [function for function in functions if not function.refused and function.export]
-    names = [function.name for function in functions]
+    names = [export_name(function) for function in functions]
     try:
-        source, _ = cpu_switch_aot.translate(Path(image), names)
+        source, _ = lifter.translate(Path(image), names)
     except ValueError as error:
         print(f"seed={seed:#x} functions={count}: {error}", file=sys.stderr)
         for function in functions:
             try:
-                cpu_switch_aot.translate(Path(image), [function.name])
+                lifter.translate(Path(image), [export_name(function)])
             except ValueError as inner:
                 print(f"refused {function.name}: {inner}", file=sys.stderr)
                 print(function.asm(), file=sys.stderr)

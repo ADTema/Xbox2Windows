@@ -11,6 +11,7 @@
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/inflate.h"
 #include "startup_stubs/dstorage_file_read.h"
+#include "startup_stubs/bcpack_decoder.h"
 
 #include <psapi.h>
 
@@ -397,7 +398,8 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                     bool cached_chunked = false;
                     // If the stream expanded beyond this request's destination and continuation chunks are queued
                     // in this submission, scope the cache to those identified continuation requests and serve slice 0 (Refs #1136, #1214).
-                    if (!memory_source && produced > destination_size && self && self->work) {
+                    // BCPack streams are atomic multi-lane rANS payloads; they are not chunk-split continuation streams (Refs #1139).
+                    if (!memory_source && !bcpack && produced > destination_size && self && self->work) {
                         auto continuation_ids = following_chunk_ids(self, submission_id, source, offset, source_size, destination_size, produced);
                         if (!continuation_ids.empty()) {
                             QueueWork& work = *self->work;
@@ -470,13 +472,29 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 }
             }
         }
+        bool bcpack_decoded = false;
         if (data && bcpack) {
-            // shortcut: BCPack is not decoded yet; the texels are left zero (a blank texture) so the
-            // title's loading continues. Counted as bcpack_blank.
-            output.assign(destination_size, 0);
-            data = output.data();
-            decode_length = destination_size;
-            outcome = "BCPack not decoded: zero-filled";
+            if (bcpack == 7 || bcpack == 1) {
+                std::vector<unsigned char> decoded(destination_size);
+                std::size_t produced = 0;
+                if (x2w_bcpack::decode_bcpack(data, decode_length, bcpack, decoded.data(), decoded.size(), &produced)) {
+                    output = std::move(decoded);
+                    data = output.data();
+                    decode_length = produced;
+                    outcome = zlib ? "inflated + bcpack decoded" : "bcpack decoded";
+                    bcpack_decoded = true;
+                } else {
+                    outcome = "bcpack failed";
+                    data = nullptr;
+                }
+            } else {
+                // shortcut for formats not decoded yet: texels are left zero (a blank texture) so the
+                // title's loading continues. Counted as bcpack_blank.
+                output.assign(destination_size, 0);
+                data = output.data();
+                decode_length = destination_size;
+                outcome = "BCPack not decoded: zero-filled";
+            }
         }
         if (data) {
             // Track decode length and destination capacity as separate values (Refs #1144).
@@ -523,9 +541,9 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 std::memcpy(destination, data, decode_length);
             }
             if (written) {
-                if (bcpack) {
+                if (bcpack && !bcpack_decoded) {
                     InterlockedIncrement(&requests_bcpack_blank);
-                } else if (zlib) {
+                } else if (zlib || bcpack) {
                     InterlockedIncrement(&requests_compressed);
                 } else {
                     InterlockedIncrement(&requests_done);
@@ -833,6 +851,8 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
                                   static_cast<unsigned long long>(sample.sections));
                 else
                     std::snprintf(section_text, sizeof(section_text), "unknown");
+                // Heartbeat preserves "inflated=%ld" format string for tools/startup/live_view.py;
+                // requests_compressed counts all compressed streams (zlib and standalone/embedded BCPack).
                 log("x2w-dstorage heartbeat %d s: requests done=%ld inflated=%ld failed=%ld bcpack-blank=%ld; page tokens 0 at enqueue=%ld, "
                     "still 0 at run=%ld; %s, live physical-page sections=%s", second, requests_done, requests_compressed,
                     requests_failed, requests_bcpack_blank, zero_tokens_at_enqueue, zero_tokens_at_run, memory,
