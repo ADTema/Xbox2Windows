@@ -124,6 +124,12 @@ These are measured on one executable; treat them as hypotheses for others.
   the one on the calling thread's stack is the return buffer.
 - **Inline samplers.** Pixel shaders build sampler descriptors from constants (`s_movk_i32`,
   `s_bfm_b32`, 64-bit moves); the translator folds those into static samplers.
+- **Flat parameters.** `v_interp_mov_f32` reads a `nointerpolation uint4` copy written from the
+  exported registers, so integer words reach the pixel stage unchanged. FXC folds `asfloat()` of a
+  constant and flushes binary32 denormal patterns such as 1 or 2 to 0, which a float copy lost
+  ([#1259](https://github.com/R0Y00/Xbox2Windows/issues/1259)). Colour exports of constant integer
+  words still go through `float4` and have the same loss. Reproduce with
+  `ctest --preset release --no-tests=error -R "^startup_flat_param_"`.
 - **Stream-cache identity.** A cached zlib stream is served only to the exact queued
   continuation entries in the same DirectStorage queue. The lookup checks the enqueued request
   id, the source, the compressed size and the destination chunk size. A later independent

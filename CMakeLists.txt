@@ -443,6 +443,7 @@ add_custom_command(OUTPUT "${startup_sampler_x_cs}" COMMAND "${DXC_EXECUTABLE}" 
     DEPENDS tests/startup_sampler_x.hlsl VERBATIM)
 target_sources(offscreen_check PRIVATE tests/startup_sampler_x.cpp "${startup_sampler_x_cs}")
 target_sources(offscreen_check PRIVATE tests/startup_sampler_heap.cpp)
+target_sources(offscreen_check PRIVATE tests/startup_flat_param.cpp)
 # Colour-blend register decoding (src/startup_stubs/cb_blend.h, #1216): decoder table plus draws
 # compared with a CPU model of the register fields.
 set(startup_cb_blend_vs "${CMAKE_CURRENT_BINARY_DIR}/startup_cb_blend_vs.h")
@@ -1093,6 +1094,16 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_sampler_heap_check.py" wrapped "$<TARGET_FILE:d3d12_xs_shim>" ${adapter})
         set_tests_properties(startup_sampler_heap_wrapped_${adapter} PROPERTIES TIMEOUT 30
             ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=1")
+    endforeach()
+    # gfx2hlsl flat parameters keep the exported words (#1259): translation controls, then a desktop
+    # draw of the translated pair with FXC 5_1 (the --pending path) and DXC 6_0.
+    add_test(NAME startup_flat_param_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_flat_param_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_flat_param_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_flat_param_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_flat_param_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
     add_test(NAME startup_xg_bc7_layout COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_xg_bc7_layout_check.py" "$<TARGET_FILE:startup_stub_xg_xs>")

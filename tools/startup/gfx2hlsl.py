@@ -674,7 +674,7 @@ class Stage:
 
     def op_v_interp_mov_f32(self, ops, mods):
         attr, comp = self.note_attr(ops[2], 'flat')
-        self.set_v(reg_range(ops[0])[1], 'U(i.fparam%d.%s)' % (attr, comp))
+        self.set_v(reg_range(ops[0])[1], 'i.fparam%d.%s' % (attr, comp))
 
     def note_attr(self, tok, how):
         m = re.fullmatch(r'attr(\d+)\.([xyzw])', tok)
@@ -755,13 +755,21 @@ class Stage:
         if 'compr' in flags:
             a, b = self.u(vals[0]), self.u(vals[2])
             exprs = ['f16tof32(%s)' % a, 'f16tof32(%s >> 16)' % a, 'f16tof32(%s)' % b, 'f16tof32(%s >> 16)' % b]
+            words = ['U(%s)' % e for e in exprs]
         else:
             exprs = ['0.0' if v == 'off' else 'F(%s)' % self.u(v) for v in vals]
+            words = ['0u' if v == 'off' else self.u(v) for v in vals]
         name = {'pos0': 'pos'}.get(target, target)
         if not re.fullmatch(r'pos|param\d+|mrt[0-7]', name):
             raise Unsupported('export target %s' % target)
         self.exports[name] = True
         self.emit('o.%s = float4(%s);' % (name, ', '.join(exprs)))
+        if name.startswith('param'):
+            # The flat copy read by v_interp_mov_f32 carries the register words. A float copy would let
+            # FXC fold asfloat() of a constant and flush integer bit patterns that are binary32
+            # denormals (#1259). hlsl_vs() drops the line for attributes the pixel stage reads only
+            # interpolated.
+            self.emit('o.f%s = uint4(%s);' % (name, ', '.join(words)))
         return None
 
     # ---- output ------------------------------------------------------------------------------
@@ -965,7 +973,7 @@ class Pipeline:
             fields.append('    float4 param%d : PARAM%d;' % (p, p))
         # Attributes read without interpolation get a second, flat copy of the vertex output.
         for p in self.flat:
-            fields.append('    nointerpolation float4 fparam%d : FPARAM%d;' % (p, p))
+            fields.append('    nointerpolation uint4 fparam%d : FPARAM%d;' % (p, p))
         fields.append('    float4 pos : SV_Position;')
         return fields
 
@@ -973,7 +981,9 @@ class Pipeline:
         s = self.vs
         out = self.common() + ['struct VSOut {'] + self.interface(False) + ['};', 'VSOut body(uint vid) {', '    VSOut o = (VSOut)0;']
         s.used_v.add(0)
-        out += s.declarations() + ['    v0 = vid;'] + s.body() + ['    o.fparam%d = o.param%d;' % (p, p) for p in self.flat] + ['    return o;', '}',
+        flat = re.compile(r'\s*o\.fparam(\d+) = ')
+        body = [line for line in s.body() if not (flat.match(line) and int(flat.match(line).group(1)) not in self.flat)]
+        out += s.declarations() + ['    v0 = vid;'] + body + ['    return o;', '}',
             '// Rectangle lists arrive as six vertices per rectangle: corners 0 1 2, 0 2 and the fourth corner 0 + 2 - 1.',
             'VSOut main(uint vid : SV_VertexID) {',
             '    if (ud%d == 0) return body(vid);' % self.rect,
