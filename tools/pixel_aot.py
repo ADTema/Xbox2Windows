@@ -3849,6 +3849,91 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             cond = f"(asint({a}) {op_sym} asint({b}))" if signed else f"({a} {op_sym} {b})"
             lines.append(f"    bool scc{i} = {cond};")
             scc = f"scc{i}"
+        elif m := match(r"(s_movrels_b32|s_movrels_b64|s_movreld_b32|s_movreld_b64|s_movrelsd_2_b32) "
+                         r"(s\d+|s\[\d+:\d+\]), (s\d+|s\[\d+:\d+\])"):
+            # Scalar relative moves (#1882): s_movrels reads SGPR[src + m0], s_movreld writes SGPR[dst + m0], and
+            # s_movrelsd_2_b32 reads SGPR[src + m0[9:0]] and writes SGPR[dst + m0[25:16]]; _b64 moves a pair.
+            op, dst, src = m.groups()
+            width = 2 if op.endswith("_b64") else 1
+            dbase = int((sgpr_pair(dst)[0] if width == 2 else sgpr_name(dst))[1:])
+            sbase = int((sgpr_pair(src)[0] if width == 2 else sgpr_name(src))[1:])
+            m0 = scalar.get("m0")
+            if isinstance(m0, int):
+                m0_u = m0 & 0xffffffff
+                soffs, doffs = {"s_movrels_b32": ([m0_u], [0]), "s_movrels_b64": ([m0_u], [0]),
+                                "s_movreld_b32": ([0], [m0_u]), "s_movreld_b64": ([0], [m0_u]),
+                                "s_movrelsd_2_b32": ([m0_u & 0x3ff], [(m0_u >> 16) & 0x3ff])}[op]
+                soff_expr = doff_expr = None
+            elif isinstance(m0, tuple) and len(m0) == 2 and m0[0] == "uint":
+                if "m0" not in scalar_mask:
+                    raise ValueError(f"Dynamic m0 offset is unbounded for {op}")
+                mask_u = scalar_mask["m0"] & 0xffffffff
+                whole = f"{m0[1]}"
+                if op.startswith("s_movrels_"):
+                    soffs, doffs, soff_expr, doff_expr = masked_offsets(mask_u), [0], whole, None
+                elif op.startswith("s_movreld_"):
+                    soffs, doffs, soff_expr, doff_expr = [0], masked_offsets(mask_u), None, whole
+                else:
+                    soffs, doffs = masked_offsets(mask_u & 0x3ff), masked_offsets((mask_u >> 16) & 0x3ff)
+                    soff_expr, doff_expr = f"({whole} & 0x3ffu)", f"(({whole} >> 16) & 0x3ffu)"
+            else:
+                raise ValueError(f"Unsupported m0 value for {op}")
+            if any(sbase + k + width - 1 > 105 for k in soffs) or any(dbase + k + width - 1 > 105 for k in doffs):
+                raise ValueError(f"Indexed SGPR exceeds s105 for {op}")
+            if width == 2 and any((sbase + k) % 2 or (dbase + k) % 2 for k in (*soffs, *doffs)):
+                raise ValueError(f"Odd 64-bit SGPR pair base for {op}")
+            reach_src = [f"s{sbase + k + h}" for k in soffs for h in range(width)]
+            reach_dst = [f"s{dbase + k + h}" for k in doffs for h in range(width)]
+            if any(r in pending for r in (*reach_src, *reach_dst)):
+                raise ValueError("Unresolved scalar memory dependency")
+            if soff_expr is None and doff_expr is None:
+                # A static index: the move is an s_mov from or to the indexed SGPR, tracked value and mask included.
+                moved = [(scalar[f"s{sbase + soffs[0] + h}"], scalar_mask.get(f"s{sbase + soffs[0] + h}"))
+                         for h in range(width)]
+                for h, (val, src_mask) in enumerate(moved):
+                    reg = f"s{dbase + doffs[0] + h}"
+                    scalar[reg] = val
+                    if isinstance(val, int):
+                        scalar_mask[reg] = val & 0xffffffff
+                    elif src_mask is not None:
+                        scalar_mask[reg] = src_mask
+            else:
+                # A dynamic index selects among plain numeric SGPRs only, so no resource depends on a runtime index.
+                words = []
+                if soff_expr is not None:
+                    lines.append(f"    uint smov_soff{i} = {soff_expr};")
+                for h in range(width):
+                    if soff_expr is None:
+                        reg = f"s{sbase + soffs[0] + h}"
+                        words.append((scalar_u32(reg, scalar, pending), scalar_mask.get(reg, 0xffffffff)))
+                        continue
+                    choices = [(k, f"s{sbase + k + h}") for k in soffs]
+                    value = scalar_u32(choices[-1][1], scalar, pending)
+                    mask_or = scalar_mask.get(choices[-1][1], 0xffffffff)
+                    for k, reg in reversed(choices[:-1]):
+                        value = f"(smov_soff{i} == {k}u ? {scalar_u32(reg, scalar, pending)} : {value})"
+                        mask_or |= scalar_mask.get(reg, 0xffffffff)
+                    lines.append(f"    uint salu{i}_s{h} = {value};")
+                    words.append((f"salu{i}_s{h}", mask_or))
+                if doff_expr is None:
+                    for h, (word, mask_w) in enumerate(words):
+                        reg = f"s{dbase + doffs[0] + h}"
+                        scalar[reg] = ("uint", word)
+                        scalar_mask[reg] = mask_w
+                else:
+                    lines.append(f"    uint smov_doff{i} = {doff_expr};")
+                    old = {reg: (scalar_u32(reg, scalar, pending), scalar_mask.get(reg, 0xffffffff))
+                           for reg in dict.fromkeys(reach_dst)}
+                    for k in doffs:
+                        for h, (word, mask_w) in enumerate(words):
+                            reg = f"s{dbase + k + h}"
+                            prev, prev_mask = old[reg]
+                            name = f"salu{i}_d{dbase + k + h}"
+                            lines.append(f"    uint {name} = (smov_doff{i} == {k}u ? {word} : {prev});")
+                            old[reg] = (name, prev_mask | mask_w)
+                    for reg, (name, mask_w) in old.items():
+                        scalar[reg] = ("uint", name)
+                        scalar_mask[reg] = mask_w
         elif m := match(r"(s_mov_b32|s_movk_i32) (s\d+|m0), (s\d+|0x[0-9a-f]+|\d+)"):
             op, dst, src = m.groups()
             if src in pending or dst in pending:

@@ -16396,6 +16396,69 @@ def _check_controls_inline(directory):
         else:
             raise AssertionError(f"Plain movrel accepted {bad_seq}")
 
+    # Scalar s_movrel* (#1882): a static move keeps a tracked descriptor pointer, and the refusals.
+    moved, copied = smovrel_descriptor_programs()
+    assert translate(moved) == translate(copied)
+    sbank = ["s_mov_b32 s60, 10", "s_mov_b32 s61, 20", "s_mov_b32 s62, 40", "s_mov_b32 s63, 80"]
+    # Overlaps, with the moved constant visible in the export: every source is read before any write.
+    export = ["v_cvt_f32_u32_e32 v12, s60", "v_cvt_f32_u32_e32 v13, s61", "v_cvt_f32_u32_e32 v14, s62",
+              "v_cvt_f32_u32_e32 v15, s63"]
+    for label, moves, words in (
+        ("a register moved onto itself", ["s_mov_b32 m0, 1", "s_movreld_b32 s60, s61"], (10, 20, 40, 80)),
+        ("a pair moved onto an overlapping pair", ["s_mov_b32 m0, 1", "s_movreld_b64 s[60:61], s[60:61]"], None),
+        ("a pair read from an overlapping pair", ["s_mov_b32 m0, 2", "s_movrels_b64 s[62:63], s[60:61]"],
+         (10, 20, 40, 80)),
+        ("s_movrelsd_2 within one bank", ["s_mov_b32 m0, 0x10002", "s_movrelsd_2_b32 s60, s60"], (10, 40, 40, 80)),
+        ("a pair shifted inside one bank", ["s_mov_b32 m0, 2", "s_movreld_b64 s[60:61], s[60:61]"],
+         (10, 20, 10, 20)),
+    ):
+        try:
+            hlsl = translate(with_constants(sbank + moves + export))
+        except ValueError as error:
+            assert words is None and "Odd 64-bit SGPR pair base" in str(error), (label, error)
+            continue
+        assert words is not None, f"{label} was accepted"
+        got = re.findall(r"float\(asuint\(asfloat\((\d+)u\)\)\)", hlsl)
+        assert tuple(map(int, got[-4:])) == words, (label, got)
+    # A dynamic s_movreld whose source lies in its own destination bank writes the source's old value.
+    overlap = translate(with_constants(sbank + ["s_bfe_u32 s56, s44, 0x20000", "s_mov_b32 m0, s56",
+                                                "s_movreld_b32 s60, s61"] + export))
+    for reg, old in ((60, 10), (61, 20), (62, 40), (63, 80)):
+        assert re.search(rf"uint salu\d+_d{reg} = \(smov_doff\d+ == {reg - 60}u \? 20u : {old}u\);", overlap), reg
+    for bad_seq, message in (
+        (["s_movrels_b32 s70, s60"], "Unsupported m0 value for s_movrels_b32"),
+        (sbank + ["s_mov_b32 m0, s44", "s_movrels_b32 s70, s60"], "Unsupported m0 value"),
+        (sbank + ["s_add_u32 s56, s44, 1", "s_mov_b32 m0, s56", "s_movrels_b32 s70, s60"],
+         "Dynamic m0 offset is unbounded"),
+        (sbank + ["s_mov_b32 m0, 50", "s_movrels_b32 s70, s60"], "Indexed SGPR exceeds s105"),
+        (sbank + ["s_mov_b32 m0, 1", "s_movrels_b64 s[70:71], s[60:61]"], "Odd 64-bit SGPR pair base"),
+        # A dynamic index may only select plain numeric words: s20 holds the descriptor table pointer.
+        (sbank + ["s_bfe_u32 s56, s44, 0x20000", "s_mov_b32 m0, s56", "s_movrels_b32 s70, s18"],
+         "Expected a numeric scalar register"),
+        # ... and may only overwrite plain numeric words, which keep their old value when not selected.
+        (sbank + ["s_bfe_u32 s56, s44, 0x20000", "s_mov_b32 m0, s56", "s_movreld_b32 s20, s60"],
+         "Expected a numeric scalar register"),
+        (sbank + ["s_mov_b32 m0, 10", "s_movreld_b32 s100, s60"], "Indexed SGPR exceeds s105"),
+        # A dynamic offset whose mask allows an odd value would give an odd pair base.
+        (sbank + ["s_bfe_u32 s56, s44, 0x20000", "s_mov_b32 m0, s56", "s_movrels_b64 s[70:71], s[60:61]"],
+         "Odd 64-bit SGPR pair base"),
+    ):
+        try:
+            translate(with_constants(bad_seq))
+        except ValueError as error:
+            assert message in str(error), (bad_seq, error)
+        else:
+            raise AssertionError(f"Scalar movrel accepted {bad_seq}")
+    # The indexed SGPRs of an outstanding scalar load are not read before its s_waitcnt: s45 is still loading.
+    early = with_constants([])
+    at = early.index("s_buffer_load_dwordx4 s[44:47], s[44:47], 0xc") + 1
+    try:
+        translate(early[:at] + ["s_mov_b32 m0, 1", "s_movrels_b32 s70, s44"] + early[at:])
+    except ValueError as error:
+        assert "Unresolved scalar memory dependency" in str(error), error
+    else:
+        raise AssertionError("Scalar movrel read an outstanding scalar load")
+
     # v_swaprel_b32 (#1795): bounded selects on both sides, and the movrel refusals.
     assert "swap_doff" in translate(with_constants(SWAPREL_BODY))
     # Dynamic offsets whose two banks overlap: v24..v27 is both the source and the destination range.
@@ -17722,6 +17785,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((with_constants(PLAIN_MOVREL_BODY), translate))
     fixtures.append((with_constants(swap_movrel_encodings(PLAIN_MOVREL_BODY)), translate))
     fixtures.append((with_constants(SWAPREL_BODY), translate))
+    fixtures.append((with_constants(SMOVREL_BODY), translate))
     fixtures.append((uncompressed_export(DPP_F16_CVT_LANES), translate_f16))
     fixtures.append((uncompressed_export(DPP_F16_CVT_WORDS), translate_f16))
     fixtures.extend((bit_program(op), translate) for op in BIT_OPERATIONS)
@@ -20836,6 +20900,156 @@ def swaprel_reference(w0, w1, w2, w3):
     return expected
 
 
+# Scalar s_movrel* (#1882): each channel moves cbuffer-indexed SGPR words and exports their weighted sum.
+# R: s_movrels_b32 (dynamic m0 = word0 & 3, static m0 = 2). G: s_movreld_b32 into s64..s67 (dynamic m0 = word1 & 3,
+# static m0 = 1). B: the _b64 forms (static s_movrels_b64 with m0 = 2; s_movreld_b64 with the even dynamic
+# m0 = (word0 & 1) * 2) into s76..s79. A: s_movrelsd_2_b32 into s80..s83 (dynamic m0 = word3 & 0x30003, static
+# m0 = 0x20001).
+SMOVREL_BODY = [
+    "s_mov_b32 s60, 10",
+    "s_mov_b32 s61, 20",
+    "s_mov_b32 s62, 40",
+    "s_mov_b32 s63, 80",
+    # R
+    "s_bfe_u32 s56, s44, 0x20000",
+    "s_mov_b32 m0, s56",
+    "s_movrels_b32 s70, s60",
+    "s_mov_b32 m0, 2",
+    "s_movrels_b32 s71, s60",
+    "v_cvt_f32_u32_e32 v20, s70",
+    "v_cvt_f32_u32_e32 v21, s71",
+    "v_add_f32_e32 v12, v20, v21",
+    # G
+    "s_mov_b32 s64, 1",
+    "s_mov_b32 s65, 2",
+    "s_mov_b32 s66, 3",
+    "s_mov_b32 s67, 4",
+    "s_mov_b32 s72, 5",
+    "s_bfe_u32 s57, s45, 0x20000",
+    "s_mov_b32 m0, s57",
+    "s_movreld_b32 s64, s72",
+    "s_mov_b32 s72, 7",
+    "s_mov_b32 m0, 1",
+    "s_movreld_b32 s64, s72",
+    "v_cvt_f32_u32_e32 v24, s64",
+    "v_cvt_f32_u32_e32 v25, s65",
+    "v_cvt_f32_u32_e32 v26, s66",
+    "v_cvt_f32_u32_e32 v27, s67",
+    "v_fma_f32 v28, 2.0, v25, v24",
+    "v_fma_f32 v28, 4.0, v26, v28",
+    "v_fma_f32 v13, 0x41000000, v27, v28",
+    # B
+    "s_mov_b32 s76, 1",
+    "s_mov_b32 s77, 2",
+    "s_mov_b32 s78, 3",
+    "s_mov_b32 s79, 4",
+    "s_mov_b32 m0, 2",
+    "s_movrels_b64 s[74:75], s[60:61]",
+    "s_mov_b32 s68, s44",
+    "s_mov_b32 s69, 0",
+    "s_and_b64 s[68:69], s[68:69], 1",
+    "s_lshl_b64 s[68:69], s[68:69], 1",
+    "s_mov_b32 m0, s68",
+    "s_movreld_b64 s[76:77], s[74:75]",
+    "v_cvt_f32_u32_e32 v32, s76",
+    "v_cvt_f32_u32_e32 v33, s77",
+    "v_cvt_f32_u32_e32 v34, s78",
+    "v_cvt_f32_u32_e32 v35, s79",
+    "v_fma_f32 v36, 2.0, v33, v32",
+    "v_fma_f32 v36, 4.0, v34, v36",
+    "v_fma_f32 v14, 0x41000000, v35, v36",
+    # A
+    "s_mov_b32 s80, 1",
+    "s_mov_b32 s81, 2",
+    "s_mov_b32 s82, 3",
+    "s_mov_b32 s83, 4",
+    "s_mov_b32 s84, s47",
+    "s_mov_b32 s85, 0",
+    "s_and_b64 s[84:85], s[84:85], 0x30003",
+    "s_mov_b32 m0, s84",
+    "s_movrelsd_2_b32 s80, s60",
+    "s_mov_b32 m0, 0x20001",
+    "s_movrelsd_2_b32 s80, s60",
+    "v_cvt_f32_u32_e32 v40, s80",
+    "v_cvt_f32_u32_e32 v41, s81",
+    "v_cvt_f32_u32_e32 v42, s82",
+    "v_cvt_f32_u32_e32 v43, s83",
+    "v_fma_f32 v44, 2.0, v41, v40",
+    "v_fma_f32 v44, 4.0, v42, v44",
+    "v_fma_f32 v15, 0x41000000, v43, v44",
+]
+
+
+def smovrel_reference(w0, w1, w2, w3):
+    """Independent reference for SMOVREL_BODY on a list of SGPR words."""
+    bank = [10, 20, 40, 80]
+    weighted = lambda b: b[0] + 2 * b[1] + 4 * b[2] + 8 * b[3]
+    r = bank[w0 & 3] + bank[2]
+    g = [1, 2, 3, 4]
+    g[w1 & 3] = 5
+    g[1] = 7
+    b = [1, 2, 3, 4]
+    off = (w0 & 1) * 2
+    b[off], b[off + 1] = bank[2], bank[3]
+    a = [1, 2, 3, 4]
+    a[(w3 >> 16) & 3] = bank[w3 & 3]
+    a[2] = bank[1]
+    expected = tuple(float(x) for x in (r, weighted(g), weighted(b), weighted(a)))
+    for x in expected:
+        assert single(x) == x == half_rtz(x), x
+    return expected
+
+
+def smovrel_descriptor_programs():
+    """The sampled program with its texture descriptor pointer first moved to s[72:73], once by s_movrels_b64 with a
+    static m0 and once by two s_mov_b32: the translations must be equal, so a static move keeps a tracked pointer."""
+    def program(move):
+        base = assembly(False)
+        at = base.index("s_mov_b32 s21, 0") + 1
+        moved = base[:at] + move + base[at:]
+        return [line.replace("s_load_dwordx8 s[28:35], s[20:21], null", "s_load_dwordx8 s[28:35], s[72:73], null")
+                for line in moved]
+    return (program(["s_mov_b32 m0, 4", "s_movrels_b64 s[72:73], s[16:17]"]),
+            program(["s_mov_b32 s72, s20", "s_mov_b32 s73, s21"]))
+
+
+def check_smovrel_draw(directory, compiler, renderer, backend):
+    program = with_constants(SMOVREL_BODY)
+    source = directory / "smovrel.hlsl"
+    shader = directory / "smovrel.cso"
+    case = directory / "smovrel.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    source.write_text(translate(program), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    references = [smovrel_reference(*words) for words in DPP_MOVREL_SETS]
+    if references[0] == references[1]:
+        raise AssertionError("The two constant sets do not tell the dynamic m0 offsets apart")
+    for words, expected in zip(DPP_MOVREL_SETS, references):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+    print(f"scalar movrel: static and dynamic s_movrels/s_movreld (b32, b64) and s_movrelsd_2 matched {references}")
+    constants = bytearray(256)
+    struct.pack_into("<4I", constants, 12, *DPP_MOVREL_SETS[0])
+    case.write_bytes(constants + struct.pack("<4f", *references[0]) * 64)
+    for old, new, label in (
+        ("s_mov_b32 m0, s56", "s_mov_b32 m0, 0", "s_movrels_b32 with the dynamic m0 ignored"),
+        ("s_mov_b32 m0, s57", "s_mov_b32 m0, 0", "s_movreld_b32 with the dynamic m0 ignored"),
+        ("s_mov_b32 m0, s68", "s_mov_b32 m0, 0", "s_movreld_b64 with the dynamic m0 ignored"),
+        ("s_mov_b32 m0, 0x20001", "s_mov_b32 m0, 0x10002", "s_movrelsd_2_b32 with the static m0 halves swapped"),
+    ):
+        mutated = [line.replace(old, new) for line in program]
+        assert mutated != program, label
+        source.write_text(translate(mutated), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Control {label} escaped detection")
+        print(f"control {label}: pixel mismatch, as required")
+    return 0
+
+
 def check_swaprel_draw(directory, compiler, renderer, backend):
     program = with_constants(SWAPREL_BODY)
     source = directory / "swaprel.hlsl"
@@ -23404,13 +23618,14 @@ def main():
                     "draw-region-body", "draw-region-waits", "draw-region-scalar-alu", "draw-region-scalar-load", "draw-div-fmas",
                     "draw-cmp64", "draw-cmp-f64", "draw-shift64",
                     "draw-f16-arith", "draw-f16-round", "draw-f16-fmac-ldexp", "draw-f16-cvt-int16", "draw-f16-to-int16", "draw-flat-scratch", "draw-smem-pointers", "draw-sopk-hwreg",
-                    "draw-dpp-cvt", "draw-dpp-movrel", "draw-plain-movrel", "draw-swaprel", "draw-dpp-f16", "draw-dpp-extra", "draw-pk-fmac"):
+                    "draw-dpp-cvt", "draw-dpp-movrel", "draw-plain-movrel", "draw-swaprel", "draw-smovrel", "draw-dpp-f16", "draw-dpp-extra", "draw-pk-fmac"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-dpp-cvt": check_dpp_cvt_draw,
                         "draw-dpp-movrel": check_dpp_movrel_draw,
                         "draw-plain-movrel": check_plain_movrel_draw,
                         "draw-swaprel": check_swaprel_draw,
+                        "draw-smovrel": check_smovrel_draw,
                         "draw-dpp-extra": check_dpp_extra_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
                         "draw-integer-nc": check_integer_nc_draws,
