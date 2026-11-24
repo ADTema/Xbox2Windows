@@ -190,7 +190,7 @@ bool bind_bc7(ID3D12Device* desktop, void* guest, const StartupBc7Input& input, 
 }  // namespace
 
 int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels, const StartupBc7Input* bc7,
-                      DXGI_FORMAT format, std::uint32_t export_word)
+                      DXGI_FORMAT format, std::uint32_t export_word, bool two_targets)
 {
     const bool bc = GetEnvironmentVariableW(L"X2W_TEST_BC_VIEW", nullptr, 0) != 0;
     const bool bc_chain = GetEnvironmentVariableW(L"X2W_TEST_BC_CHAIN", nullptr, 0) != 0;
@@ -201,7 +201,8 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     const bool narrow = format == DXGI_FORMAT_A8_UNORM || format == DXGI_FORMAT_R8_UNORM;
     const UINT width = bc_chain ? 384 : bc7 ? bc7->width : bc ? 4 * 128 : single ? 1 : 8;
     const UINT height = bc_chain ? 32 : bc7 ? bc7->height : bc ? 128 : single ? 1 : 4;
-    const UINT count = integer ? 2 : 1;
+    // two_targets: a second RGBA8 target of the same size, written after the first in the output.
+    const UINT count = integer || two_targets ? 2 : 1;
     ComPtr<ID3D12Device> desktop;
     if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
     Bc7Binding binding;

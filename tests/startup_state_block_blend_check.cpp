@@ -82,12 +82,13 @@ int main()
     if (x2w_startup::state_block_blend(block.data(), block.size(), false, &untouched, &reason) || untouched.AlphaToCoverageEnable != 77 || !reason)
         fail("refused target 0", "not refused, or the output was written");
 
-    // The same form on targets 1-7 only: target 0 is answered, the others are unblended and reported.
+    // The same form on targets 1-7 only: the whole block is refused and every refused target is
+    // reported. No target is given an unblended stand-in, which would change what it draws.
     block = block_with(0xE5040504, x2w_cb_blend::control_word(11, 0, 5, 11, 0, 5, true, true));
-    if (!x2w_startup::state_block_blend(block.data(), block.size(), false, &blend, &reason, &refused) || refused != 0xFE ||
-        !blend.RenderTarget[0].BlendEnable || blend.RenderTarget[3].BlendEnable ||
-        blend.RenderTarget[3].RenderTargetWriteMask != D3D12_COLOR_WRITE_ENABLE_ALL)
-        fail("refused other targets", "target 0 lost, or a refused target is blended or unreported");
+    reason = nullptr;
+    if (x2w_startup::state_block_blend(block.data(), block.size(), false, &untouched, &reason, &refused) || refused != 0xFE ||
+        untouched.AlphaToCoverageEnable != 77 || !reason)
+        fail("refused other targets", "not refused, a refused target is unreported, or the output was written");
 
     if (failures) {
         std::printf("startup_state_block_blend: %d FAILED\n", failures);

@@ -248,10 +248,17 @@ These are measured on one executable; treat them as hypotheses for others.
 - Colour-blend registers reach the draw path for pipelines created through device slot 57 only
   (#1216): state block A holds the eight `CB_BLENDn_CONTROL` words at +0xD0, and
   `src/startup_stubs/state_block_blend.h` decodes them into the translated pipeline's blend
-  state. `CB_TARGET_MASK` is not located, so all four channels are written. A word the decoder
-  refuses on render target 0 leaves the pipeline opaque, as before, and is logged
-  (`ctest --preset release --no-tests=error -R "^startup_state_block_blend$"`). A draw through a
-  slot 57 pipeline that tells blended from opaque output is still missing.
+  state. `CB_TARGET_MASK` is not located, so all four channels are written; no fixture covers a
+  write mask on this path. A word the decoder refuses for any of the eight targets leaves the
+  registers unused: the pipeline keeps the path it had before and the refusal is logged. No target
+  is drawn unblended in place of a refused word
+  (`ctest --preset release --no-tests=error -R "^startup_state_block_blend$"`).
+  `tests/startup_slot57_blend_draw_check.py` draws through a source-built slot 57 pipeline: red
+  with alpha 0.5 over opaque blue reads (128, 0, 128, 191) within one step with SRC_ALPHA /
+  INV_SRC_ALPHA in target 0's word and (255, 0, 0, 128) with ENABLE clear or with the word four
+  bytes before or after +0xD0. With two targets bound each follows its own word, and a refused
+  word for the second leaves both unblended
+  (`ctest --preset release --no-tests=error -R "^startup_slot57_blend_draw_" -V`).
   A graphics stream can supply a desktop `D3D12_BLEND_DESC` directly. `src/startup_stubs/cb_blend.h`
   decodes `CB_BLENDn_CONTROL` and a `CB_TARGET_MASK` nibble into `D3D12_RENDER_TARGET_BLEND_DESC`. It
   refuses forms D3D12 can't express (`BOTH_SRC_ALPHA`, constant alpha without alpha blend factor

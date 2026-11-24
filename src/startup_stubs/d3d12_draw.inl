@@ -284,8 +284,7 @@ BoundPipeline* translation_for(Wrapper* pipeline)
                 t.BlendEnable, t.SrcBlend, t.DestBlend, t.BlendOp, t.SrcBlendAlpha, t.DestBlendAlpha, t.BlendOpAlpha, t.RenderTargetWriteMask,
                 info ? info->state_a.size() : 0, info ? info->state_b.size() : 0);
             if (refusal || refused_targets)
-                log("x2w-draw   colour-blend registers: %s; refused targets 0x%x (opaque for those)", refusal ? refusal : "target 0 decoded",
-                    refused_targets);
+                log("x2w-draw   colour-blend registers not used: %s; refused targets 0x%x", refusal ? refusal : "refused", refused_targets);
             if (info && !bound->has_blend) {
                 char hex[3 * 0x1a0 + 1];
                 hex_text(info->state_a.data(), info->state_a.size() < 0x1a0 ? info->state_a.size() : 0x1a0, hex, sizeof(hex));
