@@ -4502,6 +4502,17 @@ Every inventory import row, each `unresolved_edges` entry and each
 route is unsupported; the default run keeps returning 0. These are candidate
 module routes only: no export is resolved and no provider is proven.
 
+`tests/intake/import_forms_check.py` builds one PE32+ image with a normal named
+import, a normal ordinal import, a delay named import and a delay ordinal import.
+`pe_inventory.import_tables` returns exactly those four rows, including the `#N`
+form and the `delay` kind. Intake route annotations keep
+`route_kind=candidate`, `resolution=not_checked` and `provider=null`. The same
+synthetic package feeds `pe_package_preflight.summarize` and
+`pe_run_package.plan`: a named symbol or ordinal absent from the provider surface
+in `tests/intake/provider.def` (`named_value`, `#77`) yields
+`bundled_export_not_found` and is refused before attachment as
+`app.exe: intake_provider.dll!<symbol>: bundled_export_not_found`.
+
 For each candidate the tool records SHA-256, architecture, entry RVA and section, TLS directory and callback order, then compares imports, modules and unresolved items with the baseline. Source-built PE fixtures and a miniature torrent cover named, ordinal and delayed imports, import names that pefile rejects, missing providers, TLS callbacks, invalid callback addresses, truncation, an absent entry and path conflicts. These checks establish static properties. Authenticity and startup remain unverified.
 
 `pe.startup.locations` lists TLS callbacks in table order followed by the executable entry. Each location includes its RVA, section and file offset. When the x64 exception directory supplies a covering function interval, the report includes its inclusive start, exclusive end and unwind data RVA. A location can legitimately lack a covering record. An absent or unusable table leaves the independently observed startup locations available. In the local debug fixture the table had 110 records, one covering its TLS callback. The entry had no covering record. CTest cross-checks against pefile and exercises both absent and incomplete directories. [Microsoft x64 unwind data](https://learn.microsoft.com/en-us/cpp/build/exception-handling-x64)
