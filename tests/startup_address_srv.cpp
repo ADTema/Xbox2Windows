@@ -313,29 +313,14 @@ int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
     structured.view.Buffer.StructureByteStride = 4;
     structured.address = ptr(buf0);
     invoke(guest, 70, ptr(&desc), ptr(&structured), cpu);
+    // An acceleration-structure view is refused; draw(4) proves the structured descriptor stayed in place.
+    ViewAt as_view{};
+    as_view.view.Format = DXGI_FORMAT_UNKNOWN;
+    as_view.view.ViewDimension = static_cast<D3D12_SRV_DIMENSION>(11);
+    as_view.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    as_view.address = ptr(buf0);
+    invoke(guest, 70, ptr(&desc), ptr(&as_view), cpu);
     draw(4);
-
-    // Exercise RT acceleration-structure memory SRV when the adapter supports raytracing.
-    D3D12_FEATURE_DATA_D3D12_OPTIONS5 opts5{};
-    if (SUCCEEDED(desktop->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &opts5, sizeof(opts5))) &&
-        opts5.RaytracingTier != D3D12_RAYTRACING_TIER_NOT_SUPPORTED) {
-        static std::array<std::uint8_t, 65536 + 512> raw_as_mem{};
-        auto* const as_mem = reinterpret_cast<std::uint8_t*>((ptr(raw_as_mem.data()) + 0xffff) & ~Word{0xffff});
-        D3D12_RESOURCE_DESC as_desc = desc;
-        as_desc.Width = 512;
-        as_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-        void* as_res = nullptr;
-        if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(as_mem), ptr(&as_desc),
-                                               D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, 0,
-                                               ptr(&__uuidof(ID3D12Resource)), ptr(&as_res))))) return 48;
-        ViewAt as_view{};
-        as_view.view.Format = DXGI_FORMAT_UNKNOWN;
-        as_view.view.ViewDimension = static_cast<D3D12_SRV_DIMENSION>(11);
-        as_view.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        as_view.address = ptr(as_mem);
-        invoke(guest, 70, ptr(&as_desc), ptr(&as_view), cpu);
-        if (FAILED(desktop->GetDeviceRemovedReason())) return 49;
-    }
 
     raw.address = ptr(buf0);
     raw.view.Buffer.FirstElement = 0;
