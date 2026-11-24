@@ -7,7 +7,8 @@
 
 // Experimental (docs/startup-runtime.md). With X2W_AUDIO_PERMISSIVE=1 the exports
 // stand in for the DSP stream interface; otherwise they trap. Seen:
-//   XDspConnectWithMaximumStreamLimit(queue memory, 0x60000, 30, 0x80, 1, &handle) -> 0 on success.
+//   XDspConnectWithMaximumStreamLimit(queue memory, 0x60000, 30, 0x80, 1, &handle) -> 0 on success,
+//   E_POINTER when handle is null or unwritable.
 // The others have not been seen yet; they succeed (0) and log their first calls with registers.
 // No stream is processed.
 namespace {

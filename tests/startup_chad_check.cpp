@@ -191,7 +191,26 @@ int main(int argc, char** argv)
 
     if (!log_path.empty()) {
         const std::string log_text = read_file_bytes(log_path.c_str());
+        const char* connect_prefix =
+            "x2w-audio XDspConnectWithMaximumStreamLimit memory=0x1000 bytes=0x60000 streams=30 r9=0x80 flag=1 handle_out=";
+        std::size_t epointer_hits = 0;
+        std::size_t ok_hits = 0;
+        std::size_t pos = 0;
+        while ((pos = log_text.find(connect_prefix, pos)) != std::string::npos) {
+            const std::size_t line_end = log_text.find('\n', pos);
+            const std::string line = log_text.substr(pos, line_end == std::string::npos ? std::string::npos : line_end - pos);
+            if (line.find(" -> E_POINTER") != std::string::npos) ++epointer_hits;
+            if (line.find(" -> 0") != std::string::npos) ++ok_hits;
+            pos += std::strlen(connect_prefix);
+        }
         check(log_text.find("x2w-trap") == std::string::npos, "permissive lifecycle writes zero x2w-trap entries");
+        check(ok_hits == 1, "permissive connect success logged once with -> 0");
+        check(epointer_hits == 3, "permissive connect refusals logged three times with -> E_POINTER");
+        check(log_text.find("XDspActivate") != std::string::npos &&
+                  log_text.find("XDspSubmitCommand") != std::string::npos &&
+                  log_text.find("XDspDeactivate") != std::string::npos &&
+                  log_text.find("XDspDisconnect") != std::string::npos,
+              "permissive lifecycle exports logged");
         DeleteFileW(log_path.c_str());
     }
 
