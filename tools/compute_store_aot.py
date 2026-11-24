@@ -29,6 +29,19 @@ ALU = {
     "v_mul_lo_u32": INTEGER["mul_lo_u32"][1],
     "v_mad_u32_u24": "((({0} & 0xffffffu) * ({1} & 0xffffffu)) + {2})",
 }
+# The scalar ALU subset, on known words only: s_<op> sD, a, b with two scalar sources (an SGPR holding a known
+# word, an integer inline constant or a 32-bit literal). The carry out of s_add_u32 and s_sub_u32 and the
+# nonzero flag of the logic forms go to SCC, which no accepted instruction reads. s_lshr_b32 is a logical
+# shift of src0 by src1[4:0].
+SALU = {
+    "s_add_u32": "({0} + {1})",
+    "s_sub_u32": "({0} - {1})",
+    "s_and_b32": "({0} & {1})",
+    "s_or_b32": "({0} | {1})",
+    "s_xor_b32": "({0} ^ {1})",
+    "s_lshr_b32": "({0} >> ({1} & 31u))",
+}
+SALU_SOURCE = r"(s\d+|-?\d+|0x[0-9a-f]+)"
 ALU_SOURCE = r"(s\d+|v\d+|-?\d+|0x[0-9a-f]+)"
 # Results are inline HLSL expressions; a longer one is rejected instead of growing without bound.
 ALU_EXPRESSION_LIMIT = 1024
@@ -283,6 +296,16 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 if not -(1 << 31) <= value <= 0xffffffff:
                     raise ValueError("Invalid scalar immediate")
                 scalar[dst] = value & 0xffffffff
+        elif m := re.fullmatch(rf"(s_(?:add_u32|sub_u32|and_b32|or_b32|xor_b32|lshr_b32)) s(\d+), {SALU_SOURCE}, {SALU_SOURCE}",
+                               line):
+            op, dst = m[1], int(m[2])
+            words = [alu_word(token, scalar, vector, pending) for token in m.groups()[2:]]
+            if dst > 105 or dst in pending or None in words:
+                raise ValueError("Unverified scalar ALU operand")
+            expression = SALU[op].format(*map(hlsl_word, words))
+            if len(expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            scalar[dst] = ("alu", expression)
         elif m := re.fullmatch(r"s_movk_i32 s(\d+), (-?\d+|0x[0-9a-f]+)", line):
             dst = int(m[1])
             value = int(m[2], 0)
@@ -692,12 +715,13 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     raise ValueError("Uninitialized private wide LDS word")
                 vector.update(zip(registers, (lds_wide_words[slot] for slot in slots)))
             ds_wait = True
-        elif ((m := re.fullmatch(r"ds_(add|sub|rsub|and|or|xor|min|max)(?P<ret>_rtn)?(_[uib]64) "
+        elif ((m := re.fullmatch(r"ds_(add|sub|rsub|and|or|xor|min|max|inc|dec|condxchg32)(?P<ret>_rtn)?(_[uib]64) "
                                  r"(?(ret)v\[(?P<dst_first>\d+):(?P<dst_last>\d+)\], )"
                                  r"v(?P<addr>\d+), v\[(?P<src_first>\d+):(?P<src_last>\d+)\]"
                                  r"(?: offset:(?P<offset>0|8))?", line))
               and ((op := m[1] + m[3]) in ("add_u64", "sub_u64", "rsub_u64", "and_b64", "or_b64",
-                                        "xor_b64", "min_i64", "max_i64", "min_u64", "max_u64"))):
+                                        "xor_b64", "min_i64", "max_i64", "min_u64", "max_u64", "inc_u64", "dec_u64")
+                   or op == "condxchg32_b64" and m["ret"])):
             addr, first, last = (int(m[key]) for key in ("addr", "src_first", "src_last"))
             destination = tuple(int(m[key]) for key in ("dst_first", "dst_last")) if m["ret"] else None
             slot = int(m["offset"] or 0) // 4
@@ -710,7 +734,18 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             left, right = (source, previous) if op == "rsub_u64" else (previous, source)
             lo, hi = map(hlsl_word, left)
             rhs_lo, rhs_hi = map(hlsl_word, right)
-            if op in ("and_b64", "or_b64", "xor_b64"):
+            if op == "inc_u64":
+                reset = f"({hi} > {rhs_hi} || ({hi} == {rhs_hi} && {lo} >= {rhs_lo}))"
+                low = f"({reset} ? 0u : ({lo} + 1u))"
+                high = f"({reset} ? 0u : ({hi} + uint({lo} == 0xffffffffu)))"
+            elif op == "dec_u64":
+                reset = f"(({hi} | {lo}) == 0u || {hi} > {rhs_hi} || ({hi} == {rhs_hi} && {lo} > {rhs_lo}))"
+                low = f"({reset} ? {rhs_lo} : ({lo} - 1u))"
+                high = f"({reset} ? {rhs_hi} : ({hi} - uint({lo} == 0u)))"
+            elif op == "condxchg32_b64":
+                low = f"(({rhs_lo} & 0x80000000u) != 0u ? {rhs_lo} : {lo})"
+                high = f"(({rhs_hi} & 0x80000000u) != 0u ? {rhs_hi} : {hi})"
+            elif op in ("and_b64", "or_b64", "xor_b64"):
                 symbol = {"and_b64": "&", "or_b64": "|", "xor_b64": "^"}[op]
                 low = f"({lo} {symbol} {rhs_lo})"
                 high = f"({hi} {symbol} {rhs_hi})"
