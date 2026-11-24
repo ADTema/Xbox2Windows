@@ -17,8 +17,12 @@ seeded random streams (sources, levels, strategies and flushes mixed; some with 
 table), each at exact capacity, one byte short, truncated and with flipped bits, and requires status,
 size and bytes equal to the same probe built to decode one bit at a time, and to CPython's zlib except
 where inflate.h decodes past an incomplete code set that zlib rejects. The control is the probe built with
-one wrong table entry, which must differ on some case. tests/startup_inflate_probe.cpp runs the
-decoder; no GPU and no game files are involved.
+one wrong table entry, which must differ on some case.
+
+A boundary case runs small streams at every capacity up to one past their size and truncated to every
+length: matches at distances 1 to 16 around the decoder's copy widths, stored blocks of 0 and 65535
+bytes and stored blocks at every bit position. tests/startup_inflate_probe.cpp runs the decoder; no GPU
+and no game files are involved.
 """
 from pathlib import Path
 import random
@@ -252,29 +256,117 @@ def random_cases(rng, streams):
     return cases, long_codes
 
 
-def expect_differential(probe, bitwise, work, rng):
-    streams = 900
-    cases, long_codes = random_cases(rng, streams)
-    assert long_codes >= 20, "only %d streams have codes longer than 10 bits" % long_codes
-    fast, slow = run_batch(probe, work, "random", cases), run_batch(bitwise, work, "random_bitwise", cases)
+def compare(name, cases, fast, slow, truncated_stored=False):
+    # Equal to the bit-at-a-time build in every case, and to CPython's zlib where it classifies the code sets.
+    # truncated_stored: inflate.h checks a stored block's length against the input before the output, so a
+    # truncated stored block that would not fit either is corrupt_stream where zlib, copying the bytes it
+    # has, reports insufficient output first.
     compared = lenient = 0
     for index, ((stream, capacity), got, reference) in enumerate(zip(cases, fast, slow)):
-        assert got == reference, "random case %d: %s %d bytes, bit-at-a-time %s %d bytes" % (
-            index, STATUS[got[0]], len(got[1]), STATUS[reference[0]], len(reference[1]))
+        assert got == reference, "%s case %d: %s %d bytes, bit-at-a-time %s %d bytes" % (
+            name, index, STATUS[got[0]], len(got[1]), STATUS[reference[0]], len(reference[1]))
         status, out = expected_status(stream, capacity)
+        if truncated_stored and status == INSUFFICIENT and got[0] == CORRUPT and reference_rejects(stream):
+            lenient += 1
+            continue
         if status is None:
             if got[0] != CORRUPT:
                 lenient += 1
                 continue
             status = CORRUPT
         assert (got[0], got[1] if got[0] in (OK, BAD_CHECKSUM) else b"") == (status, out), \
-            "random case %d: %s, zlib %s" % (index, STATUS[got[0]], STATUS[status])
+            "%s case %d: %s, zlib %s" % (name, index, STATUS[got[0]], STATUS[status])
         compared += 1
     counts = [sum(1 for status, _ in fast if status == s) for s in range(4)]
+    return compared, lenient, ", ".join("%s %d" % (STATUS[s], counts[s]) for s in range(4))
+
+
+def expect_differential(probe, bitwise, work, rng):
+    streams = 900
+    cases, long_codes = random_cases(rng, streams)
+    assert long_codes >= 20, "only %d streams have codes longer than 10 bits" % long_codes
+    fast, slow = run_batch(probe, work, "random", cases), run_batch(bitwise, work, "random_bitwise", cases)
+    compared, lenient, counts = compare("random", cases, fast, slow)
     print("%d random streams (%d with codes over 10 bits) as %d cases: equal to bit-at-a-time decoding in all, "
           "to zlib in %d (%d decoded past an incomplete code set zlib rejects); %s" % (
-              streams, long_codes, len(cases), compared, lenient,
-              ", ".join("%s %d" % (STATUS[s], counts[s]) for s in range(4))))
+              streams, long_codes, len(cases), compared, lenient, counts))
+    return cases, slow
+
+
+def zlib_wrap(raw, data):
+    return b"\x78\x01" + raw + zlib.adler32(data).to_bytes(4, "big")
+
+
+def stored_after_fixed(literals, stored):
+    # A fixed block of literals, so the stored block that follows starts at any bit position, then a
+    # final fixed block whose length-3 match at distance 1 reaches back into the stored bytes.
+    bits = Bits()
+    bits.put(0, 1)
+    bits.put(1, 2)
+    for literal in literals:
+        bits.code(0x30 + literal, 8) if literal < 144 else bits.code(0x190 + literal - 144, 9)
+    bits.code(0, 7)
+    bits.put(0, 1)
+    bits.put(0, 2)
+    bits.put(0, -bits.count % 8)
+    bits.put(len(stored) | (len(stored) ^ 0xFFFF) << 16, 32)
+    for byte in stored:
+        bits.put(byte, 8)
+    bits.put(1, 1)
+    bits.put(1, 2)
+    bits.code(1, 7)
+    bits.code(0, 5)
+    bits.code(0, 7)
+    data = literals + stored + (literals + stored)[-1:] * 3
+    return zlib_wrap(bits.to_bytes(), data), data
+
+
+def boundary_cases(rng):
+    # Streams whose ends meet every output capacity and input length: matches at each distance from 1 to 16
+    # with lengths around 8 and 16 bytes and up to 258, some after a sync flush; stored blocks of 0 and 65535
+    # bytes and stored blocks at every bit position. Each runs at every capacity up to one past its size
+    # and truncated to every length, at full capacity and at a random one.
+    streams = []
+    for distance in range(1, 17):
+        for strategy in (zlib.Z_DEFAULT_STRATEGY, zlib.Z_FIXED):
+            data = bytearray(rng.randbytes(40))
+            for length in list(range(3, 20)) + [24, 31, 32, 33, 258]:
+                pattern = rng.randbytes(distance)
+                data += (pattern * (length // distance + 2))[:distance + length] + rng.randbytes(1)
+            encoder = zlib.compressobj(9, zlib.DEFLATED, 15, 9, strategy)
+            if distance % 4 == 0:
+                cut = rng.randrange(len(data))
+                stream = encoder.compress(data[:cut]) + encoder.flush(zlib.Z_SYNC_FLUSH)
+                stream += encoder.compress(data[cut:]) + encoder.flush()
+            else:
+                stream = encoder.compress(data) + encoder.flush()
+            streams.append((stream, bytes(data)))
+    for count in range(8):
+        # count 9-bit literal codes put the stored block at bit position count + 2 modulo 8.
+        for stored in (b"", rng.randbytes(1), rng.randbytes(300)):
+            literals = bytes(rng.randrange(144, 256) for _ in range(count))
+            literals += bytes(rng.randrange(144) for _ in range(rng.randint(1, 300)))
+            streams.append(stored_after_fixed(literals, stored))
+    cases = []
+    for stream, data in streams:
+        assert reference(stream, "zlib") == data
+        cases += [(stream, capacity) for capacity in range(len(data) + 2)]
+        cases += [(stream[:cut], capacity) for cut in range(len(stream))
+                  for capacity in (len(data), rng.randrange(len(data) + 1))]
+    big = rng.randbytes(65535)
+    stream = zlib_wrap(b"\x01\xff\xff\x00\x00" + big, big)
+    assert reference(stream, "zlib") == big
+    cases += [(stream, capacity) for capacity in (0, 1, 65534, 65535, 65536)]
+    cases += [(stream[:cut], 65535) for cut in range(len(stream) - 12, len(stream))]
+    return cases, len(streams) + 1
+
+
+def expect_boundaries(probe, bitwise, work, rng):
+    cases, streams = boundary_cases(rng)
+    fast, slow = run_batch(probe, work, "boundary", cases), run_batch(bitwise, work, "boundary_bitwise", cases)
+    compared, lenient, counts = compare("boundary", cases, fast, slow, truncated_stored=True)
+    print("%d boundary streams as %d cases: equal to bit-at-a-time decoding in all, to zlib in %d (%d truncated "
+          "in a stored block that does not fit either); %s" % (streams, len(cases), compared, lenient, counts))
     return cases, slow
 
 
@@ -333,6 +425,8 @@ def main(probe, bitwise, faulty):
 
         cases, reference = expect_differential(probe, bitwise, work, rng)
         expect_faulty_caught(faulty, work, cases, reference)
+        # Its own seed, so the random case keeps its streams.
+        expect_boundaries(probe, bitwise, work, random.Random(1149 + 1))
     print("inflate.h matches zlib %s in 8 cases and rejects 3 controls" % zlib.ZLIB_RUNTIME_VERSION)
 
 

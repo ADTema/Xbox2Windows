@@ -338,7 +338,17 @@ Status, size and bytes must equal those of the same probe built with `X2W_INFLAT
 `inflate.h` decodes past an incomplete code set that zlib rejects; with this seed, no case needs it.
 The negative control is the probe built with
 `X2W_INFLATE_FAULTY_TABLE`, where codes exactly 10 bits long decode as the next symbol. It must
-differ from the reference in at least one case; it differs in 265. No GPU and no game files are needed:
+differ from the reference in at least one case; it differs in 265.
+
+A boundary case decodes 57 small streams at every output capacity up to one byte past their size, and
+truncated to every length at full and at a random capacity: 63994 cases. The streams hold matches at
+every distance from 1 to 16 with lengths around 8, 16 and 32 bytes and up to 258, some after a sync
+flush; stored blocks of 0, 1 and 300 bytes at each of the eight bit positions after a fixed block; and
+one stored block of 65535 bytes. Status, size and bytes must equal the bit-at-a-time build and
+CPython's zlib. The exception is a truncated stored block that would not fit either: the decoder
+checks the block's length against the input first and reports `corrupt_stream` where zlib reports
+insufficient output (809 cases). The 16 guard bytes after each destination must stay intact. No GPU and
+no game files are needed:
 
 ```powershell
 ctest --preset release --no-tests=error -R '^startup_inflate$' -V
