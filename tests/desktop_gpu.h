@@ -71,6 +71,7 @@ void check_bvh_hits(ID3D12Device* device);
 bool check_bvh_differential(ID3D12Device* device, bool forcePipeline);
 bool check_bvh_waves(ID3D12Device* device, bool force64);
 bool check_gpu_alias(ID3D12Device* device);
+bool check_gpu_alias_window(ID3D12Device* device);
 bool check_gpu_alias_lookup(ID3D12Device* device);
 bool check_gpu_alias_lookup_writes(ID3D12Device* device);
 bool check_gpu_alias_atomic_waterfall(ID3D12Device* device);
