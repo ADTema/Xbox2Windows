@@ -174,7 +174,11 @@ ALU_PROGRAM[-2:-2] = [
     "v_add_f32_e32 v3, s4, v3",
     "v_add_f32_e32 v3, s6, v3",
     "v_add_f32_e32 v3, v15, v3",
+    # Unequal use counts: a signed min/max would swap the two results and change the depth.
     "v_add_f32_e32 v3, v18, v3",
+    "v_add_f32_e32 v3, v18, v3",
+    "v_add_f32_e32 v3, v18, v3",
+    "v_add_f32_e32 v3, v17, v3",
     "v_add_f32_e32 v3, v17, v3",
 ]
 # Operands of the float adds above, as bit patterns.
@@ -182,8 +186,9 @@ ALU_OPERANDS = (0x3e800000, 0x3e000000, 0x3c000000, 0x3f300000, 0x3f200000, 0xbf
 
 
 def alu_draw():
-    # 0.5 + 0.25 + 0.125 + 2**-7 + 0.6875 + 0.625 - 1.5, all exact in binary32.
-    depth = 0.6953125
+    # 0.5 + 0.25 + 0.125 + 2**-7 + 0.6875 + 3 * 0.625 - 2 * 1.5, all exact in binary32. Swapping the unsigned
+    # min and max results (a signed comparison) would give 0.5 + ... + 3 * -1.5 + 2 * 0.625, which is -3.2578125.
+    depth = 0.4453125
     positions = [(x, y, depth, w) for x, y, _, w in TRIANGLE]
     return (
         lower(enumerate_pcs(ALU_PROGRAM), [4099], (3, 1)),
@@ -304,6 +309,10 @@ if __name__ == "__main__":
             )
             for operand in ALU_OPERANDS:
                 assert f"asfloat(0x{operand:08x}u)" in text, hex(operand)
+            # The unsigned min is 0x3f200000 and the unsigned max 0xbfc00000; a signed comparison swaps them, and the
+            # unequal use counts (three and two) make the swap visible in the text and in the drawn depth.
+            assert text.count("asfloat(0x3f200000u)") == 3, text
+            assert text.count("asfloat(0xbfc00000u)") == 2, text
             sys.exit(0)
         clipped = triangle_inputs()
         struct.pack_into("<f", clipped, 4, -0.625)  # Plus 0.375 gives Z = -0.25.
