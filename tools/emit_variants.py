@@ -16,6 +16,8 @@ def load(script):
     path = Path(script).resolve()
     sys.path.insert(0, str(path.parent))  # as when the script itself is the program
     spec = importlib.util.spec_from_file_location(path.stem, path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"cannot load {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[path.stem] = module
     spec.loader.exec_module(module)
@@ -23,7 +25,7 @@ def load(script):
 
 
 def main(argv):
-    if len(argv) < 4:
+    if len(argv) < 3:
         raise SystemExit(__doc__)
     script, image, *pairs = argv
     jobs = []
@@ -33,8 +35,9 @@ def main(argv):
             raise SystemExit(f"expected <variant>=<output>, got {pair!r}")
         jobs.append((variant, Path(output)))
     emit = load(script).emit
+    image_path = Path(image)
     for variant, output in jobs:
-        emit(Path(image), output, variant)
+        emit(image_path, output, variant)
 
 
 if __name__ == "__main__":

@@ -60,14 +60,25 @@ def main():
             a, b = (single / f"{variant}.cpp").read_bytes(), (batch / f"{variant}.cpp").read_bytes()
             assert a == b, f"{variant}: batch wrote {b!r}, one process per variant wrote {a!r}"
 
+        one = work / "one"
+        one.mkdir()
+        done = run(DRIVER, script, image, f"lifted={one / 'lifted.cpp'}")
+        assert done.returncode == 0, done.stderr
+        assert (one / "lifted.cpp").read_bytes() == (single / "lifted.cpp").read_bytes()
+
         failing = work / "failing"
         failing.mkdir()
         done = run(DRIVER, script, image, f"lifted={failing / 'lifted.cpp'}", f"broken={failing / 'broken.cpp'}")
         assert done.returncode != 0, "a failing variant must fail the batch"
         assert "control broken changed nothing" in done.stderr, done.stderr
 
-        done = run(DRIVER, script, image, "no-separator")
-        assert done.returncode != 0, "a pair without = must be refused"
+        for bad in ("no-separator", f"={failing / 'empty.cpp'}", "lifted="):
+            done = run(DRIVER, script, image, bad)
+            assert done.returncode != 0, f"malformed pair {bad!r} must be refused"
+            assert "expected <variant>=<output>" in done.stderr, done.stderr
+
+        done = run(DRIVER, script, image)
+        assert done.returncode != 0, "missing variant pairs must be refused"
     print("emit_variants: batch output equals one process per variant; failures and bad pairs are refused")
 
 
