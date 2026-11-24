@@ -340,6 +340,9 @@ target_sources(offscreen_check PRIVATE tests/bvh_reads_waves.cpp tests/bvh_hits.
 target_sources(offscreen_check PRIVATE tests/bvh_atomics.cpp tests/bvh_numeric.cpp)
 # A title graphics allocation opened as a D3D12 heap and addressed through translated GPU addresses.
 target_sources(offscreen_check PRIVATE tests/gpu_alias.cpp src/era_gpu_alias.cpp src/era_title_va.cpp src/era_heap.cpp)
+# A title buffer window: two 64 KiB pages, a non-page-aligned offset, copies in both directions and
+# named rejects for an outside address, a misaligned page run and an uncommitted page.
+target_sources(offscreen_check PRIVATE tests/gpu_alias_window.cpp)
 # The same allocations read by a shader through 64-bit title addresses (src/title_va_lookup.hlsli).
 target_sources(offscreen_check PRIVATE tests/depth_mask_draw.cpp)
 target_sources(offscreen_check PRIVATE tests/gpu_alias_lookup.cpp)
@@ -701,11 +704,12 @@ foreach(adapter IN ITEMS hardware warp)
     set_tests_properties(dxr_opacity_${adapter} dxr_opacity_pipeline_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     add_test(NAME bvh_buffer_ops_${adapter} COMMAND offscreen_check ${adapter} --buffer-ops)
     add_test(NAME gpu_alias_${adapter} COMMAND offscreen_check ${adapter} --gpu-alias)
+    add_test(NAME gpu_alias_window_${adapter} COMMAND offscreen_check ${adapter} --gpu-alias-window)
     add_test(NAME gpu_alias_lookup_${adapter} COMMAND offscreen_check ${adapter} --gpu-alias-lookup)
     add_test(NAME gpu_alias_lookup_writes_${adapter} COMMAND offscreen_check ${adapter} --gpu-alias-lookup-writes)
     add_test(NAME gpu_alias_registry_${adapter} COMMAND offscreen_check ${adapter} --gpu-alias-registry)
-    set_tests_properties(gpu_alias_${adapter} gpu_alias_lookup_${adapter} gpu_alias_lookup_writes_${adapter}
-        gpu_alias_registry_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+    set_tests_properties(gpu_alias_${adapter} gpu_alias_window_${adapter} gpu_alias_lookup_${adapter}
+        gpu_alias_lookup_writes_${adapter} gpu_alias_registry_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     add_test(NAME bvh_root_roundtrip_${adapter} COMMAND offscreen_check ${adapter} --bvh-root-roundtrip)
     set_tests_properties(bvh_root_roundtrip_${adapter} PROPERTIES TIMEOUT 45)
     foreach(work IN ITEMS reads waves wave64 hits differential atomics numeric packed)

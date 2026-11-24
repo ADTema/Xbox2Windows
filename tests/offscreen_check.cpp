@@ -884,6 +884,11 @@ OperationResult run_gpu_alias(const OperationContext& ctx)
     return skip_if_false(check_gpu_alias(ctx.device));
 }
 
+OperationResult run_gpu_alias_window(const OperationContext& ctx)
+{
+    return skip_if_false(check_gpu_alias_window(ctx.device));
+}
+
 OperationResult run_gpu_alias_lookup(const OperationContext& ctx)
 {
     return skip_if_false(check_gpu_alias_lookup(ctx.device));
@@ -1109,6 +1114,7 @@ const OperationSpec kOperations[] = {
     {"--ray-query", 3, 3, nullptr, kNoGate, run_ray_query},
     {"--dxr-pipeline", 3, 3, nullptr, kNoGate, run_dxr_pipeline},
     {"--gpu-alias", 3, 3, nullptr, kNoGate, run_gpu_alias},
+    {"--gpu-alias-window", 3, 3, nullptr, kNoGate, run_gpu_alias_window},
     {"--gpu-alias-lookup", 3, 3, nullptr, kNoGate, run_gpu_alias_lookup},
     {"--gpu-alias-lookup-writes", 3, 3, nullptr, kNoGate, run_gpu_alias_lookup_writes},
     {"--gpu-alias-atomic-waterfall", 3, 3, nullptr, kGateSm60AtomicWaterfall, run_gpu_alias_atomic_waterfall},
