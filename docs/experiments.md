@@ -5963,10 +5963,13 @@ control mismatching. The D3D12 debug layer was unavailable.
 which in an integer instruction is that source's sign bit flipped. The select handler passed the printed
 operand to the uint helper, so `v_cndmask_b32_e64 v31, v30, -v30` was refused - 2 of the 29 refused
 shaders in the first main-game loading-screen cache (#870, issue #1709). The select now reads both sources
-through a helper that flips the sign bit for a `-` operand and emits the same text as before when there is
-none. Plain negative constants retain the existing bit pattern. NEG on inline or literal constants is
-refused from the encoded source fields, because plain inline -1 and inline 1 with NEG both disassemble
-as `-1`. Another integer instruction carrying the same register modifier still refuses it. Run
+through a helper that flips bit 31 of a negated register. For a negated inline integer, inline binary32
+constant or literal dword on either data source of `v_cndmask_b32_e64`, the decoder gets the 32-bit
+word from the encoding and rewrites that operand as a hex literal with bit 31 flipped. The literal
+dword still counts toward the 12-byte instruction. Plain inline -1 and inline 1 with NEG both
+disassemble as `-1`, and they emit `0xffffffffu` and `0x80000001u`, respectively. Inline 0.5 with NEG
+emits `0xbf000000u`. ABS on an immediate and a missing literal dword are refused. Another integer
+instruction carrying the same register modifier still refuses it. Run
 `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_cndmask_neg$' -V`.
 
 **Output modifiers on float-result conversions.** The float-result conversions (`v_cvt_f32_i32`,

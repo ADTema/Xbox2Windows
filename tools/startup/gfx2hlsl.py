@@ -178,6 +178,12 @@ def stream_fetch(vs_container, layout_text):
     return fetch
 
 
+# Binary32 words for inline source encodings 240 through 248, in encoding order.
+CNDMASK_INLINE_FLOAT_BITS = (0x3f000000, 0xbf000000, 0x3f800000, 0xbf800000,
+                            0x40000000, 0xc0000000, 0x40800000, 0xc0800000,
+                            0x3e22f983)  # 1/(2*pi)
+
+
 def decode(code):
     out, off = [], 0
     while off + 4 <= len(code):
@@ -194,14 +200,32 @@ def decode(code):
                 raise Unsupported('image_load_mip a16')
         if name == 'v_cndmask_b32_e64':
             # The printed -1 is ambiguous: it can be plain inline -1 or inline 1 with NEG.
-            # Preserve plain immediates and refuse NEG on immediate data operands by encoding.
-            word1, = struct.unpack_from('<I', code, off + 4)
+            word0, word1 = struct.unpack_from('<2I', code, off)
             for i in range(2):
+                source = (word1 >> (9 * i)) & 0x1ff
+                if not (128 <= source <= 208 or 240 <= source <= 248 or source == 255):
+                    continue
+                if word0 & (1 << (8 + i)):
+                    raise Unsupported('v_cndmask_b32_e64 ABS on an immediate')
                 if not word1 & (1 << (29 + i)):
                     continue
-                source = (word1 >> (9 * i)) & 0x1ff
-                if 128 <= source <= 208 or 240 <= source <= 248 or source == 255:
-                    raise Unsupported('v_cndmask_b32_e64 NEG on an immediate')
+                if source <= 192:
+                    bits = source - 128
+                elif source <= 208:
+                    bits = (192 - source) & 0xffffffff
+                elif source <= 248:
+                    bits = CNDMASK_INLINE_FLOAT_BITS[source - 240]
+                else:
+                    if n != 12 or off + n > len(code):
+                        raise Unsupported('v_cndmask_b32_e64 missing literal dword')
+                    bits, = struct.unpack_from('<I', code, off + 8)
+                # Preserve the other operand spellings and any modifiers on the final operand.
+                fields = asm.split(',', 3)
+                if len(fields) != 4:
+                    raise Unsupported('malformed v_cndmask_b32_e64 operands')
+                operand = fields[i + 1]
+                fields[i + 1] = operand[:len(operand) - len(operand.lstrip())] + '0x%08x' % (bits ^ 0x80000000)
+                asm = ','.join(fields)
         out.append((off, n, name, asm))
         off += n
     last = max((i for i, x in enumerate(out) if x[2] == 's_endpgm'), default=len(out) - 1)
