@@ -7029,6 +7029,8 @@ range before refreshing it.
 
 The first snapshot is `13579bdf,a5a5a5a5` in all cases. The live copy reads `13579bdf,2468ace0` at fence 2. The stale mirror repeats the old word and reads `13579bdf,13579bdf`. An unknown ID must leave the descriptor copy count, submitted list count, completed fence and readback unchanged. The corrected record then produces the same result as the live path.
 
+On Windows 11 build 26300.9974 an Intel Arc 140T (device `7d51`, driver 32.0.101.8132) reproduces all three: fence 1 reads `13579bdf,a5a5a5a5`, the live copy reads `13579bdf,2468ace0` at fence 2, the stale mirror reads `13579bdf,13579bdf`, and the unknown record `000000ff` is rejected with `copies=2 submissions=1 fence=1 readback=preserved` before the live path continues to `13579bdf,2468ace0`. The records sat at slot `999999`, the last slot of the 1,000,000 that this adapter reports.
+
 Build `offscreen_check` as above and run `ctest --preset dev --no-tests=error -R '^descriptor_record_copy_' -V`. Repeat with `release`. These tests use Shader Model 6.0 and skip when the adapter lacks it.
 
 ### Runtime indexing of a bounded sampler table
