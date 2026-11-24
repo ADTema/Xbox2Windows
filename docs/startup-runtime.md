@@ -243,6 +243,13 @@ These are measured on one executable; treat them as hypotheses for others.
   still treated as Signals. The slot numbers are inferred from that layout; no title call to slot
   17 has been logged yet. Run
   `ctest --preset dev --no-tests=error -R "^startup_queue_wait_"`.
+- **Resubmitted lists.** In render mode a closed list can be submitted again until its own Reset.
+  Each title allocator stands for a pool of desktop allocators. The title's Reset resets the current
+  one only if no list holds a recording on it and every queue has passed its last submit; otherwise
+  the title continues on an idle allocator from the pool, or a new one. A recording therefore
+  survives its allocator's Reset, as on the console. If the fence that tracks a submit cannot be
+  created or signalled, that submit's allocator is never reset or reused again. Run
+  `ctest --preset dev --no-tests=error -R "^startup_list_resubmit_"`.
 - **Inline samplers.** Pixel shaders build sampler descriptors from constants (`s_movk_i32`,
   `s_bfm_b32`, 64-bit moves); the translator folds those into static samplers. A source-built
   pixel stage checks all four manifest words, rejects a mask width from a root constant, and
