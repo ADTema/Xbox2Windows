@@ -8333,8 +8333,9 @@ Windows 10 build 19045, DXC 1.9.2609.
 | 1.75 | 2 | 1 | 2 | 2 |
 | 2.5625 | 3 | 2 | 3 | 3 |
 
-Only the Windows 10 in-box WARP reads the mip below a `MinLod` clamp, so the
-difference follows the WARP build, not the runtime or shader model. On Windows
+Among the adapters measured before the Arc report below, only the Windows 10
+in-box WARP reads the mip below a `MinLod` clamp, so the difference follows the
+WARP build, not the runtime or shader model. On Windows
 11 build 26200.9974, in-box WARP 10.0.26100.9818 and an RX 7900 XTX
 (32.0.32029.2010) read the nearest mip at 1.5 and 1.5625 (`ps_6_6`, no other
 clamps). Translated and direct HLSL agreed in every case.
