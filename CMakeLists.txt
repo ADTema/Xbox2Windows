@@ -476,6 +476,25 @@ add_test(NAME pso_root_signature_warp COMMAND pso_root_check)
 add_custom_target(pso_compute_headers DEPENDS
     "${CMAKE_CURRENT_BINARY_DIR}/pso_compute_embedded.h"
     "${CMAKE_CURRENT_BINARY_DIR}/pso_compute_stripped.h")
+foreach(stage IN ITEMS vs ps)
+    string(TOUPPER "${stage}" entry)
+    set(rect_header "${CMAKE_CURRENT_BINARY_DIR}/rectlist_${stage}.h")
+    add_custom_command(OUTPUT "${rect_header}"
+        COMMAND "${DXC_EXECUTABLE}" -T ${stage}_6_0 -E ${entry}Main -Vn rectlist_${stage}
+                -Fh "${rect_header}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/rectlist_quad.hlsl"
+        DEPENDS tests/rectlist_quad.hlsl VERBATIM)
+    set(rectlist_shader_${stage} "${rect_header}")
+endforeach()
+add_custom_target(rectlist_headers DEPENDS
+    "${rectlist_shader_vs}"
+    "${rectlist_shader_ps}")
+add_executable(rectlist_draw_check tests/rectlist_draw_check.cpp
+    "${rectlist_shader_vs}"
+    "${rectlist_shader_ps}")
+add_dependencies(rectlist_draw_check rectlist_headers)
+target_compile_features(rectlist_draw_check PRIVATE cxx_std_17)
+target_include_directories(rectlist_draw_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_link_libraries(rectlist_draw_check PRIVATE d3d12 dxgi)
 add_executable(d3d12_xs_shim_check tests/d3d12_xs_shim_check.cpp)
 add_dependencies(d3d12_xs_shim_check pso_compute_headers)
 target_link_libraries(d3d12_xs_shim_check PRIVATE d3d12_xs_shim dxgi)
@@ -4502,6 +4521,14 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${DXC_BIN_DIR}/dxil.dll" "$<TARGET_FILE:root_device_probe>" "$<TARGET_FILE:offscreen_check>" hardware)
     set_tests_properties(dxil_retarget_probe_hardware PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
     add_test(NAME dxil_retarget_controls COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/dxil_retarget_check.py")
+    add_test(NAME rectlist_topology COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/rectlist_topology_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME rectlist_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/rectlist_topology_check.py"
+            --draw "$<TARGET_FILE:rectlist_draw_check>" ${adapter})
+        set_tests_properties(rectlist_draw_${adapter} PROPERTIES TIMEOUT 60)
+    endforeach()
+    set_tests_properties(rectlist_draw_hardware PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME conditional_import_paths COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/intake/paths_check.py")
     add_library(intake_provider SHARED tests/intake/provider.cpp tests/intake/provider.def)
     add_library(intake_delay SHARED tests/intake/provider.cpp tests/intake/delay.def)
