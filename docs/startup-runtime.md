@@ -397,6 +397,21 @@ These are measured on one executable; treat them as hypotheses for others.
   entire page detects the wrong stream. Moving the second request by the same distance reaches
   EOF and leaves the destination untouched. A subsequent request using its directory offset succeeds.
   Reproduce with `ctest --preset release --no-tests=error -R '^startup_storage_directory_batch$' -V`.
+- **DirectStorage allocation failure (#1199, item 3).** A queue worker runs each entry inside
+  a handler that turns any exception, including `std::bad_alloc` from a buffer sized by a request
+  field, into a failed request: the next status entry reports `E_FAIL`, the destination is
+  untouched and the worker serves the following entries. The handler only copies a short reason
+  into a fixed buffer; the log line is written after the handler has left and after the request's
+  buffers were freed, so no formatting or allocation runs while the exception is in flight. The
+  worker is a `CreateThread` thread whose stack is committed at creation (1 MiB, `worker_stack_commit`)
+  instead of growing on demand, because when the system is out of commit an untouched stack page
+  cannot be committed either. The original `0xc00000fd` (stack overflow) was not reproduced here,
+  and the stack-commit cause is a hypothesis from reading the code, not a measurement. The
+  `startup_storage_alloc_failure` check puts its own process under a job commit limit, submits
+  a request that declares a 1.5 GiB inflated size, expects a failure status within a timeout and
+  then a correct result for a normal request on the same queue. It returns 77 where the limit is
+  not enforced.
+  Reproduce with `ctest --preset release --no-tests=error -R '^startup_storage_alloc_failure$' -V`.
 
 ## Shortcuts that are known to be wrong
 

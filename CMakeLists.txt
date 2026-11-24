@@ -338,6 +338,14 @@ add_executable(startup_inflate_status tests/startup_inflate_status.cpp)
 target_compile_features(startup_inflate_status PRIVATE cxx_std_17)
 target_include_directories(startup_inflate_status PRIVATE src)
 add_test(NAME startup_inflate_status COMMAND startup_inflate_status)
+# An allocation failure on the DirectStorage stand-in's worker fails that request, and the worker
+# serves the next one (#1199). Skips (77) where the system does not enforce a job commit limit.
+add_executable(startup_storage_alloc_failure tests/startup_storage_alloc_failure.cpp)
+target_compile_features(startup_storage_alloc_failure PRIVATE cxx_std_17)
+target_link_libraries(startup_storage_alloc_failure PRIVATE psapi)
+add_dependencies(startup_storage_alloc_failure startup_stub_xcrdapi)
+add_test(NAME startup_storage_alloc_failure COMMAND startup_storage_alloc_failure "$<TARGET_FILE:startup_stub_xcrdapi>")
+set_tests_properties(startup_storage_alloc_failure PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
 target_compile_features(startup_stub_consumer PRIVATE cxx_std_17)
 target_link_libraries(startup_stub_consumer PRIVATE startup_stub_chad startup_stub_xg_xs xmem_shim d3d12_xs_shim)
 # APU heap stand-in: ApuFree reuse, coalescing, refused requests and concurrent callers (docs/startup-runtime.md).

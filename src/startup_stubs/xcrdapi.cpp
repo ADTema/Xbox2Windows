@@ -19,7 +19,7 @@
 #include <deque>
 #include <exception>
 #include <mutex>
-#include <thread>
+#include <new>
 #include <vector>
 
 #include <cstdarg>
@@ -599,42 +599,83 @@ void run_entry(Object* self, Entry& entry)
     }
 }
 
+// Stack committed up front for a queue worker. The thread decodes request buffers sized from request
+// fields, and when one allocation fails it also runs the exception unwinder and the failure log. Once
+// the system is out of commit a stack page that was never touched cannot be committed either, so the
+// stack is committed at creation (CreateThread without STACK_SIZE_PARAMS_ARE_A_RESERVATION treats the
+// size as the committed size; the reserved size stays the image default or larger).
+constexpr SIZE_T worker_stack_commit = 1u << 20;
+
+// Failure text is held in caller-provided storage: nothing here allocates.
+void copy_reason(char (&reason)[96], const char* text) noexcept
+{
+    std::size_t i = 0;
+    for (; text && text[i] && i + 1 < sizeof reason; ++i) reason[i] = text[i];
+    reason[i] = 0;
+}
+
+// Fails the entry that threw: the next status entry reports E_FAIL, the worker goes on with the queue.
+void fail_entry(Object* self, const Entry& entry, const char* reason) noexcept
+{
+    InterlockedIncrement(&requests_failed);
+    InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
+    static LONG reported;
+    if (InterlockedIncrement(&reported) <= 12)
+        log("x2w-dstorage entry type %d failed: %s (options=0x%llx)", static_cast<int>(entry.type), reason,
+            entry.type == Entry::request ? *reinterpret_cast<const unsigned long long*>(entry.bytes) : 0ull);
+}
+
+DWORD WINAPI queue_worker(void* parameter)
+{
+    auto* const self = static_cast<Object*>(parameter);
+    QueueWork& work = *self->work;
+    for (;;) {
+        Entry entry;
+        {
+            std::unique_lock lock(work.mutex);
+            work.wake.wait(lock, [&] { return !work.submitted.empty(); });
+            entry = std::move(work.submitted.front());
+            work.submitted.pop_front();
+        }
+        // Buffers are sized from request fields; a failed allocation fails that request instead of
+        // ending the process (an exception leaving a thread calls terminate). The handlers only note
+        // the reason in a fixed buffer: the request's buffers are already freed when a handler runs,
+        // and the log is written after the handler has left, so no formatting runs while the
+        // exception is in flight on this stack.
+        char reason[96] = "";
+        bool failed = false;
+        try {
+            run_entry(self, entry);
+        } catch (const std::bad_alloc&) {
+            failed = true;
+            copy_reason(reason, "out of memory");
+        } catch (const std::exception& error) {
+            failed = true;
+            copy_reason(reason, error.what());
+        } catch (...) {
+            failed = true;
+            copy_reason(reason, "unknown exception");
+        }
+        if (failed) fail_entry(self, entry, reason);
+        {
+            const std::lock_guard guard(work.mutex);
+            if (work.submitted.empty()) {
+                work.cached_streams.clear();
+            }
+        }
+    }
+}
+
 QueueWork& work_of(Object* self)
 {
     static std::mutex create;
     const std::lock_guard guard(create);
     if (!self->work) {
         self->work = new QueueWork;
-        std::thread([self] {
-            QueueWork& work = *self->work;
-            for (;;) {
-                Entry entry;
-                {
-                    std::unique_lock lock(work.mutex);
-                    work.wake.wait(lock, [&] { return !work.submitted.empty(); });
-                    entry = std::move(work.submitted.front());
-                    work.submitted.pop_front();
-                }
-                // Buffers are sized from request fields; a failed allocation fails that request
-                // instead of ending the process (an exception leaving a thread calls terminate).
-                try {
-                    run_entry(self, entry);
-                } catch (const std::exception& error) {
-                    InterlockedIncrement(&requests_failed);
-                    InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
-                    static LONG reported;
-                    if (InterlockedIncrement(&reported) <= 12)
-                        log("x2w-dstorage entry type %d failed: %s (options=0x%llx)", static_cast<int>(entry.type), error.what(),
-                            entry.type == Entry::request ? *reinterpret_cast<const unsigned long long*>(entry.bytes) : 0ull);
-                }
-                {
-                    const std::lock_guard guard(work.mutex);
-                    if (work.submitted.empty()) {
-                        work.cached_streams.clear();
-                    }
-                }
-            }
-        }).detach();
+        HANDLE worker = CreateThread(nullptr, worker_stack_commit, queue_worker, self, 0, nullptr);
+        if (!worker) worker = CreateThread(nullptr, 0, queue_worker, self, 0, nullptr);
+        if (worker) CloseHandle(worker);
+        else log("x2w-dstorage queue worker not started: error %lu", GetLastError());
     }
     return *self->work;
 }
