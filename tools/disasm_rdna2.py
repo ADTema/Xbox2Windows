@@ -2686,12 +2686,20 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             mods.append("slc")
         if r128:
             mods.append("r128")
-        if (w0 >> 14) & 1:
-            mods.append("lwe")
         if (w0 >> 7) & 1:
             mods.append("dlc")
+        if (w0 >> 16) & 1:
+            mods.append("tfe")
+        if (w0 >> 17) & 1:
+            mods.append("lwe")
+        if (w1 >> 30) & 1:
+            mods.append("a16")
         if d16:
             mods.append("d16")
+        # Word 0 bits 6 and 14 and word 1 bits 29:26 are reserved on gfx10: LLVM assembles none of them and
+        # ignores them when disassembling, so a set bit is surfaced instead of vanishing from the listing.
+        if (w0 & 0x4040) or (w1 >> 26) & 0xf:
+            mods.append("reserved")
         asm = f"{op_name} {', '.join(operands)} {' '.join(mods)}"
         comment = "Image memory load/store/sample operation"
         return (length, op_name, asm, comment)
