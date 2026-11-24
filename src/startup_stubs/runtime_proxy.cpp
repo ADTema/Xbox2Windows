@@ -54,6 +54,14 @@ constexpr u64 local_user_id = 0x0009000012345678ull;
 constexpr GUID store_provider_id{0x0dd112ac, 0x7c24, 0x448c, {0xb9, 0x2b, 0x39, 0x60, 0xfb, 0x5b, 0xd3, 0x0c}};
 constexpr u64 store_context_handle = 0x58325753'00000001ull;  // not a pointer the runtime knows
 bool fake_user() noexcept { return x2w_local::env_on("X2W_FAKE_USER"); }
+// X2W_RUNTIME_LOCAL=1 (with X2W_RUNTIME_PROXY and X2W_FAKE_USER): when the system runtime cannot
+// initialise (no Gaming Services), report the initialisation as done and hand out local objects for
+// the providers the fake layer answers. Unanswered methods of those objects fail with E_NOTIMPL.
+bool runtime_local() noexcept { return x2w_local::env_on("X2W_RUNTIME_LOCAL"); }
+volatile LONG local_active;  // set once a real initialisation failed and was answered locally
+using InitApi = u64(__stdcall*)(u64, u64, u64, u64);
+InitApi real_init[3];
+constexpr const char* init_names[3] = {"InitializeApiImpl", "InitializeApiImplEx", "InitializeApiImplEx2"};
 int user_provider = -1, save_provider = -1;
 // The user provider also hands out a second interface (iid cef4fac0...) whose slot 3 is
 // GetGamertag(handle, component, size, buffer, &used). It is proxied as an entry of its own (shown as
@@ -76,6 +84,7 @@ bool user_call(int slot, u64* args, u64* result);
 bool save_call(int slot, u64* args, u64* result);
 bool area_call(const GUID& provider_id, int slot, u64* args, u64* result);
 u64 complete_async(u64 async_block);
+u64 local_user_add(u64 async_block);
 void* storage_object();
 const char* storage_path();
 constexpr unsigned long save_provider_data1 = 0x704c3f58;  // hypothesis: the game-save API (first seen: slot 4 with the user handle)
@@ -171,6 +180,21 @@ __declspec(noinline) u64 forward(Proxy* self, u64 a, u64 b, u64 c, u64 s0, u64 s
             }
         }
     }
+    if (!handled && !self->real) {
+        // A local object (X2W_RUNTIME_LOCAL) has no runtime object behind it.
+        handled = true;
+        if (N == 0) {  // QueryInterface(iid, &object): the same local object
+            if (b && x2w_local::writable(reinterpret_cast<void*>(b), 8)) *reinterpret_cast<u64*>(b) = reinterpret_cast<u64>(self);
+            result = 0;
+        } else if (N == 1 || N == 2) {  // AddRef, Release
+            result = 1;
+        } else {
+            result = 0x80004001;  // E_NOTIMPL
+            static LONG unanswered[max_providers][max_slots];
+            if (InterlockedIncrement(&unanswered[self->provider][N]) == 1)
+                x2w_local::logf("x2w-runtime local: %08lx::slot%d has no answer, E_NOTIMPL", provider_ids[self->provider].Data1, N);
+        }
+    }
     if (!handled) {
         const Method method = reinterpret_cast<Method>((*reinterpret_cast<void***>(self->real))[N]);
         result = method(self->real, a, b, c, s0, s1, s2, s3, s4, s5, s6, s7);
@@ -219,7 +243,20 @@ HRESULT __stdcall proxy_query(const GUID* provider, const GUID* iid, void** out)
         *out = storage_object();
         return S_OK;
     }
-    if (FAILED(hr) || !out || !*out || !provider) return hr;
+    bool local = false;
+    if (FAILED(hr) && out && provider && fake_user() && InterlockedCompareExchange(&local_active, 0, 0)) {
+        // The providers the fake layer answers (user, gamertag, save, package, title, connectivity, store).
+        static constexpr unsigned long answered[] = {user_provider_data1, save_provider_data1, 0xaf406016, 0x973a344e,
+                                                     0x37e56907, 0x0dd112ac};
+        for (unsigned long id : answered) local = local || provider->Data1 == id;
+        if (local) {
+            static LONG logged;
+            if (x2w_local::first_calls(logged, 24))
+                x2w_local::logf("x2w-runtime local: provider %08lx real 0x%08lx -> local object", provider->Data1, static_cast<unsigned long>(hr));
+            *out = nullptr;
+        }
+    }
+    if ((FAILED(hr) && !local) || !out || (!*out && !local) || !provider) return hr;
     GUID key = *provider;
     const bool gamertag = provider->Data1 == user_provider_data1 && iid && iid->Data1 == gamertag_iid_data1;
     if (gamertag) key.Data1 = gamertag_iid_data1;
@@ -243,7 +280,22 @@ HRESULT __stdcall proxy_query(const GUID* provider, const GUID* iid, void** out)
     }
     ReleaseSRWLockExclusive(&proxy_lock);
     if (proxy) *out = proxy;
+    if (local) return proxy ? S_OK : hr;
     return hr;
+}
+
+// X2W_RUNTIME_LOCAL: the title's InitializeApiImpl* calls. The real export runs once; if it fails, the
+// initialisation is reported as done and later calls are answered without the real runtime.
+template <int K>
+u64 __stdcall proxy_init(u64 a, u64 b, u64 c, u64 d)
+{
+    if (InterlockedCompareExchange(&local_active, 0, 0)) return 0;
+    const u64 real = real_init[K] ? real_init[K](a, b, c, d) : 0x80004005;
+    if (static_cast<HRESULT>(real & 0xffffffffu) >= 0) return real;
+    if (InterlockedExchange(&local_active, 1) == 0)
+        x2w_local::logf("x2w-runtime local: %s(0x%llx, 0x%llx) real 0x%08lx -> S_OK (local runtime)", init_names[K], a, b,
+                        static_cast<unsigned long>(real & 0xffffffffu));
+    return 0;
 }
 
 FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR name)
@@ -255,6 +307,14 @@ FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR name)
         if (std::strcmp(name, "QueryApiImpl") == 0) {
             real_query = reinterpret_cast<QueryApi>(real);
             return reinterpret_cast<FARPROC>(&proxy_query);
+        }
+        if (runtime_local() && fake_user()) {
+            static constexpr InitApi wrappers[3] = {&proxy_init<0>, &proxy_init<1>, &proxy_init<2>};
+            for (int k = 0; k < 3; ++k) {
+                if (std::strcmp(name, init_names[k]) != 0) continue;
+                real_init[k] = reinterpret_cast<InitApi>(real);
+                return reinterpret_cast<FARPROC>(wrappers[k]);
+            }
         }
     }
     return real;
@@ -308,6 +368,10 @@ bool user_call(int slot, u64* args, u64* result)
     case 5:  // XUserCompare(a, b)
         if (args[0] != local_user_handle && args[1] != local_user_handle) return false;
         *result = args[0] == args[1] ? 0 : 1;
+        return true;
+    case 7:  // XUserAddAsync(options, async): with a local runtime there is no real operation to borrow
+        if (!InterlockedCompareExchange(&local_active, 0, 0)) return false;
+        *result = local_user_add(args[1]);
         return true;
     case 8:  // XUserAddResult(async, &handle): the real operation ends with "no default user"; answer with the local user
         if (out(args[1], 8)) *reinterpret_cast<u64*>(args[1]) = local_user_handle;
@@ -488,6 +552,35 @@ u64 async_submit(int slot, u64 update, u64 block)
     const auto status = static_cast<HRESULT>(submit_update(update));
     using Complete = void(WINAPI*)(void*,void*,HRESULT,size_t);
     reinterpret_cast<Complete>(methods[10])(service, async, status, 0);
+    return S_OK;
+}
+
+// X2W_RUNTIME_LOCAL: XUserAddAsync completes at once with S_OK through the same XAsync service;
+// XUserAddResult (user slot 8) then hands out the local user.
+constexpr char user_add_identity[] = "local XUserAddAsync";
+u64 local_user_add(u64 block)
+{
+    if (!block || !real_query) return e_fail;
+    void* service = nullptr;
+    const auto query = real_query(&submit_async_family, &submit_async_family, &service);
+    if (FAILED(query) || !service) {
+        x2w_local::logf("x2w-runtime local: XUserAddAsync, async service unavailable 0x%08lx", static_cast<unsigned long>(query));
+        return FAILED(query) ? static_cast<unsigned>(query) : e_fail;
+    }
+    auto** methods = *static_cast<void***>(service);
+    struct ApiRef {
+        void* object;
+        ULONG (WINAPI* release)(void*);
+        ~ApiRef() { release(object); }
+    } api{service, reinterpret_cast<ULONG(WINAPI*)(void*)>(methods[2])};
+    auto* async = reinterpret_cast<void*>(block);
+    using Begin = HRESULT(WINAPI*)(void*, void*, void*, const void*, const char*, decltype(&submit_provider));
+    const auto hr = reinterpret_cast<Begin>(methods[7])(service, async, nullptr, user_add_identity, user_add_identity, submit_provider);
+    if (FAILED(hr)) return static_cast<unsigned>(hr);
+    using Complete = void(WINAPI*)(void*, void*, HRESULT, size_t);
+    reinterpret_cast<Complete>(methods[10])(service, async, S_OK, 0);
+    static LONG logged;
+    if (x2w_local::first_calls(logged, 4)) x2w_local::logf("x2w-runtime local: XUserAddAsync completed with the local user");
     return S_OK;
 }
 
@@ -675,6 +768,11 @@ u64 complete_async(u64 async_block)
 {
     Proxy* user = user_provider >= 0 ? proxies[user_provider] : nullptr;
     if (!user || !async_block) return 0x80004005;
+    if (!user->real) {  // a local object (X2W_RUNTIME_LOCAL): there is no runtime operation to borrow
+        static LONG logged;
+        if (x2w_local::first_calls(logged, 4)) x2w_local::logf("x2w-runtime local: async completion needs the real runtime, E_NOTIMPL");
+        return 0x80004001;
+    }
     const LONG index = InterlockedIncrement(&tracked_count) - 1;
     if (index < 64) tracked_blocks[index] = async_block;
     const Method add = reinterpret_cast<Method>((*reinterpret_cast<void***>(user->real))[7]);
