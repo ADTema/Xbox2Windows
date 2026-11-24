@@ -7167,6 +7167,16 @@ unreadable source page are rejected before the live data changes.
 
 Build `offscreen_check` and run
 `ctest --preset release --no-tests=error -R '^cpu_srv_' -V`.
+`ctest --preset dev --no-tests=error -R '^cpu_srv_upload(_written_range_control)?$' -V`
+checks `cpu_srv::refresh` (`src/cpu_srv_upload.h`) without a device, using a
+fake upload buffer and fence. It refuses each invalid argument, a texture, a
+default or readback heap, an offset at or past the end and a refresh one byte
+too long. It returns a failing `GetHeapProperties` or `Map` result, an
+outstanding fence, a removed device and a source that straddles an
+inaccessible page as `ERROR_PARTIAL_COPY`. No refusal unmaps or changes the
+upload. Accepted refreshes map with an empty read range and unmap exactly the
+written bytes. The control expects the written range to start at byte 0 and
+must fail.
 The caller owns source lifetime and must retire all queues reading an upload
 range before refreshing it.
 

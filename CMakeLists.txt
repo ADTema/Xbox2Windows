@@ -763,6 +763,15 @@ add_custom_command(OUTPUT "${cpu_srv_cs}" COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 
     -Vn cpu_srv_refresh_cs -Fh "${cpu_srv_cs}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu_srv_refresh.hlsl"
     DEPENDS tests/cpu_srv_refresh.hlsl VERBATIM)
 target_sources(offscreen_check PRIVATE "${cpu_srv_cs}")
+# Argument, resource, fence and partial-read refusals and the Map/Unmap ranges of cpu_srv::refresh
+# (src/cpu_srv_upload.h), with a fake upload buffer and fence instead of a device. The mutated run
+# is the negative control.
+add_executable(cpu_srv_upload_check tests/cpu_srv_upload_check.cpp)
+target_include_directories(cpu_srv_upload_check PRIVATE src)
+target_compile_features(cpu_srv_upload_check PRIVATE cxx_std_17)
+add_test(NAME cpu_srv_upload COMMAND cpu_srv_upload_check)
+add_test(NAME cpu_srv_upload_written_range_control COMMAND cpu_srv_upload_check --mutate written-range)
+set_tests_properties(cpu_srv_upload_written_range_control PROPERTIES WILL_FAIL TRUE)
 set(startup_sampler_x_cs "${CMAKE_CURRENT_BINARY_DIR}/startup_sampler_x_cs.h")
 add_custom_command(OUTPUT "${startup_sampler_x_cs}" COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E main
     -Vn startup_sampler_x_cs -Fh "${startup_sampler_x_cs}"
