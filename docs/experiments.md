@@ -10979,6 +10979,15 @@ The [MASM fixture](../tests/cpu/vex_parity.asm) and [differential check](../test
 ctest --preset release --no-tests=error -R '^cpu_aot_vex_parity$' -V
 ```
 
+## Startup root signature changes
+
+`tests/startup_root_reset.cpp` and `tests/startup_root_reset_check.py` bind a 1D texture through a descriptor table (list slot 36) and check that setting a different root signature (slot 34) drops the table, that the same one keeps it, and that six out-of-range `SetGraphicsRoot32BitConstants` calls log four lines and leave the table alone. Details are in [startup-runtime.md](startup-runtime.md#root-signature-changes-and-dropped-root-constants). Limits: synthetic command-stream fixture; the `*_hardware` target skips when no hardware D3D12 adapter is present.
+
+```powershell
+cmake --build --preset dev --target startup_stream_consumer
+ctest --preset dev --no-tests=error -R "^startup_root_reset_(warp|hardware)$" -V
+```
+
 ## Startup root constant buffer views
 
 Command-list slot 42 records the address of a root parameter declared as a CBV, so a translated shader reading through its root pointer sees it. The fixture (`tests/startup_root_cbv.cpp`, driven by `tests/startup_root_cbv_check.py`) is synthetic only: it uses generated command streams and no title data, and the slot number is derived from the desktop order and the console shift, not seen in a title log. It checks a bound call, an unbound call, a null overwrite that clears the slot, a wrong-type call that is ignored with `root CBV N ignored`, a redundant root bind that preserves the address, and a signature switch that clears it. Details are in [startup-runtime.md](startup-runtime.md#root-constant-buffer-views).
