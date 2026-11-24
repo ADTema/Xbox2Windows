@@ -2133,7 +2133,9 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             addrs = [vaddr0] + extra_bytes[:max(0, addr_count - 1)]
             vaddr_str = "[" + ", ".join(f"v{r}" for r in addrs) + "]"
         else:
-            vaddr_str = f"v{vaddr0}" if addr_count == 1 else f"v[{vaddr0}:{vaddr0 + addr_count - 1}]"
+            # LLVM 15 has no 9..15-register tuple class, so a longer packed address is printed as 16 registers.
+            addr_regs = addr_count if addr_count <= 8 else 16
+            vaddr_str = f"v{vaddr0}" if addr_regs == 1 else f"v[{vaddr0}:{vaddr0 + addr_regs - 1}]"
         srsrc_width = 4 if r128 else 8
         srsrc_str = f"s[{srsrc}:{srsrc + srsrc_width - 1}]"
         operands = [vdata_str, vaddr_str, srsrc_str]
