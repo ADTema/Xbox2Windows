@@ -599,6 +599,38 @@ def check_f16_round_forms():
         pixel.ACCEPTED.update(saved)
 
 
+def check_f16_fmac_ldexp_forms():
+    """The two plain e32 binary16 forms v_fmac_f16 and v_ldexp_f16 count as covered once the translator accepts their
+    fixtures; their e64, DPP and SDWA spellings and the arithmetic they resemble stay uncovered."""
+    import pixel_aot_check as pixel
+    saved = set(pixel.ACCEPTED)
+    pixel.ACCEPTED.clear()
+    try:
+        for key in pixel.F16_FMAC_LDEXP_PROGRAMS:
+            pixel.translate_f16(pixel.f16_fmac_ldexp_program(*key))
+        forms = {("VOP2", "v_fmac_f16"), ("VOP2", "v_ldexp_f16")}
+        neighbours = {("VOP3", "v_fmac_f16_e64"), ("VOP3", "v_ldexp_f16_e64"), ("SDWA", "v_ldexp_f16_sdwa"),
+                      ("DPP16", "v_fmac_f16_dpp"), ("DPP16", "v_ldexp_f16_dpp"), ("DPP8", "v_fmac_f16_dpp"),
+                      ("DPP8", "v_ldexp_f16_dpp"), ("VOP2", "v_pk_fmac_f16"), ("VOP2", "v_add_f16")}
+        for name in ("gfx1013.tsv", "rdna2.tsv"):
+            reference = fc.load_reference(name)
+            assert forms <= reference, (name, forms - reference)
+            assert neighbours <= reference, (name, neighbours - reference)
+            covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+            assert forms <= covered, (name, forms - covered)
+            assert not neighbours & covered, (name, neighbours & covered)
+        # Without the fixtures neither form is covered, not even through the binary16 arithmetic and rounding ones.
+        pixel.ACCEPTED.clear()
+        for key in pixel.F16_ARITH_PROGRAMS:
+            pixel.translate_f16(pixel.f16_arith_program(*key))
+        for key in pixel.F16_ROUND_PROGRAMS:
+            pixel.translate_f16(pixel.f16_round_program(*key))
+        assert not forms & fc.gfx_forms(pixel.ACCEPTED, fc.load_reference("gfx1013.tsv"))
+    finally:
+        pixel.ACCEPTED.clear()
+        pixel.ACCEPTED.update(saved)
+
+
 def check_f16_cvt_int16_forms():
     """The four integer to binary16 conversion forms (e32 and e64 spellings of v_cvt_f16_i16 and v_cvt_f16_u16) count as
     covered once the translator accepts their fixtures; the normalizing conversions v_cvt_norm_i16_f16 and v_cvt_norm_u16_f16 and
@@ -1211,6 +1243,7 @@ if __name__ == "__main__":
     check_int16_ternary_forms()
     check_f16_arith_forms()
     check_f16_round_forms()
+    check_f16_fmac_ldexp_forms()
     check_f16_cvt_int16_forms()
     check_f16_to_int16_forms()
     check_swap_coverage()

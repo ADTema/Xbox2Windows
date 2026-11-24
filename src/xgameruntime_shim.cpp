@@ -19,22 +19,33 @@
 //   XGameSaveCloseProvider              https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesavecloseprovider?view=gdk-2610
 //   XGameSaveCloseContainer             https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesaveclosecontainer?view=gdk-2610
 //   XGameSaveCloseUpdate                https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesavecloseupdate?view=gdk-2610
+//   XPersistentLocalStorageGetPathSize  https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xpersistentlocalstorage/functions/xpersistentlocalstoragegetpathsize?view=gdk-2604
+//   XPersistentLocalStorageGetPath      https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xpersistentlocalstorage/functions/xpersistentlocalstoragegetpath?view=gdk-2604
+//   XPersistentLocalStorageGetSpaceInfo https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xpersistentlocalstorage/functions/xpersistentlocalstoragegetspaceinfo?view=gdk-2510
+//   XPersistentLocalStorageSpaceInfo    https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xpersistentlocalstorage/structs/xpersistentlocalstoragespaceinfo?view=gdk-2604
+//   XPackageMount                       https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xpackage/functions/xpackagemount?view=gdk-2604
+//   XPackageGetMountPathSize            https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xpackage/xpackage_members?view=gdk-2604
+//   XPackageGetMountPath                https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xpackage/functions/xpackagegetmountpath?view=gdk-2604
+//   XPackageCloseMountHandle            https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xpackage/functions/xpackageclosemounthandle?view=gdk-2510
 //   XPackageMountWithUiAsync            https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xpackage/functions/xpackagemountwithuiasync?view=gdk-2610
 //   XSystemGetConsoleId                 https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xsystem/functions/xsystemgetconsoleid?view=gdk-2604
 //   XGameGetXboxTitleId                 https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgame/functions/xgamegetxboxtitleid?view=gdk-2604
 //   XAsyncGetStatus                     https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasync/functions/xasyncgetstatus?view=gdk-2604
 //   XTaskQueueCreate                    https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xtaskqueue/functions/xtaskqueuecreate?view=gdk-2604
 //
-// Async gap: XUserAddAsync and XGameSaveInitializeProviderAsync remain stubs.
-// Their public completion contract depends on XAsyncBlock plus
-// XUserAddResult/XGameSaveInitializeProviderResult queue, callback and result
-// semantics. This repository has no GDK headers, so the shim does not invent
-// that async completion state. The synchronous XUser/XGameSave subset below is
-// the implemented surface.
+// Async gap: XUserAddAsync, XGameSaveInitializeProviderAsync and
+// XPackageMountWithUiAsync remain stubs. Their public completion contract
+// depends on XAsyncBlock plus user/save/package result queue, callback and
+// result semantics. This repository has no GDK headers, so the shim does not
+// invent that async completion state. XPackageMount is documented as a
+// deprecated synchronous alternative; the shim implements it against a local
+// synthetic package directory. The implemented surface is the synchronous
+// XUser, XGameSave, PLS and XPackage subset below.
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -50,6 +61,7 @@ struct XUserHandleStorage;
 struct XGameSaveProviderStorage;
 struct XGameSaveContainerStorage;
 struct XGameSaveUpdateStorage;
+struct XPackageMountStorage;
 }
 using XUserHandle = xgameruntime_shim::XUserHandleStorage*;
 struct XTaskQueueHandleStorage;
@@ -57,8 +69,21 @@ using XTaskQueueHandle = XTaskQueueHandleStorage*;
 using XGameSaveProviderHandle = xgameruntime_shim::XGameSaveProviderStorage*;
 using XGameSaveContainerHandle = xgameruntime_shim::XGameSaveContainerStorage*;
 using XGameSaveUpdateHandle = xgameruntime_shim::XGameSaveUpdateStorage*;
+using XPackageMountHandle = xgameruntime_shim::XPackageMountStorage*;
 enum XUserAddOptions : std::uint32_t;
 enum XTaskQueueDispatchMode : std::uint32_t;
+
+// Public XPersistentLocalStorage.h structure used by the synchronous space
+// contract. The four fields follow the documented order and width.
+struct XPersistentLocalStorageSpaceInfo {
+    std::uint64_t availableFreeBytes;
+    std::uint64_t totalFreeBytes;
+    std::uint64_t usedBytes;
+    std::uint64_t totalBytes;
+};
+
+static_assert(sizeof(XPersistentLocalStorageSpaceInfo) == 32);
+static_assert(offsetof(XPersistentLocalStorageSpaceInfo, totalBytes) == 24);
 
 // Public XGameSave.h structures used by the synchronous read contract.
 struct XGameSaveBlobInfo {
@@ -105,6 +130,13 @@ static_assert(offsetof(XGameRuntimeShimLogEntry, function) == 16);
     X(XGameSaveCloseProvider, XGameSave, void, (XGameSaveProviderHandle provider), implemented_void, (provider), game_save_close_provider) \
     X(XGameSaveCloseContainer, XGameSave, void, (XGameSaveContainerHandle context), implemented_void, (context), game_save_close_container) \
     X(XGameSaveCloseUpdate, XGameSave, void, (XGameSaveUpdateHandle context), implemented_void, (context), game_save_close_update) \
+    X(XPersistentLocalStorageGetPathSize, XPersistentLocalStorage, HRESULT, (std::size_t* pathSize), implemented_hr, (pathSize), pls_get_path_size) \
+    X(XPersistentLocalStorageGetPath, XPersistentLocalStorage, HRESULT, (std::size_t pathSize, char* path, std::size_t* pathUsed), implemented_hr, (pathSize, path, pathUsed), pls_get_path) \
+    X(XPersistentLocalStorageGetSpaceInfo, XPersistentLocalStorage, HRESULT, (XPersistentLocalStorageSpaceInfo* info), implemented_hr, (info), pls_get_space_info) \
+    X(XPackageMount, XPackage, HRESULT, (const char* packageIdentifier, XPackageMountHandle* mountHandle), implemented_hr, (packageIdentifier, mountHandle), xpackage_mount) \
+    X(XPackageGetMountPathSize, XPackage, HRESULT, (XPackageMountHandle mountHandle, std::size_t* pathSize), implemented_hr, (mountHandle, pathSize), xpackage_get_mount_path_size) \
+    X(XPackageGetMountPath, XPackage, HRESULT, (XPackageMountHandle mountHandle, std::size_t pathSize, char* path), implemented_hr, (mountHandle, pathSize, path), xpackage_get_mount_path) \
+    X(XPackageCloseMountHandle, XPackage, void, (XPackageMountHandle mountHandle), implemented_void, (mountHandle), xpackage_close_mount_handle) \
     X(XPackageMountWithUiAsync, XPackage, HRESULT, (const char*, XAsyncBlock*), stub, (), stub) \
     X(XSystemGetConsoleId, XSystem, HRESULT, (std::size_t, char*, std::size_t*), stub, (), stub) \
     X(XGameGetXboxTitleId, XGame, HRESULT, (std::uint32_t*), stub, (), stub) \
@@ -125,12 +157,23 @@ constexpr std::size_t blob_capacity = 4;
 constexpr std::size_t container_name_capacity = 257;
 constexpr std::size_t blob_name_capacity = 64;
 constexpr std::size_t blob_bytes_capacity = 1024;
+constexpr std::size_t package_identifier_capacity = 64;
+constexpr std::size_t package_mount_capacity = 4;
+constexpr wchar_t pls_directory_name[] = L"xbox-recomp-pls";
+constexpr wchar_t synthetic_pls_app_name[] = L"x2w-synthetic-title-0001";
+constexpr wchar_t package_directory_name[] = L"xbox-recomp-packages";
+constexpr std::uint64_t synthetic_pls_available_free_bytes = 32ull * 1024 * 1024;
+constexpr std::uint64_t synthetic_pls_total_free_bytes = 48ull * 1024 * 1024;
+constexpr std::uint64_t synthetic_pls_total_bytes = 64ull * 1024 * 1024;
 constexpr HRESULT e_gs_invalid_container_name = static_cast<HRESULT>(0x80830001L);
 // https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/errorcodes?view=gdk-2610
 constexpr HRESULT e_gs_handle_expired = static_cast<HRESULT>(0x8083000DL);
 
-// Synthetic identity and storage policy. There is exactly one XUser identity,
-// and XGameSave state lives only in this process. Nothing is persisted to disk.
+// Synthetic identity and storage policy. There is exactly one XUser identity.
+// XGameSave state lives only in this process. PLS reports a fixed path under
+// the process temporary directory, and XPackage mounts map to a fixed
+// subdirectory there. The shim creates empty directories; it does not write
+// title data or secrets.
 
 enum class FunctionState { stub, implemented_hr, implemented_void };
 
@@ -213,8 +256,11 @@ static_assert(has_component(thunks, "XAsync"));
 static_assert(has_component(thunks, "XTaskQueue"));
 static_assert(has_implemented(thunks, "XUser"));
 static_assert(has_implemented(thunks, "XGameSave"));
+static_assert(has_implemented(thunks, "XPersistentLocalStorage"));
+static_assert(has_implemented(thunks, "XPackage"));
 static_assert(has_stub(thunks, "XUserAddAsync"));
 static_assert(has_stub(thunks, "XGameSaveInitializeProviderAsync"));
+static_assert(has_stub(thunks, "XPackageMountWithUiAsync"));
 
 struct XUserHandleStorage {
     std::uint64_t id = 0;
@@ -260,16 +306,24 @@ struct XGameSaveUpdateStorage {
     std::array<BlobSlot, blob_capacity> staged{};
 };
 
+struct XPackageMountStorage {
+    bool live = false;
+    std::uint64_t id = 0;
+    char identifier[package_identifier_capacity]{};
+};
+
 struct RuntimeState {
     SRWLOCK lock = SRWLOCK_INIT;
     std::uint64_t next_provider_scope = 1;
     std::uint64_t next_store_id = 1;
     std::uint64_t next_container_handle_id = 1;
+    std::uint64_t next_package_mount_id = 1;
     std::array<XUserHandleStorage, user_capacity> users{};
     std::array<XGameSaveProviderStorage, provider_capacity> providers{};
     std::array<ContainerStore, container_store_capacity> container_stores{};
     std::array<XGameSaveContainerStorage, container_handle_capacity> containers{};
     std::array<XGameSaveUpdateStorage, update_capacity> updates{};
+    std::array<XPackageMountStorage, package_mount_capacity> package_mounts{};
 };
 
 RuntimeState runtime_state;
@@ -290,6 +344,76 @@ bool copy_text(char* destination, std::size_t capacity, const char* source) noex
     if (length == 0 || length >= capacity) return false;
     std::memcpy(destination, source, length + 1);
     return true;
+}
+
+bool to_utf8(const std::wstring& source, std::string& output) noexcept
+{
+    if (source.empty()) return false;
+    const int length = static_cast<int>(source.size());
+    const int needed = WideCharToMultiByte(CP_UTF8, 0, source.data(), length, nullptr, 0,
+                                           nullptr, nullptr);
+    if (needed <= 0) return false;
+    output.resize(static_cast<std::size_t>(needed));
+    return WideCharToMultiByte(CP_UTF8, 0, source.data(), length, output.data(), needed,
+                               nullptr, nullptr) == needed;
+}
+
+bool temp_directory(std::wstring& directory) noexcept
+{
+    wchar_t buffer[MAX_PATH + 1]{};
+    constexpr std::size_t buffer_capacity = sizeof(buffer) / sizeof(buffer[0]);
+    const DWORD length = GetTempPathW(static_cast<DWORD>(buffer_capacity), buffer);
+    if (length == 0 || length >= buffer_capacity) return false;
+    directory.assign(buffer, length);
+    if (directory.empty() || directory.back() != L'\\') directory.push_back(L'\\');
+    return true;
+}
+
+bool ensure_directory(const std::wstring& path) noexcept
+{
+    if (CreateDirectoryW(path.c_str(), nullptr)) return true;
+    return GetLastError() == ERROR_ALREADY_EXISTS;
+}
+
+bool pls_path_utf8(std::string& output) noexcept
+{
+    std::wstring root;
+    if (!temp_directory(root)) return false;
+    const std::wstring directory = root + pls_directory_name;
+    const std::wstring app_directory = directory + L"\\" + synthetic_pls_app_name;
+    if (!ensure_directory(directory) || !ensure_directory(app_directory)) return false;
+    return to_utf8(app_directory, output);
+}
+
+bool valid_package_identifier(const char* identifier) noexcept
+{
+    if (!identifier) return false;
+    const std::size_t length = std::strlen(identifier);
+    if (length == 0 || length >= package_identifier_capacity) return false;
+    for (const char* cursor = identifier; *cursor; ++cursor) {
+        const char c = *cursor;
+        const bool alpha = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+        const bool digit = c >= '0' && c <= '9';
+        if (!(alpha || digit || c == '.' || c == '_' || c == '-')) return false;
+    }
+    if (std::strcmp(identifier, ".") == 0 || std::strcmp(identifier, "..") == 0) return false;
+    if (std::strstr(identifier, "..") != nullptr) return false;
+    return true;
+}
+
+bool package_path_utf8(const char* identifier, std::string& output) noexcept
+{
+    if (!valid_package_identifier(identifier)) return false;
+    std::wstring root;
+    if (!temp_directory(root)) return false;
+    const std::wstring directory = root + package_directory_name;
+    if (!ensure_directory(directory)) return false;
+    std::wstring package_directory = directory + L"\\";
+    for (const char* cursor = identifier; *cursor; ++cursor) {
+        package_directory.push_back(static_cast<wchar_t>(*cursor));
+    }
+    if (!ensure_directory(package_directory)) return false;
+    return to_utf8(package_directory, output);
 }
 
 bool valid_container_name(const char* name) noexcept
@@ -449,6 +573,115 @@ HRESULT user_close_handle(XUserHandle user) noexcept
     }
     ReleaseSRWLockExclusive(&runtime_state.lock);
     return S_OK;
+}
+
+HRESULT pls_get_path_size(std::size_t* path_size) noexcept
+{
+    if (!path_size) return E_POINTER;
+    *path_size = 0;
+    std::string path;
+    if (!pls_path_utf8(path)) return E_FAIL;
+    *path_size = path.size() + 1;
+    return S_OK;
+}
+
+HRESULT pls_get_path(std::size_t path_size, char* path, std::size_t* path_used) noexcept
+{
+    if (path_used) *path_used = 0;
+    if (!path) return E_POINTER;
+    std::string expected;
+    if (!pls_path_utf8(expected)) return E_FAIL;
+    const std::size_t required = expected.size() + 1;
+    if (path_size < required) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    std::memcpy(path, expected.c_str(), required);
+    if (path_used) *path_used = required;
+    return S_OK;
+}
+
+HRESULT pls_get_space_info(XPersistentLocalStorageSpaceInfo* info) noexcept
+{
+    if (!info) return E_POINTER;
+    std::string path;
+    if (!pls_path_utf8(path)) return E_FAIL;
+    *info = XPersistentLocalStorageSpaceInfo{synthetic_pls_available_free_bytes,
+                                              synthetic_pls_total_free_bytes,
+                                              synthetic_pls_total_bytes - synthetic_pls_total_free_bytes,
+                                              synthetic_pls_total_bytes};
+    return S_OK;
+}
+
+HRESULT xpackage_mount(const char* package_identifier, XPackageMountHandle* mount_handle) noexcept
+{
+    if (!mount_handle) return E_POINTER;
+    *mount_handle = nullptr;
+    if (!valid_package_identifier(package_identifier)) return E_INVALIDARG;
+    std::string path;
+    if (!package_path_utf8(package_identifier, path)) return E_FAIL;
+    AcquireSRWLockExclusive(&runtime_state.lock);
+    for (auto& slot : runtime_state.package_mounts) {
+        if (!slot.live) {
+            slot = XPackageMountStorage{};
+            slot.live = true;
+            slot.id = runtime_state.next_package_mount_id++;
+            if (!copy_text(slot.identifier, sizeof(slot.identifier), package_identifier)) {
+                slot = XPackageMountStorage{};
+                ReleaseSRWLockExclusive(&runtime_state.lock);
+                return E_INVALIDARG;
+            }
+            *mount_handle = &slot;
+            ReleaseSRWLockExclusive(&runtime_state.lock);
+            return S_OK;
+        }
+    }
+    ReleaseSRWLockExclusive(&runtime_state.lock);
+    return E_OUTOFMEMORY;
+}
+
+HRESULT xpackage_get_mount_path_size(XPackageMountHandle mount_handle,
+                                     std::size_t* path_size) noexcept
+{
+    if (!path_size) return E_POINTER;
+    *path_size = 0;
+    char identifier[package_identifier_capacity]{};
+    AcquireSRWLockShared(&runtime_state.lock);
+    const auto found = find_live(runtime_state.package_mounts, mount_handle);
+    const bool copied = found && copy_text(identifier, sizeof(identifier), found->identifier);
+    ReleaseSRWLockShared(&runtime_state.lock);
+    if (!found) return E_HANDLE;
+    if (!copied) return E_FAIL;
+    std::string path;
+    if (!package_path_utf8(identifier, path)) return E_FAIL;
+    *path_size = path.size() + 1;
+    return S_OK;
+}
+
+HRESULT xpackage_get_mount_path(XPackageMountHandle mount_handle, std::size_t path_size,
+                                char* path) noexcept
+{
+    if (!path) return E_POINTER;
+    char identifier[package_identifier_capacity]{};
+    AcquireSRWLockShared(&runtime_state.lock);
+    const auto found = find_live(runtime_state.package_mounts, mount_handle);
+    const bool copied = found && copy_text(identifier, sizeof(identifier), found->identifier);
+    ReleaseSRWLockShared(&runtime_state.lock);
+    if (!found) return E_HANDLE;
+    if (!copied) return E_FAIL;
+    std::string expected;
+    if (!package_path_utf8(identifier, expected)) return E_FAIL;
+    const std::size_t required = expected.size() + 1;
+    if (path_size < required) return E_INVALIDARG;
+    std::memcpy(path, expected.c_str(), required);
+    return S_OK;
+}
+
+HRESULT xpackage_close_mount_handle(XPackageMountHandle mount_handle) noexcept
+{
+    if (!mount_handle) return E_HANDLE;
+    AcquireSRWLockExclusive(&runtime_state.lock);
+    const auto found = find_live(runtime_state.package_mounts, mount_handle);
+    if (found) *found = XPackageMountStorage{};
+    ReleaseSRWLockExclusive(&runtime_state.lock);
+    return found ? S_OK : E_HANDLE;
 }
 
 HRESULT game_save_initialize_provider(XUserHandle requesting_user, const char* configuration_id,
