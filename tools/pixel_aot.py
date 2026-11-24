@@ -2550,6 +2550,34 @@ def wait_counters(line):
     return None
 
 
+SCALAR_OPERAND = re.compile(r"s(?:\d|[1-9]\d|10[0-5])|vcc")
+VECTOR_OPERAND = re.compile(r"v(?:\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])")
+
+
+class UnboundOperand(ValueError):
+    """A guest register is read while lower() holds no value for it.
+
+    The register is an entry register the caller did not bind (only the texture table, the interpolation base,
+    v0, v1 and the entry registers of the constant contract start bound) or a register no earlier instruction
+    wrote. bank is "scalar" or "vector", index the 0-based instruction number, offset its byte offset when lower()
+    received (offset, text) pairs and None otherwise. Only s0-s105, vcc and v0-v255 are reported this way: any
+    other missing key in the register state is an internal lookup error and stays a KeyError.
+    """
+
+    def __init__(self, bank, register, index, offset, instruction):
+        self.bank, self.register = bank, register
+        self.index, self.offset, self.instruction = index, offset, instruction
+        where = "" if offset is None else f" (byte offset {offset:#x})"
+        super().__init__(f"Unbound {bank} operand {register} at instruction {index}{where}: {instruction}")
+
+
+def unbound_operand(registers, key, pattern, bank):
+    """Raise UnboundOperand for a missing guest register read inside an instruction, else a plain KeyError."""
+    if registers.site is not None and isinstance(key, str) and pattern.fullmatch(key):
+        raise UnboundOperand(bank, key, *registers.site)
+    raise KeyError(key)
+
+
 class TrackedVector(VectorRegisters):
     """Vector register names that record reads, so a conditionally-written register can be refused."""
 
@@ -2558,10 +2586,14 @@ class TrackedVector(VectorRegisters):
         self.reads = []
         self.masked = False
         self.conditional = set()
+        self.site = None  # (index, byte offset or None, text) of the instruction being lowered
 
     def __getitem__(self, key):
         self.reads.append(key)
         return super().__getitem__(key)
+
+    def __missing__(self, key):
+        unbound_operand(self, key, VECTOR_OPERAND, "vector")
 
     def get(self, key, default=None):
         self.reads.append(key)
@@ -2582,10 +2614,14 @@ class TrackedScalar(dict):
         self.reads = []
         self.masked = False
         self.conditional = set()
+        self.site = None  # as TrackedVector.site
 
     def __getitem__(self, key):
         self.reads.append(key)
         return super().__getitem__(key)
+
+    def __missing__(self, key):
+        unbound_operand(self, key, SCALAR_OPERAND, "scalar")
 
     def get(self, key, default=None):
         self.reads.append(key)
@@ -2626,6 +2662,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     half_denorm declares the binary16 denormal state at shader entry (MODE[7:6]). Only "preserve" is accepted; None
     means unknown, and the plain binary16 VOP2 arithmetic forms are then refused. The caller takes it from validated
     guest state; the translator does not measure or track it.
+    A read of a guest register that holds no tracked value raises UnboundOperand, a ValueError that names the
+    register and the instruction, so a missing entry binding is not mistaken for an unsupported instruction.
     """
     if title_ranges is not None and (isinstance(title_ranges, bool) or not isinstance(title_ranges, int)
                                      or not 1 <= title_ranges <= 0xffffffff):
@@ -2792,6 +2830,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     for i, (offset, line) in enumerate(positioned):
         vector.reads.clear()
         scalar.reads.clear()
+        scalar.site = vector.site = (i, offset, line)
         conditional = set(vector.conditional)
         scalar_conditional = set(scalar.conditional)
         def match(pattern):
@@ -5317,6 +5356,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             raise ValueError(f"Read of a register defined only on the masked path {i}: {line}")
         if scalar_conditional.intersection(scalar.reads):
             raise ValueError(f"Read of a register defined only on the masked path {i}: {line}")
+    # Reads after the last instruction are not operand reads: a missing key there stays a KeyError.
+    scalar.site = vector.site = None
     if region is not None:
         raise ValueError("Program ends inside a masked region")
     if not ended or samples != len(bindings):
