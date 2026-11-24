@@ -11052,7 +11052,13 @@ ctest --preset release --no-tests=error -R '^cpu_aot_vex_parity$' -V
 
 ## Startup root signature changes
 
-`tests/startup_root_reset.cpp` and `tests/startup_root_reset_check.py` bind a 1D texture through a descriptor table (list slot 36) and check that setting a different root signature (slot 34) drops the table, that the same one keeps it, and that six out-of-range `SetGraphicsRoot32BitConstants` calls log four lines and leave the table alone. Details are in [startup-runtime.md](startup-runtime.md#root-signature-changes-and-dropped-root-constants). Limits: synthetic command-stream fixture; the `*_hardware` target skips when no hardware D3D12 adapter is present.
+`tests/startup_root_reset.cpp` and `tests/startup_root_reset_check.py` bind a 1D texture through a descriptor table
+(list slot 36) and a root constant through slot 40. The pixel shader puts the constant in the blue channel. The
+fixture checks that a different root signature (slot 34) clears both inputs, the same signature preserves them,
+and six out-of-range constant writes log four lines and preserve both bindings. Before clearing cached constants,
+the switched case reads back blue 173 on a pixel where the fixture expects zero. Details are in
+[startup-runtime.md](startup-runtime.md#root-signature-changes-and-dropped-root-constants). The synthetic hardware
+case returns 77 without a physical D3D12 adapter.
 
 ```powershell
 cmake --build --preset dev --target startup_stream_consumer
