@@ -2,6 +2,15 @@
 
 Run commands from the repository root. Start with the [project overview](../README.md) and [contribution guide](../CONTRIBUTING.md). Package-specific observations below used local inputs. Community regression tests use fixtures built from this repository.
 
+## Graphics pipeline stream with a root SRV
+
+The source-built vertex shader fetches positions and colors through a root SRV at `t0, space3` using `SV_VertexID`. A VS/PS pipeline stream draws a fullscreen triangle with a different color at each vertex. Flat shading produces 64 green pixels. A zero vertex stride collapses the triangle and leaves all 64 pixels magenta. Binding an alternate range with a different leading color produces 64 red pixels. Each draw waits on its queue fence before comparing every RGBA byte.
+
+```powershell
+cmake --build --preset release --target offscreen_check
+ctest --preset release --no-tests=error -R '^stream_root_srv_' -V
+```
+
 ## Local tools
 
 For optional static dependency inspection, build Microsoft's pinned version of xbdepends from PowerShell with x64 Visual Studio Build Tools, CMake and the Windows SDK.

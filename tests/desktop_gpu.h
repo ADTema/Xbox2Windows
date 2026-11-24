@@ -23,6 +23,7 @@ void check_ffx_device_init(ID3D12Device* device);
 void check_ffx_recurrent(ID3D12Device* device);
 void check_dual_uav(ID3D12Device* device);
 enum class DescriptorWindowCase { direct, stale_window, copied_record, stale_record, unknown_record };
+void check_stream_root_srv(ID3D12Device* device);
 void check_descriptor_window_submissions(ID3D12Device* device, DescriptorWindowCase scenario);
 enum class MeshConstantBinding { root, root_pair, swapped_root_pair, table, swapped_table };
 enum class MeshDrawMode { color, textured, depth_pair };
