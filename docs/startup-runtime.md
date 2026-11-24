@@ -323,4 +323,3 @@ size, not the page's.
 earlier contract check and a batch that spans two sections, with holes punched in it, pages moved
 and reused, and a second thread reading a page while its neighbour is unmapped and mapped again.
 The `no_retry_control` variant leaves the handler out and must fail.
-
