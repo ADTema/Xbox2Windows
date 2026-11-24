@@ -274,7 +274,9 @@ class Stage:
         r = reg_range(tok)
         s = self.sym.get(r[1]) if r else None
         if s and s[0] == 'desc':
-            return s[1], s[2]
+            # A descriptor can start inside a wider load (s_load_dwordx16 fetches two image
+            # descriptors): its offset is the load's offset plus the first register's dword index.
+            return s[1], (None if s[2] is None else s[2] + 4 * s[3])
         if s and s[0] == 'ptr':
             return s[1], None
         raise Unsupported('descriptor operand %s holds %s' % (tok, s))
@@ -687,6 +689,21 @@ class Stage:
         else:
             r = reg_range(coords)
             cs = ['v%d' % n for n in range(r[1], r[2] + 1)]
+        lod = None
+        if how == 'l':
+            # Address dwords are the coordinates and then the explicit level; offsets, bias, clamp and derivatives
+            # would add dwords or modifiers this lowering does not read, so they are refused. Only the cache-policy
+            # bits (glc, slc, dlc), which never change the sampled value, are accepted next to dim and dmask;
+            # unorm, r128, tfe, lwe, a16, d16 and reserved bits would each change the address, resource or result
+            # layout and are refused by name.
+            for m in mods:
+                if not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'glc', 'slc')):
+                    raise Unsupported('image_sample_l modifier %s' % m)
+            if dmask == 0:
+                raise Unsupported('image_sample_l with an empty dmask')
+            if len(cs) != (4 if three else 3):
+                raise Unsupported('image_sample_l with %d address registers' % len(cs))
+            lod, cs = cs[-1], cs[:-1]
         tex = self.pipe.resource(self.descriptor(ops[2]), 'tex3d' if three else 'tex2d')
         if how in ('load', 'load_mip'):
             axes = 3 if three else 2
@@ -705,7 +722,9 @@ class Stage:
             smp = heap or self.pipe.sampler(tuple(words) if words else self.descriptor(ops[3]))
             uv = ('float3(%s, %s, %s)' % (self.f(cs[0]), self.f(cs[1]), self.f(cs[2])) if three
                   else 'float2(%s, %s)' % (self.f(cs[0]), self.f(cs[1])))
-            if how == 'lz' or not self.exec_known or self.kind != 'ps' or len(self.blocks) > 0:
+            if how == 'l':
+                call = '%s.SampleLevel(%s, %s, %s)' % (tex, smp, uv, self.f(lod))
+            elif how == 'lz' or not self.exec_known or self.kind != 'ps' or len(self.blocks) > 0:
                 call = '%s.SampleLevel(%s, %s, 0)' % (tex, smp, uv)
             else:
                 call = '%s.Sample(%s, %s)' % (tex, smp, uv)
@@ -721,6 +740,9 @@ class Stage:
 
     def op_image_sample_lz(self, ops, mods):
         self.image(ops, mods, 'lz')
+
+    def op_image_sample_l(self, ops, mods):
+        self.image(ops, mods, 'l')
 
     def op_image_load(self, ops, mods):
         self.image(ops, mods, 'load')
@@ -1109,8 +1131,8 @@ def fnv(data, h=1469598103934665603):
 
 
 def pipeline_key(vs_code, ps_code, root_blob):
-    """Must match the runtime: FNV-1a over the three blobs, chained."""
-    return fnv(root_blob, fnv(ps_code, fnv(vs_code)))
+    """Hash the startup translation revision and the three blobs in runtime order."""
+    return fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-srv-2'))))
 
 
 FXC = os.environ.get('X2W_FXC', r'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\fxc.exe')
@@ -1198,7 +1220,7 @@ def main():
             if not a or not b or len(a) != q[6] or len(b) != q[10]:
                 print('pso %x: code not captured' % (w & 0xffffff))
                 continue
-            key = fnv(root, fnv(b, fnv(a)))
+            key = pipeline_key(a, b, root)
             for ext, blob in (('.a', a), ('.b', b), ('.root', root)):
                 open(os.path.join(out_dir, 'req_%016x%s' % (key, ext)), 'wb').write(blob)
             print('pso %x -> request %016x' % (w & 0xffffff, key))
