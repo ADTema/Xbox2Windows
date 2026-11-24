@@ -6015,6 +6015,22 @@ the unaligned round trip matched, and the sentinel readback stayed unchanged. Th
 `0x100000000`; the CPU base varied with ASLR. `gpu_alias_window_hardware` returned 77 because no
 physical adapter was visible in that session.
 
+At commit `429a8b9` on Windows 11 build 26300.9974, `gpu_alias_window_hardware` failed on an AMD
+Radeon RX 6600 (RDNA 2, vendor `1002`, device `73ff`, driver `32.0.21045.29003`, debug layer
+enabled, 0 errors and 0 warnings) in 3 of 3 runs, at its first acceptance check, `the CPU and GPU
+window bases are 64 KiB aligned`. The CPU base was 64 KiB aligned and varied with ASLR. The GPU
+base of the aliased buffer was `0x300076000` in every run: 4 KiB aligned, with low 16 bits
+`0x6000`. In the same session `gpu_alias_window_warp` passed in 3 of 3 runs on WARP
+`10.0.26100.9818`, with GPU base `0x200000000`. For a local run, not committed, the three checks
+that compare the low 16 bits (the aligned window bases, the identical page offsets and the
+identical offset of the unaligned span) printed their result instead of failing. The hardware
+variant then passed in 3 of 3 runs. Pages 0 to 2 and the unaligned span kept their window-relative
+offsets and round-tripped, both copy directions matched with mismatches 0, and the four negative
+controls returned `E_BOUNDS`, `E_INVALIDARG`, `ERROR_INVALID_ADDRESS` and `E_INVALIDARG` without a
+submission while the sentinel readback stayed unchanged. On this adapter the window-relative alias
+holds and the low-16-bit identity does not. Whether that identity is a requirement of the window
+policy, or the acceptance should rest on window-relative offsets alone, is not decided here.
+
 Measured at commit `55cea41` on Windows 11 build 26300, with the debug layer unavailable (Graphics Tools not installed):
 - `gpu_alias_hardware` passed on an NVIDIA GeForce RTX 3070 Laptop GPU (driver 32.0.16.1088).
 - `gpu_alias_warp` passed on WARP 10.0.26100.9818.
