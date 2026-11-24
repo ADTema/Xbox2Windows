@@ -253,6 +253,14 @@ void adapter_limits()
         expect(live_windows == 0 && over_released == 0, "40 bits: the last release frees every window");
     }
     {
+        // One bit below the floor the range refuses instead of creating a window it cannot address.
+        {
+            Fixture below(16);
+            IX2WGpuRange* refused_range = reinterpret_cast<IX2WGpuRange*>(std::uintptr_t{1});
+            expect(d3d12_xs_range::create(below.get(), 3 * tile, &refused_range, create_window) == E_FAIL &&
+                       !refused_range && requests.empty() && live_windows == 0,
+                   "16 bits: the range is refused before a window is created");
+        }
         Fixture fixture(17);
         IX2WGpuRange* range = nullptr;
         expect(d3d12_xs_range::create(fixture.get(), 3 * tile, &range, create_window) == S_OK && range,
