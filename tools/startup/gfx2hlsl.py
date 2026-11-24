@@ -790,8 +790,14 @@ class Stage:
         tex = self.pipe.resource(self.descriptor(ops[2]), 'tex2d')
         smp = self.pipe.sampler(tuple(words), comparison=True)
         args = '%s, float2(%s, %s), %s' % (smp, self.f(cs[1]), self.f(cs[2]), self.f(cs[0]))
+        # MAX_LOD (word 1 bits 23:12) is not carried into the static sampler, which never limits the LOD. Level
+        # zero is the exact lowering when the source limits it to 0; an implicit comparison cannot express any
+        # other limit below the maximum.
+        max_lod = (words[1] >> 12) & 0xfff
+        if how == 'c' and max_lod not in (0, 0xfff):
+            raise Unsupported('%s with a sampler MAX_LOD of %#x' % (base, max_lod))
         # Implicit derivatives exist only in a pixel stage, as for image_sample.
-        if how == 'c' and self.exec_known and self.kind == 'ps' and len(self.blocks) == 0:
+        if how == 'c' and max_lod and self.exec_known and self.kind == 'ps' and len(self.blocks) == 0:
             call = '%s.SampleCmp(%s)' % (tex, args)
         else:
             call = '%s.SampleCmpLevelZero(%s)' % (tex, args)

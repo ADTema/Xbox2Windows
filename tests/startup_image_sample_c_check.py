@@ -28,7 +28,7 @@ from startup_sampler_heap_check import VS_WORDS, assemble, root_blob  # noqa: E4
 PRE = """\
 s_load_dwordx8 s[16:23], s[8:9], 0x0
 s_mov_b32 s24, {w0:#x}
-s_mov_b32 s25, 0
+s_mov_b32 s25, {w1:#x}
 s_mov_b32 s26, {w2:#x}
 s_mov_b32 s27, 0
 v_mov_b32 v0, 0.5
@@ -74,6 +74,10 @@ IMAGE = {
     'd16': 'image_sample_c_lz v4, v[0:2], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D d16',
     'r128': 'image_sample_c_lz v4, v[0:2], s[16:23], s[24:27] dmask:0x1 dim:SQ_RSRC_IMG_2D r128',
 }
+# SQ_IMG_SAMP_WORD1 bits 23:12 are MAX_LOD (4.8 fixed point). The translated static sampler never limits the
+# LOD, so an implicit-derivative comparison is lowered to SampleCmp only when the source does not limit it either.
+MAX_LOD_FULL = 0xfff << 12
+W1 = {'c': MAX_LOD_FULL, 'c_nsa': MAX_LOD_FULL, 'c_max_partial': 1 << 12}
 # name -> (image key, sampler word 0, sampler word 2)
 VARIANTS = {name: (name, POINT | LESS, 0) for name in IMAGE}
 VARIANTS.update({'func%d' % n: ('lz', POINT | n << 12, 0) for n in range(8) if n != 1})
@@ -83,6 +87,8 @@ VARIANTS['point_no_trunc'] = ('lz', 2 | 2 << 3 | LESS, 0)
 VARIANTS['anisotropic'] = ('lz', POINT | LESS | 1 << 9, 0)
 VARIANTS['wrap_x'] = ('lz', (POINT | LESS) & ~7, 0)
 VARIANTS['mixed'] = ('mixed', POINT | LESS, 0)
+VARIANTS['c_max0'] = ('c', POINT | LESS, 0)
+VARIANTS['c_max_partial'] = ('c', POINT | LESS, 0)
 WORDS = {
     'lz': bytes.fromhex(
         '04040cf4000000faff0398be12100008800399be80039abe80039bbef002007e'
@@ -93,13 +99,13 @@ WORDS = {
         'ff02027e0000803ef202047ef402067e7fc08cbf0a01bcf00304c40000010000'
         '703f8cbf0f1800f804040404000081bf'),
     'c': bytes.fromhex(
-        '04040cf4000000faff0398be12100008800399be80039abe80039bbef002007e'
-        'ff02027e0000803ef202047ef402067e7fc08cbf0801a0f00004c400703f8cbf'
-        '0f1800f804040404000081bf'),
-    'c_nsa': bytes.fromhex(
-        '04040cf4000000faff0398be12100008800399be80039abe80039bbef002007e'
-        'ff02027e0000803ef202047ef402067e7fc08cbf0a01a0f00304c40000010000'
+        '04040cf4000000faff0398be12100008ff0399be00f0ff0080039abe80039bbe'
+        'f002007eff02027e0000803ef202047ef402067e7fc08cbf0801a0f00004c400'
         '703f8cbf0f1800f804040404000081bf'),
+    'c_nsa': bytes.fromhex(
+        '04040cf4000000faff0398be12100008ff0399be00f0ff0080039abe80039bbe'
+        'f002007eff02027e0000803ef202047ef402067e7fc08cbf0a01a0f00304c400'
+        '00010000703f8cbf0f1800f804040404000081bf'),
     'c_l': bytes.fromhex(
         '04040cf4000000faff0398be12100008800399be80039abe80039bbef002007e'
         'ff02027e0000803ef202047ef402067e7fc08cbf0801b0f00004c400703f8cbf'
@@ -236,6 +242,14 @@ WORDS = {
         '04040cf4000000faff0398be12100008800399be80039abe80039bbef002007e'
         'ff02027e0000803ef202047ef402067e7fc08cbf08019cf00005c4000801bcf0'
         '0004c400703f8cbf0f1800f804040404000081bf'),
+    'c_max0': bytes.fromhex(
+        '04040cf4000000faff0398be12100008800399be80039abe80039bbef002007e'
+        'ff02027e0000803ef202047ef402067e7fc08cbf0801a0f00004c400703f8cbf'
+        '0f1800f804040404000081bf'),
+    'c_max_partial': bytes.fromhex(
+        '04040cf4000000faff0398be12100008ff0399be0010000080039abe80039bbe'
+        'f002007eff02027e0000803ef202047ef402067e7fc08cbf0801a0f00004c400'
+        '703f8cbf0f1800f804040404000081bf'),
 }
 
 
@@ -247,7 +261,7 @@ def source(name):
                 + IMAGE['lz'] + '\n')
     else:
         body = IMAGE[key] + '\n'
-    return PRE.format(w0=w0, w2=w2) + body + POST
+    return PRE.format(w0=w0, w1=W1.get(name, 0), w2=w2) + body + POST
 
 
 # Reserved gfx10 MIMG bits: llvm-mc cannot assemble them, so each fixture sets one in the plain instruction.
@@ -305,6 +319,10 @@ def controls():
     check_call(pipeline('lz_nsa').hlsl_ps(), 'SampleCmpLevelZero', 'v0', 'v1', 'v3')  # NSA: v3 is the reference
     check_call(pipeline('c').hlsl_ps(), 'SampleCmp', 'v1', 'v2', 'v0')  # implicit derivatives in a pixel stage
     check_call(pipeline('c_nsa').hlsl_ps(), 'SampleCmp', 'v0', 'v1', 'v3')
+    # MAX_LOD 0 limits the source to level zero, so the implicit form is exactly SampleCmpLevelZero; a limit between
+    # 0 and the maximum has no static-sampler equivalent and is refused.
+    check_call(pipeline('c_max0').hlsl_ps(), 'SampleCmpLevelZero', 'v1', 'v2', 'v0')
+    refused('c_max_partial', 'sampler MAX_LOD')
     assert 'Texture2D<float4> r0' in lz.hlsl_ps() and 'srv 0 tex2d table 0 0' in lz.manifest()
     assert manifest_samplers(lz) == ['smpc 0 0x%x 0x0 0x0 0x0' % (POINT | LESS)], manifest_samplers(lz)
     print('lz: reference v0 at (v1, v2); NSA reference v3 at (v0, v1); c uses SampleCmp; sampler smpc')
