@@ -6266,6 +6266,20 @@ interpolation. The translated DXIL draw compares every output channel at
 `(1, -2)` with `(0, 0)` and must produce a pixel mismatch. LLVM 15 assembles
 and disassembles all three gfx1030 encodings and exercises the container CLI.
 
+`tools/pixel_aot.py` used to require exactly one sample per bound texture. It now requires
+each bound texture to be sampled at least once, so one texture can take several samples (issue
+#730). `--no-texture` still requires no sample, a gather is still the program's only sample, and
+comparison and ordinary samples still cannot be mixed. The two-tap PCF fixture in the same
+script takes one `image_sample_c_lz` tap and one `image_sample_c_lz_o` tap at `(1, -2)` from the
+same depth texture and exports their mean. The CPU reference averages the two independent tap
+results above. Two controls must produce a pixel mismatch at 8×8 and 16×16, for point and
+bilinear sampling: the one-tap expectation, and a shader whose second tap lost its offset.
+`tests/pixel_aot_check.py` adds a two-tap `image_sample_lz` draw on one texture, with a one-tap
+expectation as its control. It also adds an unrendered two-tap `image_sample_c_lz` translation
+and a dual-texture program that samples `tex` twice. Its refusals cover a second texture that is
+never sampled and an ordinary sample before or after a gather. Without the translator change, the
+PCF and the multi-tap fixtures are refused with `Unexpected sample count or missing color export`.
+
 ```sh
 python3 -B tests/pixel_compare_sample_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```

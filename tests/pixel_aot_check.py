@@ -160,6 +160,73 @@ def lod_zero_sample() -> list[str]:
             if not line.startswith(mask_ops)]
 
 
+MULTITAP_COMPARE_SAMPLER = [0x08003012, 0, 0, 0]
+
+
+def multitap_sample_program() -> list[str]:
+    return [
+        "s_mov_b32 m0, s24",
+        "v_interp_p1_f32_e32 v8, v0, attr0.x",
+        "v_interp_p1_f32_e32 v9, v0, attr0.y",
+        "v_interp_p2_f32_e32 v9, v1, attr0.y",
+        "v_interp_p2_f32_e32 v8, v1, attr0.x",
+        "v_interp_p1_f32_e32 v10, v0, attr0.y",
+        "v_interp_p1_f32_e32 v11, v0, attr0.x",
+        "v_interp_p2_f32_e32 v11, v1, attr0.x",
+        "v_interp_p2_f32_e32 v10, v1, attr0.y",
+        "s_mov_b32 s21, 0",
+        "s_load_dwordx8 s[28:35], s[20:21], null",
+        "s_mov_b32 s40, 1",
+        "s_mov_b32 s41, 2",
+        "s_mov_b32 s42, 3",
+        "s_mov_b32 s43, 4",
+        "s_waitcnt lgkmcnt(0)",
+        "image_sample_lz v[12:15], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
+        "image_sample_lz v[20:23], v[10:11], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
+        "s_waitcnt vmcnt(0)",
+        "v_add_f32_e32 v24, v12, v20",
+        "v_mul_legacy_f32_e32 v24, 0.5, v24",
+        "v_cvt_pkrtz_f16_f32_e32 v16, v12, v20",
+        "v_cvt_pkrtz_f16_f32_e32 v17, v24, v21",
+        "exp mrt0 v16, v16, v17, v17 done compr vm",
+        "s_endpgm",
+    ]
+
+
+def multitap_compare_program() -> list[str]:
+    return [
+        "s_mov_b32 m0, s24",
+        "v_interp_p1_f32_e32 v7, v0, attr0.x",
+        "v_interp_p2_f32_e32 v7, v1, attr0.x",
+        "v_interp_p1_f32_e32 v8, v0, attr0.x",
+        "v_interp_p1_f32_e32 v9, v0, attr0.y",
+        "v_interp_p2_f32_e32 v9, v1, attr0.y",
+        "v_interp_p2_f32_e32 v8, v1, attr0.x",
+        "v_interp_p1_f32_e32 v10, v0, attr0.y",
+        "v_interp_p1_f32_e32 v11, v0, attr0.x",
+        "v_interp_p2_f32_e32 v11, v1, attr0.x",
+        "v_interp_p2_f32_e32 v10, v1, attr0.y",
+        "s_mov_b32 s21, 0",
+        "s_load_dwordx8 s[28:35], s[20:21], null",
+        "s_waitcnt lgkmcnt(0)",
+        *(f"s_mov_b32 s{40 + k}, 0x{word:x}" for k, word in enumerate(MULTITAP_COMPARE_SAMPLER)),
+        "image_sample_c_lz v12, [v7, v8, v9], s[28:35], s[40:43] dmask:0x1 dim:SQ_RSRC_IMG_2D",
+        "image_sample_c_lz v20, [v7, v10, v11], s[28:35], s[40:43] dmask:0x1 dim:SQ_RSRC_IMG_2D",
+        "s_waitcnt vmcnt(0)",
+        "v_add_f32_e32 v12, v12, v20",
+        "v_mul_legacy_f32_e32 v12, 0.5, v12",
+        "v_mov_b32_e32 v13, 0.5",
+        "v_mov_b32_e32 v14, 0.5",
+        "v_mov_b32_e32 v15, 1.0",
+        "exp mrt0 v12, v13, v14, v15 done vm",
+        "s_endpgm",
+    ]
+
+
+def translate_multitap_compare(instructions):
+    return lower(instructions, 20, 24, MULTITAP_COMPARE_SAMPLER)
+
+
 DUAL_CASES = ("forward", "reverse", "reuse", "partial")
 
 
@@ -15143,6 +15210,48 @@ def _check_controls_inline(directory):
     phase_two = next(i for i, line in enumerate(mixed_masks) if line.startswith("v_interp_p2"))
     mixed_masks.insert(phase_two, restore)
     must_reject(translate, mixed_masks)
+    multitap_hlsl = translate(multitap_sample_program())
+    assert multitap_hlsl.count("tex.SampleLevel(samp,") == 2, multitap_hlsl
+    assert "float2(uv.x, uv.y)" in multitap_hlsl and "float2(uv.y, uv.x)" in multitap_hlsl, multitap_hlsl
+    assert "tex1" not in multitap_hlsl, multitap_hlsl
+    multitap_cmp_hlsl = translate_multitap_compare(multitap_compare_program())
+    assert multitap_cmp_hlsl.count("tex.SampleCmpLevelZero(samp,") == 2, multitap_cmp_hlsl
+    dual_fwd = dual_program("forward")
+    dual_wait = dual_fwd.index("s_waitcnt vmcnt(0)")
+    extra_tex_tap = "image_sample v[28:31], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D"
+    dual_multitap_hlsl = translate_dual(dual_fwd[:dual_wait] + [extra_tex_tap] + dual_fwd[dual_wait:])
+    assert dual_multitap_hlsl.count("tex.Sample(samp,") == 2 and dual_multitap_hlsl.count("tex1.Sample(samp,") == 1
+    expect_value_error(translate_dual, multitap_sample_program(), "image_sample_lz requires a single texture binding")
+    dual_missing_second = [
+        line.replace("s[56:63]", "s[28:35]") if line.startswith("image_sample") else line
+        for line in dual_fwd
+    ]
+    expect_value_error(translate_dual, dual_missing_second, "Unexpected sample count or missing color export")
+    must_reject(lower, multitap_sample_program(), 20, 24, None)
+    gather_sampler = (2 + (2 << 3), 0, (1 << 20) + (1 << 22) + (1 << 26), 0)
+    gather_prog = [
+        "s_mov_b32 m0, s24",
+        "v_interp_p1_f32_e32 v8, v0, attr0.x",
+        "v_interp_p2_f32_e32 v8, v1, attr0.x",
+        "v_interp_p1_f32_e32 v9, v0, attr0.y",
+        "v_interp_p2_f32_e32 v9, v1, attr0.y",
+        "s_mov_b32 s21, 0",
+        "s_load_dwordx8 s[28:35], s[20:21], null",
+        "s_waitcnt lgkmcnt(0)",
+        *(f"s_mov_b32 s{40 + k}, {word:#x}" for k, word in enumerate(gather_sampler)),
+        "image_gather4 v[12:15], v[8:9], s[28:35], s[40:43] dmask:0x1 dim:SQ_RSRC_IMG_2D",
+        "s_waitcnt vmcnt(0)",
+        "exp mrt0 v12, v13, v14, v15 done vm",
+        "s_endpgm",
+    ]
+    g_pos = next(idx for idx, line in enumerate(gather_prog) if line.startswith("image_gather4"))
+    sample_extra = "image_sample_lz v[20:23], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D"
+    expect_value_error(lambda p: lower(p, 20, 24, gather_sampler, cpu="gfx1030", gather_mips=1),
+                       gather_prog[:g_pos + 1] + [sample_extra] + gather_prog[g_pos + 1:],
+                       "Expected one gather for the declared view")
+    expect_value_error(lambda p: lower(p, 20, 24, gather_sampler, cpu="gfx1030", gather_mips=1),
+                       gather_prog[:g_pos] + [sample_extra] + gather_prog[g_pos:],
+                       "Gather requires one unguarded instruction and a declared gather view")
     # v_cvt_f32_f16 widens the low half through widen16 and applies modifiers after widening.
     body = translate(with_constants(HALF_BODY)).split("float4 main", 1)[1]
     assert body.count("widen16(asuint(") == 4 and "(-abs(widen16(" in body, body
@@ -17126,6 +17235,8 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((readfirstlane_program(), translate_int))
     fixtures.append((uncompressed_export(["v_mul_lo_u32 v12, s44, s45"]), translate_int))
     fixtures.append((rgb_sample(), translate))
+    fixtures.append((multitap_sample_program(), translate))
+    fixtures.append((multitap_compare_program(), translate_multitap_compare))
     fixtures.append((with_constants(TRIG_BODY), translate))
     fixtures.append((with_constants(CLASS_BODY), translate))
     fixtures.append((sext_values(), translate))
@@ -20888,6 +20999,34 @@ def check_rgb_sample_draw(directory: Path, compiler: str, renderer: str, backend
         raise AssertionError("RGB sample with an overwritten alpha register escaped detection")
 
 
+def check_multitap_sample_draw(directory: Path, compiler: str, renderer: str, backend: str) -> None:
+    def f32(value: float) -> float:
+        return struct.unpack("<f", struct.pack("<f", value))[0]
+
+    hlsl = directory / "multitap-sample.hlsl"
+    shader = directory / "multitap-sample.cso"
+    hlsl.write_text(translate(multitap_sample_program()), encoding="ascii")
+    compile_shader(compiler, hlsl, shader)
+    pass_colors = []
+    mismatch_colors = []
+    for green in RAMP:
+        for red in RAMP:
+            r = f32(red / 255)
+            g = f32(green / 255)
+            avg = f32(0.5 * f32(r + g))
+            pass_colors.append(struct.pack("<4f", half_rtz(r), half_rtz(g), half_rtz(avg), half_rtz(r)))
+            mismatch_colors.append(struct.pack("<4f", half_rtz(r), half_rtz(r), half_rtz(r), half_rtz(g)))
+    cases = []
+    for status, colors in (("mismatch", mismatch_colors), ("pass", pass_colors)):
+        case = directory / f"multitap-sample-{status}.case"
+        case.write_bytes(bytes(256) + b"".join(colors))
+        cases.append((case, status))
+    result = run_pixel_batch(renderer, backend, shader, cases)
+    if "pixel_mismatch x=8 y=0" not in result.stderr:
+        raise AssertionError("Single-tap expectation for multi-tap sample escaped detection")
+    print(f"multitap_sample ({backend}): 2 taps on tex verified")
+
+
 def check_sat_pack_u8_draw(directory, compiler, renderer, backend):
     source = directory / "sat_pack_u8.hlsl"
     shader = directory / "sat_pack_u8.cso"
@@ -20959,6 +21098,7 @@ def check_render(directory, compiler, renderer, backend, *, core_only=False):
         compile_shader(compiler, source, shader, ieee=False)
         subprocess.run([renderer, backend, "--check-pixel", shader, "rgba"], check=True)
     check_rgb_sample_draw(directory, compiler, renderer, backend)
+    check_multitap_sample_draw(directory, compiler, renderer, backend)
     check_trig_draws(directory, compiler, renderer, backend)
     program = arithmetic()
     source.write_text(translate(program), encoding="ascii")
