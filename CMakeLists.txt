@@ -1910,6 +1910,12 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_switch_bit_counts>" "$<TARGET_FILE:cpu_switch_bit_counts_lifted>")
     # A host without POPCNT, BMI1 or ABM cannot run the original as the reference describes it.
     set_tests_properties(cpu_aot_switch_bit_counts PROPERTIES SKIP_RETURN_CODE 77)
+    cpu_asm_fixture(cpu_switch_bswap switch_bswap)
+    cpu_translation(cpu_switch_bswap cpu_switch_aot
+        bswap32_rax,bswap64_rax,bswap32_rcx,bswap64_rcx,bswap32_rdx,bswap64_rdx,bswap32_r8,bswap64_r8,bswap32_r9,bswap64_r9,bswap32_r10,bswap64_r10,bswap32_r11,bswap64_r11,bswap32_rbx,bswap64_rbx,bswap32_rbp,bswap64_rbp,bswap32_rsi,bswap64_rsi,bswap32_rdi,bswap64_rdi,bswap32_r12,bswap64_r12,bswap32_r13,bswap64_r13,bswap32_r14,bswap64_r14,bswap32_r15,bswap64_r15,bswap_mixed,jcc_bswap_b,cmov_bswap)
+    add_test(NAME cpu_aot_switch_bswap COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/switch_bswap_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_switch_bswap>" "$<TARGET_FILE:cpu_switch_bswap_lifted>")
     # BSF and BSR; the swapped build assembles three exports with the other scan and must follow the exchanged reference.
     foreach(variant IN ITEMS original swapped)
         cpu_asm_fixture(cpu_switch_bit_scans_${variant} switch_bit_scans)
