@@ -7630,6 +7630,13 @@ independently of the desktop device's wave size. On RTX 4060 Laptop and WARP, bo
 readbacks matched 128 output words and 192 guards. Exchanging expected positions
 31 and 32 produced exactly two mismatches on each adapter.
 
+On Windows 11 build 26300.9974, the Intel Arc 140T (32.0.101.8132) matched the same
+320 words with no mismatches, and exchanging expected positions 31 and 32 produced
+exactly two mismatches, the first at word 31. The four faulty find-LSB lowerings were
+each caught on this adapter too, first at words 64, 32, 128 and 64, with 58, 115, 24
+and 107 differing words, so the ballot results do not depend on this adapter's wave
+width either. Every run reported zero D3D12 debug errors and warnings.
+
 The same lowering handles `OpGroupNonUniformBallotFindLSB %uint %scope %ballot`, which SPIRV-Cross
 rejects for HLSL (the 2021.01.15 package stops with "Cannot trivially implement BallotFindLSB in
 HLSL"). Each of the four ballot words goes through GLSL `FindILsb`, offset by 0, 32,
