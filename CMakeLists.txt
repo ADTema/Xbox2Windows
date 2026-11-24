@@ -696,6 +696,27 @@ foreach(adapter IN ITEMS warp hardware)
 endforeach()
 set_tests_properties(d3d12x_descriptor_heap_hardware d3d12x_descriptor_table_hardware
     d3d12x_descriptor_negative_hardware PROPERTIES SKIP_RETURN_CODE 77)
+# D3D12.X compute command list recording, transitions, clear and readback (#XCL-10).
+set(d3d12x_compute_list_cs "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_compute_list_cs.h")
+add_custom_command(OUTPUT "${d3d12x_compute_list_cs}"
+    COMMAND "${DXC_EXECUTABLE}" -T cs_6_0 -E CSMain -Vn d3d12x_compute_list_cs
+            -Fh "${d3d12x_compute_list_cs}" -Fo "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_compute_list_cs.cso"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/d3d12x_compute_list.hlsl"
+    DEPENDS tests/d3d12x_compute_list.hlsl
+    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/d3d12x_compute_list_cs.cso" VERBATIM)
+add_custom_target(d3d12x_compute_list_shader DEPENDS "${d3d12x_compute_list_cs}")
+add_executable(d3d12x_compute_list_check tests/d3d12x_compute_list_check.cpp
+    tests/desktop_gpu.cpp "${d3d12x_compute_list_cs}")
+add_dependencies(d3d12x_compute_list_check d3d12_xs_shim d3d12x_compute_list_shader)
+target_include_directories(d3d12x_compute_list_check PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_features(d3d12x_compute_list_check PRIVATE cxx_std_17)
+target_link_libraries(d3d12x_compute_list_check PRIVATE d3d12 dxgi)
+foreach(adapter IN ITEMS warp hardware)
+    add_test(NAME d3d12x_compute_list_${adapter} COMMAND d3d12x_compute_list_check
+        "$<TARGET_FILE:d3d12_xs_shim>" ${adapter})
+    set_tests_properties(d3d12x_compute_list_${adapter} PROPERTIES TIMEOUT 30)
+endforeach()
+set_tests_properties(d3d12x_compute_list_hardware PROPERTIES SKIP_RETURN_CODE 77)
 # The main executable's CPU/GPU range translation against a desktop D3D12 heap (#874).
 set(vm_translation_header "${CMAKE_CURRENT_BINARY_DIR}/vm_translation_cs.h")
 add_custom_command(OUTPUT "${vm_translation_header}"
