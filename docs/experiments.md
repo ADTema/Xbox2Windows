@@ -10199,6 +10199,38 @@ cmake --build --preset release --target startup_stream_consumer startup_stub_xg_
 ctest --preset release --no-tests=error --output-on-failure -R '^(startup_xg_bc_(array|chain)_(hardware|warp)|startup_xg_bc_tiling|xg_bc64_tiling_reference|startup_xg_bc7_layout)$'
 ```
 
+### Slot-10 tile plan for layout `0x10a`
+
+For a two-dimensional texture with layout `0x10a`, one sample and a format with a known 64 KiB tile shape, XG texture-computer slot 10 is answered from `src/startup_stubs/tile64_plan.h` instead of a desktop reserved resource. The plan follows one rule:
+
+- A mip that is at most half a tile wide and at most one tile high shares a single tile with every smaller mip. That tile is the first tile of the slice and is reported as the packed tile.
+- Every other mip is a standard mip on a whole-tile grid, `ceil(width / tile width) × ceil(height / tile height)` tiles. The standard mips follow the shared tile from the smallest to the largest, so the largest mip has the highest start.
+- Slices follow each other; the tile count is the per-slice count times the slice count.
+
+Tile shapes are 512×256 texels for 8-byte blocks (BC1, BC4), 256×256 for 16-byte blocks (BC2, BC3, BC5, BC6H, BC7) and for 8-bit formats, 256×128 for 16-bit formats, and 128×128 for 32-bit formats with 8-bit channels. Other formats, other layouts and three-dimensional textures still use the desktop answer. The nine-mip `0x109` shapes above are unchanged; their starts (6, 2, 1 in a 22-tile slice) are what this rule gives for the same sizes.
+
+A 2048×2048 BC7 texture with ten mips shows the difference. A desktop reserved resource reports four standard mips starting at tiles 0, 64, 80 and 84 with the packed tile at 85. The plan reports the packed tile at 0 and the four standard mips at 22, 6, 2 and 1.
+
+The rule was fitted to texture pool files of one console package, read with the `boundary()` and descriptor parsers of `tools/texture_descriptors.py`. Each pool stores a texture's levels as separate chunks, smallest level first, and each texture record carries its size, format, slice count and the split between standard and packed mips. For 39,283 texture records in 57 pool files (179 distinct combinations of size, format, slice count, mip split and level sizes; 18 formats) the rule reproduces every level's size in tiles with no mismatch, and the number of standard mips it gives, capped at three, equals the record's own count in every case. The package is not distributed and the fitting script is not part of the repository. This is evidence for tile counts and order. It says nothing about texel addresses inside a tile, and slots 2, 8 and 9 are unchanged for these textures.
+
+`startup_xg_tile64_tiling` checks 18 source-described shapes and 120 queries: tile totals, the packed-mip record, the tile shape, the entries of the standard mips at their positions in the requested range, array slices, and sentinel bytes over packed entries and the rest of the caller's array. The expected values are written out in the test and recomputed there by an independent Python model. As a control it checks that the desktop order for the 2048×2048 case is not what the stand-in returns; run against a build without the plan, the test fails on the first shape.
+
+```powershell
+cmake --build --preset release --target startup_stub_xg_xs
+ctest --preset release --no-tests=error --output-on-failure -R '^startup_xg_(tile64|bc)_tiling$'
+```
+
+One console executable was run under the startup debugger with a scripted first-run input, before and after this change, on a clang-cl build under Wine 11.0 with vkd3d-proton (RTX 4070 Ti SUPER, driver 550.163.1). Both builds had the open DirectStorage changes #1429 and #1390 merged onto `main` at `bb6c9a0c`, and a local switch that delivers the first part of a zlib stream longer than its destination (#1198). The executable made 177 distinct slot-10 queries, all two-dimensional with layout `0x10a`.
+
+| | without the plan | with the plan |
+|---|---|---|
+| run length | stopped at 253 s (null write in the executable) | 330 s timeout |
+| `zlib failed` requests | 11,377 by 250 s | 2 by 250 s, 3 by 320 s |
+| chunk-table reads starting at a chunk start | 8,207 by 249 s | 25,829 by 325 s |
+| chunk-table reads starting elsewhere | 11,622 by 249 s | 0 by 325 s |
+
+Without the plan the failing requests ask for a whole compressed chunk at its file offset plus a constant multiple of 64 KiB (`0xE0000` and `0x3A0000` were the two values seen), which is the distance between a level's place in the desktop order and its place in the pool. The loading screen is still blank in both builds and `bcpack failed` requests remain (135 by 250 s with the plan); both are separate from this change. One earlier 168 s run with the plan stopped on a write to an unmapped destination inside the storage stand-in; it did not recur in the next two runs and is not explained.
+
 ## SSE4a bit-field and non-temporal scalar store leaf recompilation
 
 [The SSE4a leaf translator](../tools/cpu_sse4a_aot.py) lifts bounded straight-line Windows x64 leaf functions covering the six SSE4a instruction forms across the four mnemonics in `docs/coverage/x64_zen2.tsv` group `SSE3-4`:
