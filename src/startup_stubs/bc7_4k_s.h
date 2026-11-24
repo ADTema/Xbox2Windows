@@ -17,13 +17,13 @@ inline bool supports_bc7_4k_s(const D3D12_RESOURCE_DESC& desc)
            desc.SampleDesc.Quality == 0 && desc.Alignment == 0 && desc.Flags == D3D12_RESOURCE_FLAG_NONE;
 }
 
-struct Bc7Surface {
+struct Bc16Surface {
     static constexpr UINT block_texels = 4, block_bytes = 16;
     static constexpr UINT tile_blocks = 16, tile_bytes = tile_blocks * tile_blocks * block_bytes;
 
     const UINT columns, rows, tile_columns, tile_rows;
 
-    Bc7Surface(UINT width, UINT height)
+    Bc16Surface(UINT width, UINT height)
         : columns((width + block_texels - 1) / block_texels),
           rows((height + block_texels - 1) / block_texels),
           tile_columns((columns + tile_blocks - 1) / tile_blocks),
@@ -31,7 +31,7 @@ struct Bc7Surface {
     {
     }
 
-    explicit Bc7Surface(const D3D12_RESOURCE_DESC& desc) : Bc7Surface(static_cast<UINT>(desc.Width), desc.Height) {}
+    explicit Bc16Surface(const D3D12_RESOURCE_DESC& desc) : Bc16Surface(static_cast<UINT>(desc.Width), desc.Height) {}
 
     UINT padded_width() const { return tile_columns * tile_blocks * block_texels; }
     UINT padded_height() const { return tile_rows * tile_blocks * block_texels; }
@@ -41,7 +41,7 @@ struct Bc7Surface {
     std::uint64_t block_offset(UINT column, UINT row) const
     {
         const UINT x = column % tile_blocks, y = row % tile_blocks;
-        // GFX10 4 KiB standard non-XOR BC7 order: y0 y1 x0 x1 y2 x2 y3 x3.
+        // GFX10 4 KiB standard non-XOR 16-byte block order: y0 y1 x0 x1 y2 x2 y3 x3.
         const UINT block = (y & 3) | ((x & 3) << 2) | ((y & 4) << 2) |
                            ((x & 4) << 3) | ((y & 8) << 3) | ((x & 8) << 4);
         const auto tile = std::uint64_t{row / tile_blocks} * tile_columns + column / tile_blocks;

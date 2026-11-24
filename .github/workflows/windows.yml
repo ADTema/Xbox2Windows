@@ -103,6 +103,7 @@ jobs:
           python -B tests/startup_sampler_heap_check.py
           python -B tests/startup_image_sample_l_check.py
           python -B tests/startup_image_3d_check.py
+          python -B tests/startup_translator_check.py
   build-and-test:
     name: Build and test on Windows
     runs-on: windows-2025

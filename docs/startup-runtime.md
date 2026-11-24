@@ -8,6 +8,19 @@ This is not a port and not an emulator. No executable is playable. Every stand-i
 most answers are shortcuts that are logged as such. The open problems are tracked in the issues
 whose titles start with `startup-runtime:`.
 
+## Derived pipeline blend state
+
+Device slot 55 accepts up to 64 fixed-size derived pipeline patches. The translated graphics
+path reads the blend descriptor from part 2 of a 332-byte patch. Within one derivation the last
+blend patch wins. A further derivation inherits that state until it supplies another blend patch.
+Other patch parts are outside this blend implementation. The record layout can also be compared
+with [XCL's implementation at 64b3f35](https://github.com/ivall/xcl/blob/64b3f35599bb7102f55d640e1a791e7d6dd3b175/crates/xcl/src/hle/d3d12x/device_x.rs#L501-L515).
+
+Run `ctest --preset dev --no-tests=error -R "^startup_stream_draw_(hardware|warp)$" -V` after
+building `startup_stream_consumer`. The source-built shader writes to half of an 8×4 target.
+On A8 the parent preserves the zero clear and the child writes alpha 255. R8 records red 0 or
+255 according to the input shader. The untouched half stays zero in all four cases.
+
 ## Output window and fallback diagnostics
 
 The desktop swap chain has its own top-level window, class `X2WOutputWindow`.
@@ -113,6 +126,14 @@ ctest --preset release --no-tests=error -R '^startup_launch$' -V
 | `X2W_XG_BC7_4K_S_LAYOUT=1` | enables the BC7 tiled layout, copy and draw upload when `X2W_D3D12_PERMISSIVE=1` |
 | `X2W_TRAP_CONTINUE=<exports>` | lets listed trap exports return 0 instead of ending the process |
 
+The startup shader cache key includes the translator revision. After updating from
+the earlier wide-descriptor translation, run the recording build once to emit
+requests, run `python tools/startup/gfx2hlsl.py --pending <cache-directory>`,
+then start the build again. The new key keeps the former bytecode and manifest
+together under their original name. A 16-dword table load can contain two
+independent image descriptors at offsets 0 and 32 from the load address.
+
+
 ## Findings
 
 These are measured on one executable; treat them as hypotheses for others.
@@ -152,6 +173,9 @@ These are measured on one executable; treat them as hypotheses for others.
   id, the source, the compressed size and the destination chunk size. A later independent
   request at a matching offset still decodes its own bytes or fails without touching its
   destination.
+- **DirectStorage file ranges.** A nonempty file request checks its byte offset and length against
+  the current file size before allocating the staging buffer. A range ending at EOF is valid.
+  An overrun or short read fails the queue request and preserves the destination.
 
 ## Shortcuts that are known to be wrong
 

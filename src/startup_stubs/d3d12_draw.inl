@@ -150,7 +150,11 @@ void load_translation(Translation& tr, const void* a, std::size_t a_bytes, const
 Translation* cached_translation(const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes,
                                 const std::vector<unsigned char>& root_blob)
 {
-    const u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes)));
+    // Keep pre-fix desktop bytecode and manifests out of this ABI's cache.
+    // tools/startup/gfx2hlsl.py hashes the same bytes, without a trailing NUL.
+    constexpr char revision[] = "x2w-startup-srv-2";
+    const u64 seed = fnv_bytes(revision, sizeof(revision) - 1);
+    const u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes, seed)));
     auto& entry = translation_by_key()[key];
     if (!entry) {
         entry = new Translation;
@@ -217,17 +221,22 @@ BoundPipeline* translation_for(Wrapper* pipeline)
     Translation*& result = bound->translation;
     const PipelineInfo* info = pipeline_info(pipeline);
     const PipelineInfo* own = info;
-    for (int depth = 0; info && info->path == 55 && info->base && depth < 8; ++depth) info = pipeline_info(info->base);
     {
         // The pipeline's own description first (a derived pipeline overrides state), then its base's state block.
         std::size_t where = 0;
         const char* from = "none";
-        if (own && own != info && find_blend(own->desc, &bound->blend, &where)) from = "derived description";
-        else if (info && info->has_stream_blend) {
+        for (int depth = 0; info && info->path == 55 && info->base && depth < 8; ++depth) {
+            if (!bound->has_blend && x2w_derived_blend::last_blend(info->desc.data(), info->desc.size(), bound->blend, where)) {
+                from = "derived blend patch";
+                bound->has_blend = true;
+            }
+            info = pipeline_info(info->base);
+        }
+        if (!bound->has_blend && info && info->has_stream_blend) {
             from = "stream blend subobject";
             bound->blend = info->stream_blend;
-        } else if (info && find_blend(info->state_a, &bound->blend, &where)) from = "state block A";
-        else if (info && find_blend(info->state_b, &bound->blend, &where)) from = "state block B";
+        } else if (!bound->has_blend && info && find_blend(info->state_a, &bound->blend, &where)) from = "state block A";
+        else if (!bound->has_blend && info && find_blend(info->state_b, &bound->blend, &where)) from = "state block B";
         bound->has_blend = from[0] != 'n';
         static LONG logged;
         if (first_calls(logged, 24)) {
@@ -449,7 +458,7 @@ void buffer_view(D3D12_CPU_DESCRIPTOR_HANDLE dest, bool have, u64 offset, std::s
 struct TextureUpload {
     u64 hash = 0, generation = ~0ull;
     LONG checked_frame = -1000;
-    bool done = false, tiled_bc7 = false;
+    bool done = false, tiled = false;
 };
 std::unordered_map<ID3D12Resource*, TextureUpload>& texture_uploads() { static std::unordered_map<ID3D12Resource*, TextureUpload> m; return m; }
 LONG textures_uploaded, texture_bytes_uploaded, textures_unreadable;
@@ -492,21 +501,27 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     if (const auto found = written_textures().find(reinterpret_cast<u64>(memory)); found != written_textures().end())
         written = found->second;
     ReleaseSRWLockShared(&written_lock);
-    const bool tiled_bc7 = written.bc7_width != 0;
+    const bool tiled_address = resource->own().tiled_address_srv;
+    const bool tiled_bc7 = !tiled_address && written.bc7_width != 0;
+    const bool tiled = tiled_bc7 || tiled_address;
     const auto generation = written.generation;
-    const x2w_startup::Bc7Surface bc7(written.bc7_width, written.bc7_height);
+    const x2w_startup::Bc16Surface surface(tiled_bc7 ? written.bc7_width : static_cast<UINT>(desc.Width),
+                                         tiled_bc7 ? written.bc7_height : desc.Height);
     if (tiled_bc7) {
         const auto* original = resource_info(resource);
         if (!original || !x2w_startup::supports_bc7_4k_s(original->console) ||
             original->console.Width != written.bc7_width || original->console.Height != written.bc7_height ||
-            desc.Format != DXGI_FORMAT_BC7_UNORM || desc.Width != bc7.columns * bc7.block_texels ||
-            desc.Height != bc7.rows * bc7.block_texels || plan.count != 1 ||
-            plan.rows[0] != bc7.rows || plan.row_bytes[0] != u64{bc7.columns} * bc7.block_bytes) return;
+            desc.Format != DXGI_FORMAT_BC7_UNORM || desc.Width != surface.columns * surface.block_texels ||
+            desc.Height != surface.rows * surface.block_texels) return;
     }
-    const u64 total = tiled_bc7 ? bc7.size() : stride * (slices - 1) + slice_total;
+    if (tiled && (plan.count != 1 || plan.rows[0] != surface.rows ||
+                  plan.row_bytes[0] != u64{surface.columns} * surface.block_bytes)) return;
+    const u64 total = tiled ? surface.size() : stride * (slices - 1) + slice_total;
     const bool announced = state.generation != generation;
     const UINT elapsed = static_cast<UINT>(frame_number) - static_cast<UINT>(state.checked_frame);
-    if (state.done && !announced && !x2w_startup::recheck_cpu_texture(desc, total, elapsed)) return;
+    const bool recheck = tiled_address ? elapsed != 0
+        : x2w_startup::recheck_cpu_texture(desc, total, elapsed);
+    if (state.done && !announced && !recheck) return;
     if (readable_window(reinterpret_cast<u64>(memory), static_cast<std::size_t>(total)) < total) {
         if (!state.done) InterlockedIncrement(&textures_unreadable);
         state.done = true;
@@ -515,12 +530,12 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     }
     state.checked_frame = frame_number;
     const u64 hash = hash_memory(memory, static_cast<std::size_t>(total));
-    if (state.done && hash == state.hash && state.tiled_bc7 == tiled_bc7) {
+    if (state.done && hash == state.hash && state.tiled == tiled) {
         state.generation = generation;
         return;
     }
     require_state(self, texture, D3D12_RESOURCE_STATE_COPY_DEST);
-    if (tiled_bc7) {
+    if (tiled) {
         u64 offset = 0;
         const auto bytes = plan.bytes(0);
         auto* rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset);
@@ -529,7 +544,7 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
             return;
         }
         std::memset(rows, 0, static_cast<std::size_t>(bytes));
-        bc7.detile(memory, rows, plan.placed[0].Footprint.RowPitch);
+        surface.detile(memory, rows, plan.placed[0].Footprint.RowPitch);
         plan.upload(list, texture, upload_ring, 1, 1, 0, 0, offset);
     } else {
         for (UINT s = 0; s < slices; ++s)
@@ -546,7 +561,7 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     }
     state.hash = hash;
     state.generation = generation;
-    state.tiled_bc7 = tiled_bc7;
+    state.tiled = tiled;
     state.done = true;
     InterlockedIncrement(&textures_uploaded);
     InterlockedExchangeAdd(&texture_bytes_uploaded, static_cast<LONG>(total >> 10));
@@ -718,7 +733,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             desc.ViewDimension = srv.kind == 3 ? D3D12_SRV_DIMENSION_TEXTURE3D : D3D12_SRV_DIMENSION_TEXTURE2D;
             desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             desc.Texture2D.MipLevels = 1;  // same offset as Texture3D.MipLevels
-            ID3D12Resource* texture = resource && resource->own().kind == resource_kind ? static_cast<ID3D12Resource*>(resource->own().real) : nullptr;
+            ID3D12Resource* texture = sampled_address_texture(resource);
             if (texture && record.desc_bytes >= 40) {
                 std::memcpy(&desc, record.desc, 40);
                 desc.Format = desktop_format(desc.Format);
