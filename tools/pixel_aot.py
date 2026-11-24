@@ -1369,6 +1369,9 @@ DPP_EXTRA = {
 # Quad-local DPP16/DPP8 relative VGPR-indexing move instructions.
 DPP_MOVREL = ("v_movreld_b32_dpp", "v_movrels_b32_dpp", "v_movrelsd_b32_dpp", "v_movrelsd_2_b32_dpp")
 DPP_MOVREL_PATTERN = re.compile(rf"({'|'.join(DPP_MOVREL)}) (.+)")
+# The plain VOP1 (e32) and VOP3 (e64) encodings of the same four moves, as LLVM 15 prints them for gfx1013 and
+# gfx1030 (two VGPR operands; the VOP3 form takes no clamp, omod or source modifier in that spelling).
+PLAIN_MOVREL_PATTERN = re.compile(r"(v_movreld_b32|v_movrels_b32|v_movrelsd_b32|v_movrelsd_2_b32)_e(?:32|64) (v\d+), (v\d+)")
 
 
 def scalar_const_u32(token, scalar, pending):
@@ -5225,24 +5228,32 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
-        elif m := DPP_MOVREL_PATTERN.fullmatch(line):
-            op, rest = m.groups()
-            if mask != "entry":
-                raise ValueError("Invalid DPP movrel outside entry mask")
-            ops, perm, _ = parse_dpp(rest, 2)
-            if not all(re.fullmatch(r"v\d+", t) for t in ops):
-                raise ValueError(f"Expected two VGPR operands without modifiers for {op}")
+        elif (m := DPP_MOVREL_PATTERN.fullmatch(line)) or (plain := PLAIN_MOVREL_PATTERN.fullmatch(line)):
+            # The plain forms index exactly as the DPP forms do, each lane reading its own VGPRs (no swizzle).
+            if m:
+                op, rest = m.groups()
+                if mask != "entry":
+                    raise ValueError("Invalid DPP movrel outside entry mask")
+                ops, perm, _ = parse_dpp(rest, 2)
+                if not all(re.fullmatch(r"v\d+", t) for t in ops):
+                    raise ValueError(f"Expected two VGPR operands without modifiers for {op}")
+            else:
+                op, *ops = plain.groups()
+                perm = None
+                if mask != "entry":
+                    raise ValueError(f"Invalid {op} outside entry mask")
+            kind = op if op.endswith("_dpp") else f"{op}_dpp"  # the indexing rule is the same for both encodings
             dst_base, src_base = int(ops[0][1:]), int(ops[1][1:])
             if not (0 <= dst_base <= 255 and 0 <= src_base <= 255):
                 raise ValueError(f"VGPR base out of range for {op}")
             m0 = scalar.get("m0")
             if isinstance(m0, int):
                 m0_u = m0 & 0xffffffff
-                if op == "v_movreld_b32_dpp":
+                if kind == "v_movreld_b32_dpp":
                     src_offsets, dst_offsets = [0], [m0_u]
-                elif op == "v_movrels_b32_dpp":
+                elif kind == "v_movrels_b32_dpp":
                     src_offsets, dst_offsets = [m0_u], [0]
-                elif op == "v_movrelsd_b32_dpp":
+                elif kind == "v_movrelsd_b32_dpp":
                     src_offsets, dst_offsets = [m0_u], [m0_u]
                 else:
                     src_offsets, dst_offsets = [m0_u & 0x3ff], [(m0_u >> 16) & 0x3ff]
@@ -5254,13 +5265,13 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     raise ValueError(f"Dynamic m0 offset is unbounded for {op}")
                 m0_mask = scalar_mask["m0"]
                 m0_expr = m0[1]
-                if op == "v_movreld_b32_dpp":
+                if kind == "v_movreld_b32_dpp":
                     src_offsets, dst_offsets = [0], masked_offsets(m0_mask)
                     soff_expr, doff_expr = None, m0_expr
-                elif op == "v_movrels_b32_dpp":
+                elif kind == "v_movrels_b32_dpp":
                     src_offsets, dst_offsets = masked_offsets(m0_mask), [0]
                     soff_expr, doff_expr = m0_expr, None
-                elif op == "v_movrelsd_b32_dpp":
+                elif kind == "v_movrelsd_b32_dpp":
                     offs = masked_offsets(m0_mask)
                     src_offsets, dst_offsets = offs, offs
                     soff_expr, doff_expr = m0_expr, m0_expr
@@ -5278,14 +5289,16 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             # Read all reachable source VGPRs before any destination update (supports overlapping banks).
             src_exprs = [(k, movrel_vgpr(src_base + k, vector, sample_dest)) for k in src_offsets]
             if len(src_exprs) == 1:
-                swizzled = emit_quad_swizzle_u32(lines, i, src_exprs[0][1], perm)
+                swizzled = (f"asuint({src_exprs[0][1]})" if perm is None
+                            else emit_quad_swizzle_u32(lines, i, src_exprs[0][1], perm))
             else:
                 lines.append(f"    uint dpp_soff{i} = {soff_expr};")
                 sel = f"asuint({src_exprs[-1][1]})"
                 for k, expr in reversed(src_exprs[:-1]):
                     sel = f"(dpp_soff{i} == {k}u ? asuint({expr}) : {sel})"
                 lines.append(f"    precise float dpp_src{i} = asfloat({sel});")
-                swizzled = emit_quad_swizzle_u32(lines, i, f"dpp_src{i}", perm)
+                swizzled = (f"asuint(dpp_src{i})" if perm is None
+                            else emit_quad_swizzle_u32(lines, i, f"dpp_src{i}", perm))
             if len(dst_offsets) == 1:
                 dst_reg = f"v{dst_base + dst_offsets[0]}"
                 vector[dst_reg] = f"alu{i}"
