@@ -2094,6 +2094,23 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_avx_move_regs_original>"
         "$<TARGET_FILE:cpu_avx_move_regs_original_lifted>"
         "$<TARGET_FILE:cpu_avx_move_regs_altered_lifted>")
+    set(cpu_avx_move_mem_exports
+        "op_andpd_mem128,op_andps_mem128,op_andnpd_mem128,op_andnps_mem128,"
+        "op_orpd_mem128,op_orps_mem128,op_xorpd_mem128,op_xorps_mem128,"
+        "op_andpd_mem256,op_andps_mem256,op_andnpd_mem256,op_andnps_mem256,"
+        "op_orpd_mem256,op_orps_mem256,op_xorpd_mem256,op_xorps_mem256")
+    string(CONCAT cpu_avx_move_mem_exports ${cpu_avx_move_mem_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_avx_move_mem_${variant} avx_move_mem)
+        cpu_translation(cpu_avx_move_mem_${variant} cpu_avx_move_aot "${cpu_avx_move_mem_exports}")
+    endforeach()
+    target_compile_definitions(cpu_avx_move_mem_altered PRIVATE ALTER_MUT)
+    add_test(NAME cpu_aot_avx_move_mem COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/avx_move_mem_check.py"
+        "$<TARGET_FILE:cpu_avx_move_mem_original>"
+        "$<TARGET_FILE:cpu_avx_move_mem_original_lifted>"
+        "$<TARGET_FILE:cpu_avx_move_mem_altered_lifted>")
+    set_tests_properties(cpu_aot_avx_move_mem PROPERTIES SKIP_RETURN_CODE 77)
     set(cpu_avx_pcmpstr_exports
         "vpcmpestri_ub_eqany_pos_lsb,vpcmpestri_sw_ranges_neg_msb,vpcmpestri_sb_eqeach_mpos_msb,"
         "vpcmpestri_uw_eqord_mneg_lsb,vpcmpestri_mem_ub_eqany_pos_lsb,vpcmpestri_alias_xmm0,"
