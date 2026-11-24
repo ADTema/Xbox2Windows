@@ -70,6 +70,7 @@ jobs:
               (["tests/pixel_get_lod_check.py", *COMMON_LLVM], {}),
               (["tests/mesh_shadow_check.py", *COMMON_LLVM], {}),
               (["tests/startup_sampler_heap_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_gfx2hlsl_scalar_m0_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_cvt_alu_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_sample_l_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_sample_c_check.py", "binary", "llvm-mc-15"], {}),
@@ -182,6 +183,7 @@ jobs:
             tests/startup_gfx2hlsl_capture_check.py \
             tests/startup_translator_check.py \
             tests/startup_gfx2hlsl_smem_offset_check.py \
+            tests/startup_gfx2hlsl_scalar_m0_check.py \
             tests/startup_triage_run_check.py \
             tests/startup_run_ps1_check.py \
             tests/startup_flat_param_check.py \
