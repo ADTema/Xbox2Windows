@@ -1343,7 +1343,7 @@ class TestRdna2Disasm(unittest.TestCase):
             ("080f20f104102303", "image_gather4_c",
              "image_gather4_c v[16:19], v[4:6], s[12:19], s[100:103] dmask:0xf dim:SQ_RSRC_IMG_2D"),
             ("100fa8f004102303", "image_sample_c_d",
-             "image_sample_c_d v[16:19], v[4:19], s[12:19], s[100:103] dmask:0xf dim:SQ_RSRC_IMG_3D"),
+             "image_sample_c_d v[16:19], v[4:13], s[12:19], s[100:103] dmask:0xf dim:SQ_RSRC_IMG_3D"),
             ("1103a8f004102303", "image_sample_c_d_g16",
              "image_sample_c_d_g16 v[16:17], v[4:11], s[12:19], s[100:103] dmask:0x3 dim:SQ_RSRC_IMG_3D"),
             ("0101b8f104102303", "image_sample_c_cd_o_g16",
@@ -1418,8 +1418,8 @@ class TestRdna2Disasm(unittest.TestCase):
                 word1 = ((5 << 21) if op in has_sampler else 0) | (2 << 16) | 4
                 code += struct.pack("<II", word0, word1)
                 names.append(name)
-        # LLVM 15 (the CI pin) prints a 9..15-register packed address as a 16-register tuple; newer LLVM prints the
-        # exact width. Widen the newer spelling so the comparison holds on either version.
+        # LLVM 15 (the CI pin) prints a 9..15-register packed address as a 16-register tuple; newer LLVM and the
+        # decoder print the exact width. Widen both sides so the comparison holds on either LLVM version.
         def widen(line):
             def fix(m):
                 lo, hi = int(m.group(1)), int(m.group(2))
@@ -1428,11 +1428,12 @@ class TestRdna2Disasm(unittest.TestCase):
         llvm_lines = [widen(line) for line in llvm_disassemble(bytes(code), resolved_lib)]
         records = disasm_rdna2(bytes(code))
         self.assertEqual(len(llvm_lines), len(names))
-        self.assertEqual([r["assembly"] for r in records], llvm_lines)
+        self.assertEqual([widen(r["assembly"]) for r in records], llvm_lines)
         self.assertEqual([r["opcode"] for r in records], names)
 
         bvh = bytes.fromhex("019f98f100040100" "019f98f100040140" "019f9cf100040100" "019f9cf100040140")
-        self.assertEqual([r["assembly"] for r in disasm_rdna2(bvh)], llvm_disassemble(bvh, resolved_lib))
+        self.assertEqual([widen(r["assembly"]) for r in disasm_rdna2(bvh)],
+                         [widen(line) for line in llvm_disassemble(bvh, resolved_lib)])
 
     def test_binary_scan_names_newly_decoded_mimg_ops(self):
         """Issue #938: the scan report names gather, compare-sample and ray-intersection ops as LLVM does."""
