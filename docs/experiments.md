@@ -2650,6 +2650,15 @@ alias both destination VGPRs with the source pair and compare the returned pair
 and the updated LDS pair separately, using the same signed and unsigned cases
 as the non-returning forms.
 
+Private qword increment and decrement compare an unsigned two-dword limit.
+Increment clears the value at or above the limit. Decrement reloads the
+limit at zero or above the limit. Their returning forms preserve the old
+pair. `ds_condxchg32_rtn_b64` instead checks bit 31 in each input dword and
+replaces only the corresponding lanes of the memory pair where this bit is
+set. It returns the two original words. The fixtures compare values across
+a low-dword wrap and use opposite sign bits for the two replacement words.
+[AMD machine-readable RDNA 2 ISA](https://gpuopen.com/machine-readable-isa/)
+
 ### Paired exchanges and a full-wave LDS counter
 
 The compute profile lowers the returning dword exchange within a 16-byte

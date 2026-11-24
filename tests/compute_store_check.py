@@ -1777,6 +1777,42 @@ LDS_QWORD_RETURNS = {f"{stem}_rtn_{width}": op for op in LDS_QWORD_UPDATES
                      for stem, width in [op.rsplit("_", 1)]}
 
 
+LDS_QWORD_COUNTERS = ("ds_inc_u64", "ds_inc_rtn_u64", "ds_dec_u64", "ds_dec_rtn_u64", "ds_condxchg32_rtn_b64")
+
+
+def lds_qword_counter_program(op):
+    returns = "_rtn" in op
+    dest = "v[18:19], " if returns else ""
+    inputs = (["v_mov_b32_e32 v18, 0x92345678", "v_mov_b32_e32 v19, 0x12345678"]
+              if "condxchg" in op else ["v_mov_b32_e32 v18, 8", "v_mov_b32_e32 v19, 1"])
+    return LDS_WIDE_SETUP + [
+        "v_and_b32_e32 v16, 31, v8", "v_mad_u32_u24 v16, 1, v16, 0xfffffff0", "v_lshrrev_b32_e32 v17, 5, v8",
+        "ds_write_b64 v5, v[16:17] offset:8", "s_waitcnt lgkmcnt(0)",
+    ] + inputs + [
+        f"{op} {dest}v5, v[18:19] offset:8", "s_waitcnt lgkmcnt(0)",
+        "ds_read_b64 v[10:11], v5 offset:8", "s_waitcnt lgkmcnt(0)",
+    ] + (["v_mov_b32_e32 v12, v18", "v_mov_b32_e32 v13, v19",
+          "buffer_store_dwordx4 v[10:13], v8, s[20:23], 0 idxen"] if returns else
+         ["buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen"]) + ["s_endpgm"]
+
+
+def lds_qword_counter_reference(op, groups):
+    words = []
+    for lane in range(groups * 32):
+        old = (lane // 32 << 32) | ((0xfffffff0 + lane % 32) & 0xffffffff)
+        limit = 0x100000008
+        if "inc" in op:
+            new = 0 if old >= limit else old + 1
+        elif "dec" in op:
+            new = limit if old == 0 or old > limit else old - 1
+        else:
+            new = old & 0xffffffff00000000 | 0x92345678
+        words.extend((new & 0xffffffff, new >> 32))
+        if "_rtn" in op:
+            words.extend((old & 0xffffffff, old >> 32))
+    return words
+
+
 def lds_qword_program(op):
     returns = op in LDS_QWORD_RETURNS
     ret_operand = "v[18:19], " if returns else ""
@@ -2005,6 +2041,8 @@ LDS_QWORD_BINDING = LDS_WIDE_BINDING | {"stride": 8}
 LDS_QWORD_CASES = [(op, lds_qword_program(op), LDS_QWORD_BINDING) for op in LDS_QWORD_UPDATES]
 LDS_QWORD_RETURN_BINDING = LDS_WIDE_BINDING | {"stride": 16}
 LDS_QWORD_CASES += [(op, lds_qword_program(op), LDS_QWORD_RETURN_BINDING) for op in LDS_QWORD_RETURNS]
+LDS_QWORD_CASES += [(op, lds_qword_counter_program(op),
+                     LDS_QWORD_RETURN_BINDING if "_rtn" in op else LDS_QWORD_BINDING) for op in LDS_QWORD_COUNTERS]
 
 
 LDS_F64_CMPST = ("ds_cmpst_f64", "ds_cmpst_rtn_f64")
@@ -2253,7 +2291,7 @@ def lds_controls():
         ("ds_add_u32 v5, v254", "Unverified private LDS update"),
         ("ds_add_u32 v5, v6 offset:4", "Unsupported compute instruction"),
         ("ds_add_u32 v5, v6 gds", "Unsupported compute instruction"),
-        ("ds_inc_rtn_u64 v[10:11], v5, v[6:7]", "Unsupported compute instruction"),
+        ("ds_inc_rtn_u64 v[10:11], v5, v[6:7] offset:4", "Unsupported compute instruction"),
     ):
         rejects(message, aot.lower, variant(lines, (update, bad)), 32, **LDS_BINDING)
     i = lines.index(update)
@@ -2412,6 +2450,16 @@ def ds_mutants(name, lines, binding, source):
     elif name == "lds_wave_counter":
         yield aot.lower(variant(lines, ("ds_append v10", "ds_consume v10")), 32, **binding), 1
         yield aot.lower(variant(lines, ("ds_consume v12", "ds_append v12")), 32, **binding), 3
+    elif name in LDS_QWORD_COUNTERS:
+        if "condxchg" in name:
+            # Incorrectly perform the high-half store when its sign bit is clear.
+            wrong = source.replace("(0x12345678u & 0x80000000u) != 0u", "true")
+            yield wrong, 1
+        else:
+            # Returning forms use the read to keep the old pair observable.
+            no_update = ("ds_read_b64 v[18:19], v5 offset:8" if "_rtn" in name else "s_nop 0")
+            instruction = next(line for line in lines if line.startswith(name + " "))
+            yield aot.lower(variant(lines, (instruction, no_update)), 32, **binding), 0
     elif name in LDS_QWORD_RETURNS:
         # Substitute the post-update word pair for the returned pre-update pair.
         changed = variant(lines, ("v_mov_b32_e32 v12, v18", "v_mov_b32_e32 v12, v10"),
@@ -2546,6 +2594,7 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
         four_words = (name in ("lds_wave_counter", "lds_xchg2_b32") or name in LDS_QWORD_RETURNS
                       or name in LDS_WIDE_QUADS or name in LDS_STRIDED_PROGRAMS
                       or name in LDS_F64_CMPST and "_rtn" in name
+                      or name in LDS_QWORD_COUNTERS and "_rtn" in name
                       or name in LDS_WIDE_REPLACEMENTS and "_rtn" in name)
         group_counts = (1, 2) if four_words else (1, 3)
         if name == "lds_st64_xchg_b64":
@@ -2567,6 +2616,8 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False, cases=None
                 words = lds_overlap_reference(groups)
             elif name == "lds_wave_counter":
                 words = lds_wave_counter_reference(groups)
+            elif name in LDS_QWORD_COUNTERS:
+                words = lds_qword_counter_reference(name, groups)
             elif name in LDS_QWORD_UPDATES or name in LDS_QWORD_RETURNS:
                 words = lds_qword_reference(name, groups)
             elif name in LDS_WIDE_PROGRAMS or name in LDS_WIDE_QUADS:
