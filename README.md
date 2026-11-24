@@ -4,7 +4,7 @@
 
 Xbox2Windows researches static recompilation from Xbox Series X|S (Scarlett) to x64 Windows. It translates selected x64 machine code into C++ and selected gfx1013 shaders into desktop DXIL. You can run the public tests without a game installation.
 
-> **Current status.** The full-package DXIL scan found a compiled route for 26,500 of 26,503 shader records. On an RTX 4060 Laptop, the local offline startup build plays the intro, accepts setup and enters loading. The language selector displays readable names and moves the highlight from English to Deutsch. The English Privacy Policy and Terms of Service remain readable after scrolling and switching between them. Interactive main-menu navigation remains unverified. [Run results and first failure #870](https://github.com/R0Y00/Xbox2Windows/issues/870) · [Independent RX 9070 XT report](https://github.com/R0Y00/Xbox2Windows/pull/1135) · [GPU tasks #874](https://github.com/R0Y00/Xbox2Windows/issues/874)
+> **Current status.** The full-package DXIL scan found a compiled route for 26,500 of 26,503 shader records. On an RTX 4060 Laptop, an offline run with a modified local diagnostic EXE and a debugger configured to automatically continue assertions played the intro, accepted setup and reached loading. The diagnostic run displayed readable language names and English legal text after scrolling and switching pages. Startup of the original EXE, interactive main-menu navigation and gameplay remain unverified. [Run results and first failure #870](https://github.com/R0Y00/Xbox2Windows/issues/870) · [Independent RX 9070 XT report](https://github.com/R0Y00/Xbox2Windows/pull/1135) · [GPU tasks #874](https://github.com/R0Y00/Xbox2Windows/issues/874)
 
 ## Community and contributions
 
@@ -29,6 +29,7 @@ Use `#dev-coordination` on Discord to find a reviewer and `#windows-testing` to 
 | **Windows runtime** | Bink frame-buffer allocations reach the Windows heap through the shared provider. The FidelityFX experiment follows scratch writes from two passes through the RCAS output on an 8×4 tile. [Allocation, failure and retry](docs/experiments.md#frame-buffers-through-the-shared-windows-heap) · [Upscaler pixel comparison](docs/experiments.md#last-writers-of-the-pass-26-scratch-reads) |
 
 The pixel translator also supports [vector bitfield extraction, bit scans, reversal and population counts](docs/experiments.md#vector-bit-operations-in-pixel-shaders), checked by twelve source-built instruction forms.
+The [pixel readback checks](docs/experiments.md#offline-pixel-shader-recompilation) also cover `v_sat_pk_u8_i16` in e32 and e64 on hardware and WARP.
 
 ### Instruction coverage
 
@@ -118,7 +119,7 @@ The control-flow CPU translator supports [source-built string memory transfers](
 | gfx1030 typed-buffer reads | Lower [indexed UINT `tbuffer_load_format_*`](docs/experiments.md#indexed-gfx1030-typed-buffer-reads) for one to four 32-bit or packed 16-bit components. | `ctest --preset dev --no-tests=error -R '^compute_store_aot_mtbuf_load_'` |
 | gfx1030 raw subword reads | Lower [indexed byte and halfword MUBUF loads](docs/experiments.md#indexed-gfx1030-raw-subword-reads) and compare sign and zero extension in the UAV readback. | `ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_subword_'` |
 | gfx1030 raw vector reads | Lower [indexed `buffer_load_dwordx2/x3/x4`](docs/experiments.md#indexed-gfx1030-raw-vector-reads) and verify channel order, destination/index aliasing and untouched output. | `ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_vector_'` |
-| gfx1030 image loads | Lower a 2D [`image_load` with a caller-declared `R32G32B32A32_UINT` descriptor](docs/experiments.md#gfx1030-2d-image-loads) for `dmask` x through xyzw, with two-dword and packed-address `a16` coordinates, and compare the UAV readback against a CPU reference. | `ctest --preset dev --no-tests=error -R '^compute_store_aot_mimg_load_'` |
+| gfx1030 image loads | Lower typed 2D R32G32B32A32_UINT [`image_load` and `image_load_mip`](docs/experiments.md#gfx1030-2d-image-loads) with 32-bit or packed `a16` addresses for `dmask` x through xyzw, and compare the UAV readback against a CPU reference. | `ctest --preset dev --no-tests=error -R '^compute_store_aot_mimg_'` |
 | gfx1030 raw D16 reads | Lower [indexed D16 byte and short MUBUF loads](docs/experiments.md#indexed-gfx1030-raw-d16-reads) and verify that the other VGPR half stays unchanged. | `ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_d16_'` |
 | Shader census | [Distinguish archive records, header digests and cache-index entries](docs/experiments.md#reporting-shader-census-populations) before choosing a coverage denominator. | `ctest --preset dev --no-tests=error -R "^shader_metadata_census$" -V` |
 | Shader effect metadata | Inventory the [candidate programs for a named SGD5 effect](docs/experiments.md#candidate-programs-for-a-named-sgd5-effect) using independently located archive ranges. | `ctest --preset dev --no-tests=error -R "^sgd5_effect_candidates$" -V` |

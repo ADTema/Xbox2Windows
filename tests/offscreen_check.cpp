@@ -1063,6 +1063,24 @@ OperationResult run_startup_image_3d(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// --startup-flat-param <vs.cso> <ps.cso> <expected words>: draws one pixel with a gfx2hlsl vertex and
+// pixel stage pair (tests/startup_flat_param.cpp). The expected value is four 8-digit hex words,
+// comma separated.
+OperationResult run_startup_flat_param(const OperationContext& ctx)
+{
+    std::uint32_t expected[4]{};
+    if (std::sscanf(ctx.argv[5], "%8x,%8x,%8x,%8x", &expected[0], &expected[1], &expected[2], &expected[3]) != 4)
+        return {OutcomeKind::fail, "expected value is not four hex words"};
+    std::uint32_t words[4]{};
+    check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], words);
+    if (std::memcmp(words, expected, sizeof(words)) != 0) {
+        std::fprintf(stderr, "startup_flat_param mismatch expected=%08x,%08x,%08x,%08x actual=%08x,%08x,%08x,%08x\n",
+                     expected[0], expected[1], expected[2], expected[3], words[0], words[1], words[2], words[3]);
+        return {OutcomeKind::fail, "flat parameter readback differs"};
+    }
+    return {OutcomeKind::pass, nullptr};
+}
+
 constexpr CapabilityGate kNoGate{};
 constexpr CapabilityGate kGateSm60BufferOps{
     D3D_SHADER_MODEL_6_0, false, false, 0,
@@ -1158,6 +1176,7 @@ const OperationSpec kOperations[] = {
     {"--sampler-index-control", 3, 3, nullptr, kGateSm60SamplerIndexControl, run_sampler_index_control},
     {"--startup-sampler-heap", 7, 9, nullptr, kNoGate, run_startup_sampler_heap},
     {"--startup-image-3d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
+    {"--startup-flat-param", 6, 6, nullptr, kNoGate, run_startup_flat_param},
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},
     {"--spirv-address-window", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window},

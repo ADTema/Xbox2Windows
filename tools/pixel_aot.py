@@ -632,6 +632,9 @@ INTEGER = {
     "cvt_pk_u16_u32": (2, "min({0}, 65535u) | (min({1}, 65535u) << 16u)"),
     "cvt_pk_i16_i32": (2, "(asuint(clamp(asint({0}), -32768, 32767)) & 0xffffu) | "
                           "(asuint(clamp(asint({1}), -32768, 32767)) << 16u)"),
+    # Clamp both signed halfwords independently and write a full dword with bits 31:16 clear.
+    "sat_pk_u8_i16": (1, "uint(clamp(asint({0} << 16) >> 16, 0, 255)) | "
+                         "(uint(clamp(asint({0}) >> 16, 0, 255)) << 8)"),
     "alignbit_b32": (3, "(({2} & 31u) == 0u ? {1} : (({1} >> ({2} & 31u)) | ({0} << (32u - ({2} & 31u)))))"),
     "alignbyte_b32": (3, "(({2} & 3u) == 0u ? {1} : (({1} >> (({2} & 3u) * 8u)) | ({0} << (32u - (({2} & 3u) * 8u)))))"),
     "add3_u32": (3, "({0} + {1} + {2})"),
