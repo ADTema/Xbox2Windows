@@ -6132,11 +6132,14 @@ Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_opsel$' -V`.
 
 **VOPC SDWA compares (#1906).** `compare()` refused every `v_cmp*_sdwa` and `v_cmpx*_sdwa`. It now lowers the
 SDWA forms of its 32-bit table. An i32 or u32 source reads its `src0_sel`/`src1_sel` field through `sdwa_source`,
-sign-extended under `sext()`, and the compare reads that 32-bit value as its type. f32 compares stay refused
-in their SDWA form until their predicates are verified for NaN independently of the non-SDWA text (#1920). The
+sign-extended under `sext()`, and the compare reads that 32-bit value as its type. Binary32 class compares read
+a DWORD float from SRC0 and select the integer class mask from SRC1. Ordinary f32 predicates stay refused
+in their SDWA form until their NaN behavior is verified (#1920). The
 destination is `vcc_lo`, the SGPR the decoder prints, or EXEC for `v_cmpx` with the same EXEC masking as before.
-Class compares, f32 compares, a missing or repeated select and any other SDWA modifier
-(`clamp`, `dst_sel`, an output modifier) are refused. `startup_gfx2hlsl_vopc_sdwa` evaluates the emitted HLSL of
+A sub-dword class value, a missing or repeated select and unsupported SDWA modifiers are refused.
+`startup_gfx2hlsl_vopc_sdwa` evaluates the emitted class predicate for 42 forms across all ten binary32 classes,
+including both active and inactive lanes. Its readback fixture selects the mask for `-1.0` from `BYTE_1` and
+checks that a mutation using the whole dword produces a different image. The test also evaluates the emitted HLSL of
 all 32 integer compares (v_cmp into `vcc_lo` and into an SGPR, v_cmpx into EXEC) times every select and `sext()`
 on both sources, 9408 forms, over 64 source pairs each, against a plain integer reference. The draws
 `startup_gfx2hlsl_vopc_sdwa_{warp,hardware}` keep or discard each of 16 x 16 pixels with
@@ -11470,6 +11473,28 @@ though newer LLVM can fill unused VOP3 fields differently in other forms.
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_mad_' -V
 python -B tests/startup_gfx2hlsl_mad_check.py binary llvm-mc-15
+```
+
+## Startup translator: refusal census
+
+The startup shader translator normally stops a pipeline at its first refusal. Fixing that refusal can expose gaps that were previously hidden, as documented in the [issue #1723 census](https://github.com/R0Y00/Xbox2Windows/issues/1723).
+
+`python -B tools/startup/gfx2hlsl.py --refusals <cache-dir> [--json]` surveys an existing cache directory, including requests that already have a `.txt` or `.fail`. The diagnostic writes nothing and translates in memory without invoking fxc. On older translator revisions, `--refusals DIR` is treated as `--pending DIR` and writes into that directory.
+
+The text and JSON reports show two views.
+
+- **Per request key** includes RTV variants. Each reason and scope row counts requests containing that refusal, requests where it was the first site reached, and requests where it was the only distinct reason. Repeating the same reason at several sites still counts toward Only. The refusal sites per request histogram counts each site reached. **No refusal recorded (not compiled)** counts requests with zero recorded sites.
+- **Per code pair** groups base requests by a hash of their `.a` and `.b` bytes and excludes RTV variants. For each reason and scope, the report counts pairs where it was reached under every observed root signature and pairs where it was reached under some but fewer than all observed roots. Multiple requests for the same pair and root contribute their combined reasons.
+
+The Scope column distinguishes `decode`, vertex lowering (`vs`), pixel lowering (`ps`), and `pipeline`. A refusal for an instruction of known length skips that instruction and continues. An undecodable word, or a refusal during request loading, pipeline construction, or output generation ends the pipeline, with the same reason the default path would write to `.fail`. For a pipeline-scope Only row, the single observed reason is a lower bound on what may be present. Counts after the first refusal are approximate because skipped instructions leave later state unmodelled.
+
+An unexpected handler exception after an earlier refusal or crash is reported as `internal error in <operation>: <exception type>`, a possible follow-on effect. With no earlier refusal it is reported as `translator crash in <operation>: <exception type>`, which identifies a translator bug. The reports contain no request keys, raw disassembly, register numbers or immediates. Cause numbers such as a format ID, operand width, or shader model remain visible.
+
+The `startup_gfx2hlsl_refusals` check covers skip and resume, a control that stops at the first refusal, file and decoding failures, count semantics, both flag orders and the `--refusals=DIR` spelling, and unchanged cache files in diagnostic mode.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_refusals$' -V
+python -B tools/startup/gfx2hlsl.py --refusals out/startup/shader_cache
 ```
 
 ## Startup translator: SMEM offset operands

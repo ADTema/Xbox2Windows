@@ -2546,6 +2546,8 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         op_name, comment = op_info
         length = 4
         literal = None
+        if src0 in (233, 234, 250):
+            return _vop_extension(data, offset, "vopc", op_name, src0)
         if src0 in (249, 255):
             extension = "SDWA" if src0 == 249 else "literal"
             if offset + 8 > len(data):
