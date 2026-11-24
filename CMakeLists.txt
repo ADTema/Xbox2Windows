@@ -1137,6 +1137,14 @@ foreach(adapter IN ITEMS warp hardware)
         set_tests_properties(vm_translation_${scenario}_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
     endforeach()
 endforeach()
+# The configured range's windows and GPU addresses (src/d3d12_xs_range.h) with a fake device and fake
+# windows. The mutated run is the negative control.
+add_executable(d3d12_xs_range_check tests/d3d12_xs_range_check.cpp src/d3d12_xs_range.cpp)
+target_include_directories(d3d12_xs_range_check PRIVATE src)
+target_compile_features(d3d12_xs_range_check PRIVATE cxx_std_17)
+add_test(NAME d3d12_xs_range COMMAND d3d12_xs_range_check)
+add_test(NAME d3d12_xs_range_full_last_window_control COMMAND d3d12_xs_range_check --mutate full_last_window)
+set_tests_properties(d3d12_xs_range_full_last_window_control PROPERTIES WILL_FAIL TRUE)
 # XG-style swizzle selection compared with AMD addrlib (#870). addrlib is an optional local dependency
 # fetched by tools/fetch_addrlib.py into out/deps/mesa (Mesa 25.1.0, src/amd/addrlib, MIT); without it the
 # test skips (77). The source list and definitions follow Mesa's src/amd/addrlib/meson.build.
