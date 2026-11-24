@@ -5,22 +5,19 @@
   draw <dxc> <offscreen_check> <warp|hardware>
                                         translate, dispatch and compare the readback
 
-Each fixture program is a source-built gfx1013 wave program whose COMPUTE_PGM_RSRC2 enables two
-user SGPRs (the table pointer s[0:1]), the group X ID (s2) and TG_SIZE (s3). Every thread stores
-its dispatch-thread X and its TG_SIZE word to dword pair tid.x of the output:
+A gfx10 compute wave receives USER_SGPR user SGPRs, then one SGPR for each group ID that
+TGID_X/Y/Z_EN enables, in X, Y, Z order with no gap for an omitted axis, and TIDIG_COMP_CNT + 1
+local-ID VGPRs from v0. Each fixture program below is source-built for gfx1013 and names the
+group IDs only by the registers that layout gives them; no group register is passed by hand.
+Every thread computes its dispatch coordinate on each axis it uses (group * size + local) and
+stores them as a record at an address built from those coordinates, so each thread has its own
+destination. Words outside the records keep the sentinel, and all 320 are compared.
 
-    s_mov_b32 s1, 0
-    s_load_dwordx4 s[12:15], s[0:1], null
-    v_lshl_add_u32 v4, s2, log2(n), v0      dispatch thread = group * n + local
-    v_mov_b32 v6, v4
-    v_mov_b32 v7, s3                         TG_SIZE
-    buffer_store_dwordx2 v[6:7], v4, s[12:15], 0 idxen  (stride 8)
+The cases enable X with Z (Y omitted), Y with Z (X omitted), Z alone, all three, and X behind
+four user SGPRs. They run with different group counts per axis, so the coordinates on different
+axes are distinct. Mutations that swap two stored coordinates must mismatch.
 
-TG_SIZE is the group's wave count in bits 5:0 and the wave's index within the group in bits 11:6,
-the layout Mesa reads on GFX6-10. The expected words below are computed from that definition, not
-from the translator. The cases cover one wave, several waves and a partial last wave, at wave32
-and wave64. The draw also runs the same programs with the wave index moved to bit 20 (the field
-Mesa reads on GFX10.3) and requires a mismatch, so the readback separates the two layouts.
+TG_SIZE_EN is refused: its word layout and the guest wave width are not established (#1544).
 """
 import struct
 import subprocess
@@ -33,47 +30,99 @@ sys.path.insert(0, str(HERE.parent / "tools"))
 import compute_store_aot as aot  # noqa: E402
 
 SENTINEL = 0xc5c5c5c5
-USER_SGPR_2, TGID_X, TGID_Y, TGID_Z, TG_SIZE_EN = 2 << 1, 1 << 7, 1 << 8, 1 << 9, 1 << 10
-RSRC2 = USER_SGPR_2 | TGID_X | TG_SIZE_EN  # 0x484
+WORDS = 320
+TGID_X, TGID_Y, TGID_Z, TG_SIZE_EN = 1 << 7, 1 << 8, 1 << 9, 1 << 10
 
 
-def program(threads):
-    shift = threads.bit_length() - 1
-    return [
-        "s_mov_b32 s1, 0",
-        "s_load_dwordx4 s[12:15], s[0:1], null",
-        f"v_lshl_add_u32 v4, s2, {shift}, v0",
-        "v_mov_b32_e32 v6, v4",
-        "v_mov_b32_e32 v7, s3",
-        "s_waitcnt lgkmcnt(0)",
-        "buffer_store_dwordx2 v[6:7], v4, s[12:15], 0 idxen",
-        "s_endpgm",
-    ]
+def user(count):
+    return count << 1
 
 
-# (name, threads per group, wave size, groups dispatched)
-CASES = [
-    ("one_wave32", 32, 32, 3),
-    ("two_waves32", 64, 32, 2),
-    ("four_waves32", 128, 32, 1),
-    ("partial_wave32", 16, 32, 3),
-    ("one_wave64", 64, 64, 2),
-    ("partial_wave64", 32, 64, 3),
-]
+def tidig(count):
+    return count << 11
 
 
-def binding(wave):
-    return dict(table_reg=0, descriptor_offset=0, stride=8, rsrc2=RSRC2, wave_size=wave)
+HEAD = ["s_mov_b32 s1, 0", "s_load_dwordx4 s[12:15], s[0:1], null"]
+TAIL = ["s_waitcnt lgkmcnt(0)"]
+
+# X and Z enabled, Y omitted: s2 is group X and s3 is group Z. 2x1x4 threads; each stores (x, z)
+# at row z (idxen, 48-byte stride) and column x (offen, 8 bytes).
+X_Z = HEAD + [
+    "v_lshl_add_u32 v3, s2, 1, v0",
+    "v_lshl_add_u32 v4, s3, 2, v2",
+    "v_lshlrev_b32_e32 v5, 3, v3",
+    "v_mov_b32_e32 v8, v3",
+    "v_mov_b32_e32 v9, v4",
+] + TAIL + ["buffer_store_dwordx2 v[8:9], v[4:5], s[12:15], 0 idxen offen", "s_endpgm"]
+# Y and Z enabled, X omitted: s2 is group Y and s3 is group Z. 1x2x4 threads; each stores (y, z).
+Y_Z = HEAD + [
+    "v_lshl_add_u32 v4, s2, 1, v1",
+    "v_lshl_add_u32 v6, s3, 2, v2",
+    "v_lshlrev_b32_e32 v7, 3, v4",
+    "v_mov_b32_e32 v8, v4",
+    "v_mov_b32_e32 v9, v6",
+] + TAIL + ["buffer_store_dwordx2 v[8:9], v[6:7], s[12:15], 0 idxen offen", "s_endpgm"]
+# Z alone: s2 is group Z. 1x1x4 threads; each stores z at word z.
+Z_ONLY = HEAD + [
+    "v_lshl_add_u32 v6, s2, 2, v2",
+] + TAIL + ["buffer_store_dword v6, v6, s[12:15], 0 idxen", "s_endpgm"]
+# All three: s2, s3 and s4 are groups X, Y and Z. 2x2x2 threads; each stores (x, y, z) at plane z
+# (idxen, 256-byte stride), row y (64 bytes) and column x (16 bytes).
+XYZ = HEAD + [
+    "v_lshl_add_u32 v3, s2, 1, v0",
+    "v_lshl_add_u32 v4, s3, 1, v1",
+    "v_lshl_add_u32 v6, s4, 1, v2",
+    "v_lshlrev_b32_e32 v5, 4, v3",
+    "v_lshl_add_u32 v7, v4, 6, v5",
+    "v_mov_b32_e32 v8, v3",
+    "v_mov_b32_e32 v9, v4",
+    "v_mov_b32_e32 v10, v6",
+] + TAIL + ["buffer_store_dwordx3 v[8:10], v[6:7], s[12:15], 0 idxen offen", "s_endpgm"]
+# Four user SGPRs (the table in s[0:1], s2 and s3 unused here) put group X in s4. 32 threads; each
+# stores x at word x.
+X_USER4 = HEAD + [
+    "v_lshl_add_u32 v3, s4, 5, v0",
+] + TAIL + ["buffer_store_dword v3, v3, s[12:15], 0 idxen", "s_endpgm"]
+
+# name: (program, threads per group, rsrc2, stride, dispatches, record(x, y, z) -> (word, values))
+CASES = {
+    "x_z": (X_Z, (2, 1, 4), user(2) | TGID_X | TGID_Z | tidig(2), 48,
+            ((1, 1, 1), (3, 1, 2)), lambda x, y, z: ((48 * z + 8 * x) // 4, (x, z))),
+    "y_z": (Y_Z, (1, 2, 4), user(2) | TGID_Y | TGID_Z | tidig(2), 48,
+            ((1, 1, 1), (1, 3, 2)), lambda x, y, z: ((48 * z + 8 * y) // 4, (y, z))),
+    "z_only": (Z_ONLY, (1, 1, 4), user(2) | TGID_Z | tidig(2), 4,
+               ((1, 1, 1), (1, 1, 5)), lambda x, y, z: (z, (z,))),
+    "xyz": (XYZ, (2, 2, 2), user(2) | TGID_X | TGID_Y | TGID_Z | tidig(2), 256,
+            ((1, 1, 1), (2, 1, 1), (1, 2, 2), (2, 2, 2)),
+            lambda x, y, z: ((256 * z + 64 * y + 16 * x) // 4, (x, y, z))),
+    "x_user4": (X_USER4, (32, 1, 1), user(4) | TGID_X, 4,
+                ((1, 1, 1), (3, 1, 1)), lambda x, y, z: (x, (x,))),
+}
+# Swapping two stored coordinates must change the readback on the largest dispatch.
+MUTATIONS = {
+    "x_z": ("uint2(tid.x, tid.z)", "uint2(tid.z, tid.x)"),
+    "y_z": ("uint2(tid.y, tid.z)", "uint2(tid.z, tid.y)"),
+    "xyz": ("uint3(tid.x, tid.y, tid.z)", "uint3(tid.y, tid.x, tid.z)"),
+}
 
 
-def expected(threads, wave, groups):
-    """Readback from the definition: tid.x and TG_SIZE = waves | (local // wave) << 6."""
-    waves = -(-threads // wave)
-    words = []
-    for group in range(groups):
-        for local in range(threads):
-            words += [group * threads + local, waves | (local // wave) << 6]
-    return words + [SENTINEL] * (320 - len(words))
+def translate(name, **change):
+    program, dims, rsrc2, stride, _, _ = CASES[name]
+    binding = dict(table_reg=0, descriptor_offset=0, stride=stride, rsrc2=rsrc2) | change
+    return aot.lower(program, dims, **binding)
+
+
+def expected(name, groups):
+    """The readback from the record layout, independent of the translator."""
+    _, dims, _, _, _, record = CASES[name]
+    words = [SENTINEL] * WORDS
+    for x in range(groups[0] * dims[0]):
+        for y in range(groups[1] * dims[1]):
+            for z in range(groups[2] * dims[2]):
+                word, values = record(x, y, z)
+                assert word + len(values) <= WORDS and words[word] == SENTINEL, (name, x, y, z)
+                words[word:word + len(values)] = values
+    return words
 
 
 def rejects(message, function, *args, **kwargs):
@@ -86,82 +135,109 @@ def rejects(message, function, *args, **kwargs):
 
 
 def controls():
-    # Register placement: user SGPRs, then the enabled group IDs in X, Y, Z order, then TG_SIZE.
-    assert aot.entry_registers(RSRC2) == (2, {0: 2}, 3, 1)
-    assert aot.entry_registers((4 << 1) | TGID_X | TGID_Y | TGID_Z | TG_SIZE_EN | (2 << 11)) == (
-        4, {0: 4, 1: 5, 2: 6}, 7, 3)
-    assert aot.entry_registers((3 << 1) | TGID_Y | TGID_Z | TG_SIZE_EN) == (3, {1: 3, 2: 4}, 5, 1)
-    assert aot.entry_registers(USER_SGPR_2) == (2, {}, None, 1)
-    rejects("thread-ID component count", aot.entry_registers, RSRC2 | 3 << 11)
-    print("entry_registers: user SGPRs, then group X/Y/Z, then TG_SIZE; TIDIG_COMP_CNT 0-2")
+    # Placement: user SGPRs, then each enabled group ID in X, Y, Z order with no gap for an omitted
+    # axis; TIDIG_COMP_CNT + 1 local-ID VGPRs.
+    for rsrc2, placed in (
+            (user(2) | TGID_X, (2, {0: 2}, 1)),
+            (user(2) | TGID_Y, (2, {1: 2}, 1)),
+            (user(2) | TGID_Z | tidig(2), (2, {2: 2}, 3)),
+            (user(2) | TGID_X | TGID_Z | tidig(2), (2, {0: 2, 2: 3}, 3)),
+            (user(3) | TGID_Y | TGID_Z | tidig(1), (3, {1: 3, 2: 4}, 2)),
+            (user(5) | TGID_X | TGID_Y | TGID_Z | tidig(2), (5, {0: 5, 1: 6, 2: 7}, 3)),
+            (user(2), (2, {}, 1))):
+        assert aot.entry_registers(rsrc2) == placed, (hex(rsrc2), aot.entry_registers(rsrc2))
+    rejects("thread-ID component count", aot.entry_registers, user(2) | TGID_X | tidig(3))
+    print("entry_registers: user SGPRs, then the enabled group IDs in X, Y, Z order; TIDIG_COMP_CNT 0-2")
 
-    # The TG_SIZE word, and its use in a store.
-    source = aot.lower(program(64), 64, **binding(32))
-    assert "uint gindex : SV_GroupIndex" in source, source
-    assert "uint2(tid.x, (2u | ((gindex >> 5u) << 6u)))" in source, source
-    assert "(1u | ((gindex >> 6u) << 6u))" in aot.lower(program(64), 64, **binding(64))
-    print("TG_SIZE: waves | (SV_GroupIndex >> log2(wave)) << 6")
+    # TG_SIZE_EN is refused, alone, with group IDs and in a translation.
+    for rsrc2 in (user(2) | TG_SIZE_EN, user(2) | TGID_X | TG_SIZE_EN, CASES["xyz"][2] | TG_SIZE_EN):
+        rejects("TG_SIZE_EN is not supported", aot.entry_registers, rsrc2)
+    rejects("TG_SIZE_EN is not supported", translate, "x_z", rsrc2=CASES["x_z"][2] | TG_SIZE_EN)
+    print("TG_SIZE_EN: refused")
 
-    # Without rsrc2 the program's s3 is not TG_SIZE, and s2 is a group ID only if named.
-    rejects("Unresolved scalar move source", aot.lower, program(64), 64, table_reg=0, descriptor_offset=0,
-            stride=8, group_reg=2)
-    # Refusals.
-    rejects("do not also give group registers", aot.lower, program(64), 64, **binding(32), group_reg=2)
-    rejects("needs a wave size", aot.lower, program(64), 64, **dict(binding(32), wave_size=None))
-    rejects("only with COMPUTE_PGM_RSRC2", aot.lower, program(64), 64, table_reg=0, descriptor_offset=0,
-            stride=8, group_reg=2, wave_size=32)
-    rejects("within the user SGPRs", aot.lower, program(64), 64,
-            **dict(binding(32), rsrc2=(1 << 1) | TGID_X | TG_SIZE_EN))
+    # Each case translates from rsrc2 alone, to the same source as with its group registers by hand.
+    by_hand = {"x_z": dict(group_reg=2, group_reg_z=3), "y_z": dict(group_reg_y=2, group_reg_z=3),
+               "z_only": dict(group_reg_z=2), "xyz": dict(group_reg=2, group_reg_y=3, group_reg_z=4),
+               "x_user4": dict(group_reg=4)}
+    for name, registers in by_hand.items():
+        assert translate(name) == translate(name, rsrc2=None, **registers), name
+
+    # An omitted or moved group ID leaves the program's register naming another axis or nothing.
+    omitted = [
+        ("x_z", user(2) | TGID_X | tidig(2)),                       # Z omitted: s3 is not a group ID
+        ("x_z", user(2) | TGID_X | TGID_Y | TGID_Z | tidig(2)),     # Y enabled: s3 becomes group Y
+        ("x_z", user(2) | TGID_Z | tidig(2)),                       # X omitted: s2 becomes group Z
+        ("y_z", user(2) | TGID_X | TGID_Y | TGID_Z | tidig(2)),     # X enabled: s2 becomes group X
+        ("y_z", user(2) | TGID_Y | tidig(2)),                       # Z omitted
+        ("z_only", user(2) | TGID_Y | tidig(2)),                    # s2 is group Y
+        ("xyz", user(2) | TGID_X | TGID_Z | tidig(2)),              # Y omitted: s3 becomes group Z
+        ("xyz", user(2) | TGID_X | TGID_Y | tidig(2)),              # Z omitted: s4 is not a group ID
+        ("x_user4", user(2) | TGID_X),                              # two user SGPRs: group X is s2
+        ("x_user4", user(5) | TGID_X),                              # five user SGPRs: s4 is a user SGPR
+    ]
+    for name, rsrc2 in omitted:
+        rejects("Unverified dispatch index", translate, name, rsrc2=rsrc2)
+    # Local IDs beyond TIDIG_COMP_CNT are not bound.
+    for name, count in (("x_z", 1), ("y_z", 0), ("z_only", 1), ("xyz", 1)):
+        rejects("Unverified dispatch index", translate, name, rsrc2=CASES[name][2] & ~tidig(3) | tidig(count))
+    print("controls: an omitted, moved or unenabled entry register is refused")
+
+    rejects("do not also give group registers", translate, "x_z", group_reg=2)
+    rejects("within the user SGPRs", translate, "x_z", rsrc2=user(1) | TGID_X | TGID_Z | tidig(2))
     # A 4x4 pitched store (the PITCH program of compute_store_check.py): ten user SGPRs with the table
-    # at s[8:9] put the group IDs in s10 and s11, as that test names them by hand. TIDIG_COMP_CNT binds
-    # v1 (local Y) only when it enables the Y component.
+    # at s[8:9] put the group IDs in s10 and s11, as that test names them by hand.
     pitch = ["s_mov_b32 s9, 0", "s_load_dwordx4 s[12:15], s[8:9], null",
              "v_lshl_add_u32 v3, s10, 2, v0", "v_lshl_add_u32 v4, s11, 2, v1",
              "v_lshlrev_b32_e32 v5, 3, v3", "v_mad_u32_u24 v6, 0x48, v4, v5",
              "v_mov_b32_e32 v8, v3", "v_mov_b32_e32 v9, v4", "s_waitcnt lgkmcnt(0)",
              "buffer_store_dwordx2 v[8:9], v6, s[12:15], 0 offen", "s_endpgm"]
-    xy = (10 << 1) | TGID_X | TGID_Y | (1 << 11)
-    by_hand = aot.lower(pitch, (4, 4, 1), table_reg=8, descriptor_offset=0, group_reg=10, group_reg_y=11)
-    assert aot.lower(pitch, (4, 4, 1), table_reg=8, descriptor_offset=0, rsrc2=xy) == by_hand
-    rejects("Unverified dispatch index", aot.lower, pitch, (4, 4, 1), table_reg=8, descriptor_offset=0,
-            rsrc2=xy & ~(3 << 11))
-    print("controls: group registers and wave size only with rsrc2; table in the user SGPRs; v1 only with TIDIG >= 1")
+    xy = user(10) | TGID_X | TGID_Y | tidig(1)
+    assert aot.lower(pitch, (4, 4, 1), table_reg=8, descriptor_offset=0, rsrc2=xy) == aot.lower(
+        pitch, (4, 4, 1), table_reg=8, descriptor_offset=0, group_reg=10, group_reg_y=11)
+    print("controls: group registers only without rsrc2; table in the user SGPRs; hand-named PITCH unchanged")
 
 
 def check_binary(llvm_mc):
-    for name, threads, _, _ in CASES:
+    for name, (program, *_rest) in CASES.items():
         run = subprocess.run([llvm_mc, "-arch=amdgcn", "-mcpu=gfx1013", "-show-encoding"],
-                             input="\n".join(program(threads)) + "\n", capture_output=True, text=True)
+                             input="\n".join(program) + "\n", capture_output=True, text=True)
         if run.returncode or "error" in run.stderr:
             raise AssertionError(f"{name}: {run.stderr}")
     print("fixture programs assemble for gfx1013")
 
 
+def dispatch(directory, dxc, renderer, backend, label, source, groups, words):
+    src, cso, case = (directory / f"{label}.{ext}" for ext in ("hlsl", "cso", "case"))
+    src.write_text(source, encoding="ascii")
+    subprocess.run([dxc, "-T", "cs_6_0", "-E", "main", "-Fo", str(cso), str(src)], check=True)
+    case.write_bytes(struct.pack(f"<{1 + WORDS}I", groups[0] | groups[1] << 8 | groups[2] << 16, *words))
+    return subprocess.run([renderer, backend, "--compute-store-case", str(cso), str(case)],
+                          capture_output=True, text=True)
+
+
 def check_draw(directory, dxc, renderer, backend):
     controls()
-    for name, threads, wave, groups in CASES:
-        source = aot.lower(program(threads), threads, **binding(wave))
-        for variant, text in (("", source), ("_bit20", source.replace("<< 6u))", "<< 20u))"))):
-            src, cso, case = (directory / f"{name}{variant}.{ext}" for ext in ("hlsl", "cso", "case"))
-            src.write_text(text, encoding="ascii")
-            subprocess.run([dxc, "-T", "cs_6_0", "-E", "main", "-Fo", str(cso), str(src)], check=True)
-            case.write_bytes(struct.pack("<321I", groups, *expected(threads, wave, groups)))
-            run = subprocess.run([renderer, backend, "--compute-store-case", str(cso), str(case)],
-                                 capture_output=True, text=True)
+    for name, (_, dims, _, _, dispatches, _) in CASES.items():
+        source = translate(name)
+        for groups in dispatches:
+            label = f"{name}_{'x'.join(map(str, groups))}"
+            run = dispatch(directory, dxc, renderer, backend, label, source, groups, expected(name, groups))
             if run.returncode == 77:
                 print(run.stdout + run.stderr)
                 return 77
-            multi_wave = threads > wave
-            if not variant:
-                if run.returncode:
-                    raise AssertionError(f"{name}\n{run.stdout}\n{run.stderr}")
-                debug = next((line for line in (run.stdout + run.stderr).splitlines() if "debug_errors=" in line), "")
-                print(f"{name}: {groups} groups of {threads} at wave{wave} exact {debug.strip()}")
-            elif multi_wave:
-                # A later wave's index sits in bits 11:6, so the bit-20 layout must read differently.
-                if run.returncode != 1 or "expected=" not in run.stderr:
-                    raise AssertionError(f"{name}: the bit-20 layout was not detected\n{run.stderr}")
-                print(f"{name}: wave index at bit 20 mismatches, as required")
+            if run.returncode:
+                raise AssertionError(f"{label}\n{run.stdout}\n{run.stderr}")
+            debug = next((line for line in (run.stdout + run.stderr).splitlines() if "debug_errors=" in line), "")
+            print(f"{label}: groups of {'x'.join(map(str, dims))} exact {debug.strip()}")
+        if name in MUTATIONS:
+            old, new = MUTATIONS[name]
+            assert source.count(old) == 1, (name, source)
+            groups = dispatches[-1]
+            run = dispatch(directory, dxc, renderer, backend, f"{name}_swapped", source.replace(old, new),
+                           groups, expected(name, groups))
+            if run.returncode != 1 or "expected=" not in run.stderr:
+                raise AssertionError(f"{name}: swapped coordinates were not detected\n{run.stdout}\n{run.stderr}")
+            print(f"{name}: swapped coordinates mismatch, as required")
     return 0
 
 

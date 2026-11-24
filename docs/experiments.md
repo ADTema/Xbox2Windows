@@ -3171,13 +3171,12 @@ Build the emitted source with `dxc -T cs_6_0 -E main`. The Windows fixture reads
 With `--rsrc2 <COMPUTE_PGM_RSRC2>` (`rsrc2=` in `lower`), the translation places the entry registers itself instead of taking `--group-reg*`. On gfx10 a compute wave receives:
 
 - **User SGPRs:** `USER_SGPR`, bits 5:1. The table pointer must lie within them.
-- **Group IDs:** one SGPR for each group ID enabled by `TGID_X/Y/Z_EN` (bits 7–9), in X, Y, Z order.
-- **TG_SIZE:** one SGPR when `TG_SIZE_EN` (bit 10) is set.
+- **Group IDs:** one SGPR for each group ID enabled by `TGID_X/Y/Z_EN` (bits 7–9), in X, Y, Z order, with no gap for an omitted axis.
 - **Local IDs:** `TIDIG_COMP_CNT + 1` VGPRs from v0 (bits 12:11), one local ID per VGPR. A local Y or Z that `TIDIG_COMP_CNT` does not enable is not bound.
 
-The TG_SIZE word is the group's wave count in bits 5:0 and the wave's index within the group in bits 11:6. This is the layout Mesa's AMD compiler reads on GFX6–10 (`load_num_subgroups`, `load_subgroup_id`). The translation computes it from `SV_GroupIndex` and the wave size given with `--wave-size 32|64`. Mesa reads the wave index from bits 24:20 on GFX10.3 and later; the translation does not write that field, and no console readback has settled which field titles read.
+`TG_SIZE_EN` (bit 10) is refused. Mesa's AMD compiler reads the wave index of the TG_SIZE word from bits 11:6 on GFX6–10 and from bits 24:20 on GFX10.3 and later, and the guest wave width is not established either. A desktop readback can check a chosen packing but cannot tell the two guest encodings apart, so TG_SIZE waits for independent evidence.
 
-`tests/compute_entry_layout_check.py` uses source-built gfx1013 programs that store each thread's dispatch index and its TG_SIZE register. The cases cover one wave, two and four waves at wave32, and a partial last wave at wave32 and at wave64. The expected words come from the definition above. The same programs with the wave index at bit 20 must mismatch. Without `rsrc2`, a TIDIG count below Y, a table outside the user SGPRs, or `rsrc2` combined with group registers, the translation refuses the program. Run `ctest --preset dev --no-tests=error -R '^compute_entry_layout_'`.
+`tests/compute_entry_layout_check.py` uses source-built gfx1013 programs that name the group IDs only by the registers this layout gives them. The cases enable X with Z (Y omitted), Y with Z (X omitted), Z alone, all three axes, and X behind four user SGPRs. Each thread stores its dispatch coordinates as a record at its own address; the dispatches use different group counts per axis, and all 320 words are compared with the record layout, including the sentinels between and after the records. Swapping two stored coordinates must mismatch. Each case translates to the same source as with its group registers named by hand. The translation refuses a program whose register names an omitted or moved group ID, a local ID beyond `TIDIG_COMP_CNT`, a table outside the user SGPRs, `TG_SIZE_EN`, and `rsrc2` combined with group registers. Run `ctest --preset dev --no-tests=error -R '^compute_entry_layout_'`.
 
 ### gfx1030 MUBUF cache-invalidation rejection
 

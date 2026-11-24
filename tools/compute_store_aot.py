@@ -116,36 +116,27 @@ def checked_group(group):
 def entry_registers(rsrc2):
     """The entry registers a gfx10 compute wave receives, from COMPUTE_PGM_RSRC2.
 
-    Returns (user SGPR count, {axis: group ID SGPR}, TG_SIZE SGPR or None, thread-ID VGPR count).
-    The user SGPRs come first (USER_SGPR, bits 5:1), then one SGPR for each group ID enabled by
-    TGID_X/Y/Z_EN (bits 7-9) in that order, then TG_SIZE when TG_SIZE_EN (bit 10) is set. The
-    scratch wave offset, which follows them, is not read. TIDIG_COMP_CNT (bits 12:11) gives v0
-    (X), v0-v1 (X, Y) or v0-v2 (X, Y, Z), each local ID in its own VGPR on gfx10.
+    Returns (user SGPR count, {axis: group ID SGPR}, thread-ID VGPR count). The user SGPRs come
+    first (USER_SGPR, bits 5:1), then one SGPR for each group ID enabled by TGID_X/Y/Z_EN
+    (bits 7-9), in X, Y, Z order with no gap for an omitted axis. TIDIG_COMP_CNT (bits 12:11)
+    gives v0 (X), v0-v1 (X, Y) or v0-v2 (X, Y, Z), each local ID in its own VGPR on gfx10.
+    TG_SIZE_EN (bit 10) is refused: the gfx1013 TG_SIZE word layout and the guest wave width
+    are not established, so its register cannot be given a value.
     """
     if not 0 <= rsrc2 < 1 << 32:
         raise ValueError("Invalid COMPUTE_PGM_RSRC2")
+    if rsrc2 >> 10 & 1:
+        raise ValueError("COMPUTE_PGM_RSRC2 TG_SIZE_EN is not supported")
     reg = user = (rsrc2 >> 1) & 0x1f
     groups = {}
     for axis in range(3):
         if rsrc2 >> (7 + axis) & 1:
             groups[axis] = reg
             reg += 1
-    tg_size = reg if rsrc2 >> 10 & 1 else None
     components = (rsrc2 >> 11) & 3
     if components == 3:
         raise ValueError("Unsupported COMPUTE_PGM_RSRC2 thread-ID component count")
-    return user, groups, tg_size, components + 1
-
-
-def tg_size_word(dims, wave_size):
-    """The TG_SIZE SGPR as an HLSL word: the group's wave count in bits 5:0 and this wave's index in
-    the group in bits 11:6, the layout Mesa reads on GFX6-10 (load_num_subgroups, load_subgroup_id).
-    GFX10.3 and later keep the wave index in bits 24:20 as well; this translation writes bits 11:6 only.
-    """
-    if wave_size not in (32, 64):
-        raise ValueError("TG_SIZE needs a wave size of 32 or 64")
-    waves = -(-dims[0] * dims[1] * dims[2] // wave_size)
-    return ("alu", f"({waves}u | ((gindex >> {wave_size.bit_length() - 1}u) << 6u))")
+    return user, groups, components + 1
 
 
 def group_size(psv):
@@ -238,12 +229,12 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
           constant_descriptor=None, group_reg_y=None, group_reg_z=None, source_descriptor=None,
           source_stride=None, source_format=None, output_format=None, image_descriptor=None, image_format=None,
           image_uav_mip=None, cpu="gfx1013", lds_bytes=0, lds_f32_mode=None, lds_f64_mode=None,
-          mubuf_d16_xyz_mode=None, rsrc2=None, wave_size=None):
+          mubuf_d16_xyz_mode=None, rsrc2=None):
     """v0, v1 and v2 are local X, Y and Z; group_reg, group_reg_y and group_reg_z are the group IDs.
 
-    rsrc2 is the program's COMPUTE_PGM_RSRC2. When given, it places the group IDs and TG_SIZE
+    rsrc2 is the program's COMPUTE_PGM_RSRC2. When given, it places the group IDs
     (entry_registers) instead of group_reg, group_reg_y and group_reg_z, binds only the local IDs
-    it enables, and table_reg must lie within its user SGPRs. TG_SIZE needs wave_size.
+    it enables, and table_reg must lie within its user SGPRs. TG_SIZE_EN is refused.
 
     gfx10 compute waves receive each local ID in its own VGPR. Y and Z are bound only when that
     group dimension is larger than one. Descriptors name u0 and optionally b0 and a read-only raw
@@ -261,18 +252,14 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     dims = checked_group(group)
     if cpu not in ("gfx1013", "gfx1030"):
         raise ValueError("Unsupported compute target")
-    tg_size_reg, local_axes = None, 3
+    local_axes = 3
     if rsrc2 is not None:
         if group_reg is not None or group_reg_y is not None or group_reg_z is not None:
             raise ValueError("COMPUTE_PGM_RSRC2 places the group IDs; do not also give group registers")
-        user_sgprs, placed, tg_size_reg, local_axes = entry_registers(rsrc2)
+        user_sgprs, placed, local_axes = entry_registers(rsrc2)
         if table_reg + 1 >= user_sgprs:
             raise ValueError("The table pointer must lie within the user SGPRs")
         group_reg, group_reg_y, group_reg_z = (placed.get(axis) for axis in range(3))
-        if tg_size_reg is not None:
-            tg_size_value = tg_size_word(dims, wave_size)
-    elif wave_size is not None:
-        raise ValueError("A wave size is used only with COMPUTE_PGM_RSRC2")
     ds_group = cpu == "gfx1030" and dims == (32, 1, 1)
     if not 0 <= table_reg <= 105:
         raise ValueError("Invalid table or thread group binding")
@@ -335,10 +322,6 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     scalar = {table_reg: "table"}
     for axis, reg in group_regs.items():
         scalar[reg] = ("group", axis)
-    if tg_size_reg is not None:
-        if tg_size_reg > 105 or tg_size_reg == table_reg:
-            raise ValueError("Invalid TG_SIZE register")
-        scalar[tg_size_reg] = tg_size_value
     vector = {axis: ("local", axis) for axis in range(local_axes) if axis == 0 or dims[axis] > 1}
     pending = set()
     # VGPRs a buffer read still writes, with the word they receive (None when unknown);
@@ -1644,8 +1627,6 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     # Helpers are selected from the final body, so a float ALU result used only by a DS step still gets its definition.
     cbuffer += "".join(text for name, text in F32_HELPERS.items() if f"f32_{name}(" in body)
     uav = f"RWTexture2D<{image_atomic_type or 'uint4'}>" if image_output else "RWByteAddressBuffer"
-    if "gindex" in body:
-        local += ", uint gindex : SV_GroupIndex"
     return (f"{cbuffer}{uav} outputData : register(u0);\n[numthreads({dims[0]},{dims[1]},{dims[2]})]\n"
             f"void main(uint3 tid : SV_DispatchThreadID{local}) {{\n{body}\n}}\n")
 
@@ -1668,8 +1649,7 @@ def main():
     parser.add_argument("--group-reg-y", type=int, help="SGPR holding the group Y ID")
     parser.add_argument("--group-reg-z", type=int, help="SGPR holding the group Z ID")
     parser.add_argument("--rsrc2", type=lambda n: int(n, 0),
-                        help="COMPUTE_PGM_RSRC2: places the group IDs and TG_SIZE instead of --group-reg*")
-    parser.add_argument("--wave-size", type=int, choices=(32, 64), help="Wave size, needed for TG_SIZE")
+                        help="COMPUTE_PGM_RSRC2: places the group IDs instead of --group-reg*")
     parser.add_argument("--stride", type=int, help="Indexed raw UAV byte stride")
     parser.add_argument("--source-descriptor", type=lambda n: int(n, 0),
                         help="Table byte offset bound to stable read-only t0, with no overlap with u0")
@@ -1707,7 +1687,7 @@ def main():
                    image_descriptor=args.image_descriptor, image_format=args.image_format,
                    image_uav_mip=args.image_uav_mip, cpu=args.cpu, lds_bytes=args.lds_bytes,
                    lds_f32_mode=args.lds_f32_mode, lds_f64_mode=args.lds_f64_mode,
-                   mubuf_d16_xyz_mode=args.mubuf_d16_xyz_mode, rsrc2=args.rsrc2, wave_size=args.wave_size)
+                   mubuf_d16_xyz_mode=args.mubuf_d16_xyz_mode, rsrc2=args.rsrc2)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(source, encoding="ascii")
     print(json.dumps({"container_sha256": hashlib.sha256(blob).hexdigest(),
