@@ -27,6 +27,8 @@ jobs:
         run: python3 -B tests/gpu_report_format_check.py
       - name: Check the opt-in compiler cache arguments in dev.ps1
         run: python3 -B tests/dev_ps1_sccache_check.py
+      - name: Check the required SPIR-V bridge WARP test list
+        run: python3 -B tests/spirv_window/require_warp_results_check.py
       - name: Check machine-code inputs with LLVM 15
         run: |
           sudo apt-get update -q
