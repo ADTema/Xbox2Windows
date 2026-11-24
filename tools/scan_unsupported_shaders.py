@@ -118,6 +118,12 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"s_clause\s+(?:0x[0-3]?[0-9a-f]|[0-5]?[0-9]|6[0-3])",
     r"s_setprio\s+(?:0x[0-3]|[0-3])",
     r"s_sleep\s+(?:0x[0-7]?[0-9a-f]|[0-9]|[1-9][0-9]|1[01][0-9]|12[0-7])",
+    # Performance-level and trace hints, as in pixel_aot: a 4-bit counter, a 16-bit field, or no operand.
+    r"s_(?:inc|dec)perflevel\s+(?:0x[0-9a-f]|[0-9]|1[0-5])",
+    r"s_ttracedata_imm\s+(?:0x0*[0-9a-f]{1,4}|0|[1-9]\d{0,3}|[1-5]\d{4}|6[0-4]\d{3}|65[0-4]\d\d|655[0-2]\d|6553[0-5])",
+    r"s_icache_inv",
+    r"s_ttracedata",
+    r"s_wakeup",
     r"s_setreg_imm32_b32\s+hwreg\(HW_REG_FLAT_SCR_(?:LO|HI)\),\s+(?:-?\d+|0x[0-9a-f]{1,8})",
     r"s_setreg_imm32_b32\s+hwreg\(HW_REG_MODE, 2, 2\),\s+[03]",
     r"s_waitcnt_expcnt\s+(?:(?:null|s\d+),\s*)?(?:0x[0-7]|[0-7])",

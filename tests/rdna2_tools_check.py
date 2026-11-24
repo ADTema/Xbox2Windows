@@ -5449,6 +5449,15 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertIn("stages", json_content)
             self.assertIn("missing_opcodes_ranked", json_content)
 
+    def test_timing_hint_instructions(self):
+        """The scanner accepts the timing, trace and cache hints pixel_aot lowers like s_nop 0."""
+        for line in ("s_incperflevel 15", "s_decperflevel 0x2", "s_ttracedata_imm 0xffff", "s_ttracedata_imm 5",
+                     "s_icache_inv", "s_ttracedata", "s_wakeup"):
+            self.assertTrue(is_instruction_supported(line), line)
+        for line in ("s_incperflevel 16", "s_decperflevel 0x10", "s_ttracedata_imm 0x10000",
+                     "s_waitcnt_depctr 0xffe3", "s_wait_idle", "s_code_end"):
+            self.assertFalse(is_instruction_supported(line), line)
+
     def test_supported_shader_instructions(self):
         """Verify scanner patterns recognize subrev, mov_b32, waitcnt_expcnt as supported."""
         self.assertTrue(is_instruction_supported("s_waitcnt_expcnt null, 0x0"))
