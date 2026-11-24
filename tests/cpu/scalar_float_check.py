@@ -21,11 +21,20 @@ SIGNATURES = {"blend_ss": "f:ffqf", "blend_sd": "d:ddqd", "convert": "q:fdq", "f
               "zero_xorps": "d:d", "zero_pxor": "d:d", "zero_xorpd": "d:d", "probe_ss": "q:qff",
               "neg_jcc": "q:q", "setcc_mix": "q:qqq", "cmovcc_mix": "q:qqq",
               "min_ss": "f:ffq", "max_ss": "f:ffq", "min_sd": "d:ddq", "max_sd": "d:ddq",
-              "root_ss": "f:fq", "root_sd": "d:dq"}
+              "root_ss": "f:fq", "root_sd": "d:dq", "root_const_ss": "f:", "root_const_sd": "d:"}
 # MIN, MAX and SQRT: the seed behind the pointer and how far each export writes into it.
 SEED = struct.pack("<II", 0x0badf00d, 0x1badcafe)
 EXTREMA = {"min_ss": ("min", 4), "max_ss": ("max", 4), "min_sd": ("min", 8), "max_sd": ("max", 8)}
 ROOTS = {"root_ss": 4, "root_sd": 8}
+# The host MXCSR words of the MIN, MAX and SQRT checks: the default, each rounding control (nearest, down, up,
+# toward zero) and DAZ and FTZ. A native call and its translation run under the same word.
+DEFAULT_MXCSR, DAZ, FTZ = 0x1f80, 0x40, 0x8000
+ROUNDING_WORDS = [DEFAULT_MXCSR, 0x3f80, 0x5f80, 0x7f80]
+EXTREMA_WORDS = [DEFAULT_MXCSR | DAZ, DEFAULT_MXCSR | DAZ | FTZ, DEFAULT_MXCSR | FTZ]
+ROOT_WORDS = ROUNDING_WORDS + [DEFAULT_MXCSR | DAZ, 0x5f80 | DAZ, 0x3f80 | DAZ | FTZ]
+# The operands of the constant-source exports, as an integer built into the code: sqrt(2) as a float and
+# sqrt(3) as a double.
+CONSTANT_ROOTS = {"root_const_ss": (2, 4), "root_const_sd": (3, 8)}
 WINDOWS = {"min_ss": 40, "max_ss": 40, "min_sd": 48, "max_sd": 48, "root_ss": 40, "root_sd": 48}
 GUARD = bytes.fromhex("5a5a1234a5a54321")
 FILL = 0xa5
@@ -79,12 +88,42 @@ def number(bits, width):
     return struct.unpack("<f" if width == 4 else "<d", struct.pack("<I" if width == 4 else "<Q", bits))[0]
 
 
-def reference(name, values, payload, variant=None):
+def exact_root(bits, width, rounding):
+    """The square root of a positive finite number, by integer arithmetic, rounded as the RC field says:
+    0 to nearest even, 1 down, 2 up, 3 toward zero."""
+    precision, fraction_bits, exponent_bits, bias = (24, 23, 8, 127) if width == 4 else (53, 52, 11, 1023)
+    exponent = bits >> fraction_bits & (1 << exponent_bits) - 1
+    fraction = bits & (1 << fraction_bits) - 1
+    mantissa, power = (fraction | 1 << fraction_bits, exponent - bias - fraction_bits) if exponent \
+        else (fraction, 1 - bias - fraction_bits)
+    if power & 1:
+        mantissa, power = mantissa << 1, power - 1
+    scale = 2 * (precision + 2)
+    root = math.isqrt(mantissa << scale)
+    exact = root * root == mantissa << scale
+    drop = root.bit_length() - precision
+    kept, rest = root >> drop, root & (1 << drop) - 1
+    half = 1 << drop - 1
+    if rounding == 0:
+        kept += rest > half or (rest == half and (not exact or kept & 1) != 0)
+    elif rounding == 2:
+        kept += rest != 0 or not exact
+    value = math.ldexp(kept, drop + power // 2 - scale // 2)
+    return struct.unpack("<I" if width == 4 else "<Q", struct.pack("<f" if width == 4 else "<d", value))[0]
+
+
+def reference(name, values, payload, variant=None, mxcsr=DEFAULT_MXCSR):
     """Result bits and the whole buffer for MIN, MAX and SQRT, from the instruction set reference alone:
     exact Python arithmetic, no host instruction and no code of the translator. The variant, when given, is a
-    deliberately wrong rule that the negative controls must see fail."""
+    deliberately wrong rule that the negative controls must see fail. The MXCSR word gives the rounding of a
+    root and DAZ, which reads a denormal source operand as a zero of its sign, also when MIN or MAX returns it."""
+    def flush(bits, width):
+        sign = 1 << 8 * width - 1
+        magnitude = bits & ~sign
+        return bits & sign if mxcsr & DAZ and 0 < magnitude < 1 << (23 if width == 4 else 52) else bits
+
     def extreme(op, a, b, width):
-        x, y = number(a, width), number(b, width)
+        x, y = number(flush(a, width), width), number(flush(b, width), width)
         keep = x < y if op == "min" else x > y
         if variant == "tie-keeps-destination":
             keep = x <= y if op == "min" else x >= y
@@ -92,11 +131,13 @@ def reference(name, values, payload, variant=None):
             keep = not (x >= y if op == "min" else x <= y)
         elif variant == "min-is-max":
             keep = x > y if op == "min" else x < y
-        return a if keep else b
+        chosen = a if keep else b
+        return chosen if variant == "daz-result-kept" else flush(chosen, width)
 
     def root(bits, width):
         quiet = 1 << (22 if width == 4 else 51)
         indefinite = 0xffc00000 if width == 4 else 0xfff8000000000000
+        bits = flush(bits, width)
         x = number(bits, width)
         if x != x:
             return bits if variant == "snan-not-quieted" else bits | quiet
@@ -106,8 +147,7 @@ def reference(name, values, payload, variant=None):
             return 0 if variant == "negative-zero-positive" else bits
         if x == math.inf:
             return bits
-        # A double square root is correctly rounded and rounds again to float without a double rounding error.
-        return struct.unpack("<I" if width == 4 else "<Q", struct.pack("<f" if width == 4 else "<d", math.sqrt(x)))[0]
+        return exact_root(bits, width, 0 if variant == "nearest-only" else mxcsr >> 13 & 3)
 
     if name in EXTREMA:
         op, width = EXTREMA[name]
@@ -176,6 +216,7 @@ def cases():
                 found.append((name, (a, b, None), SEED + bytes([FILL]) * (WINDOWS[name] - 8)))
     for name, width in ROOTS.items():
         found += [(name, (a, None), SEED + bytes([FILL]) * (WINDOWS[name] - 8)) for a in (SINGLES if width == 4 else DOUBLES)]
+    found += [("root_const_ss", (), b""), ("root_const_sd", (), b"")]
     name, values, payload, _, _ = probe_answer(2.0, 1.0)
     found.append((name, values, payload))
     flag_values = [0, 1, 2, 0x7fffffff, 0x80000000, 0xffffffff, (1 << 63) - 1, 1 << 63, (1 << 64) - 1]
@@ -194,6 +235,25 @@ def run(call, name, values, payload):
     slots = [ctypes.addressof(buffer) + 8 if value is None else value | JUNK if kind == "f" else value
              for kind, value in zip(kinds, values)]
     return call(name, slots), buffer.raw
+
+
+def mxcsr_access(harness):
+    """The host MXCSR of the calling thread: (get, set) of the native-only harness."""
+    library = ctypes.CDLL(str(Path(harness).resolve()))
+    library.get_mxcsr.argtypes, library.get_mxcsr.restype = [], ctypes.c_uint32
+    library.set_mxcsr.argtypes, library.set_mxcsr.restype = [ctypes.c_uint32], None
+    return library.get_mxcsr, library.set_mxcsr
+
+
+def under(access, word, call, name, values, payload):
+    """run() with the host MXCSR set to a word for the call alone."""
+    get, put = access
+    saved = get()
+    put(word)
+    try:
+        return run(call, name, values, payload)
+    finally:
+        put(saved)
 
 
 def library_caller(path, prefix=""):
@@ -280,6 +340,7 @@ def known_answers():
         root("root_sd", double(-4.0), 0xfff8000000000000), root("root_sd", 0xfff0000000000000, 0xfff8000000000000),
         root("root_sd", 1 << 63, 1 << 63), root("root_sd", 0x7ff0000000000000, 0x7ff0000000000000),
         root("root_sd", 0x7ff0000000000001, 0x7ff8000000000001), root("root_sd", 1, 0x1e60000000000000),
+        ("root_const_ss", (), b"", 0x3fb504f3, b""), ("root_const_sd", (), b"", 0x3ffbb67ae8584caa, b""),
         # (1.5 + 2.25) * 2 - 0.5 = 7; 1.5 / 7.
         ("blend_ss", (single(1.5), single(2.25), None, single(0.5)), struct.pack("<II", single(2.0), 0),
          single(1.5 / 7.0), struct.pack("<II", single(2.0), single(7.0))),
@@ -413,6 +474,72 @@ def check(original, lifted, swapped, swapped_lifted):
           f"buffer for the original and the swapped-operand build; swapped operands changed {changed}")
 
 
+def mxcsr_cases():
+    """(MXCSR word, export, slot values, initial bytes): MIN and MAX with DAZ and FTZ over every pair of
+    operands, SQRT under every rounding control and DAZ, and the constant-source roots under every control."""
+    for name, (_, width) in EXTREMA.items():
+        pool = SINGLES if width == 4 else DOUBLES
+        for word in EXTREMA_WORDS:
+            for a in pool:
+                for b in pool:
+                    yield word, name, (a, b, None), SEED + bytes([FILL]) * (WINDOWS[name] - 8)
+    for name, width in ROOTS.items():
+        for word in ROOT_WORDS:
+            for a in (SINGLES if width == 4 else DOUBLES):
+                yield word, name, (a, None), SEED + bytes([FILL]) * (WINDOWS[name] - 8)
+    for name in CONSTANT_ROOTS:
+        for word in ROUNDING_WORDS:
+            yield word, name, (), b""
+
+
+def constant_root(name, word):
+    """The result bits of a constant-source root, from the integer in the code and the rounding control."""
+    operand, width = CONSTANT_ROOTS[name]
+    bits = struct.unpack("<I" if width == 4 else "<Q", struct.pack("<f" if width == 4 else "<d", float(operand)))[0]
+    return exact_root(bits, width, word >> 13 & 3)
+
+
+# Each wrong rule of the MXCSR checks and the export it breaks.
+MXCSR_MUTANTS = [("min_ss", "daz-result-kept"), ("max_ss", "daz-result-kept"), ("min_sd", "daz-result-kept"),
+                 ("max_sd", "daz-result-kept"), ("root_ss", "nearest-only"), ("root_sd", "nearest-only")]
+
+
+def check_mxcsr(original, lifted, access):
+    """MIN, MAX and SQRT of the fixture and of its translation under the same host MXCSR word, against the
+    reference. A translation that lets the compiler fold a constant root, or that returns a denormal MIN or MAX
+    operand unflushed under DAZ, disagrees with the processor here."""
+    counts = {}
+    seen = {}
+    for word, name, values, payload in mxcsr_cases():
+        native = under(access, word, original, name, values, payload)
+        actual = under(access, word, lifted, name, values, payload)
+        if actual != native:
+            raise AssertionError(f"translation mismatch under MXCSR {word:#x} for {name}{values}: {actual} != {native}")
+        if name in CONSTANT_ROOTS:
+            expected = constant_root(name, word)
+            if native != (expected, GUARD + payload + GUARD):
+                raise AssertionError(f"{name} under MXCSR {word:#x}: the processor gave {native}, the reference {expected:#x}")
+            seen.setdefault((name, expected), word)
+        else:
+            expected = reference(name, values, payload, mxcsr=word)
+            if native != (expected[0], GUARD + expected[1] + GUARD):
+                raise AssertionError(f"{name}{values} under MXCSR {word:#x}: the processor gave {native}, the reference {expected}")
+            for case, variant in MXCSR_MUTANTS:
+                if case == name:
+                    wrong = reference(name, values, payload, variant, word)
+                    if wrong != expected:
+                        counts[(name, variant)] = counts.get((name, variant), 0) + 1
+        counts[name] = counts.get(name, 0) + 1
+    for name in CONSTANT_ROOTS:
+        if len({bits for (case, bits) in seen if case == name}) < 2:
+            raise AssertionError(f"{name} gave one result under every rounding control")
+    for case, variant in MXCSR_MUTANTS:
+        if not counts.get((case, variant)):
+            raise AssertionError(f"wrong rule {variant!r} for {case} agrees with the reference on every call")
+    print(f"{sum(v for k, v in counts.items() if isinstance(k, str))} calls match the processor under MXCSR words with "
+          f"rounding controls, DAZ and FTZ; {len(MXCSR_MUTANTS)} wrong rules each disagree on a call")
+
+
 def check_rejections(original_path):
     data = Path(original_path).read_bytes()
     with pefile.PE(data=data, fast_load=True) as pe:
@@ -521,7 +648,8 @@ def check_rejections(original_path):
 
 
 if __name__ == "__main__":
-    original, lifted, swapped, swapped_lifted = sys.argv[1:]
+    original, lifted, swapped, swapped_lifted, harness = sys.argv[1:]
     check(library_caller(original), library_caller(lifted, "lifted_"),
           library_caller(swapped), library_caller(swapped_lifted, "lifted_"))
+    check_mxcsr(library_caller(original), library_caller(lifted, "lifted_"), mxcsr_access(harness))
     check_rejections(original)

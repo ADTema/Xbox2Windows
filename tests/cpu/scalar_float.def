@@ -19,3 +19,5 @@ EXPORTS
     max_sd
     root_ss
     root_sd
+    root_const_ss
+    root_const_sd

@@ -456,4 +456,29 @@ ENDIF
     ret
 root_sd ENDP
 
+; float root_const_ss(void) is the square root of 2 and double root_const_sd(void) is the square root of 3.
+; The operand is built from an integer constant, so a translation that lets the compiler evaluate the root
+; would use the default rounding and not the rounding of the host MXCSR. The control copies the operand.
+root_const_ss PROC FRAME
+    .endprolog
+    mov eax, 2
+    xorps xmm0, xmm0
+    cvtsi2ss xmm0, eax
+IFNDEF SWAP_OPERANDS
+    sqrtss xmm0, xmm0
+ENDIF
+    ret
+root_const_ss ENDP
+
+root_const_sd PROC FRAME
+    .endprolog
+    mov eax, 3
+    xorpd xmm0, xmm0
+    cvtsi2sd xmm0, eax
+IFNDEF SWAP_OPERANDS
+    sqrtsd xmm0, xmm0
+ENDIF
+    ret
+root_const_sd ENDP
+
 END

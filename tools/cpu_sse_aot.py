@@ -6,7 +6,9 @@ XMM0-XMM3 when it is floating point and in RCX, RDX, R8 or R9 otherwise; the res
 XMM0 or RAX. Control flow and the integer instructions are those of cpu_switch_aot.
 
 Scalar SQRT, MIN and MAX are lifted too. The generated code runs under the host MXCSR: a guest MXCSR write is not
-lifted, so the rounding mode, DAZ and FTZ are the host's and the exception flags are not observed.
+lifted, so the rounding mode, DAZ and FTZ are the host's and the exception flags are not observed. SQRT, MIN and
+MAX read their operands at run time, so a constant operand is not folded with the default environment; ADD, SUB,
+MUL and DIV have no such barrier.
 
 Only the low quadword of an XMM register is modelled. Every supported instruction computes
 that quadword from low quadwords alone, so the upper half never reaches a result. The two
@@ -386,12 +388,27 @@ template <class Float, class Bits> static Bits arith(Bits a, Bits b, char op) {
     const Float r = op == '+' ? x + y : op == '-' ? x - y : op == '*' ? x * y : x / y;
     return r != r ? static_cast<Bits>(~(quiet - 1)) : cast<Bits>(r);
 }
+// The host reads a value from a volatile so that no operation on it is evaluated by the compiler: a constant
+// operand would otherwise be folded with the default rounding and without DAZ instead of under the host MXCSR.
+template <class Float> static Float runtime(Float value) {
+    volatile Float input = value;
+    return input;
+}
+// With DAZ set a denormal source operand is read as a zero of its sign, also when it is returned unchanged
+// as the result of MIN or MAX. The host compare of a denormal with zero shows whether DAZ is set.
+template <class Float, class Bits> static Bits daz(Bits bits) {
+    const Bits sign = static_cast<Bits>(1) << (8 * sizeof(Bits) - 1);
+    const Bits fraction = (static_cast<Bits>(1) << (std::numeric_limits<Float>::digits - 1)) - 1;
+    const Bits magnitude = bits & ~sign;
+    if (magnitude == 0 || magnitude > fraction) return bits;
+    return runtime(cast<Float>(static_cast<Bits>(1))) == static_cast<Float>(0) ? bits & sign : bits;
+}
 // SQRTSS and SQRTSD with exceptions masked. A NaN operand is returned quieted with its payload, a negative
 // operand other than -0 gives the default NaN, whose sign is set, and -0 gives -0. The host function is
 // kept out of those cases because its NaN sign and its errno handling are not the processor's.
 template <class Float, class Bits> static Bits root(Bits b) {
     const Bits quiet = static_cast<Bits>(1) << (std::numeric_limits<Float>::digits - 2);
-    const Float y = cast<Float>(b);
+    const Float y = runtime(cast<Float>(b));
     if (y != y) return b | quiet;
     if (y < 0) return static_cast<Bits>(~(quiet - 1));
     return cast<Bits>(static_cast<Float>(std::sqrt(y)));
@@ -399,8 +416,8 @@ template <class Float, class Bits> static Bits root(Bits b) {
 // MINSS, MAXSS, MINSD and MAXSD return the destination only when the comparison is true. Equal values
 // (so zeros of either sign) and any NaN, which compares false, give the source operand unchanged.
 template <class Float, class Bits> static Bits extreme(Bits a, Bits b, char op) {
-    const Float x = cast<Float>(a), y = cast<Float>(b);
-    return (op == '<' ? x < y : x > y) ? a : b;
+    const Float x = runtime(cast<Float>(a)), y = runtime(cast<Float>(b));
+    return daz<Float>((op == '<' ? x < y : x > y) ? a : b);
 }
 // CVTTSS2SI and CVTTSD2SI: a NaN or a value outside the destination range gives the integer
 // indefinite, which is the sign bit alone.
