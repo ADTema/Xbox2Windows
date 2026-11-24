@@ -738,7 +738,7 @@ ctest --preset dev --no-tests=error -R '^spirv_address_window_' -V
 
 With SPIRV-Tools on Linux, run `python3 -B tests/spirv_window/check.py` to assemble and validate the fixture and exercise the rejection paths. This also validates a combined fixture where a lowered ballot bit controls the value stored through the address window. The adapter reserves `%x2w_` identifiers in the input and gives address and ballot temporaries separate prefixes. To use WSL tools for the GPU check, generate a logical module with `python3 tools/spirv_address_window.py tests/spirv_window/subtract.spvasm out/window.spv`, then generate HLSL with `spirv-cross out/window.spv --hlsl --shader-model 60 --output out/window.hlsl`. Compile it on Windows with `dxc -T cs_6_0 -E main -Fo out/window.dxil out/window.hlsl` and run `out/build/dev/offscreen_check.exe hardware --spirv-address-window out/window.dxil`, then repeat with `warp`.
 
-The same Linux check validates eight unsigned DWORD atomics in Vulkan 1.2 SPIR-V: `OpAtomicIAdd`, `OpAtomicExchange`, `OpAtomicUMin`, `OpAtomicUMax`, `OpAtomicAnd`, `OpAtomicOr`, `OpAtomicXor` and `OpAtomicCompareExchange`. The synthetic variant exercises a direct word cast and an indexed physical address. Each atomic is lowered into a branch taken only for an aligned, in-window address, so an invalid address issues no atomic at all (the substitute index of the plain loads and stores is never used for an atomic); the atomic keeps its operands, scope and semantics, and its result is a phi of the old value and zero. This Linux check measures SPIR-V validation and the shape of the lowering. The GPU behavior of the valid and invalid cases requires the separate readback evidence.
+The same Linux check validates eight unsigned DWORD atomics in Vulkan 1.2 SPIR-V: `OpAtomicIAdd`, `OpAtomicExchange`, `OpAtomicUMin`, `OpAtomicUMax`, `OpAtomicAnd`, `OpAtomicOr`, `OpAtomicXor` and `OpAtomicCompareExchange`. The synthetic variant exercises a direct word cast and an indexed physical address. Each atomic is lowered into a branch taken only for an aligned, in-window address, so an invalid address issues no atomic at all (the substitute index of the plain loads and stores is never used for an atomic); the atomic keeps its operands, scope and semantics, and its result is a phi of the old value and zero. This Linux check measures SPIR-V validation and the shape of the lowering. The GPU behavior of the valid and invalid cases requires the separate readback evidence. A phi in a successor block that named the original block as its parent is rewritten to the block that now ends in the branch, and the Linux check validates such a module.
 
 Run `ctest --preset dev --no-tests=error -R '^spirv_address_window_atomic_' -V` to check the atomic add's returned old value and full 16-DWORD readback for valid, misaligned, out-of-window and index-wrap addresses, with the fixture mapping the substitute index to the last bound DWORD.
 
@@ -3092,6 +3092,17 @@ all 320 UAV words for one and two groups. An otherwise valid translation
 shifted one DWORD earlier must mismatch at word 0. The LLVM 15 binary
 check assembles and decodes each opcode before repeating the lowering check.
 
+The four `tbuffer_store_format_d16_*` forms accept 16-bit UINT components
+(`xyz` uses the four-component format). Consecutive pairs are already in
+memory byte order, first component in the low half. For an odd count, a
+read-modify-write preserves the final DWORD's high half. The usual
+alignment, stride, and overlap checks reserve the entire rounded-up span.
+The caller must dispatch along the indexed axis only and bind a UAV with
+no concurrent access by other work. Each affected DWORD then belongs to
+one invocation. The fixtures check both halves and untouched words;
+swapping the first word's halves or clearing the preserved half must
+cause a readback mismatch.
+
 ```powershell
 cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^compute_store_aot_mtbuf_store_(warp|hardware)$' -V
@@ -3203,6 +3214,27 @@ group, and five groups with 150 active lanes. Two stale references truncate
 one operand at a time, and a third changes the first inactive word. The test
 requires each control to fail at the expected word. Run
 `ctest --preset dev --no-tests=error -R '^compute_store_aot_guard_read_(warp|hardware)$' -V`.
+
+#### Guarded binary32 add, subtract and multiply
+
+Four VOP2 forms lower to one rounded binary32 operation each, on the bit pattern of a word, so a result is again a word that can be stored, copied or fed to the integer forms above:
+
+| Instruction | Result |
+|---|---|
+| `v_add_f32_e32 vD, a, vB` | `a + b` |
+| `v_sub_f32_e32 vD, a, vB` | `a - b` |
+| `v_subrev_f32_e32 vD, a, vB` | `b - a` |
+| `v_mul_f32_e32 vD, a, vB` | `a * b` |
+
+A source is a VGPR, an SGPR that holds a known word, a 32-bit literal, the integer zero or one of the inline float constants LLVM prints (`0.5`, `1.0`, `2.0`, `4.0`, their negatives and `0.15915494`). The second source is a VGPR. Each operation is a small HLSL helper whose result is `precise`, so a multiply followed by an add is not contracted into one fused operation. The helpers are emitted only when the program uses them.
+
+Fused multiply-add is not in this subset. `v_fma_f32`, `v_fmac_f32_e32` and `v_mac_f32_e32` stop the lowering at that instruction, because DXIL has no binary32 form whose single rounding is guaranteed. The `_e64` spellings, `clamp`, `abs` and negation modifiers, an SGPR as the second source, `v_max_f32`, `v_min_f32` and `v_mul_legacy_f32` are refused too.
+
+NaN, infinity and denormals are not claimed. A literal, an inline integer or a scalar move that is one of them is refused with `Unverified float operand`. A word read from memory is not known statically, so its value is not checked: a caller that binds such a word must keep every operand and result finite and normal. The fixture below builds its operands with integer operations so that they always are.
+
+The fixture is a guarded read-compute-write kernel with the read bindings and `cap = params[0].y`, the float 20.0. The source word `w` gives `x = 1.5 + (w & 0x3fffff) / 2^23` in [1.5, 2) and `y = 3.0 + (w >> 10) / 2^22` in [3, 4), and the chain is `a = x + y`, `b = cap - a`, `c = b - pi`, `d = x * c`, `e = 1.0 + d`, `out = e - (-4.0)`. It uses every form, an SGPR, a literal and two inline constants as sources, and every result stays between 1.5 and 30. The exponent constants `0x3fc00000` and `0x40400000` are not inline constants, which LLVM would print as floats in the integer forms. The expected words come from a Python model that rounds each step to binary32 and shares no code with the lowering. Python rounds the double result of an add, subtract or multiply of two binary32 values once more, which is exact. At least one multiply of the active lanes is inexact, so the rounding is observed.
+
+The Windows readback uses the read harness and its three dispatches (no lane passes, a split wave, five groups with 150 active lanes) and compares all 320 words, so every word past the bound must stay at its sentinel. Each of these must fail at the first word where it differs: a reference with `sub` and `subrev` exchanged, `subrev` alone exchanged, an add for the multiply, a subtract for the final add, or the sign of `-4.0` dropped; a changed sentinel word at the bound and at word 319. So must recompiled HLSL with `add` as subtract, the subtract operands exchanged, `mul` as add, the cap read from `params[0].z`, the literal off by one bit, the inline sign flipped, the inline `1.0` replaced by `2.0`, or the guard `>` made `>=` so lane 150 writes. A separate translation check evaluates the lowered expression with numpy binary32 on all 167 active lanes of the three dispatches and finds no difference from the model; it is not part of the test. The translation controls lower the fixture exactly, check that a program using one operation carries only its helper, that `sub` and `subrev` differ, and refuse each form, operand and value listed above. Replacing the `subrev` template with `sub`, the multiply with an add, dropping `precise`, or dropping the NaN or denormal refusal each fails them. The LLVM 15 round trip assembles and disassembles the fixture as for the other forms. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_f32_(warp|hardware)$' -V`.
 
 ### Scalar ALU on known words
 
@@ -5000,7 +5032,7 @@ Run `ctest --preset dev --no-tests=error -R '^cpu_native_xg_swizzle$' -V`.
 
 ### Attribute words at xmem call sites
 
-`tools/xmem_attribute_scan.py` reads a PE image without loading or running it. It reports the attribute word at each call or tail jump into `xmem.dll`'s `XMemAlloc` or `XMemFree`, from a normal or delay-load import. It finds sites reached through the IAT slot, through an import thunk, or through a register loaded from the slot.
+`tools/xmem_attribute_scan.py` reads a PE image without loading or running it. It reports the attribute word at each call or tail jump into `xmem.dll`'s `XMemAlloc`, `XMemFree`, `XMemAllocDefault` or `XMemFreeDefault`, from a normal or delay-load import. It finds sites reached through the IAT slot, through an import thunk, or through a register loaded from the slot.
 
 Code is decoded one `.pdata` function at a time, and linearly between functions, so memory stays bounded for a large image.
 
@@ -5023,7 +5055,7 @@ The report lists each site with its route and region, and the import thunks foun
 
 | CTest case | Inputs and checks |
 |---|---|
-| `xmem_attribute_scan` | Two source-built MASM fixtures are linked against the desktop `xmem.dll` import library. `tests/cpu/xmem_attributes.asm` has 25 sites, one per form: IAT call with unwind data, linker thunk, read-only constant data, writable data with no RIP-relative writer, writable data written through an address held in a register before the RIP-relative load into EDX, written data, register copy, call through a register, exported and internal pass-throughs with a caller, caller-copy pass-throughs whose entry register is R8 (64-bit, and 32-bit with the caller's value truncated), 64-bit immediate with a reserved bit, `xor`, a computed word, direct and indirect jumps, if/else joins with equal and different words, a loop, a call that clobbers RDX, a non-volatile register across a call, a 32-bit copy of a 64-bit constant, and a partial-register write. Each site's route, source, word and classification must match, as must the summary and the exit codes of both flags. Both writable-data sites must be unresolved, so `--fail-on-unresolved` fails on them. `tests/cpu/xmem_delay.asm` is linked with `/DELAYLOAD:xmem.dll` and has one constant site through the delay-load IAT. Both flags must exit with 0 on it. The 13 decoding cases also run in the Linux Python job. |
+| `xmem_attribute_scan` | Two source-built MASM fixtures are linked against the desktop `xmem.dll` import library. `tests/cpu/xmem_attributes.asm` has 28 sites, one per form: IAT call with unwind data, linker thunk, read-only constant data, writable data with no RIP-relative writer, writable data written through an address held in a register before the RIP-relative load into EDX, written data, register copy, call through a register, exported and internal pass-throughs with a caller, caller-copy pass-throughs whose entry register is R8 (64-bit, and 32-bit with the caller's value truncated), 64-bit immediate with a reserved bit, `xor`, a computed word, direct and indirect jumps, if/else joins with equal and different words, a loop, a call that clobbers RDX, a non-volatile register across a call, a 32-bit copy of a 64-bit constant, a partial-register write, a call and a tail jump through the Default alias names (each recorded under the alias it imported, not the name it forwards to), and a conditional-move-guarded word that must stay computed. Each site's route, source, word and classification must match, as must the summary and the exit codes of both flags. Both writable-data sites must be unresolved, so `--fail-on-unresolved` fails on them. `tests/cpu/xmem_delay.asm` is linked with `/DELAYLOAD:xmem.dll` and has one constant site through the delay-load IAT. Both flags must exit with 0 on it. The 13 decoding cases also run in the Linux Python job. |
 
 Sixteen mutants of the scanner each fail this test. They cover call clobbering, join following, merging, read-only data, writers, truncation, export completeness, thunks, delay imports, indirect blocks, register following, `xor`, partial writes, caller resolution, register calls, and the null flag. After the writable-data change, two more mutants also fail it: treating writable data with no RIP-relative writer as a constant (the earlier behaviour, which reported the pointer-written site as constant `0xa8004000`), and dropping `written_at`. After the entry-register change, two more also fail it: resolving callers with the default RDX instead of the recorded entry register, and dropping the 32-bit truncation of the entry register.
 
@@ -5032,6 +5064,8 @@ A local read-only scan of the inspected package's 16 DLLs found `xmem` call site
 - the AMD upscaler: three sites through the IAT slot, word `0xa8004000` (memory type 5, an allocation-granularity graphics allocation), loaded from a read-only section.
 
 One full decoding pass over the largest DLL, 0.7 MB of code with 2,452 `.pdata` functions, read 342,768 instructions in 0.07 s.
+
+All four allocation export names are scanned, including the Default aliases that a released image imports by name. An alias and the name it forwards to have separate IAT slots and thunks, so each site records the export it imported and is never folded into the other name. A word chosen with a conditional move is not a constant here: for `mov edx,<imm32>`, `cmp byte ptr [flag],0`, `cmove rdx,rbx` and the call, the scanner reports `computed` with no word, and the immediate written before the compare is not reported either. A physical-type or other word observed at such a site comes from a separate pass over the image, not from this scanner.
 
 ```powershell
 .\out\pe-env\Scripts\python.exe -B tools/xmem_attribute_scan.py "game-files/<build-directory>/<image>" --output out/xmem-scan.json --fail-on-null

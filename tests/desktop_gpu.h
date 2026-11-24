@@ -17,7 +17,7 @@ bool check_startup_sampler_x(ID3D12Device* device, bool swapped);
 int check_startup_cb_blend(ID3D12Device* device, bool swapped);
 void check_dynamic_sampler_index(ID3D12Device* device);
 float check_startup_sampler_heap(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
-                                 std::uint32_t byte_offset);
+                                 std::uint32_t byte_offset, const char* manifest, const char* binding_case);
 void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
                             float color[4]);
 void dump_raw_uav(ID3D12Device* device, const char* shader_path, const char* groups,
