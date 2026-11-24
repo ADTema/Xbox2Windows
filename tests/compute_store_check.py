@@ -3737,7 +3737,8 @@ def mubuf_d16_draw(directory, compiler, renderer, backend):
     if record := os.environ.get("FORM_COVERAGE_RECORD"):
         path = Path(record)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("".join(f"{name}\n" for name in MUBUF_D16), encoding="utf-8")
+        # The preserved half comes from an executed DWORD load in every D16 case.
+        path.write_text("".join(f"{name}\n" for name in ("buffer_load_dword", *MUBUF_D16)), encoding="utf-8")
     return 0
 
 
