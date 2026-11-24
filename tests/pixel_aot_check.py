@@ -16369,6 +16369,30 @@ def _check_controls_inline(directory):
         else:
             raise AssertionError(f"Plain movrel accepted {bad_seq}")
 
+    # v_swaprel_b32 (#1795): bounded selects on both sides, and the movrel refusals.
+    assert "swap_doff" in translate(with_constants(SWAPREL_BODY))
+    # Dynamic offsets whose two banks overlap: v24..v27 is both the source and the destination range.
+    overlap = translate(with_constants(SWAPREL_BODY[:8] + [
+        "s_mov_b32 s64, s47", "s_mov_b32 s65, 0", "s_and_b64 s[64:65], s[64:65], 0x30003", "s_mov_b32 m0, s64",
+        "v_swaprel_b32 v24, v24"]))
+    assert all(f"_r{r} = " in overlap for r in range(24, 28)), "each register of the overlapping bank is selected"
+    swap_bank = ["v_mov_b32_e32 v24, 1.0", "v_mov_b32_e32 v25, 2.0"]
+    for bad_seq, message in (
+        (["v_swaprel_b32 v12, v12"], "Unsupported m0 value for v_swaprel_b32"),
+        (swap_bank + ["s_mov_b32 m0, s44", "v_swaprel_b32 v24, v25"], "Unsupported m0 value"),
+        (swap_bank + ["s_mov_b32 m0, 0x1000000", "v_swaprel_b32 v24, v25"], "Static m0 offset out of range"),
+        (swap_bank + ["s_mov_b32 m0, 0x00c8", "v_swaprel_b32 v24, v100"], "Indexed VGPR exceeds 255"),
+        (swap_bank + ["s_mov_b32 m0, 0x50000", "v_swaprel_b32 v24, v25"], "Expected a numeric VGPR at v29"),
+        (swap_bank + ["s_add_u32 s64, s47, 1", "s_mov_b32 m0, s64", "v_swaprel_b32 v24, v25"],
+         "Dynamic m0 offset is unbounded"),
+    ):
+        try:
+            translate(with_constants(bad_seq))
+        except ValueError as error:
+            assert message in str(error), (bad_seq, error)
+        else:
+            raise AssertionError(f"v_swaprel_b32 accepted {bad_seq}")
+
     # Quad-local DPP16/DPP8 v_movrel* controls (static and bounded dynamic m0).
     movrel_prog = with_constants(DPP_MOVREL_BODY)
     movrel_hlsl = translate(movrel_prog)
@@ -17670,6 +17694,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((with_constants(DPP_MOVREL_BODY), translate))
     fixtures.append((with_constants(PLAIN_MOVREL_BODY), translate))
     fixtures.append((with_constants(swap_movrel_encodings(PLAIN_MOVREL_BODY)), translate))
+    fixtures.append((with_constants(SWAPREL_BODY), translate))
     fixtures.append((uncompressed_export(DPP_F16_CVT_LANES), translate_f16))
     fixtures.append((uncompressed_export(DPP_F16_CVT_WORDS), translate_f16))
     fixtures.extend((bit_program(op), translate) for op in BIT_OPERATIONS)
@@ -20707,6 +20732,112 @@ def check_plain_movrel_body(directory, compiler, renderer, backend, body, varian
         print(f"control {label} ({variant}): pixel mismatch, as required")
 
 
+# v_swaprel_b32 (#1795): VGPR[vdst + m0[25:16]] and VGPR[vsrc + m0[9:0]] exchange. R and G are the two banks of
+# a dynamic swap (m0 = word3 & 0x30003); B and A are the two banks of a static swap that follows an overlapping
+# swap inside one bank and a swap of a register with itself.
+SWAPREL_SETS = DPP_MOVREL_SETS
+SWAPREL_BODY = [
+    "v_mov_b32_e32 v24, 0x41200000",
+    "v_mov_b32_e32 v25, 0x41a00000",
+    "v_mov_b32_e32 v26, 0x42200000",
+    "v_mov_b32_e32 v27, 0x42a00000",
+    "v_mov_b32_e32 v28, 1.0",
+    "v_mov_b32_e32 v29, 2.0",
+    "v_mov_b32_e32 v30, 0x40400000",
+    "v_mov_b32_e32 v31, 4.0",
+    "s_mov_b32 s64, s47",
+    "s_mov_b32 s65, 0",
+    "s_and_b64 s[64:65], s[64:65], 0x30003",
+    "s_mov_b32 m0, s64",
+    "v_swaprel_b32 v24, v28",
+    "v_fma_f32 v32, 2.0, v25, v24",
+    "v_fma_f32 v32, 4.0, v26, v32",
+    "v_fma_f32 v12, 0x41000000, v27, v32",
+    "v_fma_f32 v33, 2.0, v29, v28",
+    "v_fma_f32 v33, 4.0, v30, v33",
+    "v_fma_f32 v13, 0x41000000, v31, v33",
+    "v_mov_b32_e32 v36, 0x41200000",
+    "v_mov_b32_e32 v37, 0x41a00000",
+    "v_mov_b32_e32 v38, 0x42200000",
+    "v_mov_b32_e32 v39, 0x42a00000",
+    "v_mov_b32_e32 v40, 1.0",
+    "v_mov_b32_e32 v41, 2.0",
+    "v_mov_b32_e32 v42, 0x40400000",
+    "v_mov_b32_e32 v43, 4.0",
+    "s_mov_b32 m0, 0x30001",
+    "v_swaprel_b32 v36, v36",
+    "s_mov_b32 m0, 0x20002",
+    "v_swaprel_b32 v36, v36",
+    "s_mov_b32 m0, 0x20001",
+    "v_swaprel_b32 v36, v40",
+    "v_fma_f32 v34, 2.0, v37, v36",
+    "v_fma_f32 v34, 4.0, v38, v34",
+    "v_fma_f32 v14, 0x41000000, v39, v34",
+    "v_fma_f32 v35, 2.0, v41, v40",
+    "v_fma_f32 v35, 4.0, v42, v35",
+    "v_fma_f32 v15, 0x41000000, v43, v35",
+]
+
+
+def swaprel_reference(w0, w1, w2, w3):
+    """Independent reference for SWAPREL_BODY: list swaps, read both sides before writing."""
+    weighted = lambda bank: bank[0] + 2.0 * bank[1] + 4.0 * bank[2] + 8.0 * bank[3]
+    regs = {24 + k: v for k, v in enumerate((10.0, 20.0, 40.0, 80.0, 1.0, 2.0, 3.0, 4.0))}
+    regs.update({36 + k: v for k, v in enumerate((10.0, 20.0, 40.0, 80.0, 1.0, 2.0, 3.0, 4.0))})
+
+    def swap(dst, src, m0):
+        d, s = dst + ((m0 >> 16) & 0x3ff), src + (m0 & 0x3ff)
+        regs[d], regs[s] = regs[s], regs[d]
+
+    swap(24, 28, w3 & 0x30003)
+    swap(36, 36, 0x30001)
+    swap(36, 36, 0x20002)
+    swap(36, 40, 0x20001)
+    expected = tuple(weighted([regs[b + k] for k in range(4)]) for b in (24, 28, 36, 40))
+    for x in expected:
+        assert single(x) == x == half_rtz(x), x
+    return expected
+
+
+def check_swaprel_draw(directory, compiler, renderer, backend):
+    program = with_constants(SWAPREL_BODY)
+    source = directory / "swaprel.hlsl"
+    shader = directory / "swaprel.cso"
+    case = directory / "swaprel.case"
+    draw = [renderer, backend, "--check-pixel-case", shader, case]
+    hlsl = translate(program)
+    if "QuadRead" in hlsl or "swap_soff" not in hlsl:
+        raise AssertionError("v_swaprel_b32 was not lowered through the per-lane swap")
+    source.write_text(hlsl, encoding="ascii")
+    compile_shader(compiler, source, shader)
+    references = [swaprel_reference(*words) for words in SWAPREL_SETS]
+    if references[0] == references[1]:
+        raise AssertionError("The two constant sets do not tell the dynamic m0 offsets apart")
+    for words, expected in zip(SWAPREL_SETS, references):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words)
+        case.write_bytes(constants + struct.pack("<4f", *expected) * 64)
+        subprocess.run(draw, check=True)
+    print(f"swaprel: dynamic, overlapping, equal-index and static swaps matched {references}")
+    constants = bytearray(256)
+    struct.pack_into("<4I", constants, 12, *SWAPREL_SETS[0])
+    case.write_bytes(constants + struct.pack("<4f", *references[0]) * 64)
+    for old, new, label in (
+        ("v_swaprel_b32 v24, v28", "v_movrelsd_2_b32_e32 v24, v28", "a one-way move instead of the dynamic swap"),
+        ("s_mov_b32 m0, 0x20001", "s_mov_b32 m0, 0x10002", "the static m0 halves swapped"),
+        ("s_mov_b32 m0, s64", "s_mov_b32 m0, 0", "the dynamic m0 ignored"),
+    ):
+        mutated = [line.replace(old, new) for line in program]
+        assert mutated != program, label
+        source.write_text(translate(mutated), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        wrong = subprocess.run(draw, capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Control {label} escaped detection")
+        print(f"control {label}: pixel mismatch, as required")
+    return 0
+
+
 # Quad-local DPP16/DPP8 extra f32 (rndne, sin, cos, rcp_iflag, frexp_mant, frexp_exp, mac) and
 # carry-in/carry-out u32 (add/sub/subrev_co_ci) fixture on gfx1013. Derives 4-lane quad ID {0,1,2,3}
 # from uv.x/uv.y (64x64 RT), exercises non-symmetric quad swizzles and carry/borrow boundaries, and
@@ -23236,12 +23367,13 @@ def main():
                     "draw-region-body", "draw-region-waits", "draw-region-scalar-alu", "draw-region-scalar-load", "draw-div-fmas",
                     "draw-cmp64", "draw-cmp-f64", "draw-shift64",
                     "draw-f16-arith", "draw-f16-round", "draw-f16-fmac-ldexp", "draw-f16-cvt-int16", "draw-f16-to-int16", "draw-flat-scratch", "draw-smem-pointers", "draw-sopk-hwreg",
-                    "draw-dpp-cvt", "draw-dpp-movrel", "draw-plain-movrel", "draw-dpp-f16", "draw-dpp-extra", "draw-pk-fmac"):
+                    "draw-dpp-cvt", "draw-dpp-movrel", "draw-plain-movrel", "draw-swaprel", "draw-dpp-f16", "draw-dpp-extra", "draw-pk-fmac"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
                         "draw-dpp-cvt": check_dpp_cvt_draw,
                         "draw-dpp-movrel": check_dpp_movrel_draw,
                         "draw-plain-movrel": check_plain_movrel_draw,
+                        "draw-swaprel": check_swaprel_draw,
                         "draw-dpp-extra": check_dpp_extra_draws,
                         "draw-predicate-rounding": check_predicate_and_rounding_draws,
                         "draw-integer-nc": check_integer_nc_draws,

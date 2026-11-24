@@ -5311,6 +5311,51 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     dst_reg = f"v{dst_base + k}"
                     vector[dst_reg] = f"alu{i}_{k}"
                     lines.append(f"    precise float alu{i}_{k} = (dpp_doff{i} == {k}u) ? asfloat(dpp_val{i}) : {prev};")
+        elif m := match(r"v_swaprel_b32 (v\d+), (v\d+)"):
+            # VGPR[vdst + m0[25:16]] and VGPR[vsrc + m0[9:0]] exchange their values (#1795), with the m0 rules of
+            # the movrel forms: both sides are read before either is written, so a pair naming one register is
+            # unchanged.
+            if mask != "entry":
+                raise ValueError("Invalid v_swaprel_b32 outside entry mask")
+            dst_base, src_base = int(m.group(1)[1:]), int(m.group(2)[1:])
+            m0 = scalar.get("m0")
+            if isinstance(m0, int):
+                m0_u = m0 & 0xffffffff
+                src_offsets, dst_offsets = [m0_u & 0x3ff], [(m0_u >> 16) & 0x3ff]
+                if src_offsets[0] > 255 or dst_offsets[0] > 255:
+                    raise ValueError("Static m0 offset out of range for v_swaprel_b32")
+                soff_expr, doff_expr = f"{src_offsets[0]}u", f"{dst_offsets[0]}u"
+            elif isinstance(m0, tuple) and len(m0) == 2 and m0[0] == "uint":
+                if "m0" not in scalar_mask:
+                    raise ValueError("Dynamic m0 offset is unbounded for v_swaprel_b32")
+                m0_mask = scalar_mask["m0"]
+                src_offsets = masked_offsets(m0_mask & 0x3ff)
+                dst_offsets = masked_offsets((m0_mask >> 16) & 0x3ff)
+                soff_expr, doff_expr = f"({m0[1]} & 0x3ffu)", f"(({m0[1]} >> 16) & 0x3ffu)"
+            else:
+                raise ValueError("Unsupported m0 value for v_swaprel_b32")
+            if any(src_base + k > 255 for k in src_offsets) or any(dst_base + k > 255 for k in dst_offsets):
+                raise ValueError("Indexed VGPR exceeds 255 for v_swaprel_b32")
+            touched = sorted({dst_base + k for k in dst_offsets} | {src_base + k for k in src_offsets})
+            if any(f"v{r}" in sample_dest for r in touched):
+                raise ValueError("Write overlaps an outstanding sample")
+            old = {r: movrel_vgpr(r, vector, sample_dest) for r in touched}
+            lines.append(f"    uint swap_soff{i} = {soff_expr};")
+            lines.append(f"    uint swap_doff{i} = {doff_expr};")
+            for side, base, offsets, offset in (("s", src_base, src_offsets, f"swap_soff{i}"),
+                                                ("d", dst_base, dst_offsets, f"swap_doff{i}")):
+                value = f"asuint({old[base + offsets[-1]]})"
+                for k in reversed(offsets[:-1]):
+                    value = f"({offset} == {k}u ? asuint({old[base + k]}) : {value})"
+                lines.append(f"    uint swap_{side}val{i} = {value};")
+            for r in touched:
+                value = old[r]
+                if r - src_base in src_offsets:
+                    value = f"(swap_soff{i} == {r - src_base}u ? asfloat(swap_dval{i}) : {value})"
+                if r - dst_base in dst_offsets:
+                    value = f"(swap_doff{i} == {r - dst_base}u ? asfloat(swap_sval{i}) : {value})"
+                vector[f"v{r}"] = f"alu{i}_r{r}"
+                lines.append(f"    precise float alu{i}_r{r} = {value};")
         elif m := match(rf"v_({'|'.join(DPP_CVT)})_dpp (v\d+), (.+)"):
             op, dst, rest = m.groups()
             float_source, template, helper = DPP_CVT[op]
