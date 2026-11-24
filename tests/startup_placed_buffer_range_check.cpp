@@ -12,6 +12,8 @@
 //    page (gap before its start), one across all three and one on the first page.
 // 3. Recommit: the middle page committed again; the first two buffers are accepted again.
 // 4. Gap before the start, far from the buffer: page 1 of eight is decommitted, the buffer is on page 6.
+// 4b. The same shape with a reviewer's numbers: 1 MiB committed, a 64 KiB buffer at +0x80000, then
+//    0x10000 bytes at +0x10000 decommitted.
 // 5. Same-base replacement: the 64 MiB block is released and a 1 MiB block committed at its base. A
 //    buffer inside it, one ending past its end and one past its end.
 // 6. A mapped view is refused.
@@ -160,6 +162,19 @@ int main()
         VirtualFree(pages, 0, MEM_RELEASE);
     } else {
         fail("cannot commit eight pages", nullptr);
+    }
+
+    // Case 4b: 1 MiB committed, buffer at +0x80000, then +0x10000 decommitted for 0x10000 bytes.
+    if (char* mib = committed_pages(16)) {
+        place(mib + 0x80000, 0x10000, 1, "1 MiB: buffer at +0x80000 before the decommit");
+        if (!VirtualFree(mib + 0x10000, 0x10000, MEM_DECOMMIT)) {
+            fail("cannot decommit +0x10000", mib + 0x10000);
+        } else {
+            place(mib + 0x80000, 0x10000, 0, "1 MiB: buffer at +0x80000 after decommitting +0x10000");
+        }
+        VirtualFree(mib, 0, MEM_RELEASE);
+    } else {
+        fail("cannot commit 1 MiB", nullptr);
     }
 
     // Case 5: same-base replacement.
