@@ -1958,6 +1958,32 @@ def cvt_f64_f32_words(bits):
     return (fraction & 7) << 29, (sign << 31) | ((exponent - 127 + 1023) << 20) | (fraction >> 3)
 
 
+def cvt_f32_f64_exact_bits(low, high):
+    """Return the binary32 bits of the binary64 words (low, high), or raise ValueError.
+
+    Only a value that is exactly a normal binary32 or a signed zero is accepted: the narrowing is then exact and does
+    not depend on either rounding field (MODE[1:0] or MODE[3:2]) or either denorm field (MODE[5:4] or MODE[7:6]). The value is narrowed with
+    struct, then widened again with cvt_f64_f32_words, and the result must equal the input words bit for bit.
+    Both infinities and NaNs ("is not finite"), a subnormal binary32 ("is a subnormal") and any value that needs
+    rounding, including one that overflows or underflows binary32 ("requires rounding"), are refused.
+    """
+    if (high >> 20) & 0x7ff == 0x7ff:
+        raise ValueError(f"v_cvt_f32_f64 source 0x{high:08x}{low:08x} is not finite")
+    value, = struct.unpack("<d", struct.pack("<II", low, high))
+    try:
+        bits, = struct.unpack("<I", struct.pack("<f", value))
+    except OverflowError:
+        raise ValueError(f"v_cvt_f32_f64 source 0x{high:08x}{low:08x} requires rounding") from None
+    narrowed, = struct.unpack("<f", struct.pack("<I", bits))
+    if struct.pack("<d", narrowed) != struct.pack("<II", low, high):
+        raise ValueError(f"v_cvt_f32_f64 source 0x{high:08x}{low:08x} requires rounding")
+    if (bits >> 23) & 0xff == 0 and bits & 0x7fffff:
+        raise ValueError(f"v_cvt_f32_f64 source 0x{high:08x}{low:08x} is a subnormal binary32")
+    if cvt_f64_f32_words(bits) != (low, high):
+        raise ValueError(f"v_cvt_f32_f64 source 0x{high:08x}{low:08x} requires rounding")
+    return bits
+
+
 def cvt_f64_f32_source_bits(base, scalar, vector, pending, sample_dest, known_ssa_bits):
     """Return the statically known binary32 bits of the source of v_cvt_f64_f32, or raise ValueError.
 
@@ -2969,7 +2995,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     # The record names what the pair holds: ("i32" | "u32", name of the uint source of v_cvt_f64_i32 | v_cvt_f64_u32)
     # or ("static", low, high) for v_cvt_f64_f32 of a statically known source. Every word value is an immutable
     # HLSL temporary, so an overwritten word names another SSA value and loses its entry; v_mov_b32 and a join of
-    # equal entries are the only ways the entry travels. v_cvt_i32_f64 and v_cvt_u32_f64 read it.
+    # equal entries are the only ways the entry travels. v_cvt_i32_f64, v_cvt_u32_f64 and v_cvt_f32_f64 read it.
     f64_words: dict[str, tuple] = {}
     known_half: dict[str, int] = {}  # half16 result name -> proven binary16 bits
     # Each emitted value has a unique identity. Entry-only writes never gain a helper definition.
@@ -4880,6 +4906,31 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             else:
                 expression = record[1]
             lines.append(f"    precise float alu{i} = asfloat({expression});")
+            vector[dst] = f"alu{i}"
+        elif m := match(r"v_cvt_f32_f64(?:_e32)? (v\d+), v\[(0|[1-9]\d*):(0|[1-9]\d*)\]"):
+            # Binary64 to binary32 narrowing, for the pair of a v_cvt_f64_f32 of a static source only (a record
+            # ("static", low, high) on both words, the low word as word 0 and the high word as word 1), and only when the
+            # value is exactly a normal binary32 or a signed zero (cvt_f32_f64_exact_bits: narrowed and widened again it
+            # returns the same words). The result is that binary32 word, computed here and emitted as a constant, so no
+            # HLSL double is used and neither the rounding mode nor the denorm mode is read. Infinities, NaNs,
+            # subnormals, a value that would need rounding, a pair of integer origin (v_cvt_f64_i32 or v_cvt_f64_u32,
+            # even where the integer would fit), a pair of unknown provenance, a pair with one overwritten word or
+            # words of different pairs, the _e64 spelling and every modifier are refused (the last fall through to the
+            # unsupported error). Which MODE field governs the binary64 narrowing is not decided here.
+            dst, first, last = m.groups()
+            first, last = int(first), int(last)
+            names = (f"v{first}", f"v{last}")
+            if (mask != "entry" or last != first + 1 or last > 255 or int(dst[1:]) > 255 or dst in sample_dest
+                    or any(name in sample_dest or name in pending for name in names)):
+                raise ValueError("Invalid binary64 to binary32 conversion")
+            low_word, high_word = (f64_words.get(vector.get(name)) for name in names)
+            if (low_word is None or high_word is None or low_word[0] != high_word[0]
+                    or (low_word[1], high_word[1]) != (0, 1)):
+                raise ValueError(f"Unproven binary64 source v[{first}:{last}] at v_cvt_f32_f64")
+            record = low_word[0]
+            if record[0] != "static":
+                raise ValueError(f"v_cvt_f32_f64 of a v_cvt_f64_{record[0]} pair (integer origin) is not supported")
+            lines.append(f"    precise float alu{i} = asfloat({cvt_f32_f64_exact_bits(record[1], record[2])}u);")
             vector[dst] = f"alu{i}"
         elif m := match(rf"v_(add|sub|subrev)_co_ci_u32_(e32|e64) (v\d+), {LANE_MASK}, ([^,\s]+), ([^,\s]+), {LANE_MASK}"):
             # The carry-out add and subtracts above with a carry or borrow of each lane read from a lane mask.
