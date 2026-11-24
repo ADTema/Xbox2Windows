@@ -1662,8 +1662,11 @@ explicit via `--entry-state {defined,canonical}` and exported via
 `lifted_entry_state_profile()` / `lifted_requires_canonical_entry()`: the default `defined`
 profile tracks per-component (`x87`, `sse`, `avx`) initialization from `xrstor`/`xrstor64`
 and `vzeroupper` (`avx`) and rejects any `xsave`/`xsave64` (including entry-only saves and
-partially initialized restore/save paths) that reads uninitialized entry components, while
-the opt-in `canonical` profile permits entry-state `xsave`/`xsave64` provided the native
+partially initialized restore/save paths) that reads uninitialized entry components. `MXCSR`
+is tracked apart from the components: only an `xrstor` whose `RFBM` selects SSE or AVX defines it, so
+`vzeroupper` does not, and a save that stores `MXCSR` (`xsaveopt` with SSE or AVX selected, `xsave`/`xsavec`
+with SSE selected) is rejected when no restore defined it, with an error naming `MXCSR`. The
+opt-in `canonical` profile permits entry-state `xsave`/`xsave64` provided the native
 caller establishes canonical architectural XSAVE state (`FCW=0x037F`, `FSW=0`, `FTW=0`,
 `FOP=0`, `FIP=0`, `FCS=0`, `FDP=0`, `FDS=0`, `MXCSR=0x1F80`, zero `ST`/`XMM`/`YMM_HI`,
 `XINUSE=0`). Transport and ABI glue covers `vmovdqa`/`vmovdqu` (`XMM0`..`5`, `YMM0`..`5`),
@@ -1671,14 +1674,25 @@ caller establishes canonical architectural XSAVE state (`FCW=0x037F`, `FSW=0`, `
 `mov`/`xor` (with pointer provenance and constant-mask tracking), and terminal `ret`. The
 lifted DLL exports `host_has_xsave()` (`CPUID.1:ECX[26..28]` and `XGETBV(0) & 7 == 7`,
 returning exit code 77 when absent), `host_has_xsavec()` (`CPUID.(0DH,1):EAX[1]`; without it the
-native `xsavec` fixtures are skipped and only the lifted path is checked), `host_deprecates_fpu_cs_ds()`,
+native `xsavec` fixtures are skipped and only the lifted path is checked), `host_has_xsaveopt()`
+(`CPUID.(0DH,1):EAX[0]`, the same skip rule for the native `xsaveopt` fixtures), `host_deprecates_fpu_cs_ds()`,
 `host_fp_err_cpuid_info()`, and `host_mxcsr_mask()`. `xsavec`/`xsavec64` store the compacted
 format: a component is written only when `XINUSE & RFBM` selects it (SSE is in use when an XMM register is
 live or `MXCSR` differs from `0x1F80`, so a restored non-default `MXCSR` with `XSTATE_BV[1]=0` is still saved), `XSTATE_BV = XINUSE & RFBM`,
 `XCOMP_BV = bit 63 | RFBM`, the reserved header bytes and legacy bytes `[416..511]` are left
 untouched, and `MXCSR` is stored with the SSE component. With only `x87|SSE|AVX` the compacted
 offsets equal the standard ones (AVX at 576), so the offset rule is not separately observable.
-Alignment and mask faults are raised before the first store. `xsaveopt*`, `xsaves*`/`xrstors*`, `fxsave*`/`fxrstor*`, EVEX encodings, nonvolatile registers, unclosed
+Alignment and mask faults are raised before the first store. `xsaveopt`/`xsaveopt64` keep the
+standard format and apply the init optimization only: a component that is not in use (`XINUSE` clear,
+where SSE also counts as in use while `MXCSR` differs from `0x1F80`) is not written and its `XSTATE_BV` bit is
+cleared, `XSTATE_BV = (old & ~RFBM) | (XINUSE & RFBM)`, `MXCSR`/`MXCSR_MASK` are stored whenever `RFBM` selects
+SSE or AVX (also for `RFBM = 4`), and the header bytes `[520..575]` stay untouched. The modified optimization
+(`XMODIFIED`) is not modeled: the lifted code writes every component that is in use. A native probe on the
+development host (`xrstor64` of one buffer, then `xsaveopt64` to another) showed exactly this layout, and a
+second `xsaveopt64` to the *same* buffer that was just restored omitted the restored x87 area, which is the
+modified optimization; the fixtures therefore restore from `rcx` and save to `r8`. That host also reported
+`XSTATE_BV[1]=0` for a non-default `MXCSR` with zero XMM in standard-format saves, so the native comparison lets the
+host leave out SSE held only by `MXCSR`, while the lifted store keeps it. `xsaves*`/`xrstors*`, `fxsave*`/`fxrstor*`, EVEX encodings, nonvolatile registers, unclosed
 MMX state before `ret`, non-`r8` stores, prefixes, RIP-relative or indexed addressing, and
 branches reject.
 
@@ -1691,7 +1705,7 @@ ctest --preset dev --no-tests=error -R '^cpu_aot_xsave_state$' -V
 
 The native harness probes whether the host preserves the 16-bit FCS and FDS values in the non-REX.W legacy area after XRSTOR/XSAVE. A measured zero is expected only at the corresponding native selector bytes. Lifted results still follow the separately specified CPUID-based profile.
 
-The [MASM fixture](../tests/cpu/xsave_state.asm) exports 16 functions covering opt-in
+The [MASM fixture](../tests/cpu/xsave_state.asm) exports 22 functions covering opt-in
 canonical-entry `xsave`/`xsave64` (`cpu_xsave_state_canonical_lifted`), `xrstor`/`xrstor64`
 roundtrips, displaced `[rcx+64]`/`[r8+64]`, `RFBM = 2` SSE-only masking (and `ALTER_OP`
 `RFBM = 2 -> 7` under `cpu_xsave_state_canonical_altered_lifted`), `vzeroupper` clearing
@@ -1721,12 +1735,20 @@ the XSTATE_BV subsets above. The native comparison accepts extra initialized leg
 components and an unwritten or written `MXCSR` when SSE is not in use and `MXCSR` is the
 default, because those are implementation choices; a non-default `MXCSR` is checked against the
 SDM rule with an independent oracle; `ALTER_OP` (standard `xsave64` instead of `xsavec64`, request mask
-ignored) and header/word mutations must fail. The harness has not run on Windows yet: run
+ignored) and header/word mutations must fail. The `xsaveopt` exports (`op_xrstor64_xsaveopt`, `op_xrstor64_xsaveopt64`, `_sse`, `_x87_avx`, `_avx`, and the
+lifted-only `op_xsaveopt64_dynmask`) are read back byte for byte against an SDM layout oracle that does not use
+the Python model: `XSTATE_BV`, the `MXCSR` words and every byte outside the components in use must be exactly the
+sentinel. The native comparison keeps components in use byte for byte and accepts a component the reference leaves
+out only when the host stored it in its initial configuration. Controls that must fail: a flipped `FCW`, `ST0`, `XMM0`,
+`YMM_HI0` or `XSTATE_BV` byte, standard `xsave` in place of `xsaveopt` (`ALTER_OP`), an `XSTATE_BV` that ignores `RFBM`,
+a reference that ignores a non-default `MXCSR`, live bytes in a component the reference leaves out, and a host that
+omits live XMM state. Misaligned outputs, unsupported request masks and an invalid `MXCSR` image leave the output
+buffer untouched. The harness has not run on Windows yet: run
 `ctest --preset dev -R '^cpu_aot_xsave_state$'` (Debug and `/O2`), which is outside `--preset pr`.
 
 Not covered by this experiment: supervisor formats (`xsaves*`, `xrstors*`), compacted
 `xrstor`, components beyond x87/SSE/AVX (so no packed offsets or 64-byte component alignment),
-`xsaveopt*`, AVX-512/PKRU state components beyond `XCR0[2:0]`, control flow,
+the modified optimization of `xsaveopt*`, AVX-512/PKRU state components beyond `XCR0[2:0]`, control flow,
 and title CPU code execution.
 
 ## Mapping an image without LoadLibrary
