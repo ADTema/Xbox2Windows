@@ -1364,9 +1364,12 @@ The shared integer lowering in this tool emits flat loads and stores, so it reje
 - **Negative controls:** two mutated translations must each mismatch. One swaps through a plain load and store: every single-threaded value case still matches, but tokens are lost or duplicated under contention. The other writes only one register of a register swap.
 
 Run `ctest --preset dev --no-tests=error -R '^cpu_aot_xchg$' -V`.
-**Reserved hint NOPs.** The shared integer lowering accepts `0F 19 /r`, `0F 1D /r`, `0F 1E /r` and `0F 1F /r` in any ModRM form, memory or register, for every operand size. The AMD APM documents these as reserved hint NOPs that take a ModRM but access no memory, so each lowers to a no-op: the operand is not evaluated, no address is computed, nothing is loaded and an inaccessible operand cannot fault. The accepted set is selected by iced code, not by mnemonic, because iced also decodes `0F 0D` (Group P, which the APM's footnote aliases PREFETCH Exclusive), `0F 18 /6` and `/7` (documented as PREFETCHIT1/PREFETCHIT0 under CPUID Fn8000_0021_EAX), `0F 1A`, `0F 1B` and `0F 1C` as `RESERVEDNOP`; a mnemonic test would have lowered all of them to a no-op too. Those forms stay refused, as do `CLDEMOTE` (`0F 1C /0`), `RDSSPD`/`RDSSPQ` (`F3 0F 1E /1`), `ENDBR64`/`ENDBR32` (`F3 0F 1E FA`/`FB`), the `0F 18` prefetches and the MPX forms. `ENDBR` in particular is out of scope: this target has no CET, and accepting it would claim something about indirect-branch tracking that nothing here checks. A `F3` prefix on `0F 1E` decodes to the same code and is therefore accepted, which matches the APM: only reg=1 with mod=11 in that encoding is `RDSSP`.`cpu_hint_nop` pins the exact byte patterns. Seven accepted encodings (`0f1900`, `0f1908`, `0f19c0`, `0f1d00`, `0f1e00`, `f30f1e00`, `0f1f4000`, covering memory, displaced, register and prefixed ModRM forms) must each lower to a body *identical* to an already-accepted `0F 1F NOP`, with block labels normalised because they are numbered by instruction count rather than by effect; identical bodies are the proof the instruction evaluates nothing. Ten neighbours must still raise: `0f0dc0` (Group P), `0f18f0` and `0f18f8` (PREFETCHIT1/0), `0f1a00`, `0f1b00`, `0f1c08`, `f30f1efa` (ENDBR64), `f30f1efb` (ENDBR32), `0f1c00` (CLDEMOTE) and `f30f1ec8` (RDSSPD), so a widened accepted set is a visible change rather than a silent one. Run `ctest --preset dev --no-tests=error -R '^cpu_hint_nop$' -V`.
 
-`cpu_hint_nop_fixture` compares native execution against the lowered body for the same bytes. One generator (`tests/cpu/hint_nop_fixture.py`) assembles the exact byte sequences and lowers the same instructions, so the two arms cannot drift apart. A prologue sets RAX from the input and the arithmetic flags from an `ADD`, each case then executes the encoding under test and stores the flags in AH with `LAHF`, so a changed register or flag shows up as a different return value. The memory forms are handed a pointer to a `PAGE_NOACCESS` page as the base register: if the host or the lowering evaluated the operand, the call would fault instead of returning. Two controls make that meaningful: a real load from the same page must fault, so the harness is shown to see a memory access at all, and a real `mov eax, imm` with the same inputs must return a different value, so equal outputs are informative. Five cases matched their lowered bodies without faulting (Release, for example `hn_0f19_reg` native and lifted both `0x123456789ab1600`), the load control faulted, and the register control differed. With the lowering change reverted the generator raises on the first hint-NOP encoding and `cpu_hint_nop` reports the accepted patterns as mismatches, so both fixtures depend on the change. Run `ctest --preset dev --no-tests=error -R '^cpu_hint_nop_fixture$' -V`.
+**Reserved hint NOPs.** The shared integer lowering accepts `0F 19 /r`, `0F 1D /r`, `0F 1E /r` and `0F 1F /r` in any ModRM form, memory or register, and in every operand size. The AMD APM documents these as reserved hint NOPs that take a ModRM but access no memory, so each lowers to a no-op: the operand is not evaluated, so no address is computed, nothing is loaded and an inaccessible operand cannot fault. The accepted set is selected by iced code, not by mnemonic, because iced also decodes `0F 0D` (Group P, whose footnote aliases PREFETCH Exclusive), `0F 18 /6` and `/7` (documented as PREFETCHIT1/PREFETCHIT0 under CPUID Fn8000_0021_EAX), `0F 1A`, `0F 1B` and `0F 1C` as `RESERVEDNOP`; a mnemonic test would have lowered all of them to a no-op too. Those forms stay refused, as do `CLDEMOTE` (`0F 1C /0`), `RDSSPD`/`RDSSPQ` (`F3 0F 1E /1`), `ENDBR64`/`ENDBR32` (`F3 0F 1E FA`/`FB`), the `0F 18` prefetches and the MPX forms. `ENDBR` in particular is out of scope: this target has no CET, and accepting it would claim something about indirect-branch tracking that nothing here checks. A `F3` prefix on `0F 1E` decodes to the same code and is therefore accepted, which matches the APM: only reg=1 with mod=11 in that encoding is `RDSSP`.
+
+`cpu_hint_nop` pins the exact byte patterns. Seven accepted encodings (`0f1900`, `0f1908`, `0f19c0`, `0f1d00`, `0f1e00`, `f30f1e00`, `0f1f4000`, covering memory, displaced, register and prefixed ModRM forms) plus the 16-bit and 64-bit operand-size forms (`660f1900`, `660f1e00`, `480f1900`, `480f1e00`) must each lower to a body identical to an already-accepted `0F 1F NOP`, with block labels normalised because they are numbered by instruction count rather than by effect. Ten neighbours must still raise: `0f0dc0` (Group P), `0f18f0` and `0f18f8` (PREFETCHIT1/0), `0f1a00`, `0f1b00`, `0f1c08`, `f30f1efa` (ENDBR64), `f30f1efb` (ENDBR32), `0f1c00` (CLDEMOTE) and `f30f1ec8` (RDSSPD), so a widened accepted set is a visible change rather than a silent one. Run `ctest --preset dev --no-tests=error -R '^cpu_hint_nop$' -V`.
+
+`cpu_hint_nop_fixture` compares native execution against the lowered body for the same bytes. One generator (`tests/cpu/hint_nop_fixture.py`) assembles the exact byte sequences and lowers the same instructions, so the two arms cannot drift apart. A prologue sets RAX from the input and the arithmetic flags from an `ADD`; each case then executes the encoding under test and stores the flags in AH with `LAHF`, so a changed register or flag shows up as a different return value. The memory forms are handed a pointer to a `PAGE_NOACCESS` page as the base register, and both the native and the lifted call run under the same exception guard, so a lowering that evaluated the operand is reported as a mismatch rather than crashing the fixture. Two controls make that meaningful: a real load from the same page must fault, and a real `mov eax, imm` with the same inputs must return a different value. Run `ctest --preset dev --no-tests=error -R '^cpu_hint_nop_fixture$' -V`.
 
 A 67h address-size prefix selects 32-bit addressing. The lowering wraps base + index × scale + displacement at 32 bits and zero-extends the result, ignoring the upper halves of the registers as the hardware does. In this mode iced reports a displacement of -8 as `0xfffffff8`, so the wrap is also needed when the upper halves are zero. EIP-relative operands are rejected because the hardware adds the low 32 bits of the runtime RIP, which an RVA binding cannot represent. `cpu_aot_address_size` builds `lea`, load and store forms such as `lea rax, [ecx+edx*8-8]` and `mov [ecx+edx], r8d` from MASM source. It translates them and compares both images with a 32-bit reference over wrapped sums and upper-half noise. The loads and stores use a page committed below 4 GiB, and each store must leave the rest of the page unchanged. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_address_size$' -V`.
 
@@ -2032,6 +2035,7 @@ Against the end of the file, Windows checks raw data by two rules only. `LoadLib
 ```powershell
 ctest --preset dev --no-tests=error -R '^cpu_native_section$' -V
 ```
+
 
 ### HIGHLOW and mixed-width base relocations
 
@@ -3874,6 +3878,7 @@ operations, or replacing min with max must also change the readback.
 Run these variants with `ctest --preset dev --no-tests=error -R
 '^compute_store_aot_lds_qword_(warp|hardware)$' -V`.
 
+
 The five returning qword operations use the same updates and copy the
 old pair into the destination. The fixture aliases the destination with
 the data pair and exports all four dwords for one and two groups. Replacing
@@ -3907,6 +3912,7 @@ The `compute_store_aot_lds_packed`, `compute_store_aot_lds_private` and
 `compute_store_aot_lds_strided` fixtures check exchange ordering, operand aliasing, counter broadcast,
 wraparound and group isolation. Their mutations reverse exchange offsets or
 counter direction. The binary fixture round-trips the four forms with LLVM 15.
+
 
 A dedicated `lds_dec_borrow` case writes `0x40000001_00000000` under the
 `0x80000000_00000000` limit: the old pair is strictly below the limit and
@@ -3984,6 +3990,7 @@ ctest --preset dev --no-tests=error -R '^compute_store_aot_lds_(private|packed|a
 ```sh
 python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```
+
 
 A separate private LDS layout uses `local_x << 4` and at least 512 bytes of
 allocation. Each lane owns a 16-byte record. This layout supports
@@ -4901,6 +4908,7 @@ HLSL matched source lowering. The tests and implementation are original MIT code
 During this work, Leonida's independently implemented SPIR-V semantic tests were
 reviewed at revision `67204bf8c0471335d9046890288b33e8d5e2875b`; no Leonida source
 was incorporated into this translator.
+
 
 ## AVX2 leaf recompilation
 
@@ -7231,6 +7239,7 @@ On Windows 11 build 26200.9974, the RTX 4060 Laptop (32.0.16.1656) required 2,30
 cmake --build --preset release --target offscreen_check
 ctest --preset release --no-tests=error --output-on-failure -R '^dxr_placed_build_'
 ```
+
 
 In this configuration all `bvh_*_warp`, `dxr_*_warp` and `bvh_differential_warp` tests pass, and the hardware wave64 check skips at its 32-lane range with SM 6.6 available. `bvh_wave64_warp` now runs and fails at field 25, `WaveReadLaneAt(v, (lane*7+3) % 64)`. In two groups, all 128 lanes received the value of lane m where `7m+3 ≡ lane (mod 64)`, which is the inverse of the requested shuffle. Field 24's shuffle, the mirror read and the native-width run pass. At WARP's native width of 8, `7n+3 ≡ 3-n (mod 8)` is self-inverse, so the default `bvh_waves_warp` cannot show the difference. `wave_shuffle_warp` narrows the cause. WARP 1.0.22 runs a forced wave as blocks of its native 8 lanes, and it picks the source block using the request of the wrong lane: the lane of the reader's block that sits at the requested position. For this shuffle that equals the inverse permutation. A rotation by one lane gets 16 of 64 reads wrong at widths 16, 32 and 64, and none of them match its inverse. Reads where every lane of a block requests the same source block are unaffected. [Open question](https://github.com/R0Y00/Xbox2Windows/issues/145)
 
@@ -9630,6 +9639,7 @@ Four negative controls verify that omitting the 2^32 scale, substituting unfused
 omitting the 2Sum midpoint correction (double-rounding), or flushing intermediate
 subnormals (`ftz`) report pixel mismatches under `--check-pixel-case`.
 
+
 ## Fixture-only XGameRuntime synchronous contracts
 
 The fixture-only `src/xgameruntime_shim.cpp` now distinguishes logged stubs from
@@ -9789,6 +9799,7 @@ from the same C function. The matching pair reports one bundled export and zero
 failures; replacing only the DLL with the I386 build reports one machine mismatch.
 Before this check, both packages reported zero failures. Neither image was executed.
 
+
 ### Starting source-built packages with ordinal-only DLL exports
 
 `pe_run_package.py` can start a synthetic EXE importing `#77` from a bundled
@@ -9833,6 +9844,7 @@ or were still alive after 40 s. After it, there were none in 4,000 launches
 This addresses **only static packaged ordinal binding**, not console ABI,
 DLL cycles, unknown runtime provider contracts, thread-local slot zero, or
 execution of any retail executable. The public tests contain no private binaries.
+
 
 ## Legacy SSE FP compares and partial/non-temporal moves
 
@@ -10436,6 +10448,7 @@ ctest --preset release --no-tests=error -R '^startup_audio_output$' -V
 ```
 
 Exit code 77 is a capability skip (no render endpoint, an endpoint that does not initialise, or an unsupported mix format); it is not a pass. A failed padding query during a case fails the run. The glitch count is reported as "not available" because the render API exposes no discontinuity flag, and it is kept apart from the drained interval and the recovery. Not covered: capture-path verification of the tone, any layout of the console audio command queue (`xapu.cpp` is not decoded), and sample-rate conversion. The result of a run on a machine with an endpoint (adapter, Windows build, commit, per-case counters) is not recorded here yet.
+
 
 ### Publish a placed R8 texture SRV by its title address
 

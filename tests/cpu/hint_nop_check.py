@@ -35,6 +35,10 @@ ACCEPTED = {
     "0f1e00": "reserved nop 0F 1E [rax]",
     "f30f1e00": "reserved nop F3 0F 1E [rax] (same iced code; only reg=1/mod=11 is RDSSP)",
     "0f1f4000": "nop dword [rax+0]",
+    "660f1900": "reserved nop 0F 19 [rax], 16-bit operand size",
+    "660f1e00": "reserved nop 0F 1E [rax], 16-bit operand size",
+    "480f1900": "reserved nop 0F 19 [rax], 64-bit operand size",
+    "480f1e00": "reserved nop 0F 1E [rax], 64-bit operand size",
 }
 
 # Encodings in the same space that iced also decodes as RESERVEDNOP but that are not part of this slice, plus
