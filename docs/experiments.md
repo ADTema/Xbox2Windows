@@ -2445,7 +2445,25 @@ primitive index order and guard bytes.
 ```text
 python3 -B tests/mesh_entry_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ctest --preset dev --no-tests=error -R "^mesh_entry_draw_" -V
+ctest --preset dev --no-tests=error -R "^mesh_entry_cvt_minmax_draw_" -V
 ```
+
+The per-lane binary32 forms of the translator also include `v_cvt_f32_u32`,
+`v_cvt_f32_i32`, `v_min_f32` and `v_max_f32` (`_e32` and `_e64`). A
+conversion takes a concrete integer word and lowers to `float(0x...u)` or
+`float(asint(0x...u))`; a float expression as its source is refused. Min and
+max lower to HLSL `min` and `max`. Source modifiers, `clamp` and output
+modifiers are refused. One program converts four exact words and clamps each
+with a min or a max, so reading a word as signed instead of unsigned, or a min
+where a max belongs, moves the depth by many orders of magnitude. The binary
+mode evaluates the emitted expressions in binary32 and compares the depth with
+an independent hand calculation (0.8125), and each of the eight opcodes swapped
+for its sibling must give a different depth. The draw `mesh_entry_cvt_minmax_draw_*`
+(`draw-cvt-minmax`) compares the exported position words with that reference;
+a depth one unit in the last place off in the last vertex, or any sibling
+opcode, must report `Mesh export trace mismatch`. The draw is written for
+Windows and has not been run on Linux. NaN operands, signed zeros and
+conversions that need rounding are not exercised.
 
 A local scan based on main `933cbad` selected the shortest validated native
 stream among 9,282 MS records (832 bytes, 153 instructions). For the tested
