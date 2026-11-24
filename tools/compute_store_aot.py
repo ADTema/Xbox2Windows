@@ -219,7 +219,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     image_output = image_uav_mip is not None
     if image_output:
         if (cpu != "gfx1030" or descriptor_offset is not None or stride is not None
-                or image_descriptor is None or image_format != "R32G32B32A32_UINT"
+                or image_descriptor is None or image_format not in ("R32G32B32A32_UINT", "R8G8B8A8_UINT")
                 or not 0 <= image_uav_mip <= 15):
             raise ValueError("Invalid image UAV binding")
         descriptor_bindings = {}
@@ -1210,10 +1210,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                     or vaddr[-1] > 255 or last != first + count - 1
                     or not 0 < dmask < (1 << IMAGE_FORMATS[image_format][1])
                     or any(first + index > 255 or first + index in loading for index in range(count))
-                    or (write and (m["packed"] or stores))):
+                    or (write and (m["packed"] == "_pck_sgn" or stores))):
                 raise ValueError(f"Unsupported image {m['kind']} target")
             if bool(m["packed"]) != (image_format == "R8G8B8A8_UINT"):
-                raise ValueError("Image load opcode does not match the image format")
+                raise ValueError(f"Image {m['kind']} opcode does not match the image format")
             if high != base + 7 or base % 4 or pending.intersection(range(base, high + 1)):
                 raise ValueError("Unresolved image descriptor")
             if tuple(scalar.get(base + index) for index in range(8)) != tuple(
@@ -1235,7 +1235,11 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 values = [vector.get(first + index) for index in range(count)]
                 if not all(is_word(value) for value in values):
                     raise ValueError("Unverified image store data")
-                selected = dict(zip(channels, map(hlsl_word, values)))
+                words = list(map(hlsl_word, values))
+                if m["packed"]:
+                    # Raw RGBA8 stores take the low byte of each enabled channel's VGPR.
+                    words = [f"({word} & 0xffu)" for word in words]
+                selected = dict(zip(channels, words))
                 texel = ", ".join(selected.get(channel, "0u") for channel in "xyzw")
                 stores.append(f"    outputData[uint2({x}, {y})] = uint4({texel});")
                 continue
