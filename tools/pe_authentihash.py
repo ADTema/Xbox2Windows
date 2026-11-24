@@ -23,7 +23,8 @@ refusals are limits of this tool. A digest does not mean that Windows accepts
 the file: the tool does not validate every header field. In mutations of
 synthetic and small system DLL headers, Windows refused files after a change to
 SectionAlignment, FileAlignment, or the PointerToRawData of a section whose
-SizeOfRawData is 0; the hash does not read these fields.
+SizeOfRawData is 0. Their bytes are hashed; the tool does not validate
+their values.
 """
 import argparse
 import hashlib
