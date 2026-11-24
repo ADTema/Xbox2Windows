@@ -7212,18 +7212,46 @@ manifest. `XPackageMountWithUiAsync` remains an explicit stub, as do
 `XUserAddAsync` and `XGameSaveInitializeProviderAsync`, because the
 `XAsyncBlock` completion contract is not modeled without GDK headers.
 
+The same fixture adds the synchronous XSystem and XGame identity subset.
+`XSystemGetConsoleId` reports the fixed 38-character console ID
+`58325731.00000000.00000000.00000000.01`, which keeps the documented
+`XXXXXXXX.XXXXXXXX.XXXXXXXX.XXXXXXXX.XX` shape and the 39-byte
+`XSystemConsoleIdBytes` requirement. The docs name that constant but print only
+the 38-character default value; its 39-byte value is also published by the
+public Microsoft XBOX-GDK-dotnet interop constants. A buffer smaller than
+39 bytes returns `HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)`, a null
+buffer returns `E_POINTER`, and the optional used-size output may be null. A
+second call returns the same bytes and size. `XSystemGetDeviceType` returns
+`XSystemDeviceType::Pc` (0x01), the documented value for a PC process, and has
+no error state; repeated calls return the same value. `XGameGetXboxTitleId`
+returns the fixed 32-bit title ID `0x58325731` (`X2W1` in ASCII) and
+`E_POINTER` for a null output; a second call returns the same value. The shim
+always models a configured title, so the documented `ERROR_NOT_FOUND` case for
+a missing MicrosoftGame.config TitleID is not exercised. The public
+XSystem member list documents no `XSystemGetConsoleType`, and the public XGame
+member list documents no `XGameGetXboxTitleIdEx`, so the fixture does not invent
+either name. There is consequently no public field selector on which to test
+an unsupported-field HRESULT; the null outputs are the negative controls. The
+fixture also does not model a console mode switch: it always reports the PC
+device type.
+
 `xgameruntime_pls_xpackage` calls every implemented PLS and XPackage function,
 checks repeated path and space values, writes and removes a PLS marker, verifies
 the package mount directory, checks the unmounted `E_HANDLE` status, and asserts
 that no implemented call logged `E_NOTIMPL`. Its negative controls are
-`XPackageMountWithUiAsync` and `XSystemGetConsoleId`, which must both log
-`E_NOTIMPL`. `xgameruntime_contracts` exercises the synchronous subset and
-checks that no XUser/XGameSave call logs
-`E_NOTIMPL`; it then calls XPackage and XGame stubs as negative controls. The
-DLL remains under `out/build/dev/fixture-shims/` and is loaded by explicit path.
+`XPackageMountWithUiAsync` and `XUserAddAsync`, which must both log
+`E_NOTIMPL`. `xgameruntime_contracts` exercises the XUser/XGameSave subset and
+checks that no XUser/XGameSave call logs `E_NOTIMPL`; it then calls the
+`XPackageMountWithUiAsync` stub as a negative control. `xgameruntime_identity`
+calls `XSystemGetConsoleId`, `XSystemGetDeviceType`, and `XGameGetXboxTitleId`,
+repeats each call for stability, checks the short-buffer and null-pointer errors,
+and asserts that `XUserAddAsync` still logs `E_NOTIMPL`. The DLL remains under
+`out/build/dev/fixture-shims/` and is loaded by explicit path. The exact CTest
+names are `xgameruntime_thunks`, `xgameruntime_contracts`,
+`xgameruntime_pls_xpackage`, and `xgameruntime_identity`.
 
 ```powershell
-cmake --build --preset dev --target xgameruntime_shim xgameruntime_shim_check xgameruntime_contracts_check xgameruntime_pls_xpackage_check
+cmake --build --preset dev --target xgameruntime_shim xgameruntime_shim_check xgameruntime_contracts_check xgameruntime_pls_xpackage_check xgameruntime_identity_check
 ctest --preset dev --no-tests=error -R '^xgameruntime_' -V
 python -B tests/xgameruntime_table_check.py
 ```
