@@ -8,6 +8,19 @@ This is not a port and not an emulator. No executable is playable. Every stand-i
 most answers are shortcuts that are logged as such. The open problems are tracked in the issues
 whose titles start with `startup-runtime:`.
 
+## Derived pipeline blend state
+
+Device slot 55 accepts up to 64 fixed-size derived pipeline patches. The translated graphics
+path reads the blend descriptor from part 2 of a 332-byte patch. Within one derivation the last
+blend patch wins. A further derivation inherits that state until it supplies another blend patch.
+Other patch parts are outside this blend implementation. The record layout can also be compared
+with [XCL's implementation at 64b3f35](https://github.com/ivall/xcl/blob/64b3f35599bb7102f55d640e1a791e7d6dd3b175/crates/xcl/src/hle/d3d12x/device_x.rs#L501-L515).
+
+Run `ctest --preset dev --no-tests=error -R "^startup_stream_draw_(hardware|warp)$" -V` after
+building `startup_stream_consumer`. The source-built shader writes to half of an 8×4 target.
+On A8 the parent preserves the zero clear and the child writes alpha 255. R8 records red 0 or
+255 according to the input shader. The untouched half stays zero in all four cases.
+
 ## Output window and fallback diagnostics
 
 The desktop swap chain has its own top-level window, class `X2WOutputWindow`.
@@ -111,7 +124,7 @@ ctest --preset release --no-tests=error -R '^startup_launch$' -V
 | `X2W_XMEM_GPU_MIRROR=1` | pairs a no-access graphics reservation with the read-write reservation of the same size made just before it, and maps every physical page into both (same section) |
 | `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking |
 | `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` |
-| `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes `req_<key>.{a,b,root}` for untranslated pipelines; `tools/startup/gfx2hlsl.py --pending <dir>` translates them |
+| `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}` and, when needed, RTV variants `req_<key>.rtv`. Run `tools/startup/gfx2hlsl.py --pending <dir>`, then replay the draw. |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_D3D12_DUMP_SURFACE=<bmp>` | writes the last presented surface |
 | `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. |
@@ -124,6 +137,14 @@ ctest --preset release --no-tests=error -R '^startup_launch$' -V
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
 | `X2W_XG_BC7_4K_S_LAYOUT=1` | enables the BC7 tiled layout, copy and draw upload when `X2W_D3D12_PERMISSIVE=1` |
 | `X2W_TRAP_CONTINUE=<exports>` | lets listed trap exports return 0 instead of ending the process |
+
+The startup shader cache key includes the translator revision. After updating from
+an earlier translation revision, run the recording build once to emit
+requests, run `python tools/startup/gfx2hlsl.py --pending <cache-directory>`,
+then start the build again. The new key keeps the former bytecode and manifest
+together under their original name. A 16-dword table load can contain two
+independent image descriptors at offsets 0 and 32 from the load address.
+
 
 ## Findings
 
@@ -159,11 +180,20 @@ These are measured on one executable; treat them as hypotheses for others.
   a `float3` of the three address registers in order; 1D images are refused. A source-built pixel
   stage draws one texel of a 2x2x2 texture on WARP and hardware with DXC and FXC
   (`ctest --preset release --no-tests=error -R "^startup_image_3d_"`).
+- **Flat parameters.** `v_interp_mov_f32` reads a `nointerpolation uint4` copy written from the
+  exported registers, so integer words reach the pixel stage unchanged. FXC folds `asfloat()` of a
+  constant and flushes binary32 denormal patterns such as 1 or 2 to 0, which a float copy lost
+  ([#1259](https://github.com/R0Y00/Xbox2Windows/issues/1259)). Colour exports of constant integer
+  words still go through `float4` and have the same loss. Reproduce with
+  `ctest --preset release --no-tests=error -R "^startup_flat_param_"`.
 - **Stream-cache identity.** A cached zlib stream is served only to the exact queued
   continuation entries in the same DirectStorage queue. The lookup checks the enqueued request
   id, the source, the compressed size and the destination chunk size. A later independent
   request at a matching offset still decodes its own bytes or fails without touching its
   destination.
+- **DirectStorage file ranges.** A nonempty file request checks its byte offset and length against
+  the current file size before allocating the staging buffer. A range ending at EOF is valid.
+  An overrun or short read fails the queue request and preserves the destination.
 
 ## Shortcuts that are known to be wrong
 
@@ -209,6 +239,14 @@ These are measured on one executable; treat them as hypotheses for others.
   hardware. Swapping the red/green shader changes the 16 covered pixels. Reproduce with
   `ctest --preset release --no-tests=error -R "^startup_stream_(request|draw)_"`.
   Other stage combinations and full stream rasterizer/depth state remain open.
+- Translated draws use the bound typed RTV formats to request colour-export variants. The
+  manifest's `targets` line lists exported slots. A separate `rtv1` line identifies the base
+  shader and the ordered RTV formats, and the draw rejects a variant with a mismatched line.
+  Uncompressed `R32_UINT` and `R32_SINT` outputs use integer shader signatures.
+  Uncompressed binary32 FLOAT outputs bitcast the export words after XOR with a private
+  zero-valued entry constant so optimized FXC keeps denormal bit patterns. UNORM outputs still
+  undergo float-to-UNORM conversion. Packed integer exports and other integer formats remain
+  unsupported by this path.
 - Translating the captured console colour-blend register state blocks remains open (#1216).
   A graphics stream can supply a desktop `D3D12_BLEND_DESC` directly. `src/startup_stubs/cb_blend.h`
   decodes `CB_BLENDn_CONTROL` and a `CB_TARGET_MASK` nibble into `D3D12_RENDER_TARGET_BLEND_DESC`. It

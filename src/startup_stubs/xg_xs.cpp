@@ -8,7 +8,9 @@
 
 #include "startup_stubs/slice_footprints.h"
 
+#include <algorithm>
 #include <array>
+#include "startup_stubs/bc64_chain.h"
 #include <cstdio>
 #include <cstring>
 #include <utility>
@@ -85,6 +87,16 @@ bool use_bc7_4k_s_layout(const D3D12_RESOURCE_DESC& desc)
 
 void put64(unsigned char* at, u64 value) { std::memcpy(at, &value, sizeof(value)); }
 void put32(unsigned char* at, std::uint32_t value) { std::memcpy(at, &value, sizeof(value)); }
+
+void notify_texture_write(void* base, u64 bytes)
+{
+    using Notify = void (*)(void*, unsigned long long);
+    const HMODULE d3d = GetModuleHandleW(L"d3d12_xs.dll");
+    const auto notify = d3d ? reinterpret_cast<Notify>(GetProcAddress(d3d, "x2w_d3d12_texture_written")) : nullptr;
+    if (notify) notify(base, bytes);
+}
+
+#include "startup_stubs/xg_bc64.inl"
 
 void write_bc7_4k_s_layout(const D3D12_RESOURCE_DESC& desc, unsigned char* layout)
 {
@@ -291,12 +303,7 @@ long __stdcall computer_copy_into(Computer* self, unsigned char* base, unsigned 
         for (unsigned z = 0; z < fp.Depth; ++z)
             for (unsigned y = 0; y < rows[i]; ++y)
                 std::memcpy(target + (u64{z} * rows[i] + y) * fp.RowPitch, linear + z * source_slice + u64{y} * row_pitch, used);
-        using Notify = void (*)(void*, unsigned long long);
-        static const Notify notify = [] {
-            const HMODULE d3d = GetModuleHandleW(L"d3d12_xs.dll");
-            return d3d ? reinterpret_cast<Notify>(GetProcAddress(d3d, "x2w_d3d12_texture_written")) : nullptr;
-        }();
-        if (notify) notify(base, stride * slices);
+        notify_texture_write(base, stride * slices);
     }
     if (x2w_local::first_calls(calls, 12) || !ok)
         x2w_local::logf("x2w-xg TextureComputer::slot8(copy into) base=%p subresource=%u (mip %u slice %u) %ux%u fmt=%d rows=%u "
@@ -336,22 +343,42 @@ extern "C" __declspec(noinline) long XGCreateTextureComputer(u64 rcx, u64 rdx, u
 {
     if (!permissive())
         x2w_trap::fire(X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, "XGCreateTextureComputer", 0, rcx, rdx, r8, r9, _ReturnAddress());
-    static auto table = computer_table(std::make_index_sequence<32>{});
-    static bool ready = false;
-    if (!ready) {
-        table[1] = reinterpret_cast<void*>(&computer_release);
-        table[2] = reinterpret_cast<void*>(&computer_layout);
-        table[8] = reinterpret_cast<void*>(&computer_copy_into);
-        table[10] = reinterpret_cast<void*>(&computer_tiling);
-        ready = true;
-    }
+    static const auto table = [] {
+        auto slots = computer_table(std::make_index_sequence<32>{});
+        slots[1] = reinterpret_cast<void*>(&computer_release);
+        slots[2] = reinterpret_cast<void*>(&computer_layout);
+        slots[8] = reinterpret_cast<void*>(&computer_copy_into);
+        slots[10] = reinterpret_cast<void*>(&computer_tiling);
+        return slots;
+    }();
     if (!rcx || !rdx) return static_cast<long>(0x80004003);
     const auto& desc = *reinterpret_cast<const D3D12_RESOURCE_DESC*>(rcx);
     if (!x2w_startup::SliceFootprints::supports(desc)) {
         *reinterpret_cast<Computer**>(rdx) = nullptr;
         return E_NOTIMPL;
     }
-    auto* computer = new Computer{table.data(), desc, 1, use_bc7_4k_s_layout(desc)};
+    static const auto bc_table = [] {
+        auto slots = table;
+        slots[0] = reinterpret_cast<void*>(&bc64_add_ref);
+        slots[2] = reinterpret_cast<void*>(&bc64_layout);
+        slots[3] = reinterpret_cast<void*>(&bc64_size);
+        slots[4] = reinterpret_cast<void*>(&bc64_alignment);
+        slots[5] = reinterpret_cast<void*>(&bc64_offset);
+        slots[6] = reinterpret_cast<void*>(&bc64_element);
+        slots[8] = reinterpret_cast<void*>(&bc64_copy<true>);
+        slots[9] = reinterpret_cast<void*>(&bc64_copy<false>);
+        slots[10] = reinterpret_cast<void*>(&bc64_tiling);
+        return slots;
+    }();
+    static const auto bc_tiling_table = [] {
+        auto slots = table;
+        slots[10] = reinterpret_cast<void*>(&bc64_tiling);
+        return slots;
+    }();
+    const auto* selected = table.data();
+    if (bc64::supports(desc)) selected = bc_table.data();
+    else if (bc64::supports_nine_mip_tiling(desc)) selected = bc_tiling_table.data();
+    auto* computer = new Computer{selected, desc, 1, use_bc7_4k_s_layout(desc)};
     *reinterpret_cast<Computer**>(rdx) = computer;
     static LONG calls;
     if (InterlockedIncrement(&calls) <= 3)

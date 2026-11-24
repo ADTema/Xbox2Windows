@@ -20,6 +20,8 @@
 #include "startup_stubs/draw_dump_tracking.h"
 #include "startup_stubs/translated_sampler_bindings.h"
 #include "startup_stubs/bc7_4k_s.h"
+#include "startup_stubs/bc64_chain.h"
+#include "startup_stubs/derived_blend.h"
 
 #include "startup_stubs/slice_footprints.h"
 
@@ -2444,9 +2446,8 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
     return S_OK;
 }
 
-// Device slot 55 (Xbox order): (existing object, 1, desc*, riid, ppv) with the ID3D12PipelineState
-// IID: a pipeline derived from an existing one. Placeholder PipelineState, like the other creators.
-HRESULT __stdcall device_create_derived_pipeline(Wrapper*, void* base, u64 count, const void* desc, const GUID* iid,
+// CreateDerivedPipelineStateX: base, number of fixed-size state patches, patches, IID, result.
+HRESULT __stdcall device_create_derived_pipeline(Wrapper*, void* base, UINT count, const void* desc, const GUID* iid,
                                                  void** out)
 {
     Timed timed(time_pipeline);
@@ -2454,18 +2455,21 @@ HRESULT __stdcall device_create_derived_pipeline(Wrapper*, void* base, u64 count
     guid_text(iid, text, sizeof(text));
     if (!out || !iid) return E_POINTER;
     *out = nullptr;
-    dump_pipeline("derived", 55, desc, 0x100);
+    if (kind_for(*iid) != pipeline_kind) return E_NOINTERFACE;
+    if (count > 64) return E_INVALIDARG;
+    const std::size_t bytes_in_patches = count * x2w_derived_blend::record_size;
+    if (bytes_in_patches && (!desc || !x2w_local::readable(desc, bytes_in_patches))) return E_INVALIDARG;
+    dump_pipeline("derived", 55, desc, bytes_in_patches);
     static LONG calls;
     if (first_calls(calls, 3)) {
         Wrapper* w = as_wrapper(base);
         char bytes[3 * 64 + 1];
-        hex_text(desc, 64, bytes, sizeof(bytes));
-        log("x2w-d3d12 Device::slot55(derived pipeline?) base=%p (%s) count=%llu desc=[%s] riid=%s -> placeholder", base,
+        hex_text(desc, count ? 64 : 0, bytes, sizeof(bytes));
+        log("x2w-d3d12 Device::slot55(derived pipeline) base=%p (%s) count=%u desc=[%s] riid=%s -> placeholder", base,
             w ? kind_names[w->own().kind] : "not a wrapper", count, bytes, text);
     }
-    if (kind_for(*iid) != pipeline_kind) return E_NOINTERFACE;
     *out = wrap(nullptr, pipeline_kind);
-    note_pipeline(static_cast<Wrapper*>(*out), 55, base, desc, 0x100);
+    note_pipeline(static_cast<Wrapper*>(*out), 55, base, desc, bytes_in_patches);
     return S_OK;
 }
 

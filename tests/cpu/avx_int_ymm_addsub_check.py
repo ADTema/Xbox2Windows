@@ -313,8 +313,8 @@ def check_translator():
         ("vpsubw_xmm_still_carved_out", (loads[0], loads[1],
             Instruction.create_reg_reg_reg(Code.VEX_VPSUBW_XMM_XMM_XMMM128, R.XMM0, R.XMM1, R.XMM2), ret),
          "unsupported instruction"),
-        ("vpmaxsd_ymm_other_form", (*loads, Instruction.create_reg_reg_reg(
-            Code.VEX_VPMAXSD_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2), ret),
+        ("vpmulld_ymm_other_form", (*loads, Instruction.create_reg_reg_reg(
+            Code.VEX_VPMULLD_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2), ret),
          "unsupported VEX.256 (L=1) packed-integer encoding"),
         ("vpaddsb_ymm_other_form", (*loads, Instruction.create_reg_reg_reg(
             Code.VEX_VPADDSB_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2), ret),

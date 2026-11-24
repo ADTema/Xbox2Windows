@@ -22,6 +22,10 @@
 // two-layer Texture2DArray resources for the arrayed module (shared_sampler_array.spvasm). Layer 0
 // holds the texels above; layer 1 holds a different top-left texel in each texture (depth 0.875, so
 // both comparisons pass; ordinary 0.3125; mip 1 0.5625), so a read of the wrong layer shows.
+//
+// A "volume" prefix (volume, volume-comparison-greater, volume-ordinary-min-lod1) keeps t0 a Texture2D and
+// makes t1 a 2x2x2 Texture3D for the module with a 3D value image, which samples at w = 0.75 (slice 1).
+// Slice 0 holds the texels above; slice 1 holds 0.3125 at its top-left texel. Mip 1 is 1x1x1 (0.625).
 #include "../desktop_gpu.h"
 #include <array>
 #include <cstdio>
@@ -76,8 +80,9 @@ void check_spirv_compare_sampler(ID3D12Device* device, const char* shader_path, 
     }
     // "array" alone is the arrayed baseline; "array-<v>" is variant v on the arrayed textures.
     const bool arrayed = variant == "array" || variant.substr(0, 6) == "array-";
-    const std::string_view samplers_variant = variant == "array" || variant == "multi" ? "baseline"
-                                              : arrayed || multi ? variant.substr(variant.find('-') + 1) : variant;
+    const bool volume = variant == "volume" || variant.substr(0, 7) == "volume-";
+    const std::string_view samplers_variant = variant == "array" || variant == "multi" || variant == "volume" ? "baseline"
+                                              : arrayed || multi || volume ? variant.substr(variant.find('-') + 1) : variant;
     if (multi) {
         if (samplers_variant != "baseline" && samplers_variant != "comparison-a-greater" &&
             samplers_variant != "comparison-b-greater" && samplers_variant != "ordinary-a-min-lod1" &&
@@ -87,9 +92,9 @@ void check_spirv_compare_sampler(ID3D12Device* device, const char* shader_path, 
     } else if (samplers_variant != "baseline" && samplers_variant != "comparison-greater" &&
                samplers_variant != "ordinary-min-lod1") {
         throw std::runtime_error("Descriptor variant must be baseline, comparison-greater or ordinary-min-lod1, "
-                                 "optionally as array or array-<variant>, or a multi variant");
+                                 "optionally as array, array-<variant>, volume or volume-<variant>, or a multi variant");
     }
-    const UINT layers = arrayed ? 2 : 1;
+    const UINT layers = arrayed || volume ? 2 : 1;
     const auto shader = read_file(shader_path, "comparison-sampler shader");
     const auto reference_bytes = read_file(reference_path, "comparison-sampler reference");
     if (reference_bytes.size() != output_words * sizeof(UINT))
@@ -182,15 +187,19 @@ void check_spirv_compare_sampler(ID3D12Device* device, const char* shader_path, 
     std::array<ComPtr<ID3D12Resource>, 2> inputs;
     for (UINT i = 0; i < 2; ++i) {
         D3D12_RESOURCE_DESC texture_desc{};
-        texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        const bool is_volume = volume && i == 1;
+        const UINT depth = arrayed || is_volume ? layers : 1;
+        texture_desc.Dimension = is_volume ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         texture_desc.Width = texture_desc.Height = 2;
-        texture_desc.DepthOrArraySize = static_cast<UINT16>(layers);
+        texture_desc.DepthOrArraySize = static_cast<UINT16>(depth);
         texture_desc.MipLevels = i == 0 ? 1 : 2;
         texture_desc.Format = DXGI_FORMAT_R32_FLOAT;
         texture_desc.SampleDesc.Count = 1;
         inputs[i] = resource(device, texture_desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
         transition(list.Get(), inputs[i].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-        for (UINT layer = 0; layer < layers; ++layer) {
+        // A 3D resource has one subresource per mip: its slices follow each other in the upload at one
+        // slice pitch (2 rows), which equals texture_bytes here.
+        for (UINT layer = 0; layer < (is_volume ? 1 : depth); ++layer) {
             for (UINT mip = 0; mip < texture_desc.MipLevels; ++mip) {
                 D3D12_TEXTURE_COPY_LOCATION to{};
                 to.pResource = inputs[i].Get();
@@ -201,7 +210,7 @@ void check_spirv_compare_sampler(ID3D12Device* device, const char* shader_path, 
                 from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
                 const UINT size = mip == 0 ? 2 : 1;
                 from.PlacedFootprint = {mip == 0 ? mip0_offset(i, layer) : mip1_offset + layer * texture_bytes,
-                                        {DXGI_FORMAT_R32_FLOAT, size, size, 1, row_pitch}};
+                                        {DXGI_FORMAT_R32_FLOAT, size, size, is_volume && mip == 0 ? 2u : 1u, row_pitch}};
                 list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
             }
         }
@@ -212,7 +221,10 @@ void check_spirv_compare_sampler(ID3D12Device* device, const char* shader_path, 
         D3D12_SHADER_RESOURCE_VIEW_DESC view{};
         view.Format = DXGI_FORMAT_R32_FLOAT;
         view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        if (arrayed) {
+        if (is_volume) {
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+            view.Texture3D.MipLevels = texture_desc.MipLevels;
+        } else if (arrayed) {
             view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
             view.Texture2DArray.MipLevels = texture_desc.MipLevels;
             view.Texture2DArray.ArraySize = layers;
