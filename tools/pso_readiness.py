@@ -34,6 +34,8 @@ def scan_shader(root, record, stage, digest, llvm):
         return "disassembly_failed", str(exc)
     if not instructions:
         return "disassembly_failed", "empty instruction stream"
+    if stage == "compute":
+        return assess_compute(instructions)
     if stage == "mesh":
         from mesh_entry_aot import lower
 
@@ -47,6 +49,32 @@ def scan_shader(root, record, stage, digest, llvm):
             return "mesh_lowering_rejected", f"lowering failed unexpectedly: {type(exc).__name__}"
         return "mesh_lowering_passed", None
     return assess_pixel(digest, instructions)
+
+
+COMPUTE_BINDINGS_NOT_ASSESSED = (
+    "ISA recognized; bindings not assessed: the manifest carries no table register, descriptor offsets, "
+    "group registers or thread group size")
+
+
+def assess_compute(instructions):
+    """Check ISA recognition only; compute_store_aot.lower needs bindings the manifest cannot supply.
+
+    The result is never a lowering verdict: probing the lowerer with guessed bindings would report a
+    binding mismatch as a shader defect, or a coincidental match as readiness.
+    """
+    from scan_unsupported_shaders import extract_opcode, is_opcode_recognized
+
+    try:
+        unrecognized = set()
+        for line in instructions:
+            opcode = extract_opcode(line)
+            if opcode and not is_opcode_recognized(opcode):
+                unrecognized.add(opcode)
+    except Exception as exc:  # A malformed line must not abort the whole report.
+        return "compute_scan_failed", f"scan failed unexpectedly: {type(exc).__name__}"
+    if unrecognized:
+        return "unsupported_opcodes", ", ".join(sorted(unrecognized))
+    return "compute_isa_recognized", COMPUTE_BINDINGS_NOT_ASSESSED
 
 
 def assess_pixel(digest, instructions):
@@ -91,7 +119,7 @@ def report(manifest, pipelines, root, llvm=None):
             if key not in assessments:
                 if not matches:
                     assessments[key] = ("shader_not_in_manifest", None)
-                elif stage not in ("pixel", "mesh"):
+                elif stage not in ("pixel", "mesh", "compute"):
                     assessments[key] = ("stage_not_assessed", None)
                 elif llvm is None:
                     assessments[key] = (f"{stage}_scan_untested", None)
@@ -128,7 +156,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path, help="manifest.json from extract_shaders.py --format native or both")
     parser.add_argument("pipelines", type=Path, help="JSON metadata with pipeline IDs and stage/digest references")
-    parser.add_argument("--llvm", help="AMDGPU LLVM library for optional pixel and mesh lowering checks")
+    parser.add_argument("--llvm", help="AMDGPU LLVM library for optional pixel and mesh lowering checks and compute ISA recognition")
     args = parser.parse_args()
     try:
         result = report(json.loads(args.manifest.read_text(encoding="utf-8")),
