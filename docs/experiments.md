@@ -10899,11 +10899,18 @@ ctest --preset release --no-tests=error -R '^(startup_memory_srv_report|startup_
 
 The translated draw path can sample a read-only BC3_UNORM or BC7_UNORM SRV
 published through device slot 70 without a prior resource object. The tested
-layout is 0x105, 4 KiB standard non-XOR. Width and height must be multiples of
-64 texels, with one mip, one slice, and one sample. Each tile holds 16 by 16
-compressed blocks. The runtime copies the 16-byte blocks to their desktop
-footprint rows before uploading them. Ordinary placed R8 views and the XG
-BC7 layout probe retain their existing behavior.
+layout is 0x105, 4 KiB standard non-XOR. Width and height must be whole 4x4
+blocks, with one mip, one slice, and one sample. Each tile holds 16 by 16
+compressed blocks. A partial last tile column or row is padded to a whole tile,
+as AMD addrlib does for a single-mip thin surface: `ComputeSurfaceInfoMacroTiled`
+aligns pitch and height to the block size and places mip 0 at offset 0, and the
+address of a block is its tile index (row times tiles per padded pitch, plus
+column) times 4 KiB, plus its offset in the tile. The runtime copies the
+visible 16-byte blocks to their desktop footprint rows before uploading them.
+Ordinary placed R8 views and the XG BC7 layout probe retain their existing
+behavior. The first publication at an address of such a view with a partial
+tile logs its size, format, whether the XG stand-in had announced a copy there,
+and how many of the first and last 4 KiB are non-zero, with a hash.
 
 Keep the complete tiled guest allocation readable for the view's sampling
 lifetime. The producer stores the view identity in the title heap. The
@@ -10919,6 +10926,16 @@ restore the first image. On Windows 11 26200.9974 with the debug layer off,
 RTX 4060 Laptop (32.0.16.1656) and WARP (10.0.26100.9818) each matched
 65,536 RGBA pixels per format. The swapped-tile control changed 16,384
 of 16,384 pixels for BC3 and 15,360 for BC7.
+
+The same test draws a 100 by 68 texture of each format from the same four
+tiles, whose last tile column and row are partial. The padding blocks hold
+distinct valid blocks; texels outside the texture must load as zero. A
+reference that uses the tile pitch of the unpadded width (one tile instead of
+two) differs from the image in 1,600 pixels for BC3 and 1,500 for BC7, and a
+98 by 68 description (not whole blocks) must be refused. Restoring the
+64-texel check fails the 100 by 68 BC3 case at its first texel row. On
+Windows 11 build 26300 with the debug layer off, RTX 5090 (32.0.16.2135) and
+WARP (10.0.26100.10068) matched all 65,536 RGBA pixels per case.
 
 ```powershell
 cmake --build --preset release --target startup_stream_consumer startup_stub_consumer d3d12_xs_shim

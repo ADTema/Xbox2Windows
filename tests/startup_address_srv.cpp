@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cwchar>
 #include <fstream>
 #include <vector>
 
@@ -139,7 +140,13 @@ int draw_bc_address_srvs(void* guest, void* list)
     const DWORD length = GetEnvironmentVariableW(L"X2W_TEST_BC_VIEW", path, MAX_PATH);
     if (!length || length >= MAX_PATH) return 43;
     const bool bc3 = GetEnvironmentVariableW(L"X2W_TEST_BC3", nullptr, 0) != 0;
-    constexpr UINT tile = 4096, width = 128, height = 128;
+    // X2W_TEST_BC_SIZE=<width>x<height> (default 128x128) keeps the 2x2 tiles; a smaller size leaves the
+    // last tile column and row partial, so the padding blocks must stay outside the texture.
+    constexpr UINT tile = 4096, panel = 128;
+    UINT width = panel, height = panel;
+    wchar_t size[16]{};
+    if (GetEnvironmentVariableW(L"X2W_TEST_BC_SIZE", size, 16) &&
+        (swscanf_s(size, L"%ux%u", &width, &height) != 2 || width > panel || height > panel)) return 43;
     alignas(4096) static std::array<std::array<char, 4 * tile>, 2> backing{};
     std::ifstream input(path, std::ios::binary);
     if (!input.read(backing[0].data(), 4 * tile) || input.peek() != std::char_traits<char>::eof()) return 43;
@@ -159,10 +166,13 @@ int draw_bc_address_srvs(void* guest, void* list)
     for (LONG i = 0; i < 4; ++i) {
         v.address = addresses[i];
         invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
-        const D3D12_RECT region{i * LONG(width), 0, (i + 1) * LONG(width), LONG(height)};
+        const D3D12_RECT region{i * LONG(panel), 0, (i + 1) * LONG(panel), LONG(panel)};
         invoke(list, 22, 1, ptr(&region));
         invoke(list, 12, 3, 1);
     }
+    // Not whole 4x4 blocks: refused (the check reads the log), with nothing drawn after it.
+    desc.Width -= 2;
+    invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
     return 0;
 }
 

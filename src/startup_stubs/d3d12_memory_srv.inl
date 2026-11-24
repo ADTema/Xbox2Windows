@@ -19,7 +19,30 @@ bool tiled_bc_srv(const D3D12_RESOURCE_DESC& r)
            static_cast<UINT>(r.Layout) == 0x105 && r.Alignment == 0 &&
            (r.Flags == D3D12_RESOURCE_FLAG_NONE || static_cast<UINT>(r.Flags) == 0x300000) &&
            r.Width <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION && r.Height <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION &&
-           r.Width % 64 == 0 && r.Height % 64 == 0;
+           // A single mip pads its pitch and height to whole 4 KiB tiles (Bc16Surface); the desktop
+           // texture needs whole 4x4 blocks.
+           r.Width && r.Height && r.Width % 4 == 0 && r.Height % 4 == 0;
+}
+
+// Content summary of a published view whose last tile row or column is partial: a title run can tell
+// console-tiled data from zeros or rows written by the XG stand-in (which announces its copies).
+void log_partial_tile_view(const D3D12_RESOURCE_DESC& r, u64 address, bool announced, bool published)
+{
+    static LONG lines;
+    if (!first_calls(lines, 16)) return;
+    const auto bytes = x2w_startup::Bc16Surface(r).size();
+    const auto* data = reinterpret_cast<const unsigned char*>(address);
+    const bool readable = x2w_local::readable(data, bytes);
+    const auto nonzero = [&](u64 from) {
+        unsigned count = 0;
+        for (u64 i = from; i < from + 4096; ++i) count += data[i] != 0;
+        return count;
+    };
+    log("x2w-d3d12 Device::slot70 partial-tile BC view %llux%u format %d layout 0x%x: %s, XG-announced write %d, "
+        "%llu tiled bytes%s nonzero first/last 4 KiB %u/%u hash %016llx", r.Width, r.Height, r.Format,
+        static_cast<unsigned>(r.Layout), published ? "published" : "texture_unavailable", announced, bytes,
+        readable ? "," : " unreadable,", readable ? nonzero(0) : 0, readable ? nonzero(bytes - 4096) : 0,
+        readable ? hash_memory(data, static_cast<std::size_t>(bytes)) : 0);
 }
 
 bool supports_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
@@ -230,8 +253,20 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         view_slot<18, 2>(self, reinterpret_cast<u64>(buffer), reinterpret_cast<u64>(&adjusted), destination, 0);
         return;
     }
+    // Before the first publication at an address, only an XG stand-in copy leaves a write record there.
+    bool first = false, announced = false;
+    if (tiled_bc_srv(*resource) && (resource->Width % 64 || resource->Height % 64)) {
+        {
+            std::lock_guard lock(tiled_srv_mutex);
+            first = !tiled_srv_addresses.count(input->address);
+        }
+        AcquireSRWLockShared(&written_lock);
+        announced = written_textures().count(input->address) != 0;
+        ReleaseSRWLockShared(&written_lock);
+    }
     Wrapper* texture = (tiled_bc_srv(*resource) || x2w_startup::bc64::supports(*resource)) ? publish_tiled_texture(self, input->address, *resource)
                                               : existing_memory_texture(input->address, *resource);
+    if (first) log_partial_tile_view(*resource, input->address, announced, texture != nullptr);
     if (!texture) {
         if (first_calls(refused, 8))
             log_refused_memory_srv("unavailable texture at the supplied base and layout", "texture_unavailable", resource, input, destination);
