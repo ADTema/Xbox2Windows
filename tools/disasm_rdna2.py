@@ -2336,6 +2336,15 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             literal, = struct.unpack_from("<I", data, offset + 8)
             length = 12
 
+        if op == 0x13c:
+            # The VOP2-only v_pk_fmac_f16 has no VOP3 form on gfx1013 (llvm-mc:
+            # "e64 variant of this instruction is not supported").  Keep the
+            # real record length so the stream stays aligned, but do not
+            # report a lowerable instruction.
+            return (length, "v_pk_fmac_f16_unsupported",
+                    "v_pk_fmac_f16 <unsupported VOP3A encoding>",
+                    "VOP3A encoding of v_pk_fmac_f16 is not available on gfx1013")
+
         if is_vop3b:
             sdst = (w0 >> 8) & 0x7f
             abs_bits = [0, 0, 0]

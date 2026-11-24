@@ -618,6 +618,49 @@ class TestRdna2Disasm(unittest.TestCase):
             (8, 4, "s_endpgm"),
         )
 
+    def test_vop3_rejects_packed_fmac_f16_but_keeps_other_vop2_forms(self):
+        # gfx1013 has no VOP3 form of v_pk_fmac_f16 (llvm-mc 15 and 19 report
+        # "e64 variant of this instruction is not supported" for the e64
+        # spelling), so opcode 0x13c must not decode as the VOP2 instruction.
+        # The record keeps the real length (8 bytes, 12 with a literal) so the
+        # next instruction stays aligned, and no lowerer receives it.
+        raw = bytes.fromhex(
+            "01003cd5 02070200"           # opcode 0x13c, v1, v2, v3
+            "01003cd5 ff060200 78563412"  # same opcode with a literal src0
+            "000081bf"                    # s_endpgm
+        )
+        insns = disasm_rdna2(raw)
+        self.assertEqual(
+            [(i["offset"], i["length"], i["opcode"]) for i in insns],
+            [
+                (0, 8, "v_pk_fmac_f16_unsupported"),
+                (8, 12, "v_pk_fmac_f16_unsupported"),
+                (20, 4, "s_endpgm"),
+            ],
+        )
+        for insn in insns[:2]:
+            self.assertEqual(insn["assembly"], "v_pk_fmac_f16 <unsupported VOP3A encoding>")
+            self.assertFalse(is_opcode_recognized(insn["opcode"]))
+            self.assertFalse(is_instruction_supported(insn["assembly"]))
+
+        # Controls (encodings assembled with llvm-mc for gfx1013): the VOP2
+        # operations next to it that do have a VOP3 form still decode.
+        ctl = disasm_rdna2(bytes.fromhex(
+            "010036d5 02070200"  # v_fmac_f16_e64 v1, v2, v3
+            "010039d5 02070200"  # v_max_f16_e64 v1, v2, v3
+            "01003ad5 02070200"  # v_min_f16_e64 v1, v2, v3
+            "01003bd5 02070200"  # v_ldexp_f16_e64 v1, v2, v3
+        ))
+        self.assertEqual(
+            [i["assembly"] for i in ctl],
+            [
+                "v_fmac_f16_e64 v1, v2, v3",
+                "v_max_f16_e64 v1, v2, v3",
+                "v_min_f16_e64 v1, v2, v3",
+                "v_ldexp_f16_e64 v1, v2, v3",
+            ],
+        )
+
     def test_sopc_literal_keeps_the_following_instruction_aligned(self):
         # src1 == literal (255) makes the SOPC encoding 8 bytes. Without
         # consuming the literal dword, the following s_endpgm would be misread.
