@@ -366,14 +366,14 @@ int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
 }
 
 // One-texel textures published by address (X2W_TEST_SINGLE_ELEMENT=2d or 3d), one 1x4 column per draw. The texel
-// sits at offset 0 of its memory whatever the layout field says. Column 3 follows ten refused descriptions
-// and must still show the view published before them.
+// sits at offset 0 of its memory whatever the layout field says. Column 3 follows eleven refused descriptions
+// and must still show the view published before them; the last is a flagless view over a GPU-written resource.
 int draw_single_element_srvs(void* guest, void* list)
 {
     wchar_t mode[4]{};
     GetEnvironmentVariableW(L"X2W_TEST_SINGLE_ELEMENT", mode, 4);
     const bool volume = mode[0] == L'3';
-    alignas(256) static unsigned char memory[4][256];
+    alignas(256) static unsigned char memory[5][256];
     const unsigned char a[] = {0x11, 0x22, 0x33, 0xff}, b[] = {0xc0, 0x40, 0x80, 0xff}, c[] = {0x5a, 0xa5, 0x3c, 0xff};
     const unsigned char bgra[] = {0x10, 0x20, 0xf0, 0xff};
     const std::uint16_t half[] = {0x3400, 0x3a00, 0x3c00, 0x3c00};  // 0.25, 0.75, 1, 1
@@ -426,6 +426,13 @@ int draw_single_element_srvs(void* guest, void* list)
         v.view.ViewDimension = volume ? D3D12_SRV_DIMENSION_TEXTURE2D : D3D12_SRV_DIMENSION_TEXTURE3D;
     });
     refuse([](auto&, auto& v) { v.view.Texture2D.MipLevels = 2; });
+    // A placed UAV texture at an address is written on the desktop side; a flagless view there stays refused.
+    auto written = rgba;
+    written.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    void* uav = nullptr;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(memory[4]), ptr(&written), D3D12_RESOURCE_STATE_COMMON, 0,
+                                           ptr(&__uuidof(ID3D12Resource)), ptr(&uav))))) return 48;
+    publish(rgba, view_of(rgba, ptr(memory[4])));
     draw(3);
     const auto bgra_desc = texel(DXGI_FORMAT_B8G8R8A8_UNORM, 0x100);
     publish(bgra_desc, view_of(bgra_desc, ptr(memory[2]))); draw(4);

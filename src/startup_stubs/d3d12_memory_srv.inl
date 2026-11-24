@@ -86,6 +86,25 @@ Wrapper* existing_memory_texture(u64 address, const D3D12_RESOURCE_DESC& desc)
     return match;
 }
 
+// A live render-target, depth or UAV resource at the address is written on the desktop side, so title memory
+// there does not hold its texels.
+bool gpu_written_at(u64 address)
+{
+    constexpr UINT gpu_written = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    bool found = false;
+    AcquireSRWLockShared(&note_lock);
+    for (const auto& [wrapper, info] : resource_infos()) {
+        if (reinterpret_cast<u64>(wrapper->own().title_memory) == address && (static_cast<UINT>(info.console.Flags) & gpu_written) &&
+            InterlockedCompareExchange(&wrapper->own().refs, 0, 0) > 0) {
+            found = true;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&note_lock);
+    return found;
+}
+
 Wrapper* existing_memory_buffer(Wrapper* device, u64 address, u64 bytes)
 {
     if (!address || !bytes) return nullptr;
@@ -216,7 +235,8 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         return;
     }
     // A single-element texture is published by address like a tiled view: its texel is read at offset 0.
-    if (x2w_startup::supports_single_element_srv(*resource, input->view)) {
+    // Over a GPU-written resource it takes the lookup below, which needs the same description.
+    if (x2w_startup::supports_single_element_srv(*resource, input->view) && !gpu_written_at(input->address)) {
         if (Wrapper* texture = publish_tiled_texture(self, input->address, *resource))
             view_slot<18, 2>(self, reinterpret_cast<u64>(texture), reinterpret_cast<u64>(&input->view), destination, 0);
         else if (first_calls(refused, 8))

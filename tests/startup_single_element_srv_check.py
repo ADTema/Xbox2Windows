@@ -3,8 +3,9 @@
 Each run draws eight 1x4 columns from a translated pixel shader that loads texel (0, 0, 0):
   0  RGBA8, layout UNKNOWN            1  RGBA8, layout 0x105 (another address)
   2  the column-0 texel rewritten and published again; it must read the new value
-  3  after ten refused descriptions (2x1, two mips, two slices, four samples, XOR layout 0x115, BC1, R8,
-     a UAV flag, the other view dimension, a two-mip view): the column-2 view must be unchanged
+  3  after eleven refused calls (2x1, two mips, two slices, four samples, XOR layout 0x115, BC1, R8,
+     a UAV flag, the other view dimension, a two-mip view, and a flagless view over a placed UAV texture,
+     whose texels live on the desktop side): the column-2 view must be unchanged
   4  B8G8R8A8, layout 0x100           5  R16G16B16A16_FLOAT, layout 0x105
   6  a zero address after column 5: refused, column 5's view stays
   7  the column-0 address and description again
@@ -45,7 +46,7 @@ def check(directory, consumer, backend, dimension):
                 raise AssertionError(f"{dimension} column {(i // 4) % 8} row {i // 32}: actual {actual[i:i + 4].hex()} "
                                      f"expected {want[i:i + 4].hex()}")
         raise AssertionError(f"{dimension}: readback length {len(actual)}, expected {len(want)}")
-    print(f"{backend} {dimension}: 8 columns of one-texel views exact, ten refused descriptions kept the previous view")
+    print(f"{backend} {dimension}: 8 columns of one-texel views exact, eleven refused calls kept the previous view")
     return 0
 
 
