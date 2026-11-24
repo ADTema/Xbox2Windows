@@ -13,6 +13,8 @@
 #include <string>
 #include <string_view>
 
+#include "d3d12x_struct_return.h"
+
 using Microsoft::WRL::ComPtr;
 
 namespace {
@@ -163,7 +165,65 @@ HMODULE load_shim(const char* path, XboxCreateDevice& create)
     return module;
 }
 
-int create_checks(XboxCreateDevice create, IUnknown* adapter, const LUID& expected_luid)
+int struct_return_checks(ID3D12Device* device)
+{
+    constexpr UINT node_mask = 0;
+    constexpr auto heap_type = D3D12_HEAP_TYPE_UPLOAD;
+    const auto expected = device->GetCustomHeapProperties(node_mask, heap_type);
+    static_assert(sizeof(D3D12_HEAP_PROPERTIES) == 5 * sizeof(std::uint32_t));
+
+    struct Case {
+        const char* name;
+        bool return_buffer_first;
+        bool stale_vtable;
+    };
+    constexpr Case cases[] = {
+        {"device_first", false, false},
+        {"return_buffer_first", true, false},
+        {"return_buffer_first_stale_vtable", true, true},
+    };
+    struct alignas(16) GuardedProperties {
+        std::uint64_t before[2];
+        D3D12_HEAP_PROPERTIES value;
+        std::uint32_t after;
+    };
+    static_assert(offsetof(GuardedProperties, value) == 16);
+    static_assert(offsetof(GuardedProperties, after) ==
+                  offsetof(GuardedProperties, value) + sizeof(D3D12_HEAP_PROPERTIES));
+
+    constexpr std::uint64_t prefix = 0xd942c503b845a70full;
+    constexpr std::uint32_t suffix = 0xa658f9e2u;
+    for (const auto& test : cases) {
+        GuardedProperties output{{prefix, prefix}, {}, suffix};
+        if (test.stale_vtable) {
+            // Give the stack buffer the same first word as the real COM interface.
+            // Both arguments now look like the device to a vtable-only classifier.
+            std::memcpy(&output.value, device, sizeof(void*));
+        }
+
+        void* first = test.return_buffer_first ? static_cast<void*>(&output.value) : device;
+        void* second = test.return_buffer_first ? device : static_cast<void*>(&output.value);
+        auto* returned = d3d12x_struct_return::get_custom_heap_properties(
+            first, second, node_mask, heap_type, device);
+        if (returned != &output.value) {
+            std::fprintf(stderr, "%s: did not return the caller's output pointer\n", test.name);
+            return 1;
+        }
+        if (output.before[0] != prefix || output.before[1] != prefix || output.after != suffix) {
+            std::fprintf(stderr, "%s: output guards changed\n", test.name);
+            return 1;
+        }
+        if (std::memcmp(&output.value, &expected, sizeof(expected)) != 0) {
+            std::fprintf(stderr, "%s: heap properties differ from the desktop call\n", test.name);
+            return 1;
+        }
+        std::printf("struct_return %s: properties and guards match\n", test.name);
+    }
+    return 0;
+}
+
+int create_checks(XboxCreateDevice create, IUnknown* adapter, const LUID& expected_luid,
+                  bool check_struct_return)
 {
     void* raw = nullptr;
     const HRESULT hr = create(adapter, nullptr, __uuidof(ID3D12Device), &raw);
@@ -197,7 +257,7 @@ int create_checks(XboxCreateDevice create, IUnknown* adapter, const LUID& expect
     std::printf("device_create=S_OK node_count=1 fence=S_OK luid={%08lx:%08lx}\n",
                 static_cast<unsigned long>(actual_luid.HighPart),
                 static_cast<unsigned long>(actual_luid.LowPart));
-    return 0;
+    return check_struct_return ? struct_return_checks(device.Get()) : 0;
 }
 
 int negative_checks(XboxCreateDevice create, IUnknown* adapter)
@@ -233,13 +293,13 @@ int negative_checks(XboxCreateDevice create, IUnknown* adapter)
 int main(int argc, char** argv)
 {
     if (argc != 4) {
-        std::fprintf(stderr, "usage: %s <path-to-d3d12_xs.dll> <create|negative> <warp|hardware>\n",
+        std::fprintf(stderr, "usage: %s <path-to-d3d12_xs.dll> <create|negative|struct-return> <warp|hardware>\n",
                      argv[0]);
         return 2;
     }
     const std::string_view scenario = argv[2];
     const std::string_view backend = argv[3];
-    if ((scenario != "create" && scenario != "negative") ||
+    if ((scenario != "create" && scenario != "negative" && scenario != "struct-return") ||
         (backend != "warp" && backend != "hardware")) {
         std::fputs("unknown scenario or backend\n", stderr);
         return 2;
@@ -259,9 +319,10 @@ int main(int argc, char** argv)
     const bool debug = enable_debug_layer();
     print_environment(choice, warp, debug);
 
-    const int result = scenario == "create"
-                           ? create_checks(create, choice.adapter.Get(), choice.desc.AdapterLuid)
-                           : negative_checks(create, choice.adapter.Get());
+    const int result = scenario == "negative"
+                           ? negative_checks(create, choice.adapter.Get())
+                           : create_checks(create, choice.adapter.Get(), choice.desc.AdapterLuid,
+                                           scenario == "struct-return");
     FreeLibrary(shim);
     std::printf("d3d12x_device_check %s %s: %s\n", argv[2], argv[3], result == 0 ? "PASS" : "FAIL");
     return result;
