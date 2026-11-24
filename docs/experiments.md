@@ -3186,7 +3186,10 @@ through a buffer word, samples an interpolated UV and compares the scaled sample
 with a threshold. Both exits export only coverage. The selector, table pointers
 and point-clamp sampler are specialized for a supplied snapshot. The texture
 and two comparison inputs remain GPU resources. Changing the selector requires
-another translation. The tested inputs are finite and the textures have one mip.
+another translation. The product is `v_mul_legacy_f32_e32` (zero when either input
+is zero) or `v_mul_f32_e32` (IEEE, so zero times infinity is NaN), and the
+kill comparison is one of `v_cmpx_{lt,le,gt,ge}_f32_e32` with the scalar limit
+first. A comparison with NaN kills no pixel. The textures have one mip.
 
 The JSON bindings used by the source-built fixture are constructed by
 `bindings(slot)` in `tests/sampled_coverage_check.py`. A descriptor entry lists
@@ -3206,6 +3209,17 @@ then checks all 64 pixel locations with individual scissored draws. The color
 target must retain its clear value. It exercises both bound textures, mixed
 coverage, full survival and full rejection. A reference computed for the
 opposite texture must fail at the sample comparison.
+
+A second readback runs the IEEE multiply with each of the four comparisons on
+both textures. Its reference is computed on the CPU in binary32 and does not
+share code with the translator. The scale and limit pairs include equality at
+the exact sample values 0 and 1, a negative scale, negative zero, and an
+infinite scale with and without a zero sample. For every comparison the reference
+of each other comparison must fail at the pixel readback, and on the first
+texture so must the reference of the legacy multiply. The Linux step checks
+that these references differ and that malformed variants are rejected. The
+Windows readback has not been run on a GPU adapter by the author; the CI result
+on the pull request is the first measurement.
 
 #### Intel first-full-query diagnostic
 
