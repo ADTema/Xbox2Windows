@@ -1185,7 +1185,7 @@ debugger round trip.
 | `CLWB m8` | `CLFLUSHOPT m8` (one ModRM bit); one `NOP` of the same length once a `CLFLUSHOPT` has faulted on this host |
 | `MONITORX`, `MWAITX` | a 3-byte `NOP`; `PAUSE` and `NOP` (the wait may end at any time) |
 | `CLZERO` | a jump to a stub that stores 64 zero bytes at `rax & ~63` |
-| `INSERTQ xmm, xmm, len, idx`, `EXTRQ xmm, len, idx` (xmm0-7) | a jump to a stub that does the field move in integer registers |
+| `INSERTQ xmm, xmm, len, idx`, `INSERTQ xmm, xmm`, `EXTRQ xmm, len, idx`, `EXTRQ xmm, xmm` | a jump to a stub that does the field move in integer registers (xmm0-15) |
 | `MOVNTSS m32, xmm`, `MOVNTSD m64, xmm` | `MOVSS`, `MOVSD` stores (one opcode byte; the non-temporal hint is dropped) |
 | `RDPRU` | `RDTSC`; `NOP` (the time-stamp counter stands in for MPERF and APERF, so their ratio reads 1) |
 | `RDPID r64` | a jump to a stub that runs `RDTSCP` and moves its `ecx` to the register |
@@ -1194,10 +1194,10 @@ debugger round trip.
 The stubs keep the other registers and the flags. Instructions that the 5-byte jump overwrites
 are re-encoded behind the stub with iced-x86. `events.txt` names the first 40 rewritten sites and
 the summary counts them by instruction. `tools/startup/host_cpu.py` lists the forms that are
-refused (register-count `INSERTQ`/`EXTRQ`, xmm8-15, fields past bit 63).
+refused (memory operands, non-zero `ModRM.reg` on immediate `EXTRQ`, malformed prefixes, fields past bit 63).
 
 `python -B tests/startup_host_cpu_check.py` assembles source-built functions, patches them the same
-way and calls them on the host: 288 `INSERTQ`/`EXTRQ` results against a model, `CLZERO` with a
+way and calls them on the host: 1162 `INSERTQ`/`EXTRQ` results against a model, `CLZERO` with a
 moved `lea` and a moved rip-relative load, and decoded `CLWB` and wait rewrites, including the
 `NOP` form for every addressing mode. The fall-back from `CLFLUSHOPT` to `NOP` in the debugger is
 not exercised here: it needs a host without `CLFLUSHOPT`. Stubs that zero 56
