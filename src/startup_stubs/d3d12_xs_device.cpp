@@ -910,16 +910,16 @@ void __stdcall device_copyable_footprints(Wrapper* self, const D3D12_RESOURCE_DE
 }
 
 // Device slot 41, desktop CreateCommandSignature(desc, root, riid, ppv); on failure the descriptor and
-// its argument descriptors are logged. Argument types outside the desktop enumeration (0x69 seen,
-// stride 12) cannot be created on desktop: they are recognised before the desktop call, which the debug
-// layer would report as an error, and the title gets a placeholder CommandSignature (command lists are
-// not executed).
+// its argument descriptors are logged. The observed console-only type 0x69 gets a placeholder before
+// desktop validation. Other types still reach the desktop even when they postdate DISPATCH_MESH.
 u64 __stdcall device_create_command_signature(Wrapper* self, const D3D12_COMMAND_SIGNATURE_DESC* desc, u64 root,
                                               u64 iid, u64 out)
 {
-    const bool console_type = desc && x2w_startup::has_console_indirect_arg_type(
-        desc->pArgumentDescs, desc->NumArgumentDescs, D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH);
-    if (console_type && out) {
+    void** output = reinterpret_cast<void**>(out);
+    const bool readable_args = x2w_local::readable(desc, sizeof(*desc)) &&
+        x2w_local::readable(desc->pArgumentDescs, std::size_t{desc->NumArgumentDescs} * sizeof(*desc->pArgumentDescs));
+    if (output && readable_args && x2w_startup::has_console_indirect_arg_type(desc->pArgumentDescs, desc->NumArgumentDescs) &&
+        x2w_local::writable(output, sizeof(*output))) {
         static LONG placeholders;
         if (first_calls(placeholders, 8)) {
             log("x2w-d3d12   CreateCommandSignature: console argument type -> placeholder (stride=%u args=%u)",
@@ -930,7 +930,7 @@ u64 __stdcall device_create_command_signature(Wrapper* self, const D3D12_COMMAND
                 log("x2w-d3d12     arg[%u]=[%s]", i, bytes);
             }
         }
-        *reinterpret_cast<void**>(out) = wrap(nullptr, command_signature_kind);
+        *output = wrap(nullptr, command_signature_kind);
         return S_OK;
     }
     const u64 result = create_slot<device_kind, 41, 2>(self, reinterpret_cast<u64>(desc), root, iid, out, 0, 0, 0, 0);
@@ -951,13 +951,22 @@ u64 __stdcall device_create_command_signature(Wrapper* self, const D3D12_COMMAND
         }
     }
     static LONG failures;
-    if (FAILED(static_cast<HRESULT>(result)) && desc && first_calls(failures, 8)) {
+    if (FAILED(static_cast<HRESULT>(result)) && readable_args && first_calls(failures, 8)) {
         log("x2w-d3d12   CreateCommandSignature failed: stride=%u args=%u node=0x%x root=0x%llx", desc->ByteStride,
             desc->NumArgumentDescs, desc->NodeMask, root);
         for (UINT i = 0; i < desc->NumArgumentDescs && i < 8; ++i) {
             char bytes[3 * 16 + 1];
             hex_text(&desc->pArgumentDescs[i], sizeof(D3D12_INDIRECT_ARGUMENT_DESC), bytes, sizeof(bytes));
             log("x2w-d3d12     arg[%u]=[%s]", i, bytes);
+        }
+    }
+    // Preserve the existing fallback for unknown types only after desktop has refused the real request.
+    if (FAILED(static_cast<HRESULT>(result)) && readable_args && output && x2w_local::writable(output, sizeof(*output))) {
+        for (UINT i = 0; i < desc->NumArgumentDescs; ++i) {
+            if (static_cast<UINT>(desc->pArgumentDescs[i].Type) > D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH) {
+                *output = wrap(nullptr, command_signature_kind);
+                return S_OK;
+            }
         }
     }
     return result;

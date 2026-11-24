@@ -1,6 +1,6 @@
 // Checks src/startup_stubs/command_signature_filter.h without a device (builds on any platform): which
-// indirect argument descriptions desktop D3D12 cannot create, so that device slot 41 does not hand
-// them to the desktop device. usage: startup_command_signature_filter_check [--mutate off-by-one|first-only]
+// indirect argument descriptions device slot 41 recognises before calling desktop D3D12.
+// usage: startup_command_signature_filter_check [--mutate off-by-one|first-only]
 #include "startup_stubs/command_signature_filter.h"
 
 #include <cstdio>
@@ -12,27 +12,30 @@ struct Argument {
     unsigned Type;
     unsigned Payload[3];
 };
-constexpr unsigned last_desktop_type = 9;  // D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH
+constexpr unsigned dispatch_mesh = 10;
+constexpr unsigned incrementing_constant = 11;
 
 enum class Mutation { none, off_by_one, first_only };
 Mutation mutation = Mutation::none;
 int failures;
 
-// The two wrong versions the check must catch: a bound that refuses the last desktop type, and a
-// scan that only reads the first argument.
+// The two wrong versions: a range check that excludes new desktop types, and a first-argument-only scan.
 bool under_test(const Argument* arguments, std::size_t count)
 {
     switch (mutation) {
-    case Mutation::off_by_one: return x2w_startup::has_console_indirect_arg_type(arguments, count, last_desktop_type - 1);
-    case Mutation::first_only: return x2w_startup::has_console_indirect_arg_type(arguments, count ? 1 : 0, last_desktop_type);
-    default: return x2w_startup::has_console_indirect_arg_type(arguments, count, last_desktop_type);
+    case Mutation::off_by_one:
+        for (std::size_t i = 0; arguments && i < count; ++i)
+            if (arguments[i].Type > dispatch_mesh) return true;
+        return false;
+    case Mutation::first_only: return x2w_startup::has_console_indirect_arg_type(arguments, count ? 1 : 0);
+    default: return x2w_startup::has_console_indirect_arg_type(arguments, count);
     }
 }
 
 void expect(const char* name, const Argument* arguments, std::size_t count, bool expected)
 {
     if (under_test(arguments, count) != expected) {
-        std::printf("FAIL %s: expected %s\n", name, expected ? "a console type" : "desktop types only");
+        std::printf("FAIL %s: expected %s\n", name, expected ? "the known console type" : "desktop validation");
         ++failures;
     }
 }
@@ -50,10 +53,10 @@ int main(int argc, char** argv)
 
     const Argument draw_indexed[] = {{2, {}}};
     expect("one desktop argument", draw_indexed, 1, false);
-    const Argument largest_desktop[] = {{last_desktop_type, {}}};
-    expect("the largest desktop type", largest_desktop, 1, false);
-    const Argument first_after[] = {{last_desktop_type + 1, {}}};
-    expect("the first type above the desktop range", first_after, 1, true);
+    const Argument mesh[] = {{dispatch_mesh, {}}};
+    expect("the desktop mesh type", mesh, 1, false);
+    const Argument increment[] = {{incrementing_constant, {}}};
+    expect("the desktop incrementing-constant type reaches desktop validation", increment, 1, false);
     const Argument seen[] = {{0x69, {12, 0, 0}}};
     expect("the type seen in a title (0x69)", seen, 1, true);
     const Argument mixed[] = {{1, {}}, {0x69, {}}};
@@ -61,7 +64,7 @@ int main(int argc, char** argv)
     const Argument all_desktop[] = {{0, {}}, {4, {}}, {9, {}}};
     expect("several desktop types", all_desktop, 3, false);
     const Argument wide[] = {{0xffffffffu, {}}};
-    expect("a type with the high bit set", wide, 1, true);
+    expect("an unrecognised type reaches desktop validation", wide, 1, false);
     expect("no arguments", draw_indexed, 0, false);
     expect("a null list", nullptr, 3, false);
 

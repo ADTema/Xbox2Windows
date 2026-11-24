@@ -21,7 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <fstream>
+#include <share.h>
 #include <string>
 #include <vector>
 
@@ -58,11 +58,15 @@ bool stored_message(ID3D12Device* device, int id)
 // The wrapper's log lines that carry a debug layer message with the id.
 int logged_messages(const std::wstring& path, int id)
 {
-    std::ifstream log{path};
+    FILE* log = _wfsopen(path.c_str(), L"rb", _SH_DENYNO);
+    if (!log) return -1;
     const std::string wanted = "id=" + std::to_string(id) + " ";
     int found = 0;
-    for (std::string line; std::getline(log, line);)
-        if (line.find("x2w-d3d12-debug") != std::string::npos && line.find(wanted) != std::string::npos) ++found;
+    char line[2048];
+    while (std::fgets(line, sizeof(line), log))
+        if (std::strstr(line, "x2w-d3d12-debug") && std::strstr(line, wanted.c_str())) ++found;
+    if (std::ferror(log)) found = -1;
+    std::fclose(log);
     return found;
 }
 
@@ -130,6 +134,10 @@ int main(int argc, char** argv)
     }
     std::printf("control: the desktop device refuses type 0x%x and the layer reports message %d\n", console_argument_type,
                 unexpected_parameter_type);
+    // The guest wrapper can open the same underlying device. Remove the control's own message first.
+    ComPtr<ID3D12InfoQueue> control_queue;
+    if (FAILED(desktop.As(&control_queue))) return 4;
+    control_queue->ClearStoredMessages();
 
     std::array<unsigned char, 64> parameters{};
     void* device = nullptr;
@@ -140,7 +148,8 @@ int main(int argc, char** argv)
     std::printf("valid DRAW_INDEXED: hr 0x%08lx object %p\n", static_cast<unsigned long>(hr), created);
     if (FAILED(hr) || !created) return 10;
     if (const int seen = logged_messages(log_path, unexpected_parameter_type)) {
-        std::printf("FAIL valid DRAW_INDEXED: %d debug layer message(s) %d\n", seen, unexpected_parameter_type);
+        if (seen < 0) std::puts("FAIL valid DRAW_INDEXED: could not read debug log");
+        else std::printf("FAIL valid DRAW_INDEXED: %d debug layer message(s) %d\n", seen, unexpected_parameter_type);
         return 11;
     }
 
@@ -148,7 +157,8 @@ int main(int argc, char** argv)
     std::printf("console type 0x%x: hr 0x%08lx object %p\n", console_argument_type, static_cast<unsigned long>(hr), created);
     if (FAILED(hr) || !created) return 12;
     if (const int seen = logged_messages(log_path, unexpected_parameter_type)) {
-        std::printf("FAIL console type: %d debug layer message(s) %d\n", seen, unexpected_parameter_type);
+        if (seen < 0) std::puts("FAIL console type: could not read debug log");
+        else std::printf("FAIL console type: %d debug layer message(s) %d\n", seen, unexpected_parameter_type);
         return 13;
     }
     DeleteFileW(log_path.c_str());
