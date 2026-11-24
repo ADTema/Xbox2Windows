@@ -2965,6 +2965,12 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     scalar = TrackedScalar({f"s{texture_sgpr}": "texture_ptr", f"s{interp_sgpr}": "interp_base"}, scalar_mask)
     vector = TrackedVector({"v0": "bary_i", "v1": "bary_j"})
     known_ssa_bits: dict[str, int] = {}
+    # Provenance of binary64 words: SSA name of a VGPR word -> (record, 0 for the low word or 1 for the high word).
+    # The record names what the pair holds: ("i32" | "u32", name of the uint source of v_cvt_f64_i32 | v_cvt_f64_u32)
+    # or ("static", low, high) for v_cvt_f64_f32 of a statically known source. Every word value is an immutable
+    # HLSL temporary, so an overwritten word names another SSA value and loses its entry; v_mov_b32 and a join of
+    # equal entries are the only ways the entry travels. v_cvt_i32_f64 and v_cvt_u32_f64 read it.
+    f64_words: dict[str, tuple] = {}
     known_half: dict[str, int] = {}  # half16 result name -> proven binary16 bits
     # Each emitted value has a unique identity. Entry-only writes never gain a helper definition.
     # The boolean records whether the quad value depends on interpolated coordinates.
@@ -3078,6 +3084,12 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         offset_index = {}
         positioned = ((None, line) for line in instructions)
 
+    def join_f64_word(name, *values):
+        """A joined register keeps its binary64 word provenance only if every path carries the same entry."""
+        entry = f64_words.get(values[0])
+        if entry is not None and all(f64_words.get(value) == entry for value in values[1:]):
+            f64_words[name] = entry
+
     def close_region(i, pair):
         """Merge every register the open region rewrote with a per-lane select on its condition."""
         nonlocal scc
@@ -3101,6 +3113,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 else_value = dict.get(vector, dst) if in_else else outer
                 lines.append(f"    precise float alu{i}_{dst} = ({region['cond']} ? {then_value} : {else_value});")
                 vector[dst] = f"alu{i}_{dst}"
+                join_f64_word(vector[dst], then_value, else_value)
         for dst, outer in ({} if region["else"] is not None else region["written"]).items():
             if outer is MISSING or dst in vector.conditional:
                 vector.conditional.add(dst)
@@ -3110,6 +3123,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             inner = vector[dst]
             lines.append(f"    precise float alu{i}_{dst} = ({region['cond']} ? {inner} : {outer});")
             vector[dst] = f"alu{i}_{dst}"
+            join_f64_word(vector[dst], inner, outer)
         if region["skipped"]:
             # A wave that skipped the region (or one arm) never ran its waits, so what was outstanding at the opener
             # still is.
@@ -4481,7 +4495,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             elif src.startswith("v") and isinstance(vector.get(src), str) and vector[src] in known_ssa_bits:
                 src_bits = known_ssa_bits[vector[src]]
             is_uniform = src.startswith("s") or bool(re.fullmatch(r"-?\d+(?:\.\d+)?|0x[0-9a-f]{1,8}", src)) or vector.is_uniform(src)
+            word = f64_words.get(vector.get(src)) if src.startswith("v") else None
             vector[dst] = f"alu{i}"
+            if word is not None:
+                f64_words[f"alu{i}"] = word
             if src_bits is not None:
                 known_ssa_bits[f"alu{i}"] = src_bits
             if is_uniform:
@@ -4768,6 +4785,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    precise float alu{i}l = asfloat(c{i}u == 0u ? 0u : c{i}f << 21);")
             lines.append(f"    precise float alu{i}h = asfloat(c{i}u == 0u ? 0u : c{i}s | ((1023u + c{i}n) << 20) | (c{i}f >> 11));")
             vector[names[0]], vector[names[1]] = f"alu{i}l", f"alu{i}h"
+            f64_words[f"alu{i}l"], f64_words[f"alu{i}h"] = ((kind, f"c{i}x"), 0), ((kind, f"c{i}x"), 1)
         elif m := match(r"v_cvt_f64_f32(_e32|_e64)? v\[(0|[1-9]\d*):(0|[1-9]\d*)\], ([^,\s]+)"):
             # Exact binary32 to binary64 conversion into a VGPR pair v[d:d+1], for a statically known source only
             # (cvt_f64_f32_source_bits). Both result words are computed here, in Python, and emitted as constants:
@@ -4802,6 +4820,41 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    precise float alu{i}l = asfloat({low}u);")
             lines.append(f"    precise float alu{i}h = asfloat({high}u);")
             vector[names[0]], vector[names[1]] = f"alu{i}l", f"alu{i}h"
+            f64_words[f"alu{i}l"], f64_words[f"alu{i}h"] = (("static", low, high), 0), (("static", low, high), 1)
+        elif m := match(r"v_cvt_(i32|u32)_f64(?:_e32)? (v\d+), v\[(0|[1-9]\d*):(0|[1-9]\d*)\]"):
+            # Binary64 to 32-bit integer, for a pair whose provenance is proven (f64_words); no HLSL double is used.
+            # Accepted: the pair of v_cvt_f64_i32 read by v_cvt_i32_f64 and the pair of v_cvt_f64_u32 read by
+            # v_cvt_u32_f64 (every 32-bit integer is exact in binary64, so the round trip returns the source word),
+            # and the pair of v_cvt_f64_f32 of a static source, truncated toward zero here in Python when the value is
+            # finite and the truncated result fits the destination. Both words must carry the same record, the low
+            # word as word 0 and the high word as word 1. Cross-signedness, NaN, infinity, out-of-range values, a
+            # pair of unknown provenance (raw constants, runtime registers) and a pair with one overwritten word are
+            # refused; so are the _e64 spelling and every modifier, which fall through to the unsupported error.
+            kind, dst, first, last = m.groups()
+            first, last = int(first), int(last)
+            names = (f"v{first}", f"v{last}")
+            if (mask != "entry" or last != first + 1 or last > 255 or int(dst[1:]) > 255 or dst in sample_dest
+                    or any(name in sample_dest or name in pending for name in names)):
+                raise ValueError("Invalid binary64 to 32-bit integer conversion")
+            low_word, high_word = (f64_words.get(vector.get(name)) for name in names)
+            if (low_word is None or high_word is None or low_word[0] != high_word[0]
+                    or (low_word[1], high_word[1]) != (0, 1)):
+                raise ValueError(f"Unproven binary64 source v[{first}:{last}] at v_cvt_{kind}_f64")
+            record = low_word[0]
+            if record[0] == "static":
+                value = struct.unpack("<d", struct.pack("<II", record[1], record[2]))[0]
+                if not math.isfinite(value):
+                    raise ValueError(f"v_cvt_{kind}_f64 source is not finite")
+                result = math.trunc(value)
+                if not (-0x80000000 if kind == "i32" else 0) <= result <= (0x7fffffff if kind == "i32" else 0xffffffff):
+                    raise ValueError(f"v_cvt_{kind}_f64 source {value!r} is out of range")
+                expression = f"{result & 0xffffffff}u"
+            elif record[0] != kind:
+                raise ValueError(f"v_cvt_{kind}_f64 of a v_cvt_f64_{record[0]} pair is not a supported round trip")
+            else:
+                expression = record[1]
+            lines.append(f"    precise float alu{i} = asfloat({expression});")
+            vector[dst] = f"alu{i}"
         elif m := match(rf"v_(add|sub|subrev)_co_ci_u32_(e32|e64) (v\d+), {LANE_MASK}, ([^,\s]+), ([^,\s]+), {LANE_MASK}"):
             # The carry-out add and subtracts above with a carry or borrow of each lane read from a lane mask.
             # LLVM 15 prints both encodings with their suffix. The VOP2 (e32) encoding reads and writes VCC and
