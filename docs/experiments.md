@@ -3060,6 +3060,40 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^compute_store_aot_mtbuf_store_(warp|hardware)$' -V
 ```
 
+### Indexed gfx1030 raw subword reads
+
+The compute store profile lowers `buffer_load_ubyte`, `buffer_load_sbyte`,
+`buffer_load_ushort` and `buffer_load_sshort` to full 32-bit VGPR values.
+It accepts `idxen` with a verified dispatch-thread index, a zero scalar
+offset, and a naturally aligned immediate that fits in the bound source
+record. The `t0` raw view base and the explicit source stride are DWORD
+aligned. The translator loads the containing DWORD, then extracts and
+zero- or sign-extends the selected field. The descriptor needs
+`lgkmcnt(0)` and the result needs `vmcnt(0)` before use. Other address
+modes, modifiers, D16 operations and reads from the output UAV are refused.
+The caller supplies stable, disjoint, fully in-range source records with
+no swizzle; this profile does not emulate native descriptor bounds.
+
+The wave32 programs copy one subword from each eight-byte source record
+to the second DWORD of an eight-byte output record. The CPU reference
+reads little-endian bytes independently and compares all 320 output words,
+including inter-record gaps and the untouched tail, after one and three
+groups. Selecting the wrong byte or halfword, or zero-extending either
+signed load, must fail first at output word 1. Controls also refuse an
+odd halfword offset, a read outside its record, and missing waits. LLVM 15
+assembles all four programs and checks that the compute container CLI
+emits the same HLSL as lowering the source instructions; the dispatches
+execute translated desktop DXIL, not native RDNA2 code.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_subword_' -V
+```
+
+```sh
+python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
 ### Per-lane guards around compute stores
 
 A per-lane bound such as `if (gid < n) store` compiles under LLVM 15 to one exit, with no early `s_endpgm`. A `v_cmp` sets `vcc_lo`, `s_and_saveexec_b32` saves `exec_lo` and masks it, and an optional `s_cbranch_execz` skips the masked block when no lane passes. `s_or_b32 exec_lo, exec_lo, sN` then restores the mask, or the program exits with the mask still applied. The store profile lowers this form as control flow: the stores issued under the mask go inside an HLSL `if`, and stores after the restore stay outside it.

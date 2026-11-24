@@ -980,15 +980,19 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     or row_tag[1] == column_tag[1]):
                 raise ValueError("Unverified row pitch byte offset")
             vector[dst] = ("pitch_bytes", row_tag[1], int(pitch, 0), *column_tag[1:])
-        elif m := re.fullmatch(r"(?:buffer_load_dword|(?P<typed>tbuffer_load_format_x)) "
+        elif m := re.fullmatch(r"(?:buffer_load_(?:dword|(?P<subword>[us](?:byte|short)))|(?P<typed>tbuffer_load_format_x)) "
                                r"v(?P<dst>\d+), (?P<addr>off|v\d+), s\[(?P<base>\d+):(?P<high>\d+)\], 0"
                                r"(?(typed) format:\[BUF_FMT_32_UINT\])(?P<idxen> idxen)?(?P<offen> offen)?"
                                r"(?: offset:(?P<offset>\d+))?", line):
             dst, base, high = int(m["dst"]), int(m["base"]), int(m["high"])
             offset = int(m["offset"] or 0)
             addr, idxen, offen = m["addr"], m["idxen"], m["offen"]
+            subword = m["subword"]
+            width = 4 if subword is None else 1 if subword.endswith("byte") else 2
             if m["typed"] and (cpu != "gfx1030" or not idxen or offen):
                 raise ValueError("Unsupported typed buffer read target or address mode")
+            if subword and (cpu != "gfx1030" or not idxen or offen):
+                raise ValueError("Unsupported subword buffer read target or address mode")
             if (dst > 255 or high != base + 3 or base % 4 or high > 105
                     or pending.intersection(range(base, high + 1))):
                 raise ValueError("Unverified buffer read descriptor")
@@ -998,7 +1002,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Reads from the stored UAV are not supported")
             if kinds != tuple(("srv", i) for i in range(4)):
                 raise ValueError("Unverified buffer read descriptor")
-            if offset % 4 or offset > 4095:
+            if offset % width or offset > 4095:
                 raise ValueError("Unverified read offset")
             tag = vector.get(int(addr[1:])) if addr != "off" else None
             if addr == "off" and not idxen and not offen:
@@ -1010,13 +1014,22 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             elif (idxen and not offen and source_stride is not None and isinstance(tag, tuple)
                   and tag[0] == "thread"):
                 # idxen: index * stride + instruction offset, inside one source element.
-                if offset + 4 > source_stride:
+                if offset + width > source_stride:
                     raise ValueError("Read leaves its source element")
-                address = f"tid.{AXES[tag[1]]} * {source_stride}u + {offset}u"
+                address = f"tid.{AXES[tag[1]]} * {source_stride}u + {offset & ~3}u"
             else:
                 raise ValueError("Unsupported read address")
             vector.pop(dst, None)
-            loading[dst] = ("source", address)
+            word = ("source", address)
+            if subword:
+                # The stride and SRV base are DWORD-aligned, so the enclosing word stays in the record.
+                bits, shift = width * 8, (offset % 4) * 8
+                field = f"(({hlsl_word(word)} >> {shift}u) & {((1 << bits) - 1):#x}u)"
+                if subword.startswith("s"):
+                    sign = f"{1 << (bits - 1):#x}u"
+                    field = f"(({field} ^ {sign}) - {sign})"
+                word = ("alu", field)
+            loading[dst] = word
         elif m := re.fullmatch(r"(?:buffer_store_dword(?:x([234]))?|tbuffer_store_format_(?P<channels>x|xy|xyz|xyzw)) "
                                r"(v\d+|v\[\d+:\d+\]), (off|v\d+|v\[\d+:\d+\]), s\[(\d+):(\d+)\], 0"
                                r"(?(channels) format:\[(?P<format>BUF_FMT_(?:32_){1,4}UINT)\])"
