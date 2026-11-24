@@ -4570,6 +4570,86 @@ Run `ctest --preset dev --no-tests=error -R '^(d3d12x_descriptor|d3d12x_device_)
 [Descriptor heaps](https://learn.microsoft.com/en-us/windows/win32/direct3d12/descriptor-heaps) ·
 [Descriptor tables](https://learn.microsoft.com/en-us/windows/win32/direct3d12/using-descriptor-tables)
 
+#### D3D12.X compute command list recording, barriers and readback (XCL-10)
+
+The public Microsoft D3D12 material and the Windows SDK `d3d12.h` expose no
+`D3D12X`-prefixed command-list creation or recording export. The documented path is
+`ID3D12Device::CreateCommandList` on the `ID3D12Device` returned by
+`D3D12XboxCreateDevice`; Microsoft's Xbox ATG sample creates the device and then calls the
+desktop `CreateCommandList` method on it. This fixture therefore adds no `d3d12_xs.dll`
+export and starts from the XCL-08 device. The observed console vtable slots in
+`src/d3d12x_device_slots.h` remain diagnostic inventory, not a production command-list ABI.
+
+[`tests/d3d12x_compute_list.hlsl`](../tests/d3d12x_compute_list.hlsl) is a source-built
+`cs_6_0` shader with one structured UAV (`u0`) and four root constants (`b0`). The shader
+adds the root-constant addend to `targetWords[baseIndex + SV_DispatchThreadID.x]`.
+[`tests/d3d12x_compute_list_check.cpp`](../tests/d3d12x_compute_list_check.cpp) loads the
+built `d3d12_xs.dll` by explicit path, verifies that `D3D12XboxCreateDevice` belongs to that
+module, creates the device with `parameters == nullptr` and `IID_ID3D12Device`, and records
+a compute list on the returned device. It reuses the source-built `ComputeCommands`,
+`make_buffer` and `transition` helpers from [`tests/desktop_gpu.cpp`](../tests/desktop_gpu.cpp).
+
+The target is a 320-word default-heap buffer with `ALLOW_UNORDERED_ACCESS`. The upload and
+readback buffers use their D3D12-fixed heap states (`GENERIC_READ` and `COPY_DEST`), so the
+fixture does not transition them; it transitions the default-heap target and treats the two
+fixed states as requirements on every copy. One non-visible and one shader-visible
+four-descriptor view heap hold the full-buffer UAV at slot 0 and a 64-word tail UAV at slot
+1. The visible copies are written with `CopyDescriptorsSimple` and the visible heap is bound
+before the clear and the descriptor table.
+
+The recorded sequence is:
+
+1. `target` `COMMON -> COPY_DEST`, `CopyBufferRegion` from the upload buffer, then
+   `target` `COPY_DEST -> UNORDERED_ACCESS`.
+2. `ClearUnorderedAccessViewUint` on the 64-word tail view with `0xdeadbeef`, using the CPU
+   handle from the non-visible heap and the GPU handle from the bound visible heap.
+3. `Dispatch(1, 1, 1)` with base 0 and addend `0x01020304`.
+4. A `D3D12_RESOURCE_BARRIER_TYPE_UAV` barrier on `target`.
+5. `Dispatch(3, 1, 1)` with base 64 and addend `0x0f0e0d0c`.
+6. `target` `UNORDERED_ACCESS -> COPY_SOURCE`, `CopyBufferRegion` into the readback buffer,
+   then `target` `COPY_SOURCE -> COMMON`.
+
+The expected readback is 64 words of input plus the first addend, 192 words of input plus
+the second addend, and 64 tail words still holding the clear value. The fixture checks all
+320 words and prints an FNV-1a hash. Both backends read back the same hash, `0x0afb0285`.
+
+The negative controls cover a missing dispatch and wrong resource states. Re-recording the
+same list without `Dispatch(3, 1, 1)` must leave the 192 words at the copied input values:
+the first mismatch is word 64, expected `0x1f0e0ecc`, actual `0x100001c0`, and exactly 192
+words differ. The first 64 words and the 64-word clear tail still match. A source-owned
+state audit rejects four wrong-state operations and names each one: a dispatch while
+`target` is `COMMON` instead of `UNORDERED_ACCESS`, a transition of the fixed upload buffer,
+a transition of the fixed readback buffer, and a copy from `target` while it is `COMMON`
+instead of `COPY_SOURCE`. The audit is fixture policy; it does not claim the in-box runtime
+rejects those commands without the debug layer.
+
+| CTest case | Inputs and checks |
+|---|---|
+| `d3d12x_compute_list_warp` | Creates the XCL-08 device on WARP, records and submits the two dispatches with four transitions, one UAV barrier, one tail clear, one upload copy and one readback copy, then checks all 320 readback words and both negative controls. |
+| `d3d12x_compute_list_hardware` | Runs the same fixture on the first non-software D3D12 adapter, or the one selected by `XBOX2WINDOWS_ADAPTER`; skips (77) without a physical adapter. |
+
+Run `ctest --preset dev --no-tests=error -R '^d3d12x_compute_list_' -V`.
+
+On Windows 10.0.26300 with the debug layer unavailable, both cases passed on in-box WARP
+(Microsoft Basic Render Driver, vendor `1414`, device `008c`, driver `10.0.26100.10068`) and
+on an AMD Radeon RX 9060 XT (vendor `1002`, device `7590`, driver `32.0.32029.2010`). WARP
+reported 64-byte view increments; the Radeon reported 32-byte increments and a zero GPU
+start for the non-visible heap. No case failed; the first limit is that the wrong-state
+controls are source-owned because the debug layer was unavailable. The hardware case returns
+77 when no physical adapter is available.
+
+The boundary is the desktop device path, not a claimed console command-list ABI. The fixture
+uses the desktop allocator, command-list, barrier, clear, copy and queue methods on the
+XCL-08 device. It does not establish a console command-list creation export, console
+allocator or list layout, PresentX, bundles, multi-queue submission or console resource-state
+rules. The command list, shader and buffers are source-built desktop fixtures.
+
+[Microsoft CreateCommandList](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-createcommandlist) ·
+[Recording command lists and bundles](https://learn.microsoft.com/en-us/windows/win32/direct3d12/recording-command-lists-and-bundles) ·
+[ClearUnorderedAccessViewUint](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12graphicscommandlist-clearunorderedaccessviewuint) ·
+[Resource barriers](https://learn.microsoft.com/en-us/windows/win32/direct3d12/using-resource-barriers-to-synchronize-resource-states-in-direct3d-12) ·
+[Xbox ATG SimpleDeviceAndSwapChain12](https://github.com/microsoft/Xbox-ATG-Samples/blob/main/XDKSamples/IntroGraphics/SimpleDeviceAndSwapChain12/SimpleDeviceAndSwapChain.cpp)
+
 #### D3D12ConfigureVirtualMemoryX call shape (#874)
 
 The main executable imports `d3d12_xs.dll!D3D12ConfigureVirtualMemoryX` and calls it once, before the D3D12 device is created. A static read of the call site shows:
