@@ -768,10 +768,17 @@ READ_MUL_LO = variant(
     ("v_mad_u32_u24 v1, v2, v1, v0", "v_mul_lo_u32 v1, s0, v1"),
     ("v_min_u32_e32 v1, s0, v1", ""),
 )
+# The remaining unsigned VOP2 operations of the subset, chained so each result feeds the next.
+READ_VOP2 = variant(
+    READ_COMPUTE,
+    ("v_min_u32_e32 v1, s0, v1", "v_add_nc_u32_e32 v2, 7, v1\nv_or_b32_e32 v2, s0, v2\n"
+                                 "v_xor_b32_e32 v2, 0x80000001, v2\nv_max_u32_e32 v1, s0, v2"),
+)
 ALU_CASES = [
     ("read_compute", READ_COMPUTE, 32, READ_BINDING),
     ("read_mad24", READ_MAD24, 32, READ_BINDING),
     ("read_mul_lo", READ_MUL_LO, 32, READ_BINDING),
+    ("read_vop2", READ_VOP2, 32, READ_BINDING),
 ]
 
 
@@ -989,6 +996,11 @@ def alu_controls():
     load = READ_LOADS["read_copy"]
     assert (f"min(params[0].y, (((0x0000012cu & 0xffffffu) * ((0xfffffff0u & {load}) & 0xffffffu)) + params[0].y)"
             in alu(("0xffff, v1", "-16, v1"), (mad, "v_mad_u32_u24 v1, 0x12c, v2, s0"))[-3])
+    # Add, or, xor and max apply in order: max(cap, 0x80000001 ^ (cap | (7 + mad))); src0 prints first.
+    mad_word = ALU_WORD.split(", ", 1)[1][:-1]
+    vop2 = aot.lower(READ_VOP2, 32, **READ_BINDING).splitlines()
+    assert vop2[-3] == ("        outputData.Store(tid.x * 4u + 0u, max(params[0].y, "
+                        f"(0x80000001u ^ (params[0].y | (0x00000007u + {mad_word})))));"), vop2
     mul = "v_mul_lo_u32 v1, s0, v1"
     lines = aot.lower(READ_MUL_LO, 32, **READ_BINDING).splitlines()
     assert lines[-4:] == [GUARD_IF, f"        outputData.Store(tid.x * 4u + 0u, (params[0].y * {load}));",
@@ -1006,9 +1018,9 @@ def alu_controls():
     for message, changes in (
         # Wrong opcodes: signed or other operations, and a carry form that would write vcc.
         (unsupported + "v_min_i32_e32", (("v_min_u32_e32", "v_min_i32_e32"),)),
-        (unsupported + "v_max_u32_e32", (("v_min_u32_e32", "v_max_u32_e32"),)),
+        (unsupported + "v_max_i32_e32", (("v_min_u32_e32", "v_max_i32_e32"),)),
         (unsupported + "v_ashrrev_i32_e32", (("v_lshrrev_b32_e32", "v_ashrrev_i32_e32"),)),
-        (unsupported + "v_or_b32_e32", (("v_and_b32_e32", "v_or_b32_e32"),)),
+        (unsupported + "v_xnor_b32_e32", (("v_and_b32_e32", "v_xnor_b32_e32"),)),
         (unsupported + "v_mad_i32_i24", ((mad, "v_mad_i32_i24 v1, v2, v1, v0"),)),
         (unsupported + "v_add_co_u32", ((mad, "v_add_co_u32 v1, vcc_lo, v2, v0"),)),
         # Wrong operand widths: 16-bit, 64-bit and sub-dword (SDWA) forms, and a register range.
