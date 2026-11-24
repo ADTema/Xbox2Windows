@@ -385,7 +385,13 @@ int main(int argc, char** argv)
             IGameInputReading* kback = nullptr;
             failures += check(input->GetPreviousReading(pad_b, kind_keyboard, kbd_device, &kback) == S_OK && kback, "previous keyboard reading");
             if (kback) {
-                failures += check(kback->GetSequenceNumber(kind_keyboard) == key52 - 1 && key52 > key51, "previous keyboard reading skips pad-only entries");
+                failures += check(kback->GetSequenceNumber(kind_keyboard) == key52 && key52 > key51,
+                                  "previous keyboard reading skips pad-only entries");
+                IGameInputReading* earlier_key = nullptr;
+                failures += check(input->GetPreviousReading(kback, kind_keyboard, kbd_device, &earlier_key) == S_OK &&
+                                      earlier_key && earlier_key->GetSequenceNumber(kind_keyboard) == key52 - 1,
+                                  "previous keyboard reading steps back from a keyboard entry");
+                if (earlier_key) earlier_key->Release();
                 kback->Release();
             }
             pad_b->Release();

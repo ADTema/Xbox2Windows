@@ -278,6 +278,7 @@ struct Reading : Object {
     std::uint32_t key_count;
     KeyState keys[max_keys];
     u64 timestamp;
+    u64 order;
     u64 pad_sequence, key_sequence;  // per-kind sequence numbers, as GameInput documents them
 };
 constexpr std::uint32_t history_pad = 1, history_keys = 2;
@@ -416,14 +417,22 @@ std::uint32_t history_mask(std::uint32_t reading_kind)
     return (wants_gamepad(reading_kind) ? history_pad : 0) | ((reading_kind & kind_keyboard) ? history_keys : 0);
 }
 
-// Looks `step` (+1 / -1) kinds-sequence away from `ref_sequence` in one kind's ring.
+// Finds the nearest entry before or after the reference position in one kind's ring.
 // Returns 0 on hit, -1 if there is none (not found), -2 if the wanted entry was already evicted (too old).
-int find_in_ring(const KindRing& ring, u64 ref_sequence, int step, HistoryEntry& out)
+int find_in_ring(const KindRing& ring, u64 ref_sequence, u64 ref_order, int step, HistoryEntry& out)
 {
     if (ring.count == 0) return -1;
-    const u64 target = step > 0 ? ref_sequence + 1 : ref_sequence - 1;
+    const u64 oldest = ring.latest - ring.count + 1;
+    u64 target = ref_sequence + 1;
+    if (step < 0) {
+        if (ref_sequence == 0) return -1;
+        if (ref_sequence < oldest) return -2;
+        target = ref_sequence;
+        // A different kind may have advanced the stream since this kind last changed.
+        if (ring.entries[target % history_capacity].order == ref_order) --target;
+    }
     if (target == 0 || target > ring.latest) return -1;
-    if (target < ring.latest - ring.count + 1) return -2;
+    if (target < oldest) return -2;
     out = ring.entries[target % history_capacity];
     return 0;
 }
@@ -439,7 +448,7 @@ int find_history(const Reading& ref, int step, std::uint32_t mask, HistoryEntry&
         if (!(mask & bit)) continue;
         const KindRing& ring = i == 0 ? pad_ring : key_ring;
         HistoryEntry candidate{};
-        const int found = find_in_ring(ring, i == 0 ? ref.pad_sequence : ref.key_sequence, step, candidate);
+        const int found = find_in_ring(ring, i == 0 ? ref.pad_sequence : ref.key_sequence, ref.order, step, candidate);
         if (found == -2) {
             result = -2;
             have = false;
@@ -467,6 +476,7 @@ Reading* make_reading(const HistoryEntry& entry, std::uint32_t kind, Object* dev
     reading->pad_sequence = entry.pad_sequence;
     reading->key_sequence = entry.key_sequence;
     reading->timestamp = entry.timestamp;
+    reading->order = entry.order;
     return reading;
 }
 
