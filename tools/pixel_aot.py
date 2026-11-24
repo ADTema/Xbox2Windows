@@ -2579,7 +2579,11 @@ def fma_mix_operand(token, is_f16, is_hi, scalar, vector, pending, sample_dest):
     if m := re.fullmatch(r"abs\(([^()|]+)\)|\|([^()|]+)\|", token):
         use_abs = True
         token = m.group(1) or m.group(2)
-    if is_f16:
+    if re.fullmatch(r"-\d+", token) and -16 <= int(token) <= -1:
+        raise ValueError(f"Ambiguous mixed-precision inline constant {token}")
+    if token == "-0":
+        expr = "asfloat(0x80000000u)"
+    elif is_f16:
         if token in INLINE_F16:
             word = f"{INLINE_F16[token]}u"
         elif re.fullmatch(r"[vs]\d+", token):

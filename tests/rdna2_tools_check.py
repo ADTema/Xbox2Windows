@@ -2456,6 +2456,18 @@ class TestRdna2Disasm(unittest.TestCase):
                 ]
                 self.assertEqual(lowered, [f"widen16(asuint(alu_{i}){shift})" for i in (2, 3, 4)])
 
+        # The inline zero's negation applies after half selection and widening.
+        for is_f16, is_hi in ((False, False), (True, False), (True, True)):
+            with self.subTest(is_f16=is_f16, is_hi=is_hi):
+                self.assertEqual(
+                    fma_mix_operand("-0", is_f16, is_hi, {}, vec, set(), set()),
+                    "asfloat(0x80000000u)",
+                )
+                for value in range(-16, 0):
+                    with self.subTest(value=value):
+                        with self.assertRaisesRegex(ValueError, "Ambiguous mixed-precision inline constant"):
+                            fma_mix_operand(str(value), is_f16, is_hi, {}, vec, set(), set())
+
         # Literal operand with combined -|literal| modifiers must consume trailing DWORD and round-trip.
         lit_raw = encode_fma_mix(0x20, 1, 255, 259, 260, abs_bits=(1, 0, 0), neg_bits=(1, 0, 0), literal=0x3f800000)
         lit_insns = disasm_rdna2(lit_raw)
