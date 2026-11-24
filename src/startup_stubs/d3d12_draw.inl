@@ -675,7 +675,8 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             address = pass.root_address[srv.a];
             bytes = readable_window(address, 0x10000);
         }
-        const u64 entry = srv.source == 0 && srv.a < 16 && pass.table_address[srv.a] ? pass.table_address[srv.a] + static_cast<u64>(srv.b) : 0;
+        const u64 entry = srv.source == 0 && srv.a >= 0 && srv.a < 16 && srv.b >= 0 ?
+            pass.view_tables[srv.a].record(static_cast<u64>(srv.b), 32) : 0;
         std::uint32_t words[8] = {};
         if (entry && x2w_local::readable(reinterpret_cast<const void*>(entry), 32)) std::memcpy(words, reinterpret_cast<const void*>(entry), 32);
         if (srv.kind == 1 || srv.kind == 3) {
@@ -826,10 +827,15 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
 void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const* heaps)
 {
     x2w_startup::SamplerSource source;
+    u64 view_heap = 0;
     if (count && count <= 4 && x2w_local::readable(heaps, std::size_t{count} * sizeof(*heaps))) {
         AcquireSRWLockShared(&note_lock);
         for (UINT i = 0; i < count; ++i) {
             for (const HeapInfo& heap : heap_infos()) {
+                if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
+                    heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+                    heap.logical_count > heap.count)
+                    view_heap = heap.wrapper;
                 if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
                     heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER && heap.desktop_gpu)
                     source = {static_cast<std::uintptr_t>(heap.title_sampler_cpu), heap.count};
@@ -837,7 +843,11 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
         }
         ReleaseSRWLockShared(&note_lock);
     }
-    pass_of(self).title_samplers = source;
+    auto& pass = pass_of(self);
+    if (pass.source_view_heap != view_heap)
+        for (auto& table : pass.view_tables) table = {};
+    pass.source_view_heap = view_heap;
+    pass.title_samplers = source;
 }
 
 // List slot 36 (desktop 32 + 4), SetGraphicsRootDescriptorTable(parameter, GPU handle): the table's
@@ -845,13 +855,18 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
 void __stdcall list_table(Wrapper* self, UINT parameter, u64 gpu_handle)
 {
     if (parameter >= 16) return;
-    u64 address = 0;
+    auto& pass = pass_of(self);
+    x2w_startup::ViewTable table;
     AcquireSRWLockShared(&note_lock);
-    for (const HeapInfo& heap : heap_infos())
-        if (heap.desktop_gpu && heap.title_cpu && gpu_handle >= heap.desktop_gpu && gpu_handle < heap.desktop_gpu + u64{heap.count} * heap.increment)
-            address = heap.title_cpu + (gpu_handle - heap.desktop_gpu);
+    for (const HeapInfo& heap : heap_infos()) {
+        if (heap.type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) continue;
+        if (pass.source_view_heap && heap.wrapper != pass.source_view_heap) continue;
+        if (!pass.source_view_heap && heap.logical_count > heap.count) continue;
+        table = x2w_startup::resolve_view_table(heap.desktop_gpu, heap.title_cpu, heap.logical_count, heap.increment, gpu_handle);
+        if (table.address) break;
+    }
     ReleaseSRWLockShared(&note_lock);
-    pass_of(self).table_address[parameter] = address;
+    pass.view_tables[parameter] = table;
 }
 // List slot 40 (desktop 36 + 4), SetGraphicsRoot32BitConstants(parameter, count, data, offset).
 void __stdcall list_root_constants(Wrapper* self, UINT parameter, UINT count, const std::uint32_t* data, UINT offset)
