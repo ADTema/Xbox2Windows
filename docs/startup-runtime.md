@@ -516,7 +516,7 @@ These are measured on one executable; treat them as hypotheses for others.
   graphics draws; other consumers need their own binding path. Drivers refuse the request
   with different codes for the same condition (`E_INVALIDARG` on a GTX 1660 SUPER, `E_OUTOFMEMORY` on
   an RTX 3060), so any failure of an oversized shader-visible view heap takes this path. The measured
-  limits so far are 1,000,000 descriptors on both adapters. Reproduce with
+  limits so far are 1,000,000 descriptors on both adapters. On Windows 11 build 26300.9974 an RTX 5080 Laptop (32.0.15.8142) also reports 1,000,000, so the fixtures' 1,245,184-descriptor request takes the shortcut above and the remaining 245,184 descriptors stay in title memory. Reproduce with
   `ctest --preset release --no-tests=error -R '^startup_(view_heap|logical_view)_' -V`, which skips (77) on an
   adapter that accepts the full request. WARP 10.0.26100.9818 and an RX 6600 (driver 32.0.21045.29003)
   accept it, so those draws do not reach the table bounds there. `ctest --preset dev --no-tests=error -R '^startup_logical_view_table$' -V` checks
