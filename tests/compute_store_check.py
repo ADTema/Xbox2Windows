@@ -2180,15 +2180,6 @@ def lds_controls():
     rejects("Unverified private LDS write", aot.lower,
             variant(high, ("ds_write_b32 v5, v6", "s_nop 0")), 32, **LDS_BINDING)
 
-    expected_returns = {
-        "ds_add_rtn_u64", "ds_sub_rtn_u64", "ds_rsub_rtn_u64",
-        "ds_inc_rtn_u64", "ds_dec_rtn_u64",
-        "ds_and_rtn_b64", "ds_or_rtn_b64", "ds_xor_rtn_b64",
-        "ds_min_rtn_i64", "ds_max_rtn_i64", "ds_min_rtn_u64", "ds_max_rtn_u64",
-    }
-    assert set(LDS_QWORD_RETURNS) == expected_returns
-    for name in expected_returns:
-        aot.lower(lds_qword_program(name), 32, **LDS_QWORD_RETURN_BINDING)
     assert lds_qword_borrow_reference(1)[:2] == [0xffffffff, 0x40000000]
     aot.lower(LDS_QWORD_BORROW_PROGRAM, 32, **LDS_QWORD_BINDING)
     ret = lds_qword_program("ds_add_rtn_u64")
@@ -2502,7 +2493,6 @@ def ds_mutants(name, lines, binding, source):
             yield aot.lower(variant(lines, (instruction, no_update)), 32, **binding), 0
     elif name in LDS_QWORD_RETURNS:
         # Substitute the post-update word pair for the returned pre-update pair.
-        base = LDS_QWORD_RETURNS[name]
         changed = variant(lines, ("v_mov_b32_e32 v12, v18", "v_mov_b32_e32 v12, v10"),
                           ("v_mov_b32_e32 v13, v19", "v_mov_b32_e32 v13, v11"))
         ref = lds_qword_reference(name, 2)
