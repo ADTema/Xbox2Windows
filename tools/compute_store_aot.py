@@ -371,6 +371,12 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         if (guard is not None and guard["at_label"]
                 and not re.fullmatch(r"s_waitcnt_depctr 0x[0-9a-f]+|s_nop \d+|s_or_b32 .*", line)):
             raise ValueError("Lane guard branch does not reach its restore")
+        if m := re.fullmatch(r"s_setreg_imm32_b32 hwreg\(HW_REG_FLAT_SCR_(?:LO|HI)\), (-?(?:0x[0-9a-fA-F]+|\d+))", line):
+            # A whole-register immediate write of the scratch base. Nothing the lowering accepts can read
+            # either half: a read through s_getreg_b32 and every scratch or flat memory form are themselves
+            # unmodelled and refused, so the write has no observable consumer and lowers to nothing. Its value
+            # is not tracked, which is why only this exact whole-register immediate form is accepted.
+            continue
         if re.fullmatch(r"s_inst_prefetch (?:0x[0-9a-f]+|\d+)|s_nop \d+|s_waitcnt_depctr 0x[0-9a-f]+", line):
             continue
         if m := re.fullmatch(r"s_clause (0x[0-9a-f]+|\d+)", line):

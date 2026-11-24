@@ -171,6 +171,12 @@ PITCH = [
     "s_endpgm",
 ]
 INDEX_BINDING = dict(table_reg=7, group_reg=11, descriptor_offset=48, stride=12)
+
+# The indexed kernel with a whole-register immediate write of the scratch base in front. Nothing in the
+# kernel reads FLAT_SCR_LO or touches scratch memory, so the write is a no-op and the readback must match the
+# untouched fixture word for word, guards included.
+SCRATCH_BASE_WRITE_LINES = ["s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 0"] + INDEXED
+SCRATCH_BASE_WRITE_CASES = [("indexed", SCRATCH_BASE_WRITE_LINES, 32, INDEX_BINDING)]
 FIXED_BINDING = dict(table_reg=8, descriptor_offset=0)
 RUNTIME_BINDING = dict(FIXED_BINDING, constant_descriptor=32)
 TILE_BINDING = dict(FIXED_BINDING, group_reg=10, group_reg_y=11, stride=72)
@@ -247,6 +253,18 @@ def controls():
     must_reject(lambda: aot.lower(INDEXED[:7] + ["s_mov_b32 s21, 0"] + INDEXED[7:], 32, **INDEX_BINDING))
     must_reject(lambda: aot.lower(FIXED, 32, **FIXED_BINDING))
     must_reject(lambda: aot.lower(["s_endpgm"], 1, **FIXED_BINDING))
+    # The scratch-base write is accepted only while the program cannot observe the base (#1648): a read of
+    # either half, a scratch memory form anywhere in the program, or a write to any other hardware register
+    # keeps it refused.
+    must_reject(lambda: aot.lower(["s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 0",
+                                      "s_getreg_b32 s9, hwreg(HW_REG_FLAT_SCR_LO)"] + INDEXED,
+                                 32, **INDEX_BINDING))
+    must_reject(lambda: aot.lower(["s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_LO), 0",
+                                      "scratch_store_dword off, v0"] + INDEXED, 32, **INDEX_BINDING))
+    must_reject(lambda: aot.lower(["s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_HI), 0x400"] + INDEXED, 32,
+                                 **dict(INDEX_BINDING, stride=8)))
+    must_reject(lambda: aot.lower(["s_setreg_imm32_b32 hwreg(HW_REG_MODE), 0"] + INDEXED, 32,
+                                 **INDEX_BINDING))
 
     # Read a constant word directly into v10 before the constant-load wait.
     must_reject(lambda: aot.lower(
@@ -5825,6 +5843,16 @@ def draw_mul_lo(cmd, case):
     return 0
 
 
+
+def draw_scratch_base_write(directory, compiler, renderer, backend):
+    """The scratch-base write must leave the generated HLSL byte for byte identical to the untouched kernel,"
+    then run on the GPU so the readback and the untouched guards are checked as for the original case."""
+    control = aot.lower(INDEXED, 32, **INDEX_BINDING)
+    written = aot.lower(SCRATCH_BASE_WRITE_LINES, 32, **INDEX_BINDING)
+    if control != written:
+        raise AssertionError("the scratch-base write changed the generated HLSL")
+    return draw(directory, compiler, renderer, backend, cases=SCRATCH_BASE_WRITE_CASES)
+
 def draw(directory, compiler, renderer, backend, cases=None):
     for name, lines, width, binding in (CASES if cases is None else cases):
         src, cso, case = [directory / x for x in ("store.hlsl", "store.cso", "store.case")]
@@ -5900,6 +5928,7 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as tmp:
         # The store cases and the guard/read cases run as separate CTest entries so each stays within its timeout.
         modes = {"binary": binary, "draw": draw,
+                 "draw-scratch-base-write": draw_scratch_base_write,
                  "draw-mubuf-subword": mubuf_subword_draw,
                  "draw-mubuf-reduction": mubuf_reduction_draw,
                  "draw-mubuf-csub": lambda d, *a: mubuf_counter_draw(d, *a, csub=True),
