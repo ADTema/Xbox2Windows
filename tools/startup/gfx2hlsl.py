@@ -286,7 +286,7 @@ class Stage:
         _, ops, mods = parse(asm)
         base = re.sub(r'_e(32|64)$', '', name)
         if base in ('s_inst_prefetch', 's_waitcnt', 's_nop', 'v_nop', 's_clause', 's_sopp_0f', 's_wqm_b64', 's_wqm_b32',
-                    's_setreg_imm32_b32', 's_code_end'):
+                    's_setreg_imm32_b32', 's_code_end', 's_setprio'):
             return None
         if base == 's_endpgm':
             return ('end',)
