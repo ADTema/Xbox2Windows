@@ -5,7 +5,6 @@ depth-reference samples needs a second view. This pass finds every uniform-const
 type is an array (fixed or runtime) of samplers, whatever its names and decorations, and adds a
 copy of it at descriptor set 3 and the same binding for the depth-reference uses.
 """
-import re
 
 CHAINS = ("OpAccessChain", "OpInBoundsAccessChain")
 BRIDGE = "%bridge_cmp"
@@ -171,7 +170,9 @@ def split_sampler_views(assembly):
         return assembly
     if module["indirect"]:
         raise ValueError("unsupported indirect descriptor decorations")
-    if BRIDGE in assembly or re.search(r"OpDecorate %\S+ DescriptorSet 3\b", assembly):
+    set_three = any(values and values[0].isdigit() and int(values[0]) == int(BRIDGE_SET)
+                    for assigned in module["sets"].values() for values in assigned)
+    if BRIDGE in assembly or set_three:
         raise ValueError("comparison sampler view requires free descriptor set 3 and bridge_cmp IDs")
     names = bridge_names(module, split)
     replacements = {}

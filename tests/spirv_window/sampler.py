@@ -187,6 +187,14 @@ def check_sampler_tables(source, folder, assembler, validator, cross):
             assert clash and "overlap in the set 3 register range" in str(error), (binding, runtime, error)
         else:
             assert not clash, (binding, runtime)
+    # The reserved set is found from the parsed decoration, whatever the spacing or leading zeros.
+    for spelled in ("OpDecorate  %samplers   DescriptorSet 3", "\tOpDecorate %samplers DescriptorSet 03"):
+        try:
+            split_sampler_views(source.replace("OpDecorate %samplers DescriptorSet 0", spelled))
+        except ValueError as error:
+            assert "free descriptor set 3" in str(error), error
+        else:
+            raise AssertionError("accepted set 3 spelled " + repr(spelled))
     # A comment may follow any declaration, and a semicolon in a name is not a comment.
     named = source.replace('"main" %texture', '"main;x" %texture')
     commented = named.replace("%smp = OpTypeSampler", "%smp = OpTypeSampler ; sampler type").replace(
