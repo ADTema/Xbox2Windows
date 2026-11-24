@@ -1041,6 +1041,8 @@ x2w_startup::DrawReadbacks& draw_dumps()
 }
 
 LONG render_resets, render_closes, render_clears, render_executes, render_reset_failures;
+// OMSetRenderTargets calls that bound targets, and render target / depth handles that resolved to no view.
+LONG render_target_binds, render_target_unresolved;
 
 // A console recording survives its allocator's Reset; a desktop one is discarded with it, and
 // resetting an allocator whose lists the GPU still runs is invalid. Each title allocator therefore
@@ -1168,6 +1170,14 @@ void note_submits(ID3D12CommandQueue* queue, const std::vector<Wrapper*>& lists)
     ReleaseSRWLockExclusive(&allocator_lock);
 }
 
+// Fixtures: how many OMSetRenderTargets calls bound targets, and how many render target or depth handles
+// (also in ClearRenderTargetView) resolved to no view.
+extern "C" __declspec(dllexport) void x2w_d3d12_render_target_stats(unsigned* binds, unsigned* unresolved)
+{
+    if (binds) *binds = static_cast<unsigned>(InterlockedCompareExchange(&render_target_binds, 0, 0));
+    if (unresolved) *unresolved = static_cast<unsigned>(InterlockedCompareExchange(&render_target_unresolved, 0, 0));
+}
+
 // Fixtures: the number of desktop allocators a title allocator stands for (0 if it has none yet).
 extern "C" __declspec(dllexport) unsigned x2w_d3d12_allocator_pool_size(void* allocator)
 {
@@ -1228,25 +1238,6 @@ HRESULT __stdcall list_close(Wrapper* self)
         if (FAILED(hr) && first_calls(failures, 6)) log("x2w-render list Close failed 0x%08lx", static_cast<unsigned long>(hr));
     }
     return S_OK;
-}
-
-// List slot 52 (desktop 48 + 4), ClearRenderTargetView(view, colour, rect count, rects). Desktop
-// resources rest in COMMON here, so the target is moved to RENDER_TARGET around the clear.
-void __stdcall list_clear_target(Wrapper* self, u64 handle, const float* colour, UINT rect_count, const D3D12_RECT* rects)
-{
-    if (!self->own().list_open || !colour) return;
-    const u64 desktop = desktop_cpu_handle(handle);
-    ID3D12Resource* target = view_target(desktop);
-    static LONG logged;
-    if (first_calls(logged, 4))
-        log("x2w-render ClearRenderTargetView view=0x%llx target=%p colour=%.3f %.3f %.3f %.3f rects=%u", handle,
-            static_cast<void*>(target), colour[0], colour[1], colour[2], colour[3], rect_count);
-    if (!target) return;
-    auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
-    use_as_target(self, target);
-    list->ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(desktop)}, colour, rect_count,
-                                rect_count ? rects : nullptr);
-    InterlockedIncrement(&render_clears);
 }
 
 // A fence signalled on a queue completes when the desktop GPU reaches it.
@@ -1826,9 +1817,40 @@ bool format_has_stencil(DXGI_FORMAT format)
     return format == DXGI_FORMAT_D24_UNORM_S8_UINT || format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
            format == DXGI_FORMAT_R24G8_TYPELESS || format == DXGI_FORMAT_R32G8X24_TYPELESS;
 }
+// List slot 52 (desktop 48 + 4), ClearRenderTargetView(view, colour, rect count, rects). Desktop
+// resources rest in COMMON here, so the target is moved to RENDER_TARGET around the clear. The view is
+// read from its shadow record, as OMSetRenderTargets does, so a descriptor the title copied clears the
+// resource it now holds; a handle with no record falls back to the creation-time map.
+void __stdcall list_clear_target(Wrapper* self, u64 handle, const float* colour, UINT rect_count, const D3D12_RECT* rects)
+{
+    if (!self->own().list_open || !colour) return;
+    const u64 desktop = desktop_cpu_handle(handle);
+    const ResolvedView view = resolve_view(desktop, 20);
+    ID3D12Resource* target = view.resource;
+    if (!target && !view.wrong_kind) target = view_target(desktop, 20);
+    static LONG logged;
+    if (first_calls(logged, 4))
+        log("x2w-render ClearRenderTargetView view=0x%llx target=%p colour=%.3f %.3f %.3f %.3f rects=%u", handle,
+            static_cast<void*>(target), colour[0], colour[1], colour[2], colour[3], rect_count);
+    if (!target) {
+        InterlockedIncrement(&render_target_unresolved);
+        static LONG refused;
+        if (first_calls(refused, 6))
+            log("x2w-d3d12 ClearRenderTargetView skipped: view 0x%llx is %s", handle,
+                view.wrong_kind ? "not a render target view" : "not a known render target view");
+        return;
+    }
+    auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
+    use_as_target(self, target);
+    list->ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(desktop)}, colour, rect_count,
+                                rect_count ? rects : nullptr);
+    InterlockedIncrement(&render_clears);
+}
 // List slot 50 (desktop 46 + 4), OMSetRenderTargets(count, handles, single range, depth).
-// A descriptor of the wrong kind, a DSV with only one plane read-only (needs per-plane states), or a
-// depth view that resolves to nothing refuses the whole bind: nothing is set and draws are skipped.
+// With single_range the title passes the first handle only and the rest follow it at the title's own
+// descriptor stride (also for one target). A descriptor of the wrong kind, a handle that holds no view, a
+// DSV with only one plane read-only (needs per-plane states), or a depth view that resolves to nothing
+// refuses the whole bind: nothing is set and draws are skipped. Each refusal is logged and counted.
 void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* handles, BOOL single_range,
                             const D3D12_CPU_DESCRIPTOR_HANDLE* depth)
 {
@@ -1838,18 +1860,39 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     pass.target_count = 0;
     pass.target0 = nullptr;
     pass.dsv_format = DXGI_FORMAT_UNKNOWN;
-    if (!list || count > 8 || single_range) return;
-    if (count && !x2w_local::readable(handles, count * sizeof(*handles))) return;
-    static LONG refused;
+    if (!list) return;
+    static LONG refused, unresolved_logged;
+    if (count > 8) {
+        InterlockedIncrement(&render_target_unresolved);
+        if (first_calls(refused, 6)) log("x2w-d3d12 OMSetRenderTargets refused: %u render targets (at most 8)", count);
+        return;
+    }
+    const UINT listed = single_range ? (count ? 1 : 0) : count;
+    if (listed && !x2w_local::readable(handles, listed * sizeof(*handles))) return;
+    UINT stride = 0;
+    if (single_range && count) {
+        const UINT increment = the_device ? device_of(the_device)->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) : 0;
+        stride = increment ? title_descriptor_stride(handles[0].ptr, increment) : 0;
+        if (!stride) {
+            InterlockedIncrement(&render_target_unresolved);
+            return;
+        }
+    }
     D3D12_CPU_DESCRIPTOR_HANDLE desktop[8];
     ID3D12Resource* targets[8]{};
     DXGI_FORMAT formats[8]{};
     for (UINT i = 0; i < count; ++i) {
-        desktop[i].ptr = static_cast<SIZE_T>(desktop_cpu_handle(handles[i].ptr));
+        const u64 title = single_range ? handles[0].ptr + u64{i} * stride : handles[i].ptr;
+        desktop[i].ptr = static_cast<SIZE_T>(desktop_cpu_handle(title));
         const ResolvedView view = resolve_view(desktop[i].ptr, 20);
         if (view.wrong_kind && first_calls(refused, 6)) log("x2w-d3d12 OMSetRenderTargets refused: render target %u is not a render target view", i);
         targets[i] = view.resource;
-        if (!targets[i]) return;
+        if (!targets[i]) {
+            InterlockedIncrement(&render_target_unresolved);
+            if (!view.wrong_kind && first_calls(unresolved_logged, 6))
+                log("x2w-d3d12 OMSetRenderTargets refused: render target %u (0x%llx) holds no view", i, static_cast<unsigned long long>(title));
+            return;
+        }
         formats[i] = view_format_of(desktop[i].ptr, targets[i]);
     }
     D3D12_CPU_DESCRIPTOR_HANDLE desktop_dsv{};
@@ -1859,10 +1902,16 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     D3D12_RESOURCE_STATES dsv_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
     if (depth && x2w_local::readable(depth, sizeof(*depth))) {
         const u64 resolved = desktop_cpu_handle(depth->ptr);
-        if (resolved) {
+        if (!resolved) {
+            // The handle maps to no desktop descriptor: no depth is bound although the pipeline may expect one.
+            InterlockedIncrement(&render_target_unresolved);
+            if (first_calls(unresolved_logged, 6))
+                log("x2w-d3d12 OMSetRenderTargets: depth handle 0x%llx maps to no descriptor; binding no depth", static_cast<unsigned long long>(depth->ptr));
+        } else {
             const ResolvedView view = resolve_view(resolved, 21);
             dsv_target = view.resource;
             if (!dsv_target) {
+                InterlockedIncrement(&render_target_unresolved);
                 if (first_calls(refused, 6))
                     log("x2w-d3d12 OMSetRenderTargets refused: depth handle is %s", view.wrong_kind ? "not a depth stencil view" : "not a known depth stencil view");
                 return;
@@ -1891,6 +1940,7 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
     pass.dsv_format = dsv_format;
     list->OMSetRenderTargets(count, count ? desktop : nullptr, FALSE, dsv_ptr);
     pass.targets_bound = true;
+    InterlockedIncrement(&render_target_binds);
 }
 // List slots 21 / 22 / 23, RSSetViewports / RSSetScissorRects / OMSetBlendFactor.
 void __stdcall list_viewports(Wrapper* self, UINT count, const D3D12_VIEWPORT* viewports)
@@ -3166,11 +3216,11 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         ReleaseSRWLockExclusive(&draw_lock);
     }
     if (render_mode() && frame % 300 == 0)
-        log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, executes %ld, draws %ld (skipped %ld), "
+        log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
             "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld), "
             "textures uploaded %ld (%ld KiB, unreadable %ld), heap-indexed roots deferred %ld (real draws refused: view heap %ld, "
             "sampler heap %ld, both heaps %ld, state %ld)", render_resets,
-            render_reset_failures, render_closes, render_clears, render_executes, render_draws, render_draws_skipped,
+            render_reset_failures, render_closes, render_clears, render_target_binds, render_target_unresolved, render_executes, render_draws, render_draws_skipped,
             translated_draws, untranslated_draws, translation_ready, translation_missing, null_total,
             null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], textures_uploaded,
             texture_bytes_uploaded, textures_unreadable, heap_roots_deferred,
