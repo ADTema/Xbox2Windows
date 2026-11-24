@@ -2,8 +2,9 @@
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 
-#include <cstdint>
 #include <array>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -19,6 +20,8 @@ extern "C" __declspec(dllimport) HRESULT XGCreateTextureComputer(const D3D12_RES
 // queue and its readback buffer are desktop objects owned only by the fixture.
 using Word = std::uint64_t;
 template<class T> Word arg(T* value) { return reinterpret_cast<Word>(value); }
+
+
 
 
 int draw_logical_tables(ID3D12Device* desktop, void* guest, void* list)
@@ -178,24 +181,33 @@ bool bind_bc7(ID3D12Device* desktop, void* guest, const StartupBc7Input& input, 
 }
 }  // namespace
 
-int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels, const StartupBc7Input* bc7, DXGI_FORMAT format)
+int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels, const StartupBc7Input* bc7,
+                      DXGI_FORMAT format, std::uint32_t export_word)
 {
     const bool bc = GetEnvironmentVariableW(L"X2W_TEST_BC_VIEW", nullptr, 0) != 0;
     const bool bc_chain = GetEnvironmentVariableW(L"X2W_TEST_BC_CHAIN", nullptr, 0) != 0;
-    const UINT width = bc_chain ? 384 : bc7 ? bc7->width : bc ? 4 * 128 : 8;
-    const UINT height = bc_chain ? 32 : bc7 ? bc7->height : bc ? 128 : 4;
+    const bool integer = format == DXGI_FORMAT_R32_UINT || format == DXGI_FORMAT_R32_SINT;
+    // The translated MRT formats draw one pixel; the other formats keep the 8x4 target.
+    const bool single = integer || format == DXGI_FORMAT_R32G32B32A32_FLOAT;
+    const bool legacy = !single;
+    const UINT width = bc_chain ? 384 : bc7 ? bc7->width : bc ? 4 * 128 : single ? 1 : 8;
+    const UINT height = bc_chain ? 32 : bc7 ? bc7->height : bc ? 128 : single ? 1 : 4;
     ComPtr<ID3D12Device> desktop;
     if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
     Bc7Binding binding;
     if (bc7 && !bind_bc7(desktop.Get(), guest, *bc7, binding)) return 34;
     StreamTarget frame;
     if (const int rc = open_stream_target(desktop.Get(), guest, pso, width, height, format,
-                                          bc7 || bc_chain ? width : width / 2, frame)) return rc;
+                                          legacy && !bc7 && !bc_chain ? width / 2 : width, frame)) return rc;
     auto* list = frame.list;
     auto* queue = frame.queue;
     auto* fence = frame.fence;
+    if (export_word) invoke(list, 40, 0, 1, arg(&export_word), 0);
     if (GetEnvironmentVariableW(L"X2W_TEST_LOGICAL_VIEW", nullptr, 0)) {
         if (int result = draw_logical_tables(desktop.Get(), guest, list)) return result;
+    } else if (GetEnvironmentVariableW(L"X2W_TEST_PLACED_VERTEX", nullptr, 0)) {
+        extern int draw_placed_vertices(ID3D12Device*, void*, void*);
+        if (const int result = draw_placed_vertices(desktop.Get(), guest, list)) return result;
     } else if (bc_chain) {
         extern int draw_bc_chain(void*, void*);
         if (const int result = draw_bc_chain(guest, list)) return result;
@@ -217,5 +229,5 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     while (invoke(fence, 8) == 0 && GetTickCount64() < deadline) Sleep(1);
     if (invoke(fence, 8) != 1) return 25;
 
-    return read_stream_target(desktop.Get(), frame.target.Get(), pixels);
+    return read_stream_target(desktop.Get(), frame, pixels);
 }

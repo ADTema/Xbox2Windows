@@ -38,7 +38,7 @@ struct Scene
             if (buffer.memory)
                 VirtualFree(buffer.memory, 0, MEM_RELEASE);
         }
-        for (auto* object : {frame.list, frame.allocator, frame.fence, frame.queue, pipeline, device})
+        for (auto* object : {frame.list, frame.allocator, frame.fence, frame.queue, frame.rtv_heap, pipeline, device})
             if (object)
                 invoke(object, 2);
         if (trace)
@@ -171,7 +171,7 @@ extern "C" __declspec(dllexport) Word placed_submit(UINT lists, UINT fence_value
     if (!fence_complete(s))
         return 1;
     s.submitted = false;
-    return read_stream_target(s.desktop.Get(), s.frame.target.Get(), "pixels.bin");
+    return read_stream_target(s.desktop.Get(), s.frame, "pixels.bin");
 }
 extern "C" __declspec(dllexport) Word placed_close()
 {

@@ -29,11 +29,12 @@ def prepare_draw_cache(directory, consumer, hlsl, modes, binding):
     return env, args, output
 
 
-def draw_texture(directory, consumer, backend, hlsl, modes, binding="srv 0 tex2d table 0 0"):
+def draw_texture(directory, consumer, backend, hlsl, modes, view_kind="tex2d", *, binding=None):
+    binding = binding or f"srv 0 {view_kind} table 0 0"
     env, args, output = prepare_draw_cache(directory, consumer, hlsl, modes, binding)
     result = subprocess.run([*args, backend, output], env=env, capture_output=True, text=True)
     print(result.stdout, end="")
-    if backend == "hardware" and result.returncode == 77:
+    if result.returncode == 77:
         return None
     if result.returncode:
         raise RuntimeError(f"consumer failed ({result.returncode})\n{result.stderr[-5000:]}")
