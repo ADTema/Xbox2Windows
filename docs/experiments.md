@@ -3374,6 +3374,50 @@ ctest --preset dev --no-tests=error -j 1 -R '^compute_store_aot_mimg_msaa_(warp|
 python3 -B tests/compute_mimg_msaa_check.py --binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```
 
+### gfx1030 2D image gathers
+
+The pixel AOT tool accepts `image_gather4`, `image_gather4_o`,
+`image_gather4_lz`, `image_gather4_lz_o`, `image_gather4_l` and
+`image_gather4_l_o` with `--cpu gfx1030 --gather-mips <count>` and the
+four native sampler words. The caller binds matching, single-sample 2D float4
+views in the native image descriptor and desktop SRV at `t0`. The declared mip
+count and the view-relative extents and channels must agree. This profile uses
+normalized coordinates, clamp-to-edge in X and Y, bilinear XY and point mip
+filtering, with zero LOD bias, minimum LOD zero and maximum LOD at or above the
+last visible mip. Implicit gathers require a one-mip view. `_lz` selects view
+mip zero and `_l` requires a statically known integral LOD inside the view.
+
+One-hot DMASK selects a source component. All four destination VGPRs receive
+that component from the 2×2 footprint, in `(0,1), (1,1), (1,0), (0,0)` order
+in increasing texture coordinates. The lowering uses four desktop `Load` calls
+at the selected mip. Coordinates must be finite and select the same
+half-texel footprint under native texture-coordinate precision and desktop
+floating-point arithmetic. Use a static signed six-bit XY offset with `_o`.
+The address uses consecutive full-width VGPRs in offset (if present), U, V,
+LOD (if present) order. Wait for both descriptors with `lgkmcnt(0)` and for
+the gather result with `vmcnt(0)`. The profile accepts one gather and rejects
+comparison forms, additional image sampling, NSA, A16, D16 and other image
+modifiers. See the MIMG address and sampler tables in the
+[AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture).
+
+The fixture assembles and disassembles all 24 opcode and DMASK pairs with
+LLVM 15 and compares text lowering with the synthetic-container CLI. The draw
+checks compare 64 pixels and 256 exact channel values per case using a CPU
+reference, independently patterned channels and mip levels, and an SRV with
+`MostDetailedMip = 1`. The desktop `GatherRed`, `GatherGreen`, `GatherBlue`
+and `GatherAlpha` controls cross-check tap order and channel selection at
+view mip zero. Mutations change the channel, exchange two taps, force mip
+zero or zero-extend a negative offset. The draw fixture executes desktop DXIL.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -j 1 -R '^pixel_aot_gather_(warp|hardware)$' -V
+```
+
+```bash
+python3 -B tests/pixel_gather_check.py --binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
 ### gfx1030 2D image stores
 
 `image_store`, `image_store_mip`, `image_store_pck` and `image_store_mip_pck`
