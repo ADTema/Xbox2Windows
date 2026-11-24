@@ -3230,6 +3230,48 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^compute_store_aot_mtbuf_load_(warp|hardware)$' -V
 ```
 
+### gfx1030 native FP32 BVH box readback probe
+
+This Linux HIP fixture captures all four destination DWORDs of
+`image_bvh_intersect_ray` and `image_bvh64_intersect_ray`. The code object
+contains the contiguous, full-precision instructions. The host uploads two
+synthetic 128-byte nodes and dispatches five rays per opcode. The first node
+has a disabled child and covers two hits, extent clipping, all-miss and
+reverse traversal. The second node supplies four hits with distinct entry
+points. The 32-bit kernel uses a descriptor-relative typed pointer. The
+64-bit kernel uses both DWORDs of an absolute typed pointer with descriptor
+base zero. The host computes both pointers from offsets in the uploaded
+allocation.
+
+The [RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+Tables 48 and 49 describe the operand order and resource fields. Mesa 25.1.0
+provides a reference for the
+[FP32 box node layout](https://github.com/chaotic-cx/mesa-mirror/blob/mesa-25.1.0/src/amd/vulkan/bvh/bvh.h)
+and the [absolute-pointer descriptor](https://github.com/chaotic-cx/mesa-mirror/blob/mesa-25.1.0/src/amd/vulkan/nir/radv_nir_rt_common.c).
+The CPU candidate orders hits by entry distance and uses `ffffffff` in
+unused positions. Reversing the sort first changes word 0 from `0000001d`
+to `00000025`. Using zero for the all-miss result changes word 0 from
+`ffffffff` to `00000000`.
+
+```sh
+sh tests/gfx1030_bvh_box/build.sh
+python3 -B tests/gfx1030_bvh_box/check.py --model-only
+```
+
+Select a physical `gfx1030` device using `rocminfo`, then pass its HIP ordinal
+with `--device`. The runner prints the code object SHA-256, HIP versions,
+descriptor, typed pointer, and all four raw and candidate words for each ray.
+Include the device target and the first reported difference in the capture.
+
+```sh
+python3 -B tests/gfx1030_bvh_box/check.py --device 0
+```
+
+LLVM and LLD 15 build the code object and verify one instruction of each
+kind in its disassembly. The CPU witnesses and mutations pass independently.
+Native readback remains pending, including the raw miss and disabled-slot
+words. The probe leaves translator behavior and form coverage unchanged.
+
 ### gfx1030 2D image loads
 
 The `gfx1030` compute store profile lowers the typed MIMG form
