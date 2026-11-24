@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import json
+import math
 import re
 import struct
 import subprocess
@@ -252,6 +253,17 @@ class F32(float):
         return F32(float(self) * float(o))
 
 
+# Host models of the HLSL intrinsics the unary lowering emits, on exact inputs only. round is half-even.
+HLSL_MATH = {
+    "sqrt": lambda x: F32(math.sqrt(x)),
+    "rsqrt": lambda x: F32(1 / math.sqrt(x)),
+    "floor": lambda x: F32(math.floor(x)),
+    "trunc": lambda x: F32(math.trunc(x)),
+    "round": lambda x: F32(round(float(x))),
+    "frac": lambda x: F32(x - math.floor(x)),
+}
+
+
 def evaluate_depth(text, inputs):
     # Evaluate the emitted float chain in binary32 and return position component z of vertex 0.
     def word(m):
@@ -271,7 +283,8 @@ def evaluate_depth(text, inputs):
         expr = re.sub(r"(?<!\w)float\(0x([0-9a-f]+)u\)", lambda m: repr(F32(int(m[1], 16))), expr)
         expr = re.sub(r"asfloat\(0x([0-9a-f]+)u\)", word, expr)
         expr = re.sub(r"(point|matrix)Data\[(\d+)\]\.([xyzw])", buffer, expr)
-        return eval(re.sub(r"(?<![\w.])(-?\d+\.\d+(?:e[+-]?\d+)?)", r"F32(\1)", expr), {"F32": F32}, names)
+        expr = re.sub(r"(?<![\w.])(-?\d+\.\d+(?:e[+-]?\d+)?)f?", r"F32(\1)", expr)
+        return eval(expr, {"F32": F32, **HLSL_MATH}, names)
 
     names = {}
     for name, expr in re.findall(r"precise float (f\d+) = (.*);", text):
@@ -544,6 +557,119 @@ def cvt_minmax_binary(tmp, tools):
         raise AssertionError(line)
 
 
+# One-source binary32 math. Every input has an exact result, and the sibling opcode gives a different one: a
+# reciprocal and a reciprocal square root of different powers of two, floor and truncation of negative fractions,
+# a tie rounded to even (3.5 and -2.5; floor of -2.5 is -3, round half away is -3 too), and a fractional part.
+UNARY_CASES = [
+    ("v_rcp_f32_e32", 4.0, "v_rsq_f32_e32"),
+    ("v_rsq_f32_e32", 16.0, "v_rcp_f32_e32"),
+    ("v_sqrt_f32_e32", 2.25, "v_rsq_f32_e32"),
+    ("v_floor_f32_e32", -2.5, "v_trunc_f32_e32"),
+    ("v_trunc_f32_e32", -2.5, "v_floor_f32_e32"),
+    ("v_rndne_f32_e32", 3.5, "v_floor_f32_e32"),
+    ("v_fract_f32_e32", -2.25, "v_floor_f32_e32"),
+    ("v_rcp_f32_e64", 0.125, "v_rsq_f32_e64"),
+    ("v_rsq_f32_e64", 0.0625, "v_rcp_f32_e64"),
+    ("v_sqrt_f32_e64", 0.5625, "v_rsq_f32_e64"),
+    ("v_floor_f32_e64", -7.75, "v_trunc_f32_e64"),
+    ("v_trunc_f32_e64", -6.75, "v_floor_f32_e64"),
+    ("v_rndne_f32_e64", -2.5, "v_floor_f32_e64"),
+    ("v_fract_f32_e64", 5.125, "v_floor_f32_e64"),
+]
+
+
+def fword(x):
+    return struct.unpack("<I", struct.pack("<f", x))[0]
+
+
+def unary_program(swap=None, line=None):
+    # The e32 forms read a literal; the e64 forms read a register. A swap replaces one case's opcode with its sibling.
+    program = PROGRAM.copy()
+    body = []
+    for i, (op, x, sibling) in enumerate(UNARY_CASES):
+        op = sibling if op == swap else op
+        out = f"v{20 + i}"
+        if op.endswith("_e32"):
+            body.append(f"{op} {out}, 0x{fword(x):08x}")
+        else:
+            body += [f"v_mov_b32_e32 v{40 + i}, 0x{fword(x):08x}", f"{op} {out}, v{40 + i}"]
+        body.append(f"v_add_f32_e32 v3, {out}, v3")
+    program[-2:-2] = body
+    if line:
+        program.insert(-2, line)
+    return program
+
+
+def unary_reference():
+    # Independent of the lowering: Python arithmetic on exact values, in the order the program runs. Python rounds
+    # a tie to even, which is what v_rndne_f32 does.
+    exact = {
+        "v_rcp": lambda x: 1 / x,
+        "v_rsq": lambda x: 1 / math.sqrt(x),
+        "v_sqrt": math.sqrt,
+        "v_floor": math.floor,
+        "v_trunc": math.trunc,
+        "v_rndne": round,
+        "v_fract": lambda x: x - math.floor(x),
+    }
+    z = 0.125 + 0.375  # pointData y plus the matrix value
+    for op, x, _ in UNARY_CASES:
+        z += exact[op.rsplit("_f32", 1)[0]](x)
+    return z
+
+
+def unary_draw(program=None):
+    depth = unary_reference()
+    positions = [(x, y, depth, w) for x, y, _, w in TRIANGLE]
+    program = unary_program() if program is None else program
+    return lower(enumerate_pcs(program), [4099], (3, 1)), [(triangle_inputs(), positions, True)]
+
+
+def unary_negative_draws(dxc, renderer, adapter, tmp):
+    source, cases = unary_draw()
+    expected = cases[0][1]
+    # One unit in the last place of the depth word of the last vertex only, then every sibling opcode.
+    word = fword(expected[2][2])
+    off_by_one = struct.unpack("<f", struct.pack("<I", word + 1))[0]
+    wrong = [(source, expected[:2] + [(*expected[2][:2], off_by_one, expected[2][3])])]
+    wrong += [(unary_draw(unary_program(op))[0], expected) for op, _, _ in UNARY_CASES]
+    for text, positions in wrong:
+        if mismatch(dxc, renderer, adapter, tmp, text, positions) == 77:
+            return 77
+    return 0
+
+
+def unary_binary(tmp, tools):
+    inputs, reference = triangle_inputs(), unary_reference()
+    text = binary(tmp, *tools, program=unary_program(), words=[4099])
+    assert evaluate_depth(text, inputs) == reference, text
+    # Each lowering is present, and each sibling opcode changes the depth.
+    for hlsl in ("(1.0f / ", "rsqrt(", "sqrt(", "floor(", "trunc(", "round(", "frac("):
+        assert hlsl in text, hlsl
+    for op, _, _ in UNARY_CASES:
+        mutated = evaluate_depth(binary(tmp, *tools, program=unary_program(op), words=[4099]), inputs)
+        assert mutated != reference, (op, mutated)
+    # Source and output modifiers change the result, so they are refused, as is a clamp.
+    for line in (
+        "v_floor_f32_e64 v21, -v47",
+        "v_sqrt_f32_e64 v21, |v47|",
+        "v_rcp_f32_e64 v21, v47 clamp",
+        "v_fract_f32_e64 v21, v47 mul:2",
+        "v_rndne_f32_e64 v21, v47 div:2",
+    ):
+        try:
+            lower(enumerate_pcs(unary_program(line=line)), [4099], (3, 1))
+        except ValueError:
+            continue
+        raise AssertionError(line)
+    # A second source is not a form of these opcodes.
+    try:
+        lower(enumerate_pcs(unary_program(line="v_floor_f32_e32 v21, v47, v48")), [4099], (3, 1))
+    except ValueError:
+        return
+    raise AssertionError("two-source unary")
+
+
 def offset_draw():
     program = PROGRAM.copy()
     program[program.index("s_buffer_load_dword s30, s[16:19], 0x4")] = (
@@ -590,12 +716,19 @@ if __name__ == "__main__":
             assert text.count("asfloat(0xbfc00000u)") == 2, text
             float_binary(Path(directory), sys.argv[2:])
             cvt_minmax_binary(Path(directory), sys.argv[2:])
+            unary_binary(Path(directory), sys.argv[2:])
             sys.exit(0)
         if sys.argv[1] == "draw-cvt-minmax":
             args = sys.argv[2:]
             sys.exit(
                 draw(*args, Path(directory), *cvt_minmax_draw())
                 or cvt_minmax_negative_draws(*args, Path(directory))
+            )
+        if sys.argv[1] == "draw-unary":
+            args = sys.argv[2:]
+            sys.exit(
+                draw(*args, Path(directory), *unary_draw())
+                or unary_negative_draws(*args, Path(directory))
             )
         if sys.argv[1] == "draw-float":
             args = sys.argv[2:]
