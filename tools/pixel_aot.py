@@ -4038,6 +4038,33 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for ch, n in zip(channels, dest):
                 vector[f"v{n}"] = f"sample{i}.{ch}"
                 sample_dest[f"v{n}"] = vector_loads
+        elif m := match(r"image_get_lod v\[(\d+):(\d+)\], v\[(\d+):(\d+)\], "
+                        r"s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0x3 dim:SQ_RSRC_IMG_2D"):
+            dest, coords, image, state = [registers(*m.groups()[k:k+2], width)
+                                          for k, width in zip((0, 2, 4, 6), (2, 2, 8, 4))]
+            if dest.stop > 256 or coords.stop > 256:
+                raise ValueError("Texture LOD VGPR out of range")
+            if any(f"v{n}" in sample_dest for n in dest):
+                raise ValueError("Write overlaps an outstanding sample")
+            descriptor = [scalar.get(f"s{n}") for n in image]
+            if (mask != "entry" or sampler is None or sample_kind == "comparison"
+                    or second_texture_offset is not None
+                    or descriptor != [(bindings[texture_offset], j) for j in range(8)]
+                    or any(f"s{n}" in pending for n in (*image, *state))
+                    or [scalar.get(f"s{n}") for n in state] != list(sampler)):
+                raise ValueError("Unsupported texture LOD image or sampler binding")
+            uv = [vector.get(f"v{n}") for n in coords]
+            if any(value not in quad_values for value in uv):
+                raise ValueError("Texture LOD requires coordinates with quad provenance")
+            coord = f"float2({', '.join(uv)})"
+            lines.append(f"    float2 sample{i} = float2(tex.CalculateLevelOfDetail(samp, {coord}), "
+                         f"tex.CalculateLevelOfDetailUnclamped(samp, {coord}));")
+            sample_kind = "plain"
+            samples += 1
+            vector_loads += 1
+            for channel, n in zip("xy", dest):
+                vector[f"v{n}"] = f"sample{i}.{channel}"
+                sample_dest[f"v{n}"] = vector_loads
         elif m := match(r"(flat|global)_load_dword (v\d+), v\[(\d+):(\d+)\](, off)?(?: offset:(-?\d+))?"):
             # One DWORD through a 64-bit title address. Cache-policy bits, the global saddr form and
             # every other width or direction are refused by the fall-through.

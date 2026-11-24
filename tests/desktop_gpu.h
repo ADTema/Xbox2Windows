@@ -65,11 +65,12 @@ struct PixelMismatch : std::runtime_error {
 };
 
 void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference = nullptr,
-                            UINT8 writeMask = D3D12_COLOR_WRITE_ENABLE_ALL);
+                            UINT8 writeMask = D3D12_COLOR_WRITE_ENABLE_ALL, const char* rawReadback = nullptr);
 void check_attribute_pixel(ID3D12Device* device, const char* shader, const char* reference, bool rg);
 void check_compute_to_pixel(ID3D12Device* device, const char* compute, const char* pixel,
                             const char* reference, const char* previous);
-void check_pixel_quad_lod(ID3D12Device* device, const char* shader);
+void check_pixel_quad_lod(ID3D12Device* device, const char* shader, const char* rawReadback = nullptr,
+                         bool allowUpperRawLodStep = false);
 void check_pixel_mip_clamp(ID3D12Device* device, const char* shader, unsigned expectedLevel);
 void check_pixel_mip_blend(ID3D12Device* device, const char* shader, float clamp, float tolerance);
 void check_pixel_compare(ID3D12Device* device, const char* shader, const char* reference);
