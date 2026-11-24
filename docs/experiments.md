@@ -2816,7 +2816,7 @@ ctest --preset dev --no-tests=error -R '^compute_store_aot_mtbuf_load_(warp|hard
 
 ### gfx1030 2D image loads
 
-The `gfx1030` compute store profile lowers one typed MIMG form:
+The `gfx1030` compute store profile lowers the typed MIMG form
 `image_load vD, v[x:y], s[A:A+7] dmask:0x1|0x3|0x7|0xf
 dim:SQ_RSRC_IMG_2D`, with the `unorm` flag optional, and its packed-address
 `a16` spelling `image_load vD, vP, s[A:A+7] ... unorm a16`. The lowering is one
@@ -2836,8 +2836,9 @@ The 8-dword image resource descriptor (T#) is runtime data. The caller
 guarantees through `--image-format R32G32B32A32_UINT` that its 9-bit GFX10
 format field (DW1[28:20]) is `32_32_32_32_UINT`, that its type (DW3[31:28])
 is `SQ_RSRC_IMG_2D`, that its swizzle mode (DW3[24:20]) is linear, that
-resource level (DW2[31]) is 1, that base and last mip are zero, and that the
-selected channels use the identity destination selects. The translator
+resource level (DW2[31]) is 1, that base mip is zero, and that the
+selected channels use the identity destination selects. The bound desktop
+SRV must expose the same mip range starting at level zero. The translator
 checks where the eight words were loaded from, not those fields. The binding
 assumes an unswizzled, in-range, single-layer image and does not emulate
 native descriptor bounds, tiling or DCC. D3D returns zero for an
@@ -2863,6 +2864,29 @@ assembled gfx1030 program.
 ```powershell
 cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^compute_store_aot_mimg_load_(warp|hardware)$' -V
+```
+
+`image_load_mip` uses the same descriptor and wait rules. Without `a16`, three
+consecutive VGPRs hold x, y and the integer mip level. With `a16` the first
+VGPR packs x and y as above, and the low 16 bits of the second VGPR hold the
+mip level. The high 16 bits of that second VGPR are ignored. The translator
+emits `Texture2D<uint4>.Load(int3(x, y, mip))`. The caller guarantees that the
+mip and the coordinates are in range for the selected subresource. The
+lowering covers the same contiguous DMASKs and refuses other dimensions,
+NSA, `d16`, `tfe` and the cache policy flags.
+
+The mip fixture uploads a 32×8 base image and 16×4 and 8×2 mips. Every
+subresource encodes the mip, row, column and channel in the texels. Each
+dispatch selects levels 0, 1 and 2 across its lanes and compares all 320 UAV
+words, including the sentinel region. The four-component case also aliases
+address and destination VGPRs. The packed mip operand carries nonzero
+high bits. Forcing level zero must first differ at word 32, and using the
+packed high half as the mip must first differ at word 0. LLVM 15 assembles
+and decodes each address family and DMASK, then the CLI lowers the decoded
+program. WARP and hardware execute the translated desktop DXIL.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mimg_mip_(warp|hardware)$' -V
 ```
 
 ### Bounded gfx1030 DS lane routing

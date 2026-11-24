@@ -26,6 +26,8 @@ constexpr UINT uavs = 13, srvs = 21;
 // texture words, so the same runner checks dmask variants without a second content generator.
 constexpr UINT texture_width = 32, texture_height = 8, texture_channels = 4;
 constexpr UINT texture_words = texture_width * texture_height * texture_channels;
+constexpr UINT texture_mip_levels = 3;
+constexpr UINT texture_mip_words = texture_words + texture_words / 4 + texture_words / 16;
 }
 
 static UINT input_word(UINT i) { return 0x8b02a7f1u + i * 0x413b1u; }
@@ -53,29 +55,32 @@ static ComPtr<ID3D12Resource> upload_texture(ID3D12Device* device, ID3D12Graphic
                                              const std::vector<UINT>& texels,
                                              ComPtr<ID3D12Resource>& staging)
 {
-    if (texels.size() != texture_words)
-        throw std::runtime_error("Invalid image-load texture");
+    const UINT mips = texels.size() == texture_words ? 1 : texture_mip_levels;
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = texture_width;
     desc.Height = texture_height;
     desc.DepthOrArraySize = desc.SampleDesc.Count = 1;
-    desc.MipLevels = 1;
+    desc.MipLevels = static_cast<UINT16>(mips);
     desc.Format = DXGI_FORMAT_R32G32B32A32_UINT;
     auto texture = resource(device, desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout{};
+    std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, texture_mip_levels> layouts{};
     UINT64 upload_bytes = 0;
-    device->GetCopyableFootprints(&desc, 0, 1, 0, &layout, nullptr, nullptr, &upload_bytes);
+    device->GetCopyableFootprints(&desc, 0, mips, 0, layouts.data(), nullptr, nullptr, &upload_bytes);
     staging = make_buffer(device, upload_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     void* mapped = nullptr;
     const D3D12_RANGE no_reads{};
     check(staging->Map(0, &no_reads, &mapped), "Map texture upload");
     std::memset(mapped, 0, static_cast<std::size_t>(upload_bytes));
-    for (UINT y = 0; y < texture_height; ++y) {
-        auto* row = reinterpret_cast<UINT*>(static_cast<unsigned char*>(mapped) + layout.Offset
-                                            + y * layout.Footprint.RowPitch);
-        std::memcpy(row, &texels[y * texture_width * texture_channels],
-                    texture_width * texture_channels * sizeof(UINT));
+    std::size_t word = 0;
+    for (UINT level = 0; level < mips; ++level) {
+        const auto& layout = layouts[level];
+        const UINT row_words = (texture_width >> level) * texture_channels;
+        for (UINT y = 0; y < (texture_height >> level); ++y) {
+            auto* row = static_cast<unsigned char*>(mapped) + layout.Offset + y * layout.Footprint.RowPitch;
+            std::memcpy(row, texels.data() + word, row_words * sizeof(UINT));
+            word += row_words;
+        }
     }
     staging->Unmap(0, nullptr);
     D3D12_TEXTURE_COPY_LOCATION dest{}, src{};
@@ -83,8 +88,11 @@ static ComPtr<ID3D12Resource> upload_texture(ID3D12Device* device, ID3D12Graphic
     dest.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     src.pResource = staging.Get();
     src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    src.PlacedFootprint = layout;
-    list->CopyTextureRegion(&dest, 0, 0, 0, &src, nullptr);
+    for (UINT level = 0; level < mips; ++level) {
+        dest.SubresourceIndex = level;
+        src.PlacedFootprint = layouts[level];
+        list->CopyTextureRegion(&dest, 0, 0, 0, &src, nullptr);
+    }
     transition(list, texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     return texture;
 }
@@ -275,6 +283,12 @@ void check_compute_texture_file(ID3D12Device* device, const char* path, const ch
     source.read(reinterpret_cast<char*>(&store.groups), sizeof(store.groups));
     source.read(reinterpret_cast<char*>(store.expected.data()), sizeof(store.expected));
     source.read(reinterpret_cast<char*>(texels.data()), static_cast<std::streamsize>(texels.size() * sizeof(UINT)));
+    // Older cases stop after the base image. A mip case appends levels one and two.
+    if (source && source.peek() != std::char_traits<char>::eof()) {
+        texels.resize(texture_mip_words);
+        source.read(reinterpret_cast<char*>(texels.data() + texture_words),
+                    (texture_mip_words - texture_words) * sizeof(UINT));
+    }
     if (!source || source.peek() != std::char_traits<char>::eof() || store.groups >> 24 || !store.axis(0) ||
         store.axis(0) > 5 || store.axis(1) > 5 || store.axis(2) > 5)
         throw std::runtime_error("Invalid compute image load reference");
