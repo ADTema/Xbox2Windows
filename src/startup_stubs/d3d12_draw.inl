@@ -1049,7 +1049,7 @@ void __stdcall list_vertex_buffers(Wrapper* self, UINT start, UINT count, const 
     Pass& pass = pass_of(self);
     for (UINT i = 0; i < count && i < 8 - start; ++i) {
         pass.vb[start + i] = views[i];
-        pass.placed_vb[start + i] = placed_vertex_view(self->own().list_device, views[i]);
+        pass.placed_vb[start + i] = placed_buffer_range(self->own().list_device, views[i].BufferLocation, views[i].SizeInBytes);
     }
 }
 // List slot 13, DrawIndexedInstanced(index count, instances, start index, base vertex, start instance).
