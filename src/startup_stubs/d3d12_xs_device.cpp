@@ -27,6 +27,7 @@
 #include "startup_stubs/slice_footprints.h"
 
 #include <d3d12.h>
+#include "null_binding_cause.h"
 #include "null_texture_view.h"
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
@@ -2696,10 +2697,11 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     }
     if (render_mode() && frame % 300 == 0)
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, executes %ld, draws %ld (skipped %ld), "
-            "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld, textures uploaded %ld "
-            "(%ld KiB, unreadable %ld)", render_resets,
+            "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld), "
+            "textures uploaded %ld (%ld KiB, unreadable %ld)", render_resets,
             render_reset_failures, render_closes, render_clears, render_executes, render_draws, render_draws_skipped,
-            translated_draws, untranslated_draws, translation_ready, translation_missing, null_bindings, textures_uploaded,
+            translated_draws, untranslated_draws, translation_ready, translation_missing, null_bindings,
+            null_by_cause[0], null_by_cause[1], null_by_cause[2], null_by_cause[3], null_by_cause[4], textures_uploaded,
             texture_bytes_uploaded, textures_unreadable);
     if (render_mode() && frame % 300 == 0) {
         // Which command-list slots the title called in the last 300 frames, per frame.
