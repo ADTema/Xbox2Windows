@@ -134,6 +134,11 @@ These are measured on one executable; treat them as hypotheses for others.
   a `float3` of the three address registers in order; 1D images are refused. A source-built pixel
   stage draws one texel of a 2x2x2 texture on WARP and hardware with DXC and FXC
   (`ctest --preset release --no-tests=error -R "^startup_image_3d_"`).
+- **Explicit mip loads.** For 2D and 3D textures, `image_load_mip` passes the final address
+  register to `Texture.Load` as the mip level. Ordinary `image_load` still reads mip zero.
+  The source-built 2D draw reads distinct colors from mips zero and two, and a wrong-mip
+  reference must fail at pixel (0, 0). The 3D case checks nonconsecutive address registers
+  during translation. Run `ctest --preset release --no-tests=error -R '^startup_image_load_mip_' -V`.
 - **Stream-cache identity.** A cached zlib stream is served only to the exact queued
   continuation entries in the same DirectStorage queue. The lookup checks the enqueued request
   id, the source, the compressed size and the destination chunk size. A later independent
