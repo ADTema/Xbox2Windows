@@ -4116,7 +4116,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     vector[dst] = f"uv.{component}" if mask == "quad" else ("entry_uv", component)
             else:
                 raise ValueError("Unpaired interpolation")
-        elif m := match(r"(image_sample(?:(?:_lz|_l|_b)?(?:_o)?|_d(?:_o)?(?:_g16)?)) (?:v\[(\d+):(\d+)\]|v(\d+)), "
+        elif m := match(r"(image_sample(?:(?:_lz|_l|_b)?(?:_o)?|_c?d(?:_o)?(?:_g16)?)) (?:v\[(\d+):(\d+)\]|v(\d+)), "
                         r"v\[(\d+):(\d+)\], s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0x([1-9a-f]) dim:SQ_RSRC_IMG_2D"):
             op, dst_first, dst_last, dst_single, *rest, dmask_hex = m.groups()
             dmask = int(dmask_hex, 16)
@@ -4126,7 +4126,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             sample_op = op.removesuffix("_g16")
             base_op = sample_op.removesuffix("_o")
             has_offset = sample_op != base_op
-            if base_op == "image_sample_d":
+            coarse = base_op == "image_sample_cd"
+            gradient = coarse or base_op == "image_sample_d"
+            if coarse and cpu != "gfx1030":
+                raise ValueError("Coarse-gradient sampling requires gfx1030")
+            if gradient:
                 # LLVM disassembly lists only the live address operands.
                 coord_width = (4 if g16 else 6) + has_offset
             else:
@@ -4174,8 +4178,21 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     return value
                 return fp_operand(reg, scalar, vector, pending, sample_dest)
 
-            if base_op == "image_sample_d":
+            if gradient:
                 u, v = [sample_coord(reg) for reg in coord_regs[-2:]]
+                if coarse:
+                    # Uniform slopes give the same inputs if the texture unit shares
+                    # gradient operands between invocations. Refuse lane-varying slopes.
+                    words = [known_ssa_bits.get(vector[reg]) for reg in coord_regs[:-2]]
+                    if any(word is None for word in words):
+                        raise ValueError("Coarse gradients require statically known slopes")
+                    if g16:
+                        finite = all((word & 0x7c00) != 0x7c00
+                                     and (word >> 16 & 0x7c00) != 0x7c00 for word in words)
+                    else:
+                        finite = all((word & 0x7f800000) != 0x7f800000 for word in words)
+                    if not finite:
+                        raise ValueError("Coarse gradients require finite slopes")
                 # Two coordinate slopes per screen axis, horizontal first. G16 packs
                 # U in the low half and V in the high half of each gradient word.
                 if g16:

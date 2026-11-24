@@ -5560,6 +5560,8 @@ python3 -B tests/pixel_sample_offset_check.py binary llvm-mc-15 llvm-objcopy-15 
 ctest --preset dev --no-tests=error -R '^pixel_aot_sample_offset_' -V
 ```
 
+### gfx1030 2D explicit and coarse-gradient sampling
+
 The same pixel profile lowers `image_sample_d`, `image_sample_d_o`,
 `image_sample_d_g16`, and `image_sample_d_o_g16` to `SampleGrad`. For `gfx1030`,
 use `--cpu gfx1030` with wave64 input. Each instruction uses contiguous 2D
@@ -5581,6 +5583,24 @@ vertical U slope from zero gradients. It also checks a larger slope against
 mip 2 of a four-mip texture and both offset forms against the spatial ramp.
 Zero gradients must change the first covered pixel from green to red. Zero
 offset must change the ramp's first red value from `0x3d808000` to `0x00000000`.
+
+`image_sample_cd`, `image_sample_cd_o`, `image_sample_cd_g16`, and
+`image_sample_cd_o_g16` share the same layout in the LLVM 15 gfx1030 image
+intrinsics. This profile accepts only statically known finite slope words.
+The explicit slopes then agree across lanes, so the lowering supplies the
+same pair to `SampleGrad` irrespective of which lane supplies a coarse
+slope. Lane-varying or non-finite slopes and LOD-clamp variants are refused.
+The coarse fixture checks the exact four gfx1030 opcodes through the CLI and
+uses the same desktop readback cases and mutations in a separately recorded
+CTest pair. Native lane selection for varying gradients remains unmeasured.
+
+```bash
+python3 -B tests/pixel_sample_gradient_check.py binary-coarse llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1 llc-15
+```
+
+```powershell
+ctest --preset dev --no-tests=error -R '^pixel_aot_sample_coarse_gradient_' -V
+```
 
 ```bash
 python3 -B tests/pixel_sample_gradient_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1 llc-15
