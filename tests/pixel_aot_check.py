@@ -8773,6 +8773,24 @@ def translate_buffer_color(instructions):
     return lower(instructions, 9, 24, None, 0)
 
 
+def min_num(*values):
+    """HLSL min, and V_MIN_F32 with IEEE mode off: a NaN operand gives the other operand."""
+    numbers = [v for v in values if v == v]
+    return min(numbers) if numbers else math.nan
+
+
+def max_num(*values):
+    numbers = [v for v in values if v == v]
+    return max(numbers) if numbers else math.nan
+
+
+def med3_f32(a, b, c):
+    """V_MED3_F32 (RDNA 2 ISA): the median, or V_MIN3_F32 of the three operands when any of them is NaN."""
+    if any(v != v for v in (a, b, c)):
+        return min_num(a, b, c)
+    return sorted((a, b, c))[1]
+
+
 def three_way_case(directory, low, high, cap, middle, *, name="three_way.case"):
     """Expected colors for three_way(); no rounding occurs before the half export."""
     case = bytearray(256)
@@ -8780,8 +8798,8 @@ def three_way_case(directory, low, high, cap, middle, *, name="three_way.case"):
     for y in RAMP:
         for x in RAMP:
             r, g, b = single(x / 255), single(y / 255), single(128 / 255)
-            clamped = sorted((r, low, high))[1]
-            color = (clamped, min(abs(cap), g, clamped), max(r, b, g), sorted((middle, g, r))[1])
+            clamped = med3_f32(r, low, high)
+            color = (clamped, min(abs(cap), g, clamped), max(r, b, g), med3_f32(middle, g, r))
             case.extend(struct.pack("<4f", *map(half_rtz, color)))
     path = directory / name
     path.write_bytes(case)
@@ -8789,15 +8807,24 @@ def three_way_case(directory, low, high, cap, middle, *, name="three_way.case"):
 
 
 def check_three_way_templates():
-    """The HLSL forms must pick the expected operand for every operand order."""
-    values = (-1.5, 0.0, 0.25, 0.25, 3.0)
+    """The HLSL forms must pick the expected operand for every operand order, NaN operands included."""
+    names = {"min": min_num, "max": max_num, "asuint": lambda x: struct.unpack("<I", struct.pack("<f", x))[0]}
+    # Evaluate the med3_32 helper of the preamble: its NaN test on the encoding, then the selected form.
+    helper = (r"^float med3_32\(float a, float b, float c\) \{\n    uint top = (.+);\n"
+              r"    return top > (0x[0-9a-f]+)u \? (.+) : (.+);\n\}")
+    for top, limit, nan_form, finite_form in re.findall(helper, pixel_aot.PREAMBLE, re.M):
+        top = re.sub(r"(0x[0-9a-f]+)u\b", r"\1", top)
+        names["med3_32"] = lambda a, b, c: eval(
+            nan_form if eval(top, names, {"a": a, "b": b, "c": c}) > int(limit, 16) else finite_form,
+            names, {"a": a, "b": b, "c": c})
+    values = (-1.5, 0.0, 0.25, 0.25, 3.0, math.nan)
     for a in values:
         for b in values:
             for c in values:
-                pick = {name: eval(ALU[name][1].format("a", "b", "c"), {"min": min, "max": max},
-                                   {"a": a, "b": b, "c": c}) for name in ("min3", "max3", "med3")}
-                assert pick == {"min3": min(a, b, c), "max3": max(a, b, c),
-                                "med3": sorted((a, b, c))[1]}, (a, b, c)
+                for name, expected in (("min3", min_num(a, b, c)), ("max3", max_num(a, b, c)),
+                                       ("med3", med3_f32(a, b, c))):
+                    pick = eval(ALU[name][1].format("a", "b", "c"), names, {"a": a, "b": b, "c": c})
+                    assert pick == expected or pick != pick and expected != expected, (name, a, b, c, pick)
 # Give the four invocations lane IDs 0, 1, 2, 3, then gather the converted values
 # using the author's injective base-4 weights. This witnesses every routed lane.
 DPP_CVT_LANES = [
@@ -15854,9 +15881,9 @@ def _check_controls_inline(directory):
                      ("v_add_f32_e32 v19, s44, v13", "v_add_f32_e32 v19, v13")):
         must_reject(translate, [line.replace(old, new) for line in shaping()])
     source = translate(three_way())
-    for expected in ("max(min(params[1].z, sample16.y), min(max(params[1].z, sample16.y), sample16.x))",
+    for expected in ("med3_32(params[1].z, sample16.y, sample16.x)",
                      "max(max(sample16.x, sample16.z), sample16.y)",
-                     "max(min(sample16.x, params[0].w), min(max(sample16.x, params[0].w), params[1].x))",
+                     "med3_32(sample16.x, params[0].w, params[1].x)",
                      "min(min(abs(params[1].y), sample16.y), alu"):
         assert expected in source, expected
     for old, new in (("v_med3_f32 v12, v12, s44, s45", "v_med3_f32 v12, v12, s44"),
@@ -20273,10 +20300,20 @@ def check_three_way_draw(directory, compiler, renderer, backend):
     source.write_text(translate(three_way()), encoding="ascii")
     compile_shader(compiler, source, shader)
     cases = []
-    for idx, constants in enumerate(((.25, .75, .375, .5), (.625, .125, -.3125, .5))):
+    # The second case makes the bounds of the first med3 and the first operand of the second NaN.
+    for idx, constants in enumerate(((.25, .75, .375, .5), (math.nan, .75, .375, math.nan), (.625, .125, -.3125, .5))):
         case = three_way_case(directory, *constants, name=f"three_way-{idx}.case")
         cases.append((case, "pass"))
     run_pixel_batch(renderer, backend, shader, cases)
+    # Desktop min and max alone skip a NaN operand instead of taking V_MIN3_F32 of the rest.
+    text = source.read_text(encoding="ascii")
+    nan_ignored = text.replace("? min(min(a, b), c) :", "? max(min(a, b), min(max(a, b), c)) :")
+    assert nan_ignored != text
+    source.write_text(nan_ignored, encoding="ascii")
+    compile_shader(compiler, source, shader)
+    wrong = subprocess.run([renderer, backend, "--check-pixel-case", shader, cases[1][0]], capture_output=True, text=True)
+    if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+        raise AssertionError("A median that ignores a NaN operand escaped detection")
     draw = [renderer, backend, "--check-pixel-case", shader, cases[-1][0]]
     without_abs = [line.replace("|s46|", "s46") for line in three_way()]
     source.write_text(translate(without_abs), encoding="ascii")
