@@ -717,12 +717,14 @@ class TestRdna2Disasm(unittest.TestCase):
                 (4, 4, "sopk_truncated", "s_setreg_imm32_b32 <truncated>"),
             ],
         )
-        # A 32-bit literal equal to s_endpgm (0xbf810000) belongs to s_setreg_imm32_b32.
+        # Boundary control: a 32-bit literal equal to s_endpgm (0xbf810000) belongs to
+        # s_setreg_imm32_b32.  Trailing bytes after s_endpgm are still decoded and marked
+        # with after_endpgm=True (matches LLVM 15 decode-through-end behaviour).
         stream = bytes.fromhex(
             "810880ba000081bf"  # s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 0xbf810000
             "01f804b9"          # s_getreg_b32 s4, hwreg(HW_REG_MODE)
             "000081bf"          # s_endpgm
-            "810884b9"          # s_setreg_b32 after s_endpgm is still in the supplied span
+            "810884b9"          # trailing instruction decoded past s_endpgm
         )
         insns = disasm_rdna2(stream)
         self.assertEqual(
@@ -848,6 +850,39 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertEqual(result["supported_instructions"], len(scan_source))
         self.assertFalse(result["translator_accepted"])
         self.assertEqual(result["lower_error"], "Instruction follows program end")
+
+    def test_decode_continues_past_s_endpgm(self):
+        """Issue #938 step 4: disasm_rdna2 must decode past s_endpgm (LLVM 15 behaviour).
+
+        Verifies that instructions after s_endpgm are decoded, and that the
+        after_endpgm field distinguishes pre/post terminator instructions.
+        """
+        # s_endpgm followed by a valid instruction — must NOT stop at offset 4.
+        stream = bytes.fromhex("000081bf" + "0103007e")  # s_endpgm | v_mov_b32_e32 v0, v1
+        insns = disasm_rdna2(stream)
+        self.assertEqual(len(insns), 2)
+        self.assertEqual(insns[0]["opcode"], "s_endpgm")
+        self.assertEqual(insns[1]["opcode"], "v_mov_b32_e32")
+        self.assertFalse(insns[0]["after_endpgm"])
+        self.assertTrue(insns[1]["after_endpgm"])
+
+        # Instruction sequence: v_mov_b32_e32 v0, v1 | s_nop 0 | s_endpgm | v_mov_b32_e32 v2, v3
+        stream2 = bytes.fromhex(
+            "0103007e" +  # v_mov_b32_e32 v0, v1
+            "000080bf" +  # s_nop 0
+            "000081bf" +  # s_endpgm
+            "0307007e"    # v_mov_b32_e32 v2, v3
+        )
+        insns2 = disasm_rdna2(stream2)
+        self.assertGreaterEqual(len(insns2), 4)
+        self.assertEqual(insns2[2]["opcode"], "s_endpgm")
+        self.assertEqual(insns2[3]["after_endpgm"], True)
+
+        # A second terminator cannot move the first boundary.
+        repeated = disasm_rdna2(stream + bytes.fromhex("000081bf0103007e"))
+        self.assertEqual([ins["after_endpgm"] for ins in repeated], [False, True, True, True])
+        unterminated = disasm_rdna2(bytes.fromhex("0103007e000080bf"))
+        self.assertEqual([ins["after_endpgm"] for ins in unterminated], [False, False])
 
     def test_second_dword_forms_keep_the_stream_aligned(self):
         # Independent GFX10 encodings from LLVM MC 15.0.7 test/MC/AMDGPU (gfx10_asm_vop1.s,
