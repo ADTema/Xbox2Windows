@@ -1143,11 +1143,31 @@ class Stage:
             mip = self.u(cs[axes]) if how == 'load_mip' else '0'
             call = '%s.Load(int%d(%s))' % (tex, axes + 1, ', '.join(address + [mip]))
         else:
+            packed_2d = False
+            if not one and how in ('sample', 'lz'):
+                op_name = 'image_sample' if how == 'sample' else 'image_sample_lz'
+                packed_2d = dim == 'SQ_RSRC_IMG_2D' and 'a16' in mods
+                allowed = ('dlc', 'glc', 'slc') + (('a16',) if packed_2d else ())
+                for m in mods:
+                    if not (m.startswith(('dim:', 'dmask:')) or m in allowed):
+                        raise Unsupported('%s modifier %s' % (op_name, m))
+                if not dmask:
+                    raise Unsupported('%s with an empty dmask' % op_name)
+                expected = 1 if packed_2d else (3 if three else 2)
+                if len(cs) != expected:
+                    raise Unsupported('%s with %d address registers' % (op_name, len(cs)))
             heap = self.heap_sampler(ops[3])
             words = None if heap else self.const_words(ops[3])
             smp = heap or self.pipe.sampler(tuple(words) if words else self.descriptor(ops[3]))
-            uv = (self.f(cs[0]) if one else 'float3(%s, %s, %s)' % (self.f(cs[0]), self.f(cs[1]), self.f(cs[2])) if three
-                  else 'float2(%s, %s)' % (self.f(cs[0]), self.f(cs[1])))
+            if packed_2d:
+                packed = self.u(cs[0])
+                uv = 'float2(f16tof32(%s), f16tof32(%s >> 16))' % (packed, packed)
+            elif one:
+                uv = self.f(cs[0])
+            elif three:
+                uv = 'float3(%s, %s, %s)' % (self.f(cs[0]), self.f(cs[1]), self.f(cs[2]))
+            else:
+                uv = 'float2(%s, %s)' % (self.f(cs[0]), self.f(cs[1]))
             if how == 'l':
                 call = '%s.SampleLevel(%s, %s, %s)' % (tex, smp, uv, self.f(lod))
             elif how == 'lz' or not self.exec_known or self.kind != 'ps' or len(self.blocks) > 0:
@@ -1970,7 +1990,7 @@ def fnv(data, h=1469598103934665603):
 
 def pipeline_key(vs_code, ps_code, root_blob, layout=b''):
     """Hash the startup translation revision and the three blobs in runtime order, then a stream's input layout."""
-    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-5'))))
+    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-6'))))
     return fnv(layout, key) if layout else key
 
 

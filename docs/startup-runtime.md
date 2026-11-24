@@ -855,6 +855,14 @@ These are measured on one executable; treat them as hypotheses for others.
   high halves of one VGPR and reads mip zero. The packed form requires one address VGPR without an
   NSA extension. Plain loads refuse an empty `dmask`, `r128`, `lwe`, `d16`, `tfe` and reserved bits.
   The source-built startup mip-load check covers this translation on Linux.
+- **Packed 2D sample coordinates.** Plain 2D `image_sample` and `image_sample_lz` with `a16` unpack two
+  IEEE binary16 coordinates from one VGPR (`float2(f16tof32(p), f16tof32(p >> 16))`) without an NSA
+  extension, and both the offline and runtime cache keys advance to `x2w-startup-shader-6` so pre-fix
+  two-VGPR translations are not reused. Non-1D `image_sample` and `image_sample_lz` accept cache-policy
+  flags (`glc`, `slc`, `dlc`) and refuse `unorm`, `r128`, `tfe`, `lwe`, `d16`, reserved bits, an empty
+  `dmask`, wrong address-register counts, fake NSA extensions, and `a16` on 3D or 2D-array images
+  (`ctest --preset dev --no-tests=error -R "^startup_image_sample_a16_" -V`). `image_sample_l` and 3D /
+  2D-array `a16` stay refused.
 - **2D array images.** `image_sample`, `image_sample_lz`, `image_sample_l` and `image_load` with
   `dim:SQ_RSRC_IMG_2D_ARRAY` use a `Texture2DArray<float4>` (manifest kind `tex2da`). The slice is
   the third address component, as `float3(u, v, slice)` for a sample and `int4(x, y, slice, 0)`
