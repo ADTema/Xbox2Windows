@@ -154,6 +154,22 @@ class OfflinePreflightChecks(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Entry is not"):
             summarize(self.package, "missing.exe")
 
+    def test_strict_plan_refuses_external_provider(self):
+        package = {
+            "app.exe": info("app", imports=[("normal", "xgameruntime.dll", "XUserAddAsync")]),
+        }
+        report = summarize(package, "app.exe")
+        row = report["imports"][0]
+        self.assertEqual(row["status"], "external_unverified")
+        self.assertFalse(row["chain"][0]["package"])
+        with self.assertRaisesRegex(
+                ValueError, r"app\.exe: xgameruntime\.dll!XUserAddAsync: external_unverified"):
+            plan(report, allow_external=False)
+        order, bindings = plan(report)
+        self.assertEqual(order, ["app.exe"])
+        self.assertEqual(bindings["app.exe"][("xgameruntime.dll", "XUserAddAsync")]["dll"],
+                         "xgameruntime.dll")
+
     def test_inspect_never_executes_and_ignores_non_pe_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

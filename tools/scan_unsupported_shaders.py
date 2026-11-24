@@ -246,7 +246,7 @@ COMPILED_SUPPORTED_PATTERNS = [re.compile(f"^{p}$") for p in SUPPORTED_INSTRUCTI
 
 KNOWN_RDNA2_BASE_OPCODES = {
     # SOPP
-    "s_nop", "s_endpgm", "s_branch", "s_cbranch_scc0", "s_cbranch_scc1",
+    "s_nop", "s_endpgm", "s_code_end", "s_branch", "s_cbranch_scc0", "s_cbranch_scc1",
     "s_cbranch_vccz", "s_cbranch_vccnz", "s_cbranch_execz", "s_cbranch_execnz",
     "s_barrier", "s_waitcnt", "s_inst_prefetch", "s_clause", "s_waitcnt_vscnt",
     "s_waitcnt_vmcnt", "s_waitcnt_expcnt", "s_waitcnt_lgkmcnt", "s_trap", "s_round_mode",
