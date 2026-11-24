@@ -441,6 +441,13 @@ add_test(NAME startup_draw_bmp COMMAND startup_draw_bmp_check)
 add_executable(startup_gamesave_persist tests/startup_gamesave_persist.cpp)
 target_compile_features(startup_gamesave_persist PRIVATE cxx_std_17)
 add_test(NAME startup_gamesave_persist COMMAND startup_gamesave_persist)
+# Enumeration of the same store (Store::list_containers, Store::list_blobs): exact names, sizes and
+# order, what is not listed, the busy and untouched-output rules, and a second process that
+# publishes two-blob updates while this one lists.
+add_executable(startup_gamesave_enumerate tests/startup_gamesave_enumerate.cpp)
+target_compile_features(startup_gamesave_enumerate PRIVATE cxx_std_17)
+add_test(NAME startup_gamesave_enumerate COMMAND startup_gamesave_enumerate)
+set_tests_properties(startup_gamesave_enumerate PROPERTIES TIMEOUT 120)
 # Publication of a multi-blob update: a second process sees the whole old generation or the whole
 # new one. The test is built from two generated copies of the store headers, each with a pause
 # point at every step of the publication (the `x2w-seam` comments). In the second copy the file lock
