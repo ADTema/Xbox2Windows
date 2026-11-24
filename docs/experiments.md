@@ -5746,6 +5746,11 @@ modifier the emitted text is unchanged. `op_sel` and source modifiers are still 
 rather than silently ignored, and a uint-result conversion such as `v_cvt_f16_f32` keeps refusing output
 modifiers. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_vcvt_omod$' -V`.
 
+The SDWA forms of those conversions read the same table: after the split, `sdwa()` still looked only at the
+uint-result table, so every `v_cvt_f32_*_sdwa` was refused until it was pointed at both (#1727). The
+restored path keeps the source selection, the `dst_sel`/`dst_unused` write and the `U(...)` wrapper, and a
+conversion's output modifier inside an SDWA form is still refused rather than dropped.
+
 ## Pixel color without a texture sample
 
 For an unsampled pixel program, a matched P1/P2 interpolation in the entry mask can supply attr0.x/y/z/w from a four-component TEXCOORD0. The profile binds entry v0/v1 to the barycentric pair and the observed m0 source to the interpolation base. Each completed P2 produces a distinct value, including when the destination overwrites v0. The test vertex shader varies all four channels across a full-screen triangle. CPU references check all four output words at 1,024 pixel centers; an incorrect channel at an interior pixel must fail. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_attribute_'`.
