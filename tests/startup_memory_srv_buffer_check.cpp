@@ -119,6 +119,14 @@ int main()
     const auto typ_ok = typed_view(DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 4);
     check("typed valid", x2w_startup::supports_buffer_memory_srv(buf, typ_ok));
     check("typed unknown format", !x2w_startup::supports_buffer_memory_srv(buf, typed_view(DXGI_FORMAT_UNKNOWN, 0, 1)));
+    check("typed element bytes 16", x2w_startup::typed_buffer_format_bytes(DXGI_FORMAT_R32G32B32A32_FLOAT) == 16);
+    check("typed element bytes 12", x2w_startup::typed_buffer_format_bytes(DXGI_FORMAT_R32G32B32_UINT) == 12);
+    check("typed element bytes 2", x2w_startup::typed_buffer_format_bytes(DXGI_FORMAT_R16_UNORM) == 2);
+    check("typed srgb rejected", !x2w_startup::supports_buffer_memory_srv(buf, typed_view(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 0, 1)));
+    check("typed bgra srgb rejected", !x2w_startup::supports_buffer_memory_srv(buf, typed_view(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, 0, 1)));
+    check("typed bc rejected", !x2w_startup::supports_buffer_memory_srv(buf, typed_view(DXGI_FORMAT_BC7_UNORM, 0, 1)));
+    check("typed depth rejected", !x2w_startup::supports_buffer_memory_srv(buf, typed_view(DXGI_FORMAT_D32_FLOAT, 0, 1)));
+    check("typed typeless rejected", !x2w_startup::supports_buffer_memory_srv(buf, typed_view(DXGI_FORMAT_R32G32B32A32_TYPELESS, 0, 1)));
     check("typed resolve interior",
           x2w_startup::resolve_buffer_srv_desc(0x10000, 1024, 0x10010, typ_ok, resolved) &&
               resolved.Buffer.FirstElement == 2);

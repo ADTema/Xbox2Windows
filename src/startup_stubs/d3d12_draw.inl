@@ -938,10 +938,12 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 std::memcpy(&view, record.desc, 40);
                 Wrapper* resource = as_wrapper(reinterpret_cast<const void*>(record.resource));
                 if (view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER && resource && resource->own().title_memory) {
-                    const UINT element = view.Buffer.StructureByteStride ? view.Buffer.StructureByteStride : 4;
+                    const bool typed_view = !view.Buffer.StructureByteStride && view.Format != DXGI_FORMAT_R32_TYPELESS;
+                    const UINT element = view.Buffer.StructureByteStride ? view.Buffer.StructureByteStride
+                                         : typed_view ? x2w_startup::typed_buffer_format_bytes(view.Format) : 4;
                     address = reinterpret_cast<u64>(resource->own().title_memory) + view.Buffer.FirstElement * element;
                     bytes = std::size_t{view.Buffer.NumElements} * element;
-                    strides[i] = view.Buffer.StructureByteStride;
+                    strides[i] = typed_view ? element : view.Buffer.StructureByteStride;
                 }
             }
         }

@@ -719,6 +719,12 @@ descriptions with:
   forwards to slot 18 with `pResource == nullptr`. Adapters without raytracing support refuse the
   call cleanly (`raytracing_unsupported`) without removing the device.
 
+Typed element bytes come from the format (1 to 16 bytes). Formats that cannot back a typed buffer SRV
+(sRGB, BGRA, block-compressed, depth/stencil, typeless, planar) are refused with
+`unsupported_description` and leave the destination descriptor unchanged. Translated draws bind typed
+views with the format's element size and stride. The refusal reasons are listed in
+`docs/experiments.md` ("Name the cause of a refused slot 70 call").
+
 Checks:
 
 - `ctest --preset release --no-tests=error -R '^startup_memory_srv_(report|buffer)$' -V`
