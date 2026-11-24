@@ -22,6 +22,7 @@
 #include "startup_stubs/bc7_4k_s.h"
 #include "startup_stubs/bc64_chain.h"
 #include "startup_stubs/derived_blend.h"
+#include "startup_stubs/placement_publish.h"
 
 #include "startup_stubs/slice_footprints.h"
 
@@ -67,6 +68,7 @@ const char* const kind_names[kind_count] = {
 // The title also writes into those fields (seen: a command list at +0x544), so the wrapper's own
 // state lives in front of the object, out of the title's reach, and the zero-filled area behind the
 // vtable pointer is sized per kind (64 KiB for command lists).
+struct Wrapper;
 struct WrapperOwn {
     IUnknown* real;
     LONG refs;
@@ -80,7 +82,7 @@ struct WrapperOwn {
     bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
     bool list_ready;  // CommandList (render mode): closed with recorded work, not yet submitted
     void* pass;       // CommandList (render mode): recording state (Pass)
-    std::uint64_t pad;  // keeps the size a multiple of 16: the title uses aligned loads on objects
+    Wrapper* list_device;    // CommandList: wrapper that created this list.
 };
 static_assert(sizeof(WrapperOwn) % 16 == 0, "the title-visible object must stay 16-byte aligned");
 struct Wrapper {
@@ -674,7 +676,9 @@ __declspec(noinline) u64 create_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d, 
     Kind kind = other_kind;
     if (SUCCEEDED(static_cast<HRESULT>(result)) && iid && out && *out) {
         kind = kind_for(*iid);
-        *out = wrap(static_cast<IUnknown*>(*out), kind);
+        Wrapper* child = wrap(static_cast<IUnknown*>(*out), kind);
+        if (K == device_kind && kind == list_kind) child->own().list_device = self;
+        *out = child;
     }
     static LONG calls;
     if (first_calls(calls, 4)) {
@@ -730,7 +734,13 @@ HRESULT __stdcall query_interface(Wrapper* self, const GUID* iid, void** out)
 }
 ULONG __stdcall add_ref(Wrapper* self) { return static_cast<ULONG>(InterlockedIncrement(&self->own().refs)); }
 // The wrappers and their desktop objects stay alive for the process (experiment scope).
-ULONG __stdcall release(Wrapper* self) { return static_cast<ULONG>(InterlockedDecrement(&self->own().refs)); }
+void retire_placement(Wrapper* w);
+ULONG __stdcall release(Wrapper* self)
+{
+    const auto refs = InterlockedDecrement(&self->own().refs);
+    if (!refs && self->own().kind == resource_kind && self->own().title_memory) retire_placement(self);
+    return static_cast<ULONG>(refs);
+}
 
 // Slot 7 of every device child, desktop ID3D12DeviceChild::GetDevice(riid, ppv).
 HRESULT __stdcall child_get_device(Wrapper* self, const GUID* iid, void** out)
@@ -1425,6 +1435,7 @@ struct Pass {
     u64 root_address[16] = {};       // title address of each root descriptor
     std::uint32_t constants[16][8] = {};
     D3D12_VERTEX_BUFFER_VIEW vb[8] = {};
+    PlacedVertexView placed_vb[8] = {};
     D3D12_INDEX_BUFFER_VIEW ib = {};
     DXGI_FORMAT target_formats[8] = {};
     UINT target_count = 0;
@@ -2076,7 +2087,9 @@ HRESULT __stdcall device_create_command_list_x(Wrapper* self, const void* desc, 
         log("x2w-d3d12 Device::slot73(CreateCommandList?) desc=[%s] allocator=%p pso=%p riid=%s -> 0x%08lx", bytes,
             allocator, pso, text, static_cast<unsigned long>(hr));
     if (FAILED(hr)) return hr;
-    *out = wrap(list, list_kind);
+    Wrapper* child = wrap(list, list_kind);
+    child->own().list_device = self;
+    *out = child;
     return S_OK;
 }
 
@@ -2197,6 +2210,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
                                                    IID_PPV_ARGS(&resource));
     // A buffer that spans several allocations (adjacent placeholder pieces) cannot be placed on one
     // existing heap. Fallback: a committed default-heap buffer, not aliased with the title memory.
+    const bool aliased = SUCCEEDED(hr);
     const char* placement = "aliased";
     if (FAILED(hr)) {
         const D3D12_HEAP_PROPERTIES props{D3D12_HEAP_TYPE_DEFAULT};
@@ -2211,7 +2225,19 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
     if (FAILED(hr)) return hr;
     Wrapper* w = wrap(resource, resource_kind);
     w->own().title_memory = address;
-    note_resource(w, desc, desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? desc->Width : 0);
+    const ResourceInfo record{*desc, desc->Width, aliased ? Placement::aliased_buffer : Placement::copied_buffer, self};
+    auto& group = placement_group(desc->Width);
+    hr = x2w_startup::publish_placement(note_lock, resource_infos, group.by_start, group.max_width,
+        static_cast<const Wrapper*>(w), reinterpret_cast<u64>(address), record);
+    if (FAILED(hr)) {
+        // The caller has never received this wrapper; release its desktop resource and storage.
+        AcquireSRWLockExclusive(&registry_lock);
+        registry().erase(w);
+        ReleaseSRWLockExclusive(&registry_lock);
+        resource->Release();
+        _aligned_free(&w->own());
+        return hr;
+    }
     *out = w;
     return S_OK;
 }

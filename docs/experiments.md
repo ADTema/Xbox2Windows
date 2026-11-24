@@ -1480,6 +1480,8 @@ Seven native-only exports move on the caller's flags. `fcmovb` and `fcmove` move
 
 `cpu_aot_x87_examine` checks `ftst`, `fxam`, `ficom` and `ficomp` with an m16 or m32 integer, `fnop`, `fnclex` and `fclex` in the same way, with 4 exports and 782 cases. `ftst` compares ST(0) with +0.0 and `ficom` with the integer, converted exactly as for `fild`; both set C0, C2 and C3 like `fcom`, and `ficomp` pops. `fxam` writes C3, C2 and C0 from the 80-bit encoding: unsupported, NaN, normal, infinity, zero, empty and denormal, where a pseudo-denormal is a denormal, as the native run confirms. An empty ST(0) is known at translation time. C1, which `fxam` sets to the sign, stays unknown, as for every instruction in the profile except `fprem` and `fprem1` in the checked entry. `fnop` and `fnclex` change nothing the profile models, and `fclex` decodes as `wait` and `fnclex`; like every other x87 instruction they leave C0, C2 and C3 undefined. The inputs cover every class, both signs, the integer bounds and values on either side of an integer. Three mutated controls, which report a denormal as normal, convert the integer as unsigned, and compare `ftst` with 1.0, gave 5, 136 and 7 mismatches. Translation rejects `ftst` and `ficomp` on an empty stack, and a reader of C0 after `fnop` or `fnclex`. The rejection cases that used these instructions in the earlier x87 tests now use instructions that stay outside the profile. Run `ctest --preset dev --no-tests=error -R '^cpu_aot_x87_examine$' -V`.
 
+The profile also accepts the 8087/287 controls `fneni`, `fndisi` and `fnsetpm`, which the 80387 and later execute as `fnop`; `feni` and `fdisi` decode as `wait` and the no-wait form, and ML64 assembles `fsetpm` as `fnsetpm` without a `wait` and has no `fnsetpm` spelling. A fifth export, `legacy_controls`, runs `feni`, `fneni`, `fdisi`, `fndisi` and `fsetpm` between a load and a store, so the check now has 5 exports and 816 cases. On Windows 10 build 19045 the native run stored the loaded value unchanged and returned with control word 0x027F and an empty stack in every case, as the translation does. A fourth control, which flips the sign of ST(0) at `fnsetpm`, gave 34 mismatches, one per `legacy_controls` case, and translation rejects a reader of C0 after `fneni` or `fnsetpm`.
+
 `lower(..., x87=x87_lower.Checked(reject))` is the checked entry of the profile. It also accepts `fldcw m16`, and keeps the control word in a local of the lowered function, `fninit` and `finit`, which load `0x037F`, clear C0 to C3 and empty every register, `fbld` (`cpu_aot_x87_bcd`), and `fprem` and `fprem1` (`cpu_aot_x87_fprem`). The arithmetic, `fsqrt`, `fscale`, `frndint`, `fist` and `fistp`, the m32 and m64 stores, `fnstcw` and the five inexact constant loads all follow that word. The precision control applies only to the arithmetic and `fsqrt`. `fldcw` accepts a word with all six exceptions masked and precision control 00, 10 or 11 (24, 53 or 64 bits). It keeps the word as `fnstcw` reads it back: bit 6 reads as 1, bits 7 and 13 to 15 as 0, and bit 12 is kept. The lowered function leaves through the caller's `reject` statement with a status in these cases:
 
 - status 1, at an `fldcw` whose word unmasks an exception;
@@ -2755,6 +2757,7 @@ python3 -B tests/mesh_entry_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-1
 ctest --preset dev --no-tests=error -R "^mesh_entry_draw_" -V
 ctest --preset dev --no-tests=error -R "^mesh_entry_float_draw_" -V
 ctest --preset dev --no-tests=error -R "^mesh_entry_cvt_minmax_draw_" -V
+ctest --preset dev --no-tests=error -R "^mesh_entry_unary_draw_" -V
 ```
 
 The per-lane binary32 forms of the translator now also include `v_add_f32_e64`,
@@ -2787,6 +2790,42 @@ a depth one unit in the last place off in the last vertex, or any sibling
 opcode, must report `Mesh export trace mismatch`. The draw is written for
 Windows and has not been run on Linux. NaN operands, signed zeros and
 conversions that need rounding are not exercised.
+
+The translator also lowers the one-source binary32 math and rounding forms
+`v_rcp_f32`, `v_rsq_f32`, `v_sqrt_f32`, `v_floor_f32`, `v_trunc_f32`,
+`v_rndne_f32` and `v_fract_f32` (`_e32` and `_e64`) to `1.0f / x`,
+`rsqrt`, `sqrt`, `floor`, `trunc`, `round` (half to even) and `frac` capped at
+`0x3f7fffff`, so that `v_fract_f32` of -2^-30 is the largest binary32 below 1.0 and not 1.0 (the
+same rule as the pixel translator). The cap is a comparison (a result of 1.0 or more is replaced), not `min`,
+because D3D `min` returns its other operand for a NaN, and a NaN input must stay a NaN. Source
+modifiers, `clamp`, output modifiers and a second source are refused. The
+precision of reciprocal, reciprocal square root and square root is not
+claimed, because D3D allows each of them an error. The test program does not
+depend on it: each of the six results is rounded to the nearest integer (add 0.5,
+then floor) before it is summed, and the inputs are chosen so that the exact
+result is an integer (reciprocals of 0.25 and 0.125 give 4 and 8, reciprocal
+square roots of 0.0625 and 0.25 give 4 and 2, square roots of 16 and 9 give 4
+and 3), so any result within 0.5 of the exact one gives the same
+depth. The binary mode checks that scaling those three results by plus or minus
+one part in 1024 leaves the depth unchanged. Floor, truncation, a tie rounded to
+even (-2.5 and -0.5) and a negative fractional part are exact and are compared
+directly, with inputs where the sibling opcode gives a different value. Each
+input reaches its opcode through a register holding a zero that the compiler
+cannot prove (the point and matrix value minus itself), so the shader compiler
+does not fold the operation away. One program applies all fourteen encodings,
+adds the results and a fixed bias of -4.25 that keeps the final depth (0.625)
+inside the clip range; the binary mode
+evaluates the emitted expressions in binary32 and compares the depth with an
+independent Python calculation, and each opcode swapped for its sibling must give
+a different depth. The draw `mesh_entry_unary_draw_*` (`draw-unary`) compares
+the exported position words with that reference; a depth one unit in the last
+place off in the last vertex, or any of the fourteen opcodes swapped for its
+sibling, must report `Mesh export trace mismatch`. The draw is written for
+Windows and has not been run there since this program changed. The binary mode also
+checks that a NaN input of either fract encoding gives a NaN depth, and that the cap written as `min` loses it.
+Infinity,
+denormals, a zero or negative operand of reciprocal square root or square root,
+and signed zero results are not exercised.
 
 A local scan based on main `933cbad` selected the shortest validated native
 stream among 9,282 MS records (832 bytes, 153 instructions). For the tested
@@ -3419,6 +3458,47 @@ ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_d16_' -V
 python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```
 
+### Indexed gfx1030 formatted UINT buffer reads
+
+The compute store profile lowers `buffer_load_format_x`,
+`buffer_load_format_xy`, `buffer_load_format_xyz`, and `buffer_load_format_xyzw`
+for `--source-format BUF_FMT_32_32_32_32_UINT`. The formatted MUBUF opcodes use
+format and channel selectors from the resource descriptor
+([AMD RDNA 2 Shader ISA](https://gpuopen.com/download/rdna2-shader-instruction-set-architecture.pdf), §8.1.4).
+The option declares this format and identity XYZW selectors for the table
+slot named by `--source-descriptor`. The caller checks those fields, disables
+swizzle and add-thread-ID, and binds the same bytes as an aligned raw SRV at
+`t0`. The lowering copies the requested prefix of the four 32-bit words in
+channel order. Each word retains its full UINT representation.
+
+The verified address uses `idxen` with a dispatch-thread index, zero scalar
+offset and an immediate aligned to 16 bytes. A full 16-byte texel must fit
+within the caller's 16-byte-aligned source stride. The source must remain
+stable, in range and disjoint from the output. The descriptor must be ready
+after `lgkmcnt(0)` and all result words become available at `vmcnt(0)`. The
+index may alias a destination. Other formats, channel mappings, native
+bounds, status returns and D16 forms are outside the supported subset.
+
+The wave32 fixtures reuse the first destination as the input index and copy
+one to four distinguishable channels per record. An independent CPU
+reference checks all 320 words, including inter-record gaps and the
+untouched tail, for one and two groups on both backends. Reading Y instead
+of X, or swapping the first and last channels, must mismatch at word 0.
+Rejection controls cover missing and unsupported format declarations,
+address modes, partial records, invalid operand ranges and missing waits.
+LLVM 15 assembles and decodes the four source-built fixtures and compares
+synthetic compute-container CLI HLSL to direct lowering. The GPU tests
+execute the translated desktop DXIL.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_format_' -V
+```
+
+```sh
+python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
 ### Per-lane guards around compute stores
 
 A per-lane bound such as `if (gid < n) store` compiles under LLVM 15 to one exit, with no early `s_endpgm`. A `v_cmp` sets `vcc_lo`, `s_and_saveexec_b32` saves `exec_lo` and masks it, and an optional `s_cbranch_execz` skips the masked block when no lane passes. `s_or_b32 exec_lo, exec_lo, sN` then restores the mask, or the program exits with the mask still applied. The store profile lowers this form as control flow: the stores issued under the mask go inside an HLSL `if`, and stores after the restore stay outside it.
@@ -3958,6 +4038,27 @@ the CLI and pins the lowered line, and changing that one instruction word to
 another compare must change the line. On a Linux host only the LLVM part and the
 reference pictures were run; no WARP or GPU readback of these four forms exists yet.
 
+The program may also apply the one-source binary32 forms `v_rcp_f32_e32`,
+`v_rsq_f32_e32`, `v_sqrt_f32_e32`, `v_floor_f32_e32`, `v_trunc_f32_e32` and
+`v_rndne_f32_e32` (VGPR destination; constant, scalar word or VGPR source). They
+lower to `1.0f / x`, `rsqrt`, `sqrt`, `floor`, `trunc` and `round` (half to
+even). Source modifiers, `clamp`, output modifiers, a second source and the e64
+encodings reject translation. The precision of reciprocal, reciprocal square root
+and square root is not claimed, since D3D allows each an error, and a zero or
+negative operand of the last two, NaN, infinity, denormals and signed zero are not
+exercised. `depth_mask_unary_draw_*` (`unary` mode) therefore feeds the three
+approximate forms an input whose exact result is an integer (1/8, 1/4 and 9), through
+a zero the compiler cannot prove (`v7 - v7`) so the opcode really runs on WARP, rounds
+the result (add 0.5, floor) and scales v7 by it. Floor, truncation and round-to-even
+are compared exactly on `4 * (v7 - 0.5)`, an odd multiple of 1/16 that is never a tie
+or an integer, with thresholds where each sibling gives different pixels. The CPU
+reference is written with Python arithmetic, and every other form's reference must
+fail on exactly the pixels where the two differ. LLVM CI also assembles each form,
+translates it through the CLI, pins the lowered line, and changing that one
+instruction word to each of the other five forms must change the line. On a Linux
+host only the LLVM part (LLVM 19; LLVM 15 was not run) and the reference pictures
+were run; no WARP readback of these six forms exists yet.
+
 The Windows fixture binds distinct seeds and thresholds, changes each separately,
 then exchanges the two root CBV addresses. It checks all 1,024 D32_FLOAT
 pixels and requires comparison against the old reference to fail after the
@@ -3966,7 +4067,7 @@ synthetic container through the CLI.
 
 ```text
 python3 -B tests/depth_mask_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
-ctest --preset dev --no-tests=error -R "^depth_mask_(ops_|cmpx_)?draw_" -V
+ctest --preset dev --no-tests=error -R "^depth_mask_(ops_|cmpx_|unary_)?draw_" -V
 ```
 
 In a local inventory based on main `933cbad`, 354 of 12,101 PS records
@@ -5298,6 +5399,14 @@ Run `ctest --preset dev --no-tests=error -R '^vm_copy_queue_' -V`.
 `vm_page_provenance_warp` and `vm_page_provenance_hardware` test the source side independently. Two pagefile sections hold distinct data and are mapped into adjacent CPU addresses in reverse creation order. D3D12 reopens those same sections as heaps. The test copies a 4 KiB span centered on the page boundary into a GPU buffer using the logical page order, then compares its readback with the two expected token patterns. It writes new data through the CPU aliases and reads the GPU buffer again before uploading, which must still return the old data. A second upload must produce all the updated words. The tests skip (77) if the requested adapter or section-backed D3D12 buffers are unavailable. [Opening a D3D12 heap from a file mapping](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device3-openexistingheapfromfilemapping)
 
 Run `ctest --preset dev --no-tests=error -R '^vm_page_provenance_' -V`.
+
+`vm_raw_srv_warp` and `vm_raw_srv_hardware` select 1024 words straddling a 64 KiB boundary using a GPU byte address and a separate first element. A compute shader reads the native raw buffer SRV through a descriptor table. Readback checks the intended span and a second valid descriptor shifted by four elements. The second span has to match its own expected contents and differ from every word of the first span. The view builder rejects misaligned addresses and views outside the declared buffer.
+
+Run `cmake --build --preset dev --target vm_copy_queue_check` and `ctest --preset dev --no-tests=error -R '^vm_raw_srv_' -V`.
+
+`vm_raw_uav_warp` and `vm_raw_uav_hardware` store through two logical address windows. Each window maps a 2040-byte range that starts 256 or 512 bytes into its own 4 KiB buffer, and each buffer holds distinct sentinel words. `resolve_raw_uav_store` (`src/raw_buffer_uav.h`) maps a logical address to the window that contains it and returns a raw UAV covering exactly that window, plus the store's byte offset. It requires the declared alignment (4 bytes for a scalar DWORD store, 16 bytes for a four-DWORD store) and the whole store inside one window. Seven requests are refused before any descriptor is created: a 16-byte-aligned vector that runs 8 bytes past its window, the first byte after a window, a 4-byte-aligned vector, a misaligned scalar, an address between the windows, an address just before a window, and an undeclared 8-byte width. Four metadata controls also reject a shader offset beyond 32 bits, a misaligned logical base, an address range that wraps and an ambiguous overlapping window. The descriptor result is unchanged on refusal. A compute shader then performs the accepted scalar store in the last DWORD of window 0 and the accepted vector store 24 bytes before the end of window 1. Readback matches both full buffers against the five positions fixed by the fixture, independently of the resolved offsets. A second pass reloads the sentinels and swaps the two window bindings. The stores then land at the matching offsets of the other buffer, and the five intended words keep their sentinels.
+
+Run `cmake --build --preset dev --target vm_copy_queue_check` and `ctest --preset dev --no-tests=error -R '^vm_raw_uav_' -V`.
 
 #### Xbox frame events and token wait semantics (#874)
 
@@ -7678,10 +7787,13 @@ explicitly.
 - Clamp 1 checked against mip 2, and clamp 1.25 checked against the 1.5 blend,
   must fail at pixel (0, 0).
 
-`spirv_minlod_fractional_*` retains the `ps_6_6` capability gate. It checks
-nearest-mip selection at 1.4375, 1.5625 and 3.75. At the 1.5 tie, either
-neighbor is accepted when both shader sources select the same mip. The
-stale-reference check at 1.5625 must reject mip 1 at pixel (0, 0).
+`spirv_minlod_fractional_*` retains the `ps_6_6` capability gate. It requires
+mip 1 at 1.4375 and mip 3 at 3.75. At 1.5 and 1.5625 it checks for exact
+readback of mip 1 or 2, then requires the translated and direct HLSL shaders
+to agree and reports the selected mip. The wrong-mip control at 1.5625
+must reject mip 0 at pixel (0, 0) under either rounding rule. To test
+nearest-mip selection away from the tie, append `--strict-rounding` to
+the normal arguments to `tests/spirv_window/minlod_fractional.py`.
 [Issue #809](https://github.com/R0Y00/Xbox2Windows/issues/809) records why the
 fractional point cases run separately.
 
@@ -8172,9 +8284,10 @@ execution of any retail executable. The public tests contain no private binaries
 ## Legacy SSE FP compares and partial/non-temporal moves
 
 [The SSE FP leaf translator](../tools/cpu_sse_fp_aot.py) lifts bounded straight-line
-Windows x64 leaf functions covering five uncovered forms from `docs/coverage/x64_zen2.tsv`
+Windows x64 leaf functions covering twelve forms from `docs/coverage/x64_zen2.tsv`
 group `SSE`:
 
+- Packed float arithmetic: `addps`, `subps`, `mulps`, `divps`, `minps` and `maxps` (`xmm` and 16-byte aligned `m128` sources, the destination is read and replaced) and `sqrtps` (the destination is only written)
 - Packed float compare: `cmpps` (all eight `imm8` predicates `0..7`, `xmm` and 16-byte aligned `m128` sources)
 - Scalar float compare: `cmpss` (all eight `imm8` predicates `0..7`, `xmm` and unaligned `m32` sources, preserving bits `127:32` of the destination)
 - Half-qword float moves: `movlps` and `movhps` (`m64` load-merge preserving the other 64 bits, and `m64` store)
@@ -8189,6 +8302,15 @@ must target an `r8`-rooted flat `[r8 + disp]` address; full 128-bit aligned oper
 (`cmpps` `m128`, `movntps`, `movaps` `m128`, `movdqa` `m128`) require displacements
 divisible by 16.
 
+The arithmetic forms run the host instruction at run time through the `xmmintrin.h` intrinsics, so the
+rounding mode, DAZ and FTZ are those of the host control word, and nothing is folded at translation time.
+A lane with a NaN source is resolved in software (the first source operand when it is a NaN, else the
+second, made quiet), so a compiler that swaps the operands of an addition cannot change a payload; `minps`
+and `maxps` use the host instruction unchanged, which returns the second source operand for equal values
+(signed zeros included) and for any NaN. A guest `ldmxcsr` is not lifted and exception flags are not observed.
+The packed double forms (`addpd`, `sqrtpd`, `minpd` and the others), the scalar forms, `rcpps` and
+`rsqrtps` stay rejected.
+
 The translator explicitly rejects VEX/EVEX encodings, `cmpps`/`cmpss` predicates
 `imm8 >= 8`, nonvolatile vector registers (`xmm6`..`xmm15`), nonvolatile or non-argument
 memory base registers, non-`r8` store destinations, unaligned 16-byte memory operands,
@@ -8202,8 +8324,8 @@ ctest --preset dev --no-tests=error -R '^cpu_aot_sse_fp$' -V
 
 ### Measured results and open scope
 
-The [MASM fixture](../tests/cpu/sse_fp.asm) exports 34 functions covering all five
-forms: all eight `cmpps` predicates plus aligned `m128`, displaced `m128` and self-compare
+The [MASM fixture](../tests/cpu/sse_fp.asm) exports 34 functions covering the five
+compare and move forms, and 29 more for the arithmetic described below: all eight `cmpps` predicates plus aligned `m128`, displaced `m128` and self-compare
 cases; all eight `cmpss` predicates plus `m32`, unaligned `+1` `m32` and self-compare
 cases; `movlps`/`movhps` loads and stores including unaligned `+1` addresses; `movntps`
 aligned stores at `+0` and `+16`; and a chained `op_pipeline` export. [The differential check](../tests/cpu/sse_fp_check.py)
@@ -8226,7 +8348,53 @@ controls passed 7 alternate-encoding lift checks, 60 unit rejection controls (9 
 4 `imm8 >= 8`, 15 unsupported instructions, 32 ABI/state/addressing/prefix/stream violations),
 and 10 end-to-end PE-patched DLL rejection controls.
 
-Not covered by this experiment: non-default MXCSR modes (FTZ/DAZ or unmasked exceptions),
+#### Packed arithmetic
+
+Each of the seven operations has four exports (register source, aligned `m128` at `[rdx]`, `m128` at
+`[rdx+16]` and the same register as both operands), plus a chained `op_arith_pipeline` that feeds
+`addps`, `mulps`, `subps`, `divps`, `minps`, `maxps` and `sqrtps` into each other. The only stores
+are the `movaps` stores the earlier exports already had, so there is no new store form: every call is
+checked against 32-byte guards before and after the input and output buffers, and bytes of the output
+region the function does not write must keep their fill value.
+
+The reference is [exact rational arithmetic in Python](../tests/cpu/sse_fp_ref.py) with the four rounding
+modes, DAZ and FTZ, written without the processor or the translator. [The check](../tests/cpu/sse_fp_check.py) first
+compares native code, translated code and reference bit for bit on 128 cases per export (every ordered pair of 28 edge
+values, including signed zeros, infinities, quiet and signaling NaNs with payloads, denormals, values that tie
+at a rounding boundary and overflow and underflow, plus 30 random vectors with biased exponents). It then runs
+all 29 exports under 16 control words (round to nearest, down, up and toward zero, each with neither, DAZ,
+FTZ or both) through a native harness export, `op_call_with_mxcsr`, that sets the word for one call and restores
+the caller's word afterwards. The export lives in its own [native-only source](../tests/cpu/sse_fp_harness.asm), built as a separate image and never translated, so the form coverage report credits `cpu_aot_sse_fp` with only the 16 mnemonics of the translated fixture (13 SSE forms) and not the driver's `ldmxcsr`, `stmxcsr` and `call`. A lane the reference cannot decide stays unconstrained and the translated code
+must then still equal the processor: FTZ when the exact result is below the smallest normal number but rounds up
+to it (the manuals leave open whether tininess is judged before or after rounding), and `minps`/`maxps` under DAZ
+when the returned operand is a denormal (it is not established here whether the processor returns the original bits or
+a flushed zero; on the machine used for the Linux run it returned the flushed zero).
+
+Negative controls: an `ALTER_IMM` build assembles each register form with another operation (add and subtract,
+multiply and divide, minimum and maximum, and `sqrtps` as `addps`), each memory form with the other
+displacement, each self form with a second register and the chain with a division in place of the multiplication,
+and the altered translation must match its own reference and differ from the original on every one of the 35
+exports; each non-default control word must change at least one result, so the harness is
+shown to apply it; fifteen deliberately wrong reference rules (NaN operand order, no quieting, mixed-sign zero,
+division by zero, zero and `min` ordering, ignored rounding mode, DAZ or FTZ, and two `sqrtps` rules) must each
+disagree with the processor on some call; a call under a different control word must leave the next default-mode call
+unchanged. The translator also rejects, with the message each time checked, VEX and EVEX forms, unaligned
+displacements, nonvolatile or undefined registers, non-argument and indexed memory bases and the unsupported packed
+double, scalar, `rcpps` and `rsqrtps` forms.
+
+Measured on Linux x86-64 on 24 November 2026 (a QEMU virtual x86-64 processor, not the Windows CI machine): the
+fixture was assembled with `llvm-ml-19` and linked with `lld-link-19`, the native code was run through a Windows-ABI
+caller, and the translation was built with `clang++-19` at `-O0`, `-O2` and `-O3`. All three passed: 4,432 default-mode cases
+over 63 exports, 59,392 arithmetic runs in 16 control words agreeing on 468,906 lanes (6,230 left undecided by the reference), 82 unit
+rejection controls and 10 PE-patched rejection controls. The translator from `origin/main` fails on the same fixture with
+`unsupported instruction at RVA 0x11f9: addps xmm0,xmm1`. Seven mutants of the translator (add as subtract, multiply as divide, minimum as maximum,
+swapped `minps` operands, `sqrtps` that does not quiet a NaN, `sqrtps` that reads its destination, and one that drops the software NaN rule) were
+each built and run: the first six fail on a named word of a named export, for example `lifted op_addps case 0`. The seventh passes on this
+host because the host instruction already returns the architectural NaN, so that rule is defensive and not shown here to matter. The MSVC
+build and `ctest` run of `cpu_aot_sse_fp` are left to CI.
+
+Not covered by this experiment: unmasked exceptions and exception flags, the packed double and scalar arithmetic
+forms, `rcpps` and `rsqrtps`, non-default MXCSR modes for the compares and moves,
 non-temporal cache-bypass hints on `movntps`, control flow, nonvolatile `xmm6`..`xmm15`
 prologues, and title CPU code execution.
 
@@ -8614,6 +8782,19 @@ The fixture checks the XG layout, tile spans, block offsets, copy in and out, an
 ```powershell
 ctest --preset release --no-tests=error --output-on-failure -R '^startup_xg_bc_chain_'
 ```
+
+### Placed vertex buffers consumed by a translated draw
+
+`startup_placed_vertex_{hardware,warp}` opens two real slot-133 buffers on CPU-visible allocations with bases separated by 1 TiB. Slot 48 supplies the full guest address and byte length to a translated vertex-stream binding. The shader can read from the registered GPU buffer directly when the resource aliases the guest memory, the length covers whole DWORDs and the start is aligned to 16 bytes. Views crossing a registered boundary or overlapping multiple live placements on the list's device produce a null descriptor before staging. Final wrapper release removes the placement from binding lookup.
+
+The fixture records draws reading the last valid DWORD, updates that word before submission and verifies the GPU sees the new value. An eight-byte view starting at the last DWORD is rejected. Its shader reads only offset zero from the null descriptor. After a fence, the high range is released and a larger buffer is registered at the same address. The second draw reads both the end of the new range and an address common to the old and new registrations. The RTX 4060 Laptop GPU (32.0.16.1656) and WARP (10.0.26100.9818) each read back all 64 pixels on Windows 11 build 26200.9974 with the debug layer off.
+
+```powershell
+cmake --build --preset release --target startup_stream_consumer startup_placement_alloc
+ctest --preset release --no-tests=error --output-on-failure -R '^startup_(placement_alloc|placed_vertex_)'
+```
+
+`startup_placement_alloc` fails each allocation made while adding a second buffer. It checks that the operation returns `E_OUTOFMEMORY`, the existing resource and index remain intact, the lock can be reacquired, and registration at the same address succeeds on retry.
 
 ### Nine-mip BC5/BC7 tile queries
 

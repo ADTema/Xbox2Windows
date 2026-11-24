@@ -158,5 +158,15 @@ int main(int argc, char** argv)
             format != DXGI_FORMAT_R32G32B32A32_FLOAT) return 2;
         if (argc == 8) export_word = static_cast<UINT>(std::strtoul(argv[7], nullptr, 0));
     }
+    if (GetEnvironmentVariableW(L"X2W_TEST_PLACED_VERTEX", nullptr, 0)) {
+        extern void release_placed_vertices(bool);
+        const std::string first = std::string(argv[5]) + ".first";
+        if (const int rc = check_stream_draw(adapter.Get(), device, pso, first.c_str(), nullptr, format)) return rc;
+        // GPU fence and readback are complete before the high range is released.
+        release_placed_vertices(false);
+        const int rc = check_stream_draw(adapter.Get(), device, pso, argv[5], nullptr, format);
+        release_placed_vertices(true);
+        return rc;
+    }
     return check_stream_draw(adapter.Get(), device, pso, argv[5], bc7.blocks ? &bc7 : nullptr, format, export_word);
 }

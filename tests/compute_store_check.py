@@ -3080,6 +3080,8 @@ def binary(directory, assembler, objcopy, library):
     mimg_load_binary(directory, assembler, objcopy, library)
     gfx1030_binary(directory, assembler, objcopy, library, MTBUF_LOAD_CASES, "tbuffer_")
     two_exits(directory, assembler, objcopy, library)
+    mubuf_format_controls()
+    gfx1030_binary(directory, assembler, objcopy, library, mubuf_format_cases(), "buffer_load_format_")
     for name, lines, width, binding in CASES + GUARD_CASES + READ_CASES + ALU_CASES + F32_CASES:
         src, obj, raw = [directory / x for x in ("test.s", "test.o", "test.bin")]
         src.write_text("\n".join(lines) + "\n", encoding="ascii")
@@ -3525,6 +3527,104 @@ def mubuf_d16_draw(directory, compiler, renderer, backend):
         path = Path(record)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("".join(f"{name}\n" for name in MUBUF_D16), encoding="utf-8")
+    return 0
+
+
+MUBUF_RGBA_UINT = "BUF_FMT_32_32_32_32_UINT"
+
+
+def mubuf_format_cases():
+    for count in range(1, 5):
+        channels = "xyzw"[:count]
+        name = f"buffer_load_format_{channels}"
+        last = 7 + count
+        data = "v8" if count == 1 else f"v[8:{last}]"
+        store = "buffer_store_dword" if count == 1 else f"buffer_store_dwordx{count}"
+        # v8 is the source index and first result. v15 keeps the output index.
+        yield name, [
+            "s_mov_b32 s12, s7", "s_mov_b32 s13, 0",
+            "s_load_dwordx4 s[20:23], s[12:13], 0x30",
+            "s_load_dwordx4 s[16:19], s[12:13], 0x40",
+            "v_lshl_add_u32 v8, s11, 5, v0", "v_lshl_add_u32 v15, s11, 5, v0",
+            "s_waitcnt lgkmcnt(0)", f"{name} {data}, v8, s[16:19], 0 idxen",
+            "s_waitcnt vmcnt(0)", f"{store} {data}, v15, s[20:23], 0 idxen", "s_endpgm",
+        ], DS_BINDING | {"stride": 4 * (count + 1), "source_descriptor": 0x40,
+                          "source_stride": 16, "source_format": MUBUF_RGBA_UINT}
+
+
+def mubuf_format_controls():
+    cases = list(mubuf_format_cases())
+    _, lines, binding = cases[0]
+    load = lines[7]
+    for replacement, diagnostic in (
+        (load.replace("idxen", "offen"), "Unsupported formatted buffer read target or address mode"),
+        (load + " tfe", "Unsupported compute instruction"),
+        (load.replace(", 0 idxen", ", s0 idxen"), "Unsupported compute instruction"),
+        (load + " offset:4", "Unverified read offset"),
+        (load + " offset:16", "Read leaves its source element"),
+        (load.replace("v8, v8", "v[8:9], v8"), "Unverified buffer read destination"),
+        (load.replace("s[16:19]", "s[20:23]"), "Reads from the stored UAV"),
+        (load.replace("buffer_load_format_x", "buffer_load_format_d16_x"), "Unsupported compute instruction"),
+    ):
+        rejects(diagnostic, aot.lower, variant(lines, (load, replacement)), 32, **binding)
+    for options, diagnostic in (
+        ({"source_format": None}, "Formatted buffer reads require a source format"),
+        ({"source_format": "BUF_FMT_32_FLOAT"}, "Unsupported formatted source binding"),
+        ({"source_stride": 20}, "Unsupported formatted source binding"),
+        ({"source_descriptor": None, "source_stride": None}, "Unsupported formatted source binding"),
+        ({"cpu": "gfx1013"}, "Unsupported formatted source binding"),
+    ):
+        rejects(diagnostic, aot.lower, lines, 32, **(binding | options))
+    rejects("Unverified buffer read descriptor", aot.lower,
+            variant(lines, ("s_waitcnt lgkmcnt(0)", "")), 32, **binding)
+    rejects("Vector load result used or overwritten before s_waitcnt vmcnt(0)", aot.lower,
+            variant(lines, ("s_waitcnt vmcnt(0)", "")), 32, **binding)
+
+    _, lines, binding = cases[-1]
+    for use in ("v_mov_b32_e32 v16, v11", "v_mov_b32_e32 v11, 0"):
+        rejects("Vector load result used or overwritten before s_waitcnt vmcnt(0)", aot.lower,
+                variant(lines, ("s_waitcnt vmcnt(0)", use + "\ns_waitcnt vmcnt(0)")), 32, **binding)
+
+
+def mubuf_format_draw(directory, compiler, renderer, backend):
+    src, cso, case = (directory / f"mubuf-format.{ext}" for ext in ("hlsl", "cso", "case"))
+    compile_shader = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
+    run = [renderer, backend, "--compute-store-case", cso, case]
+    for name, lines, binding in mubuf_format_cases():
+        count = len(name.rsplit("_", 1)[1])
+        print(f"{name}: CPU reference", flush=True)
+        src.write_text(aot.lower(lines, 32, **binding), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        for groups in (1, 2):
+            words = [SENTINEL] * 320
+            for gid in range(32 * groups):
+                start = gid * (count + 1)
+                words[start:start + count] = [source_word(gid * 4 + i) for i in range(count)]
+            case.write_bytes(struct.pack("<321I", groups, *words))
+            result = subprocess.run(run)
+            if result.returncode:
+                return result.returncode
+        if count == 1:
+            changed = variant(lines, (lines[7], "buffer_load_dword v8, v8, s[16:19], 0 idxen offset:4"))
+            actual = source_word(1)
+        else:
+            last = 7 + count
+            swap = ["s_waitcnt vmcnt(0)", "v_mov_b32_e32 v16, v8",
+                    f"v_mov_b32_e32 v8, v{last}", f"v_mov_b32_e32 v{last}, v16"]
+            changed = variant(lines, ("s_waitcnt vmcnt(0)", "\n".join(swap)))
+            actual = source_word(count - 1)
+        print(f"{name}: select the wrong first channel", flush=True)
+        src.write_text(aot.lower(changed, 32, **binding), encoding="ascii")
+        subprocess.run(compile_shader, check=True)
+        result = subprocess.run(run, capture_output=True, text=True)
+        if result.returncode != 1 or f"word=0 expected={words[0]:08x} actual={actual:08x}" not in result.stderr:
+            raise AssertionError(f"{name}: wrong channel escaped detection\n{result.stderr}")
+        print(result.stderr, end="")
+    mubuf_format_controls()
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(f"{name}\n" for name, _, _ in mubuf_format_cases()), encoding="utf-8")
     return 0
 
 
@@ -4509,6 +4609,7 @@ if __name__ == "__main__":
                  "draw-mubuf-subword": mubuf_subword_draw,
                  "draw-mubuf-vector": mubuf_vector_draw,
                  "draw-mubuf-d16": mubuf_d16_draw,
+                 "draw-mubuf-format": mubuf_format_draw,
                  "draw-mtbuf-load": mtbuf_load_draw,
                  "draw-mimg-load": mimg_load_draw,
                  "draw-mimg-mip": mimg_mip_draw,
