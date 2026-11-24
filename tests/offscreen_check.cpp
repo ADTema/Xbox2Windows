@@ -500,6 +500,12 @@ OperationResult run_spirv_sampler_views(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_dynamic_sampler_index(const OperationContext& ctx)
+{
+    check_dynamic_sampler_index(ctx.device);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_raw_uav_dump(const OperationContext& ctx)
 {
     dump_raw_uav(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], ctx.argv[6]);
@@ -1041,6 +1047,7 @@ const OperationSpec kOperations[] = {
     {"--ffx-immediate-conversion", 4, 4, nullptr, kNoGate, run_ffx_immediate_conversion},
     {"--compute-store-case", 5, 5, nullptr, kNoGate, run_compute_store_case},
     {"--spirv-sampler-views", 4, 4, nullptr, kGateSm60SamplerViews, run_spirv_sampler_views},
+    {"--dynamic-sampler-index", 3, 3, nullptr, kGateSm60SamplerViews, run_dynamic_sampler_index},
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},
     {"--spirv-address-window", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window},

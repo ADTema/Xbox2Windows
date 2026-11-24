@@ -4959,6 +4959,12 @@ The first snapshot is `13579bdf,a5a5a5a5` in all cases. The live copy reads `135
 
 Build `offscreen_check` as above and run `ctest --preset dev --no-tests=error -R '^descriptor_record_copy_' -V`. Repeat with `release`. These tests use Shader Model 6.0 and skip when the adapter lacks it.
 
+### Runtime indexing of a bounded sampler table
+
+`dynamic_sampler_index_{hardware,warp}` dispatch a source-built `cs_6_0` shader against one two-texel texture and one fixed shader-visible sampler table. The runtime index is a root constant. At U = 1.25, sampler 0 wraps to the first texel and sampler 1 clamps to the second. The two expected words are `3e800000,3f400000`. A shader control forces index zero for both requests and expects `3e800000,3e800000` through the same bindings. This fixture exercises the desktop sampler table for the sampler portion of [#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143).
+
+Build `offscreen_check` and run `ctest --preset dev --no-tests=error -R '^dynamic_sampler_index_' -V`. Repeat with `release`.
+
 ### Desktop GPU addresses for xmem graphics allocations
 
 `era_title_gpu` (`src/era_title_gpu.cpp`) is a process-wide registry that connects `xmem.dll` to the GPU address pieces above.
