@@ -67,6 +67,7 @@ struct CachedStream {
     u64 source = 0;
     u64 base_offset = 0;
     unsigned compressed_size = 0;
+    unsigned chunk_size = 0;
     std::vector<unsigned char> data;
 };
 
@@ -77,7 +78,7 @@ struct QueueWork {
     static constexpr std::size_t max_cached_streams = 16;
     std::deque<CachedStream> cached_streams;
 
-    void put_stream(u64 source, u64 base_offset, unsigned compressed_size, std::vector<unsigned char> data)
+    void put_stream(u64 source, u64 base_offset, unsigned compressed_size, unsigned chunk_size, std::vector<unsigned char> data)
     {
         for (auto it = cached_streams.begin(); it != cached_streams.end(); ++it) {
             if (it->source == source && it->base_offset == base_offset && it->compressed_size == compressed_size) {
@@ -88,7 +89,7 @@ struct QueueWork {
         if (cached_streams.size() >= max_cached_streams) {
             cached_streams.pop_front();
         }
-        cached_streams.push_back({source, base_offset, compressed_size, std::move(data)});
+        cached_streams.push_back({source, base_offset, compressed_size, chunk_size, std::move(data)});
     }
 };
 
@@ -377,7 +378,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                         if (self && self->work) {
                             QueueWork& work = *self->work;
                             const std::lock_guard guard(work.mutex);
-                            work.put_stream(source, offset, source_size, output);
+                            work.put_stream(source, offset, source_size, destination_size, output);
                         }
                         decode_length = destination_size;
                         data = output.data();
@@ -394,7 +395,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
             }
 
             // If not directly decoded from a standalone stream, check if this request is a continuation
-            // slice of an already-inflated chunked stream on this queue (Refs #1136, #1214).
+            // slice of an already-inflated chunked stream on this queue (Refs #1136, #1144, #1214).
             // A request presenting a zlib header that failed decode (e.g. damaged checksum) is an actual
             // decode error and must stay distinct from a proven continuation. Memory requests stay strictly on direct decode.
             if (!direct_decoded && !decode_error && !memory_source && self && self->work) {
@@ -405,14 +406,19 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                     for (auto it = work.cached_streams.rbegin(); it != work.cached_streams.rend(); ++it) {
                         if (it->source == source && it->compressed_size == source_size && offset > it->base_offset) {
                             const u64 delta = offset - it->base_offset;
-                            if (destination_size > 0 && (delta % destination_size) == 0 &&
-                                delta <= it->data.size() && destination_size <= it->data.size() - delta) {
-                                output.assign(it->data.begin() + delta, it->data.begin() + delta + destination_size);
-                                decode_length = destination_size;
-                                data = output.data();
-                                outcome = "inflated (slice from stream cache)";
-                                direct_decoded = true;
-                                break;
+                            const unsigned step = it->chunk_size ? it->chunk_size : 0x10000;
+                            if ((delta % step) == 0 && delta < it->data.size()) {
+                                const std::size_t available = it->data.size() - delta;
+                                // Handle short final destinations in multi-piece streams (Refs #1144)
+                                const std::size_t slice_size = destination_size < available ? destination_size : available;
+                                if (slice_size > 0 && destination_size <= available) {
+                                    output.assign(it->data.begin() + delta, it->data.begin() + delta + slice_size);
+                                    decode_length = slice_size;
+                                    data = output.data();
+                                    outcome = "inflated (slice from stream cache)";
+                                    direct_decoded = true;
+                                    break;
+                                }
                             }
                         }
                     }

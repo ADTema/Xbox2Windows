@@ -639,6 +639,192 @@ bool dstorage_checks() {
         }
     }
 
+    // Test short final destination in a multi-piece stream vs invalid oversized decode targeting physical pages (Refs #1144)
+    {
+        // Multi-piece stream: total plain size = 100 KiB (piece 0 = 64 KiB, piece 1 = 36 KiB short final piece)
+        const size_t total_plain_size = 100 * 1024;
+        std::vector<unsigned char> full_plain(total_plain_size);
+        for (size_t i = 0; i < total_plain_size; ++i) full_plain[i] = static_cast<unsigned char>((i % 251) ^ 0x3c);
+        const auto full_comp = make_stored_zlib(full_plain.data(), total_plain_size);
+
+        wchar_t temp_dir[MAX_PATH];
+        if (!GetTempPathW(MAX_PATH, temp_dir)) return false;
+        wchar_t temp_file[MAX_PATH];
+        if (!GetTempFileNameW(temp_dir, L"x2w", 0, temp_file)) return false;
+
+        std::vector<unsigned char> file_bytes(256 * 1024, 0);
+        std::memcpy(file_bytes.data(), full_comp.data(), full_comp.size());
+
+        HANDLE h = CreateFileW(temp_file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        DWORD written = 0;
+        WriteFile(h, file_bytes.data(), static_cast<DWORD>(file_bytes.size()), &written, nullptr);
+        CloseHandle(h);
+
+        void* file_ptr = nullptr;
+        if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, temp_file, nullptr, &file_ptr) != 0 || !file_ptr) {
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* file_obj = static_cast<Object*>(file_ptr);
+
+        // Allocate 2 physical pages for the valid multi-piece stream: page 0 (piece 0) and page 1 (piece 1)
+        size_t page_count = 2;
+        u64 pages[2] = {};
+        if (!XMemAllocatePhysicalPages(0x20400000ull, &page_count, pages) || page_count != 2) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+
+        ULONG_PTR tokens_all[2] = { pages[0], pages[1] };
+        void* va = XMemVirtualAlloc(nullptr, 2 * 65536, 0x20402000, 0x21, PAGE_READWRITE);
+        if (!va || XMemMapPhysicalPages(va, 2, tokens_all) != va) {
+            XMemFreePhysicalPages(2, pages);
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        // Prefill both physical pages with guard byte 0xAA
+        std::memset(va, 0xAA, 2 * 65536);
+
+        void* status_ptr = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 2, "ShortFinalStatus", nullptr, &status_ptr) != 0 || !status_ptr) {
+            XMemMapPhysicalPages(va, 2, nullptr);
+            VirtualFree(va, 0, MEM_RELEASE);
+            XMemFreePhysicalPages(2, pages);
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* status = static_cast<Object*>(status_ptr);
+
+        void* queue_ptr = nullptr;
+        unsigned char desc[0x20] = {};
+        *reinterpret_cast<uint16_t*>(desc + 8) = 16;
+        if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &queue_ptr) != 0 || !queue_ptr) {
+            XMemMapPhysicalPages(va, 2, nullptr);
+            VirtualFree(va, 0, MEM_RELEASE);
+            XMemFreePhysicalPages(2, pages);
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* queue = static_cast<Object*>(queue_ptr);
+
+        // Piece 0: full 64 KiB physical page destination
+        ULONG_PTR tokens0[1] = { pages[0] };
+        unsigned char req0[0x48] = {};
+        *reinterpret_cast<u64*>(req0 + 0x00) = 1 | (1ull << 21); // zlib | page_destination
+        *reinterpret_cast<ULONG_PTR**>(req0 + 0x08) = tokens0;
+        *reinterpret_cast<u64*>(req0 + 0x10) = 0;
+        *reinterpret_cast<unsigned*>(req0 + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req0 + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req0 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req0 + 0x30) = static_cast<unsigned>(full_comp.size());
+        *reinterpret_cast<unsigned*>(req0 + 0x38) = static_cast<unsigned>(total_plain_size);
+
+        // Piece 1: short final destination below 64 KiB (36 KiB) with 1 page grant; neighboring token left null
+        ULONG_PTR tokens1[2] = { pages[1], 0 };
+        unsigned char req1[0x48] = {};
+        *reinterpret_cast<u64*>(req1 + 0x00) = 1 | (1ull << 21); // zlib | page_destination
+        *reinterpret_cast<ULONG_PTR**>(req1 + 0x08) = tokens1;
+        *reinterpret_cast<u64*>(req1 + 0x10) = 0;
+        *reinterpret_cast<unsigned*>(req1 + 0x18) = 36 * 1024; // Short destination capacity (< 64 KiB)
+        *reinterpret_cast<void**>(req1 + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req1 + 0x28) = 64 * 1024; // Stepped by previous chunk size
+        *reinterpret_cast<unsigned*>(req1 + 0x30) = static_cast<unsigned>(full_comp.size());
+        *reinterpret_cast<unsigned*>(req1 + 0x38) = static_cast<unsigned>(total_plain_size);
+
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req0);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 0);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req1);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 1);
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+
+        for (int i = 0; i < 200; ++i) {
+            if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 1)) break;
+            Sleep(10);
+        }
+        bool valid_complete = reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 0) &&
+                              reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 1);
+        long hr0 = valid_complete ? reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 0) : -1;
+        long hr1 = valid_complete ? reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 1) : -1;
+
+        bool valid_ok = valid_complete && hr0 == 0 && hr1 == 0;
+        const auto* page0_bytes = static_cast<const unsigned char*>(va);
+        const auto* page1_bytes = static_cast<const unsigned char*>(va) + 65536;
+
+        // Check piece 0 exact match
+        if (valid_ok && std::memcmp(page0_bytes, full_plain.data(), 64 * 1024) != 0) valid_ok = false;
+        // Check piece 1 exact 36 KiB match
+        if (valid_ok && std::memcmp(page1_bytes, full_plain.data() + 64 * 1024, 36 * 1024) != 0) valid_ok = false;
+        // Check guard bytes in page 1 beyond 36 KiB remain intact (0xAA)
+        if (valid_ok) {
+            for (size_t i = 36 * 1024; i < 65536; ++i) {
+                if (page1_bytes[i] != 0xAA) {
+                    valid_ok = false;
+                    break;
+                }
+            }
+        }
+        // Neighboring token in tokens1 must have remained untouched (0)
+        if (valid_ok && tokens1[1] != 0) valid_ok = false;
+
+        // Negative control: invalid oversized decode targeting short physical page destination
+        // (100 KiB standalone stream into 36 KiB destination with only 1 page grant)
+        void* neg_status_ptr = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 1, "OversizedNegStatus", nullptr, &neg_status_ptr) != 0 || !neg_status_ptr) {
+            valid_ok = false;
+        }
+        auto* neg_status = static_cast<Object*>(neg_status_ptr);
+
+        // Reset page 1 to guard byte 0x55
+        std::memset(static_cast<unsigned char*>(va) + 65536, 0x55, 65536);
+        ULONG_PTR tokens_neg[2] = { pages[1], 0 }; // Neighboring grant is 0
+
+        unsigned char req_oversized[0x48] = {};
+        *reinterpret_cast<u64*>(req_oversized + 0x00) = 1 | (1ull << 21) | 0x400000; // zlib | page_destination | memory_source
+        *reinterpret_cast<ULONG_PTR**>(req_oversized + 0x08) = tokens_neg;
+        *reinterpret_cast<u64*>(req_oversized + 0x10) = 0;
+        *reinterpret_cast<unsigned*>(req_oversized + 0x18) = 36 * 1024; // Capacity 36 KiB < 100 KiB decode
+        *reinterpret_cast<const unsigned char**>(req_oversized + 0x20) = full_comp.data();
+        *reinterpret_cast<u64*>(req_oversized + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req_oversized + 0x30) = static_cast<unsigned>(full_comp.size());
+        *reinterpret_cast<unsigned*>(req_oversized + 0x38) = static_cast<unsigned>(total_plain_size);
+
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req_oversized);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, neg_status, 0);
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+
+        for (int i = 0; i < 200; ++i) {
+            if (reinterpret_cast<IsCompleteFn>(neg_status->vtable[3])(neg_status, 0)) break;
+            Sleep(10);
+        }
+        bool neg_complete = reinterpret_cast<IsCompleteFn>(neg_status->vtable[3])(neg_status, 0);
+        long hr_neg = neg_complete ? reinterpret_cast<GetHResultFn>(neg_status->vtable[4])(neg_status, 0) : 0;
+
+        // Oversized decode must fail with non-zero HRESULT
+        bool neg_ok = neg_complete && hr_neg != 0;
+        // All 64 KiB of destination page must remain completely untouched (guard byte 0x55)
+        for (size_t i = 0; i < 65536; ++i) {
+            if (page1_bytes[i] != 0x55) {
+                neg_ok = false;
+                break;
+            }
+        }
+        // Neighboring token must remain untouched (0)
+        if (tokens_neg[1] != 0) neg_ok = false;
+
+        XMemMapPhysicalPages(va, 2, nullptr);
+        VirtualFree(va, 0, MEM_RELEASE);
+        XMemFreePhysicalPages(2, pages);
+        reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+        DeleteFileW(temp_file);
+
+        if (!valid_ok || !neg_ok) return false;
+    }
+
     return true;
 }
 
