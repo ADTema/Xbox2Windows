@@ -335,7 +335,10 @@ bool dstorage_error_record_checks()
 
     auto memory = sentinel;
     auto source = input;
-    const StorageRequest too_small{1ull << 22, memory.data(), 0, 2, source.data(), 0, 4, 0, 0xaabbccddull, "memory read"};
+    // A 70-character name: the record keeps its first 63 characters and a NUL (CHAR Name[64]).
+    static const char long_name[] = "memory read with a name longer than the record's sixty-four bytes 0123";
+    static_assert(sizeof long_name - 1 == 70);
+    const StorageRequest too_small{1ull << 22, memory.data(), 0, 2, source.data(), 0, 4, 0, 0xaabbccddull, long_name};
     failing.enqueue(too_small);
     if (!check(failing.submit() == E_FAIL && memory == sentinel, "short memory destination was not refused") ||
         !check(WaitForSingleObject(failing.event, 0) == WAIT_OBJECT_0, "next failure did not re-signal the event")) return false;
@@ -351,7 +354,7 @@ bool dstorage_error_record_checks()
                  rec::read<void*>(memory_failure, rec::source) == too_small.source &&
                  rec::read<std::uint32_t>(memory_failure, rec::source_size) == too_small.source_size &&
                  rec::read<u64>(memory_failure, rec::cancellation_tag) == too_small.cancellation_tag &&
-                 text_equal(memory_failure, rec::name, too_small.name, 64) &&
+                 text_equal(memory_failure, rec::name, long_name, 63) && memory_failure[rec::name + 63] == 0 &&
                  buffer.after == 0xabcdef0123456789ull && WaitForSingleObject(failing.event, 0) == WAIT_TIMEOUT,
                  "record did not restart with the next memory request");
 }
