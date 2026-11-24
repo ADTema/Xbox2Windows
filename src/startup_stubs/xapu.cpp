@@ -4,6 +4,7 @@
 #define X2W_TRAP_MODULE_ID 3
 #include "startup_stubs/trap.h"
 #include "startup_stubs/local_log.h"
+#include <timeapi.h>
 
 // Experimental (docs/startup-runtime.md). With X2W_AUDIO_PERMISSIVE=1 the exports
 // stand in for the audio command queue; otherwise they trap. Call shapes from the title:
@@ -18,6 +19,9 @@ namespace {
 using u64 = std::uint64_t;
 bool permissive() noexcept { return x2w_local::env_on("X2W_AUDIO_PERMISSIVE"); }
 int connection;  // its address is the handle
+SRWLOCK connection_lock = SRWLOCK_INIT;
+unsigned long long connection_count = 0;
+bool timer_active = false;
 
 void hex(const void* data, std::size_t bytes, char* out, std::size_t size)
 {
@@ -36,7 +40,17 @@ extern "C" __declspec(noinline) long XApuConnect(u64 rcx, u64 rdx, u64 r8, u64 r
     char input[3 * 0x18 + 1], output[3 * 0x10 + 1];
     hex(reinterpret_cast<const void*>(rcx), 0x18, input, sizeof(input));
     hex(reinterpret_cast<const void*>(rdx), 0x10, output, sizeof(output));
-    if (r8) *reinterpret_cast<void**>(r8) = &connection;
+    if (r8) {
+        *reinterpret_cast<void**>(r8) = &connection;
+        AcquireSRWLockExclusive(&connection_lock);
+        if (connection_count++ == 0) {
+            // The mix worker sleeps for 2 ms between refills. A coarse Windows tick can
+            // stretch that wait beyond the time represented by the queued samples.
+            timer_active = timeBeginPeriod(1) == TIMERR_NOERROR;
+            if (!timer_active) x2w_local::logf("x2w-audio 1 ms mixer timer request unavailable");
+        }
+        ReleaseSRWLockExclusive(&connection_lock);
+    }
     x2w_local::logf("x2w-audio XApuConnect input=[%s] output(before)=[%s] -> handle %p, S_OK", input, output,
                     static_cast<void*>(&connection));
     return r8 ? 0 : static_cast<long>(0x80004003);
@@ -80,5 +94,13 @@ extern "C" __declspec(noinline) long XApuDisconnect(u64 rcx, u64 rdx, u64 r8, u6
     if (!permissive())
         x2w_trap::fire(X2W_TRAP_MODULE, X2W_TRAP_MODULE_ID, "XApuDisconnect", 2, rcx, rdx, r8, r9, _ReturnAddress());
     x2w_local::logf("x2w-audio XApuDisconnect handle=0x%llx", rcx);
+    if (rcx == reinterpret_cast<u64>(&connection)) {
+        AcquireSRWLockExclusive(&connection_lock);
+        if (connection_count && --connection_count == 0 && timer_active) {
+            timeEndPeriod(1);
+            timer_active = false;
+        }
+        ReleaseSRWLockExclusive(&connection_lock);
+    }
     return 0;
 }

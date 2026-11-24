@@ -468,6 +468,11 @@ These are measured on one executable; treat them as hypotheses for others.
 
 ## Audio output
 
+While a permissive XApu connection is open, the desktop shim requests 1 ms Windows
+timer resolution for the mix worker's short refill waits. The last disconnect
+releases the request. This affects scheduling and preserves the existing audio
+routing and sample format.
+
 `src/startup_stubs/audio_sink.{h,cpp}` is a desktop WASAPI shared-mode render sink. It opens the
 default render endpoint, takes the mix format from `GetMixFormat` (32-bit float or 16-bit PCM only),
 converts each submitted block (format, frame count, bytes) to it, and writes it through
