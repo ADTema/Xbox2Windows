@@ -2818,16 +2818,19 @@ ctest --preset dev --no-tests=error -R '^compute_store_aot_mtbuf_load_(warp|hard
 
 The `gfx1030` compute store profile lowers one typed MIMG form:
 `image_load vD, v[x:y], s[A:A+7] dmask:0x1|0x3|0x7|0xf
-dim:SQ_RSRC_IMG_2D`, with the `unorm` flag optional. The lowering is one
+dim:SQ_RSRC_IMG_2D`, with the `unorm` flag optional, and its packed-address
+`a16` spelling `image_load vD, vP, s[A:A+7] ... unorm a16`. The lowering is one
 `Texture2D<uint4>.Load(int3(x, y, 0))` from `t0`; the DMASK-selected leading
 components are written to consecutive destination VGPRs in ascending channel
 order and stored to the output UAV. The accepted form requires a `gfx1030`
-target, `dim:SQ_RSRC_IMG_2D`, two consecutive known address VGPRs (x then y),
-and a contiguous DMASK. `a16`, `d16`, `tfe`, `glc`, `slc`, `dlc`, `r128` and
-the NSA address spelling are refused. The eight descriptor words must come
-from one tracked `s_load_dwordx8` at `--image-descriptor`, its scalar load
-must complete before the image load, and the loaded registers may only be
-read after `s_waitcnt vmcnt(0)`.
+target, `dim:SQ_RSRC_IMG_2D`, known address values and a contiguous DMASK.
+Without `a16` the address is two consecutive VGPRs (x then y); with `a16` it
+is one VGPR holding x in bits [15:0] and y in bits [31:16]. `d16`, `tfe`,
+`glc`, `slc`, `dlc`, `r128` and the NSA address spelling are refused, as is
+the `a16` flag on a two-register address or the packed spelling without it.
+The eight descriptor words must come from one tracked `s_load_dwordx8` at
+`--image-descriptor`, its scalar load must complete before the image load,
+and the loaded registers may only be read after `s_waitcnt vmcnt(0)`.
 
 The 8-dword image resource descriptor (T#) is runtime data. The caller
 guarantees through `--image-format R32G32B32A32_UINT` that its 9-bit GFX10
@@ -2844,15 +2847,18 @@ that behavior is not measured here.
 The source-built wave32 fixture uses an 8x8 thread group and a 32x8
 `R32G32B32A32_UINT` source texture whose words are carried in the case file.
 Dispatches of four, two, one and one groups exercise `dmask:0x1`, `0x3`,
-`0x7` and `0xf` and fill the 320-word output UAV. The independent CPU
-reference recomputes every written word and expects the sentinel in the
-untouched words. A single flipped written word (`word=0`) and a single
-flipped untouched word (`word=300`) must both be reported. Two mutated
-translations must each differ at a named word: reordering the emitted
-components fails at word 0, and swapping the two address registers fails at
-word 4. The LLVM 15 binary check assembles and decodes each DMASK form and
-lowers the decoded program through the CLI. These are desktop DXIL
-executions, not native runs of the assembled gfx1030 program.
+`0x7` and `0xf` and fill the 320-word output UAV, once with the two-dword
+address and once with the packed `a16` address; the packed address is built
+from `tid.y * 0x10000 + tid.x`. The independent CPU reference recomputes every
+written word and expects the sentinel in the untouched words. A single flipped
+written word (`word=0`) and a single flipped untouched word (`word=300`) must
+both be reported. Each mutated translation must differ at a named word:
+reordering the emitted components fails at word 0, swapping the two address
+registers fails at word 4, and reading the whole packed address as the y
+coordinate fails at word 4. The LLVM 15 binary check assembles and decodes
+every DMASK form in both address families and lowers the decoded program
+through the CLI. These are desktop DXIL executions, not native runs of the
+assembled gfx1030 program.
 
 ```powershell
 cmake --build --preset dev --target offscreen_check
