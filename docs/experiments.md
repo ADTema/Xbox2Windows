@@ -3383,6 +3383,54 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^compute_store_aot_mimg_store_(packed_)?(warp|hardware)$' -V
 ```
 
+### gfx1030 2D integer image atomics
+
+The compute store profile lowers one unguarded 32-bit `image_atomic_*`
+instruction per `gfx1030` shader, with `glc` clear, one 32-bit data VGPR,
+a contiguous pair of 32-bit X/Y coordinate VGPRs, and optional `unorm`.
+The caller supplies in-bounds coordinates and declares a scalar `R32_UINT`
+2D image with identity channel selectors and binds its matching UAV to
+`u0` at mip 0. The eight resource words must be loaded from the declared table
+offset and ready at issue. The translator tracks the descriptor's provenance.
+The caller supplies its format, layout and bounds. Other address widths,
+dimensions, cache flags, returned values and additional UAV accesses are outside
+this profile. See sections 8.2 and 12.16 of the
+[AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture).
+
+| Native suffixes | Desktop `cs_6_0` operation and view |
+|---|---|
+| `add`, `sub` | `InterlockedAdd`, `R32_UINT`, negate the subtract operand modulo 2^32 |
+| `and`, `or`, `xor` | Matching `Interlocked` bitwise intrinsic, `R32_UINT` |
+
+`DMASK` is `0x1`. The
+[format support query](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ne-d3d12-d3d12_format_support2)
+gates the typed atomic operations for each view. An unavailable capability
+returns 77. The GPU fixture compares 336 words over all three mips of a
+32x8 texture per case, including untouched words. One- and two-group draws
+exercise high-bit inputs, arithmetic wraparound and two lanes adding to
+each texel in the contended add case. Lowering subtract as add must fail
+first at mip 0, word 32. The test records the five forms only after all
+positive and negative dispatch checks complete.
+
+The LLVM 15 test assembles, disassembles and translates the cases through the
+synthetic-container CLI. The standalone compile mode checks the generated
+`cs_6_0` shaders and the subtract mutation without adapter access. The GPU
+tests are the translated DXIL comparison against the CPU reference. Run these
+serially after coordinating adapter access.
+
+```powershell
+$Dxc = (Get-Command dxc -ErrorAction Stop).Source
+$env:TMP = (Resolve-Path out).Path
+$env:TEMP = $env:TMP
+python -B tests/compute_store_check.py compile-mimg-atomic-integer $Dxc
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -j 1 -R '^compute_store_aot_mimg_atomic_integer_(warp|hardware)$' -V
+```
+
+```bash
+python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
 ### Bounded gfx1030 DS lane routing
 
 The `gfx1030` compute profile lowers `ds_bpermute_b32` (gather) and
