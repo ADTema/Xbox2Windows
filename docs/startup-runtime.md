@@ -161,6 +161,19 @@ and no game files are needed, and the `pr` preset builds the probe and runs the 
 ctest --preset release --no-tests=error -R '^startup_launch$' -V
 ```
 
+## zlib decoder check
+
+`tests/startup_inflate_check.py` (ctest `startup_inflate`) runs the DirectStorage stand-in's decoder
+(`src/startup_stubs/inflate.h`) through the source-built `tests/startup_inflate_probe.cpp`. CPython's
+zlib encodes seeded synthetic data as stored, fixed and dynamic Huffman blocks, with matches up to
+the 32 KiB window and a sync flush between blocks; each result must equal the input. A stream with
+one byte too little capacity, a truncated stream and a match that starts before the output must be
+rejected without writes outside the destination. No GPU and no game files are needed:
+
+```powershell
+ctest --preset release --no-tests=error -R '^startup_inflate$' -V
+```
+
 ## Switches
 
 | Variable | Effect |
