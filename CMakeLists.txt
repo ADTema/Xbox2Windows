@@ -397,6 +397,13 @@ target_link_libraries(startup_storage_alloc_failure PRIVATE psapi)
 add_dependencies(startup_storage_alloc_failure startup_stub_xcrdapi)
 add_test(NAME startup_storage_alloc_failure COMMAND startup_storage_alloc_failure "$<TARGET_FILE:startup_stub_xcrdapi>")
 set_tests_properties(startup_storage_alloc_failure PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+# A refused file request (offset at the end of the file, implausible size; raw and zlib) leaves its destination
+# untouched, fails its status entry, and the requests around it in the same Submit complete in order (#1586).
+add_executable(startup_storage_refusal_order tests/startup_storage_refusal_order.cpp)
+target_compile_features(startup_storage_refusal_order PRIVATE cxx_std_17)
+add_dependencies(startup_storage_refusal_order startup_stub_xcrdapi)
+add_test(NAME startup_storage_refusal_order COMMAND startup_storage_refusal_order "$<TARGET_FILE:startup_stub_xcrdapi>")
+set_tests_properties(startup_storage_refusal_order PROPERTIES TIMEOUT 60)
 # A queue whose worker cannot start (both CreateThread attempts fail, or the construction of its work
 # throws std::bad_alloc) completes status entries and fences at Submit, never inside Enqueue (#1199).
 # The test compiles the stand-in's source into itself so it can redirect CreateThread and operator new.
