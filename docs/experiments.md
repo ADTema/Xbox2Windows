@@ -5654,8 +5654,9 @@ which in an integer instruction is that source's sign bit flipped. The select ha
 operand to the uint helper, so `v_cndmask_b32_e64 v31, v30, -v30` was refused - 2 of the 29 refused
 shaders in the first main-game loading-screen cache (#870, issue #1709). The select now reads both sources
 through a helper that flips the sign bit for a `-` operand and emits the same text as before when there is
-none. The helper is used only where the translation models the modifier: another integer instruction
-carrying the same `-` operand is still refused rather than silently flipping a bit. Run
+none. Plain negative constants retain the existing bit pattern. NEG on inline or literal constants is
+refused from the encoded source fields, because plain inline -1 and inline 1 with NEG both disassemble
+as `-1`. Another integer instruction carrying the same register modifier still refuses it. Run
 `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_cndmask_neg$' -V`.
 
 ## Pixel color without a texture sample

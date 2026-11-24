@@ -104,22 +104,19 @@ check('no negation is unchanged', emitted == 'v31 = (s0 & 1) ? v30 : v30;', emit
 check('a negation on another integer op stays refused',
       refused(encode_vop2_e64(AND_B32, 1, V30, V30, neg1=1)))
 
-# 5. A negated integer *constant* prints the same as a negative literal: `src 129` with NEG is the inline
-#    constant 1 with its sign bit flipped (0x80000001), while `src 193` is the literal -1 (0xffffffff), and
-#    the disassembler prints both as `-1`. The printed operand does not identify the value, so the select
-#    refuses it instead of picking one reading.
-check('a negated inline constant is refused as ambiguous',
-      refused(encode_vop2_e64(CNDMASK, 31, 129, V30, neg0=1)))
-check('a negative literal source is refused as ambiguous too',
-      refused(encode_vop2_e64(CNDMASK, 31, 193, V30)))
-check('both spellings decode identically',
-      G.decode(encode_vop2_e64(CNDMASK, 31, 129, V30, neg0=1))[0][3] ==
-      G.decode(encode_vop2_e64(CNDMASK, 31, 193, V30))[0][3] ==
-      'v_cndmask_b32_e64 v31, -1, v30, s0')
-# A double negation (`--1`, src 193 with NEG) is unambiguous and still translates.
-asm, emitted = translate(encode_vop2_e64(CNDMASK, 31, 193, V30, neg0=1))
-check('a double negation still translates',
-      'v31 = (s0 & 1) ? v30 : (0xffffffffu ^ 0x80000000u);' in emitted, emitted)
+# Plain negative inline constants keep their bit patterns even when the printed spelling is identical.
+asm, emitted = translate(encode_vop2_e64(CNDMASK, 31, 193, V30))
+check('plain inline -1 still translates',
+      asm == ['v_cndmask_b32_e64 v31, -1, v30, s0'] and
+      'v31 = (s0 & 1) ? v30 : 0xffffffffu;' in emitted, emitted)
+asm, emitted = translate(encode_vop2_e64(CNDMASK, 31, 243, V30))
+check('plain inline -1.0 still translates',
+      asm == ['v_cndmask_b32_e64 v31, -1.0, v30, s0'] and
+      'v31 = (s0 & 1) ? v30 : 0xbf800000u;' in emitted, emitted)
+check('NEG on inline integer remains refused', refused(encode_vop2_e64(CNDMASK, 31, 129, V30, neg0=1)))
+check('NEG on inline float remains refused', refused(encode_vop2_e64(CNDMASK, 31, V30, 242, neg1=1)))
+check('NEG on literal remains refused', refused(encode_vop2_e64(CNDMASK, 31, V30, 255, neg1=1)
+                                              + struct.pack('<I', 0x12345678)))
 
 if failures:
     print('FAIL')

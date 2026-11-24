@@ -72,6 +72,16 @@ def decode(code):
                 raise Unsupported('image_load_mip tfe')
             if word1 & (1 << 30):
                 raise Unsupported('image_load_mip a16')
+        if name == 'v_cndmask_b32_e64':
+            # The printed -1 is ambiguous: it can be plain inline -1 or inline 1 with NEG.
+            # Preserve plain immediates and refuse NEG on immediate data operands by encoding.
+            word1, = struct.unpack_from('<I', code, off + 4)
+            for i in range(2):
+                if not word1 & (1 << (29 + i)):
+                    continue
+                source = (word1 >> (9 * i)) & 0x1ff
+                if 128 <= source <= 208 or 240 <= source <= 248 or source == 255:
+                    raise Unsupported('v_cndmask_b32_e64 NEG on an immediate')
         out.append((off, n, name, asm))
         off += n
     last = max((i for i, x in enumerate(out) if x[2] == 's_endpgm'), default=len(out) - 1)
@@ -224,10 +234,6 @@ class Stage:
         # sources keep using u(), so an unexpected negation stays a refusal rather than a silent flip.
         if tok.startswith('-') and not re.match(r'-[\d.]', tok):
             return '(%s ^ 0x80000000u)' % self.u(tok[1:])
-        if tok.startswith('-') and re.match(r'-[\d.]', tok):
-            # The disassembler prints both `src 193` (the literal -1) and `src 129` with NEG (inline 1 with
-            # its sign bit flipped, 0x80000001) as `-1`, so the printed operand does not identify the value.
-            raise Unsupported('negated integer constant %r is ambiguous' % tok)
         return self.u(tok)
 
     def f(self, tok):
