@@ -6005,6 +6005,25 @@ The level and fractional fixtures use a plain `Sample` over an 8x8 texture
 with four solid-color mips. The coordinate is constant, so the LOD is the
 clamp. Each clamp runs as translated SPIR-V and direct HLSL on the same adapter.
 
+The dedicated exact-mip reproducer for issue #809 starts with clamp 1 against
+mip 1 and uses mip 2 as a stale-result negative control:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^spirv_minlod_exact_warp$' -V
+```
+
+`spirv_minlod_exact_warp` and `spirv_minlod_exact_hardware` both use the
+source-built 8x8 RGBA8 four-mip texture, a fixed `(0.25, 0.25)` coordinate,
+`MIN_MAG_MIP_POINT`, and `ps_6_0`. The HLSL control uses the same texture,
+sampler and texel offset. The exact readback is 64 pixels and 256 channels
+with zero absolute error; no adapter-specific tolerance is applied. At commit
+`4ad7b0a212825c8369e866b8d16228437970acf2`, DXC 1.9.2602.17, Windows 11 build
+26300 and WARP driver 10.0.26100.10068 with the debug layer enabled, this target
+passed for translated SPIR-V and the direct HLSL control. This is a WARP claim
+only. Physical-adapter claims remain separate and require the adapter, driver,
+Windows build, DXC version and flags, debug-layer status, and runtime reported
+explicitly.
+
 `spirv_minlod_levels_*` compiles at `ps_6_0`:
 
 - With point mip filtering, each integer clamp from 0 through 3 selects its
