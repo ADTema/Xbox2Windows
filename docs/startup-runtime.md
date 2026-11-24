@@ -146,6 +146,12 @@ These are measured on one executable; treat them as hypotheses for others.
   state block is not measured yet, so the draw path doesn't call it.
 - Audio produces no output.
 
+## Uniform first-lane reads
+
+The startup shader translator accepts `v_readfirstlane_b32` in straight-line code with the
+entry mask when its active VGPR holds an integer conversion of a fixed-offset scalar buffer
+value. Run `python -B tests/startup_uniform_lane_check.py` to check the producer and the
+varying-source, register-clobber, mask and branch controls.
 
 ## NV12 plane upload
 
