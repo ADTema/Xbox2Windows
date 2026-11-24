@@ -85,6 +85,15 @@ for label, instructions, lines, *source in ACCEPTED:
     check(label, got == lines + ['s9 = v%d;' % reg], repr(got))
 
 REFUSED = [
+    ('restored exec copy after WQM',
+     ('s_mov_b64 s[10:11], exec', 's_wqm_b64 exec, exec', 's_mov_b64 s[12:13], exec', 's_mov_b64 exec, s[10:11]',
+      'v_mov_b32_e32 v7, s2', 's_mov_b64 exec, s[12:13]', READ)),
+    ('overlapping 64-bit move high word',
+     ('v_cmp_lt_f32_e64 s2, v0, v1', 's_mov_b64 s[3:4], s[2:3]', 'v_mov_b32_e32 v7, s4', READ)),
+    ('descriptor move high word',
+     ('v_cmp_lt_f32_e64 s11, v0, v1', 's_buffer_load_dword s8, s[4:7], 0x0', 's_mov_b64 s[10:11], s[7:8]',
+      'v_mov_b32_e32 v7, s11', READ)),
+    ('mask from uniform compare', ('v_cmp_eq_u32_e64 s2, 0, 0', 'v_mov_b32_e32 v7, s2', READ)),
     ('entry VGPR', (MOVE, 'v_mov_b32_e32 v7, v0', READ)),
     ('vcc', (MOVE, 'v_mov_b32_e32 v7, vcc_lo', READ)),
     ('exec', (MOVE, 'v_mov_b32_e32 v7, exec_lo', READ)),

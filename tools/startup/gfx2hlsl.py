@@ -541,6 +541,8 @@ class Stage:
                 return False
             if kind == 'v':
                 return lo in self.uniform_v
+            if lo in getattr(self, 'masks', ()):
+                return False
             sym = self.sym.get(lo)
             if sym:
                 return sym[0] in ('const', 'ud', 'fixed_buffer_word')
@@ -719,7 +721,7 @@ class Stage:
                 self.sym[d] = syms[0]
                 if pair:
                     hi = self.sym.get(reg_range(ops[1])[2])
-                    if hi:
+                    if hi and hi[0] in ('desc', 'descnum', 'ptr', 'ptrhi', 'const', 'ud'):
                         self.sym[d + 1] = hi
                     else:
                         self.sym.pop(d + 1, None)
@@ -744,6 +746,9 @@ class Stage:
             if var == 'exec':
                 copy = base in ('s_mov_b64', 's_mov_b32') and self.exec_known and (syms[0] == ('execcopy',))
                 if copy:
+                    # A restored copy can re-activate lanes a WQM added: drop every VGPR proof.
+                    if hasattr(self, 'uniform_v'):
+                        self.uniform_v.clear()
                     return None
                 self.exec_known = False
             self.emit('%s = (%s) & 1;' % (var, expr))
@@ -779,7 +784,8 @@ class Stage:
             high = r[2] if r and r[1] != r[2] else None
             # Classify the source high word before a destination write can change its status.
             high_source = 's%d' % high if high is not None else srcs[0]
-            high_uniform = self.tracks_uniformity() and self.uniform_source(high_source)
+            high_uniform = (self.tracks_uniformity() and high != d and
+                            self.uniform_source(high_source))
         self.set_s(d, expr, scc=scc)
         if pair and base != 's_mov_b64':
             self.set_s(d + 1, '0u')
