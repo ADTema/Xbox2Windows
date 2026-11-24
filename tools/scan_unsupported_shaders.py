@@ -389,6 +389,9 @@ KNOWN_RDNA2_BASE_OPCODES |= {
     "s_wait_idle", "s_waitcnt_depctr", "s_denorm_mode", "s_call_b64",
 }
 
+# VOP1 forms the disassembler decodes that no translator lowers: recognition only.
+KNOWN_RDNA2_BASE_OPCODES |= {"v_pipeflush", "v_clrexcp", "v_frexp_exp_i32_f32"}
+
 KNOWN_RDNA2_BASE_OPCODES |= (
     SUPPORTED_ALU
     | {f"v_{name}" for name in PIXEL_INTEGER}
