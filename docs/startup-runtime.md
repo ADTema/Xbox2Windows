@@ -171,6 +171,16 @@ by reading a render log. The device prints the counts by cause value, so
 checks without a device that each cause lands in the slot printed under its label, and that the
 header's names follow the same order. The control swaps the buffer and token slots and must fail.
 
+## Root signature changes and dropped root constants
+
+Command-list slot 34 (`SetGraphicsRootSignature`) leaves no descriptor table bound when the signature differs from the
+current one, as it already clears the root addresses; setting the same signature again keeps the tables. Slot 40
+(`SetGraphicsRoot32BitConstants`) keeps 16 parameters of 8 words. A call with a parameter of 16 or more or an offset of
+8 or more is dropped, and one whose count passes the eighth word is truncated; each logs one line
+(`root constants dropped` or `root constants truncated`, with the parameter, offset and count) for the first four such
+calls in the process. `startup_root_reset_{warp,hardware}` draws a 1D texture through a bound table with no change, the same
+signature, a switched signature and six out-of-range calls.
+
 ## Root constant buffer views
 
 Command-list slot 42 (desktop `SetGraphicsRootConstantBufferView` plus four) records the title address for a root

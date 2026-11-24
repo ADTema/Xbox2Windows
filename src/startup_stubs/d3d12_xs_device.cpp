@@ -1732,11 +1732,15 @@ void __stdcall list_graphics_root(Wrapper* self, void* root)
 {
     Wrapper* w = as_wrapper(root);
     Pass& pass = pass_of(self);
+    const auto* previous = pass.root;
     const auto* params = w ? root_info(w) : nullptr;
     if (pass.root != params)
         std::fill_n(pass.root_address, 16, 0);
     pass.root = params;
     pass.srv_bound = 0;
+    // A different root signature leaves no descriptor table bound; the same one keeps them.
+    if (previous != params)
+        for (auto& table : pass.view_tables) table = {};
     if (auto* list = recording(self); list && w && w->own().kind == root_signature_kind && w->own().real)
         list->SetGraphicsRootSignature(static_cast<ID3D12RootSignature*>(w->own().real));
 }
