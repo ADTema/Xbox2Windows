@@ -19,9 +19,14 @@ REQUIRED_COMPONENTS = {
     "XAsync",
     "XTaskQueue",
 }
+REQUIRED_IMPLEMENTED = {"XUser", "XGameSave"}
+REQUIRED_STUBS = {"XUserAddAsync", "XGameSaveInitializeProviderAsync"}
+STATES = {"stub", "implemented_hr", "implemented_void"}
 
 ROW_RE = re.compile(
-    r"^X\(\s*([A-Za-z_]\w*)\s*,\s*([A-Za-z_]\w*)\s*,\s*(\(.*\))\s*\)\s*\\?$"
+    r"^X\(\s*([A-Za-z_]\w*)\s*,\s*([A-Za-z_]\w*)\s*,\s*"
+    r"([A-Za-z_]\w*)\s*,\s*(\([^)]*\))\s*,\s*([A-Za-z_]\w*)\s*,\s*"
+    r"(\([^)]*\))\s*,\s*([A-Za-z_]\w*)\s*\)\s*\\?$"
 )
 
 
@@ -40,11 +45,13 @@ def parse_table(source):
             break
         match = ROW_RE.match(stripped)
         if match:
-            name, component, parameters = match.groups()
+            name, component, return_type, parameters, state, args, implementation = match.groups()
             if not parameters.startswith("(") or not parameters.endswith(")") or \
                     parameters.count("(") != parameters.count(")"):
                 raise AssertionError(f"malformed signature for {name}: {parameters}")
-            rows.append((name, component, parameters))
+            if not args.startswith("(") or not args.endswith(")"):
+                raise AssertionError(f"malformed implementation arguments for {name}: {args}")
+            rows.append((name, component, return_type, parameters, state, args, implementation))
         if not line.rstrip().endswith("\\"):
             break
     if not rows:
@@ -84,6 +91,25 @@ def validate(source, rows, library, exports):
     missing = sorted(REQUIRED_COMPONENTS - components)
     if missing:
         errors.append(f"missing required classes: {', '.join(missing)}")
+    for component in sorted(REQUIRED_IMPLEMENTED):
+        if not any(row[1] == component and row[4] != "stub" for row in rows):
+            errors.append(f"missing implemented contract for {component}")
+    for name in sorted(REQUIRED_STUBS):
+        matches = [row for row in rows if row[0] == name]
+        if len(matches) != 1 or matches[0][4] != "stub":
+            errors.append(f"{name} must remain an explicit stub")
+    for name, _, return_type, _, state, args, implementation in rows:
+        if state not in STATES:
+            errors.append(f"unknown state for {name}: {state}")
+        if state == "stub":
+            if return_type != "HRESULT" or args != "()" or implementation != "stub":
+                errors.append(f"stub row has inconsistent implementation: {name}")
+        elif implementation == "stub":
+            errors.append(f"implemented row has no implementation function: {name}")
+        elif state == "implemented_hr" and return_type != "HRESULT":
+            errors.append(f"implemented_hr row does not return HRESULT: {name}")
+        elif state == "implemented_void" and return_type != "void":
+            errors.append(f"implemented_void row does not return void: {name}")
 
     if library != "xgameruntime":
         errors.append(f"LIBRARY is {library!r}, expected 'xgameruntime'")
@@ -120,8 +146,10 @@ def main():
         return 1
 
     components = ",".join(sorted({row[1] for row in rows}))
+    states = ",".join(f"{state}={sum(row[4] == state for row in rows)}"
+                      for state in sorted(STATES))
     print(f"xgameruntime table: exports={len(rows)} classes={components} "
-          "duplicate_control=detected PASS")
+          f"states={states} duplicate_control=detected PASS")
     return 0
 
 

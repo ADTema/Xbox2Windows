@@ -201,13 +201,14 @@ class NativeHarness:
         finally:
             self.rstor_fn(self._save_ptr)
 
-    def probe_xsave_err_ptrs(self, mxcsr_mask: int) -> dict[tuple[bool, bool, bool], tuple[bool, bool, bool]]:
-        """Observe whether native XRSTOR* -> XSAVE* preserves FOP/FIP/FDP for (rstor64, save64, FSW.ES)."""
-        caps: dict[tuple[bool, bool, bool], tuple[bool, bool, bool]] = {}
+    def probe_xsave_err_ptrs(self, mxcsr_mask: int) -> dict[tuple[bool, bool, bool], tuple[bool, bool, bool, bool, bool]]:
+        """Observe whether native XRSTOR* -> XSAVE* preserves FOP/FIP/FDP and selectors per (rstor64, save64, FSW.ES)."""
+        caps: dict[tuple[bool, bool, bool], tuple[bool, bool, bool, bool, bool]] = {}
         seed_fop = 0x0357
         seed_fip = 0x00007FFF12345678
         seed_fdp = 0x00007FFF87654321
         exp_fop = struct.pack("<H", seed_fop)
+        selector_seeds = (0x3B, 0x2B)
         for rstor64 in (False, True):
             eff_fip = seed_fip if rstor64 else (seed_fip & 0xFFFFFFFF)
             eff_fdp = seed_fdp if rstor64 else (seed_fdp & 0xFFFFFFFF)
@@ -223,6 +224,8 @@ class NativeHarness:
                         fop=seed_fop,
                         fip=seed_fip,
                         fdp=seed_fdp,
+                        fcs=0 if rstor64 else selector_seeds[0],
+                        fds=0 if rstor64 else selector_seeds[1],
                         mxcsr=0x1F80,
                         seed=1,
                         poison_reserved=False,
@@ -252,7 +255,17 @@ class NativeHarness:
                         raise AssertionError(
                             f"unexpected host FDP probe value for rstor64={rstor64}, save64={save64}, es={es}: {got_fdp.hex()}"
                         )
-                    caps[(rstor64, save64, es)] = (got_fop == exp_fop, got_fip == exp_fip, got_fdp == exp_fdp)
+                    selectors = [False, False]
+                    if not save64:
+                        for index, offset in enumerate((12, 20)):
+                            observed = struct.unpack_from("<H", raw, offset)[0]
+                            expected = 0 if rstor64 else selector_seeds[index]
+                            if observed not in (0, expected):
+                                raise AssertionError(f"unexpected host selector at {offset}: {observed:#x}")
+                            selectors[index] = not rstor64 and observed == expected
+                    caps[(rstor64, save64, es)] = (
+                        got_fop == exp_fop, got_fip == exp_fip, got_fdp == exp_fdp, *selectors
+                    )
         return caps
 
 
@@ -560,7 +573,7 @@ def invoke_native(harness: NativeHarness, fn, a: bytes, b: bytes, entry_ptr: int
 
 
 def expected_native_output(want: bytes, a: bytes, name: str, fp_caps: dict) -> bytes:
-    """Adapt reference FOP/FIP/FDP expectations strictly to observed host preservation."""
+    """Adapt native pointer and selector expectations to the separate host probe."""
     rstor64, save64, save_rfbm, off = EXPORT_MODES[name]
     if (save_rfbm & 1) == 0:
         return want
@@ -569,9 +582,7 @@ def expected_native_output(want: bytes, a: bytes, name: str, fp_caps: dict) -> b
         return want
     fsw_in = struct.unpack_from("<H", a, off + 2)[0]
     es = (fsw_in & 0x0080) != 0
-    preserves_fop, preserves_fip, preserves_fdp = fp_caps[(rstor64, save64, es)]
-    if preserves_fop and preserves_fip and preserves_fdp:
-        return want
+    preserves_fop, preserves_fip, preserves_fdp, preserves_fcs, preserves_fds = fp_caps[(rstor64, save64, es)]
     width = 8 if save64 else 4
     out = bytearray(want)
     if not preserves_fop:
@@ -580,6 +591,10 @@ def expected_native_output(want: bytes, a: bytes, name: str, fp_caps: dict) -> b
         out[off + 8 : off + 8 + width] = b"\x00" * width
     if not preserves_fdp:
         out[off + 16 : off + 16 + width] = b"\x00" * width
+    if not save64:
+        for offset, preserves in ((12, preserves_fcs), (20, preserves_fds)):
+            start = off + offset
+            out[start : start + 2] = a[start : start + 2] if preserves else bytes(2)
     return bytes(out)
 
 
@@ -1012,8 +1027,8 @@ def check_differential(
         else:
             raise AssertionError("mutated output was not caught by comparator")
 
-        es0_64 = fp_caps[(True, True, False)]
-        es1_64 = fp_caps[(True, True, True)]
+        es0_64 = fp_caps[(True, True, False)][:3]
+        es1_64 = fp_caps[(True, True, True)][:3]
         print(
             f"{total} native/lifted/reference XSAVE/XRSTOR cases across {len(EXPORTS)} exports matched bit-for-bit "
             f"(mxcsr_mask={mxcsr_mask:#x}, deprecates_fpu_cs_ds={deprecates_cs_ds}, "
