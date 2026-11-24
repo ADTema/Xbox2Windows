@@ -1,4 +1,5 @@
 """Check both gfx1030 image_get_lod results against a CPU footprint model."""
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -67,48 +68,117 @@ def binary(directory, assembler, objcopy, library):
     return 0
 
 
+def compare_draws(renderer, backend, mode, operands, shaders, directory, label):
+    draws = []
+    for name, shader in shaders:
+        path = directory / f"{label}-{name}.rgba32f"
+        print(f"{label} path={name}", flush=True)
+        result = subprocess.run([renderer, backend, mode, shader, *operands, path],
+                                capture_output=True, text=True)
+        print(result.stdout, end="", flush=True)
+        if result.returncode:
+            print(result.stderr, end="", flush=True)
+        data = path.read_bytes() if path.is_file() else None
+        if data is not None:
+            assert len(data) == 8 * 8 * 16, len(data)
+            first = struct.unpack_from("<4f", data)
+            bits = struct.unpack_from("<4I", data)
+            print(f"first_pixel_rgba={first} bits={','.join(f'{word:08x}' for word in bits)} "
+                  f"readback_sha256={hashlib.sha256(data).hexdigest()}", flush=True)
+        draws.append((result.returncode, data))
+
+    (translated_code, translated), (direct_code, direct) = draws
+    if translated is not None and direct is not None:
+        if translated == direct:
+            print(f"{label} translated/direct readbacks identical (256 FP32 channels)", flush=True)
+        else:
+            for index, (left, right) in enumerate(zip(struct.iter_unpack("<I", translated),
+                                                      struct.iter_unpack("<I", direct))):
+                if left != right:
+                    y, x = divmod(index // 4, 8)
+                    print(f"{label} first translated/direct mismatch x={x} y={y} channel={index % 4} "
+                          f"translated={left[0]:08x} direct={right[0]:08x}", flush=True)
+                    break
+            return 1
+    if any(code not in (0, 77) for code in (translated_code, direct_code)):
+        return 1
+    if translated_code == 77 or direct_code == 77:
+        return 77
+    assert translated is not None and direct is not None, "Missing GPU readback"
+    return 0
+
+
 def draw(directory, compiler, renderer, backend):
     controls()
+    direct_source = Path(__file__).with_name("pixel_get_lod_direct.hlsl")
+    direct_shaders = {}
+    for entry in ("lower_scale", "upper_clamp"):
+        direct_shaders[entry] = directory / f"direct_{entry}.cso"
+        subprocess.run([compiler, "-Gis", "-T", "ps_6_0", "-E", entry,
+                        "-Fo", direct_shaders[entry], direct_source], check=True)
+
     source = translate(program())
     cso = compile_ps(compiler, source, directory, "lod")
     case = directory / "lod.case"
-    command = [renderer, backend, "--check-pixel-case", cso, case]
+    status = 0
     for scale in (0.5, 0.25, 1.0, 2.0):
         raw_lod = math.log2(scale)
         # The viewport and texture are both 8x8. The point sampler has MinLOD=0,
-        # and the view has one mip. Negative derivative LODs must remain negative in Y.
+        # and the view has one mip. Negative derivative LODs must stay negative in Y.
         reference = struct.pack("<4f", 0, raw_lod, 0.5, 1)
-        case.write_bytes(struct.pack("<4f", 0, 0, scale, scale) + bytes(240) + reference * 64 + struct.pack("<B4I", 2, 0, 0, 8, 8))
-        result = subprocess.run(command)
-        if result.returncode:
-            return result.returncode
+        case.write_bytes(struct.pack("<4f", 0, 0, scale, scale) + bytes(240)
+                         + reference * 64 + struct.pack("<B4I", 2, 0, 0, 8, 8))
+        result = compare_draws(renderer, backend, "--check-pixel-case", [case],
+                               [("translated", cso), ("direct", direct_shaders["lower_scale"])],
+                               directory, f"scale-{scale}")
+        if result == 77:
+            return status or 77
+        status |= result
         if scale == 0.5:
             mutant = source.replace("CalculateLevelOfDetailUnclamped", "CalculateLevelOfDetail")
             assert mutant != source
             bad_cso = compile_ps(compiler, mutant, directory, "clamp_both")
-            bad = subprocess.run([*command[:3], bad_cso, case], capture_output=True, text=True)
+            bad = subprocess.run([renderer, backend, "--check-pixel-case", bad_cso, case],
+                                 capture_output=True, text=True)
             if (bad.returncode != 1 or "pixel_mismatch x=0 y=0" not in bad.stderr
                     or "channel=1 expected=-1 actual=0" not in bad.stderr):
                 raise AssertionError(f"Clamping both LODs escaped detection\n{bad.stderr}")
-            print(bad.stderr, end="")
+            print(bad.stderr, end="", flush=True)
+
     upper = translate(upper_clamp_program())
     cso = compile_ps(compiler, upper, directory, "lod_upper")
-    command = [renderer, backend, "--check-pixel-quad-lod"]
-    result = subprocess.run([*command, cso])
-    if result.returncode:
-        return result.returncode
+    mode = "--check-pixel-quad-lod"
+    result = compare_draws(renderer, backend, mode, [],
+                           [("translated", cso), ("direct", direct_shaders["upper_clamp"])],
+                           directory, "upper-clamp")
+    if result == 77:
+        return status or 77
+    status |= result
     mutant = upper.replace("CalculateLevelOfDetail(", "CalculateLevelOfDetailUnclamped(")
     assert mutant != upper
     bad_cso = compile_ps(compiler, mutant, directory, "unclamp_both")
-    bad = subprocess.run([*command, bad_cso], capture_output=True, text=True)
-    if bad.returncode != 1 or "channel=1 expected=1 actual=2" not in bad.stderr:
+    mutant_readback = directory / "unclamp-both.rgba32f"
+    bad = subprocess.run([renderer, backend, mode, bad_cso, mutant_readback], capture_output=True, text=True)
+    # On an adapter with a small raw LOD error, the mutation must still
+    # remove the clamp by a large amount and keep the strict check failing.
+    if bad.returncode != 1 or "pixel_mismatch x=0 y=0" not in bad.stderr or not mutant_readback.is_file():
         raise AssertionError(f"Removing the upper mip clamp escaped detection\n{bad.stderr}")
-    print(bad.stderr, end="")
+    mutated_clamped = struct.unpack_from("<f", mutant_readback.read_bytes(), 4)[0]
+    if status:
+        if not 1.5 < mutated_clamped <= 2.5:
+            raise AssertionError(f"Upper mutant clamped output is {mutated_clamped}, expected near 2")
+    elif mutated_clamped != 2.0:
+        raise AssertionError(f"Upper mutant clamped output is {mutated_clamped}, expected 2")
+    print(bad.stderr, end="", flush=True)
+    if status:
+        return status
     write_record(os.environ.get("FORM_COVERAGE_RECORD"))
     return 0
 
 
 if __name__ == "__main__":
     mode, *args = sys.argv[1:]
-    with tempfile.TemporaryDirectory() as tmp:
+    out = Path(__file__).resolve().parents[1] / "out"
+    out.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="pixel-get-lod-", dir=out) as tmp:
         sys.exit({"binary": binary, "draw": draw}[mode](Path(tmp), *args))

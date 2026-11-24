@@ -157,7 +157,7 @@ struct Extent {
 
 void draw_verified(ID3D12Device* device, const char* path, const std::vector<PixelInput>& levels,
                    Extent base, UINT firstResident, const std::vector<MipDraw>& draws, const char* capture,
-                   ID3D12Resource* gpuConstants = nullptr)
+                   ID3D12Resource* gpuConstants = nullptr, const char* rawReadback = nullptr)
 {
     const auto& input = levels.front();
     ComPtr<ID3D12Resource> uploadedConstants;
@@ -424,6 +424,15 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
             std::printf("covered_samples=%u checked_pixels=%zu\n", sum, input.coverage.size());
         }
         auto words = read(back.Get(), resultBytes/4);
+        if (rawReadback) {
+            std::ofstream output(rawReadback, std::ios::binary);
+            for (UINT y = 0; y < height; ++y) {
+                const auto* row = words.data() + y * resultLayout.Footprint.RowPitch / sizeof(UINT);
+                output.write(reinterpret_cast<const char*>(row), width * sizeof(Color));
+            }
+            output.close();
+            if (!output) throw std::runtime_error("Cannot save raw pixel readback");
+        }
         float maxError = 0;
         std::array<UINT, 4> firstBits{};
         std::vector<BYTE> image;
@@ -528,11 +537,11 @@ void draw_verified(ID3D12Device* device, const char* path, const std::vector<Pix
 
 void draw_verified(ID3D12Device* device, const char* path, const std::vector<PixelInput>& levels,
                    UINT firstResident, UINT sampledLevel, const char* capture,
-                   ID3D12Resource* gpuConstants = nullptr)
+                   ID3D12Resource* gpuConstants = nullptr, const char* rawReadback = nullptr)
 {
     const auto& top = levels.front();
     draw_verified(device, path, levels, {top.width << firstResident, top.height << firstResident},
-                  firstResident, {{sampledLevel, levels.at(sampledLevel).scale}}, capture, gpuConstants);
+                  firstResident, {{sampledLevel, levels.at(sampledLevel).scale}}, capture, gpuConstants, rawReadback);
 }
 
 ComPtr<ID3D12Resource> produce_pixel_constants(ID3D12Device* device, const char* path)
@@ -574,7 +583,7 @@ ComPtr<ID3D12Resource> produce_pixel_constants(ID3D12Device* device, const char*
 }
 
 static void check_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference,
-                        UINT8 writeMask, ID3D12Resource* gpuConstants)
+                        UINT8 writeMask, ID3D12Resource* gpuConstants, const char* rawReadback = nullptr)
 {
     PixelInput input{8, 8, 8, DXGI_FORMAT_R8G8B8A8_UNORM};
     input.writeMask = writeMask;
@@ -635,12 +644,13 @@ static void check_pixel(ID3D12Device* device, const char* path, bool swapRB, con
     }
     std::vector<PixelInput> levels;
     levels.push_back(std::move(input));
-    draw_verified(device, path, levels, 0, 0, nullptr, gpuConstants);
+    draw_verified(device, path, levels, 0, 0, nullptr, gpuConstants, rawReadback);
 }
 
-void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference, UINT8 writeMask)
+void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference,
+                            UINT8 writeMask, const char* rawReadback)
 {
-    check_pixel(device, path, swapRB, reference, writeMask, nullptr);
+    check_pixel(device, path, swapRB, reference, writeMask, nullptr, rawReadback);
 }
 
 void check_compute_to_pixel(ID3D12Device* device, const char* compute, const char* pixel,
@@ -652,7 +662,7 @@ void check_compute_to_pixel(ID3D12Device* device, const char* compute, const cha
                 stale ? stale.Get() : current.Get());
 }
 
-void check_pixel_quad_lod(ID3D12Device* device, const char* shader)
+void check_pixel_quad_lod(ID3D12Device* device, const char* shader, const char* rawReadback)
 {
     PixelInput top{8, 8, 1, DXGI_FORMAT_R8G8B8A8_UNORM};
     PixelInput next{4, 4, 1, DXGI_FORMAT_R8G8B8A8_UNORM};
@@ -669,7 +679,8 @@ void check_pixel_quad_lod(ID3D12Device* device, const char* shader)
         next.rows.insert(next.rows.end(), {0, 255, 0, 255});
     MipDraw draw{0, 1};
     draw.partialQuad = true;
-    draw_verified(device, shader, {std::move(top), std::move(next)}, {8, 8}, 0, {draw}, nullptr);
+    draw_verified(device, shader, {std::move(top), std::move(next)}, {8, 8}, 0, {draw}, nullptr,
+                  nullptr, rawReadback);
 }
 
 namespace {

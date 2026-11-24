@@ -713,7 +713,8 @@ OperationResult run_check_pixel_compare(const OperationContext& ctx)
 
 OperationResult run_check_pixel_case(const OperationContext& ctx)
 {
-    check_translated_pixel(ctx.device, ctx.argv[3], false, ctx.argv[4]);
+    check_translated_pixel(ctx.device, ctx.argv[3], false, ctx.argv[4], D3D12_COLOR_WRITE_ENABLE_ALL,
+                           ctx.argc == 6 ? ctx.argv[5] : nullptr);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -744,7 +745,7 @@ OperationResult run_check_pixel_attribute_rg(const OperationContext& ctx)
 
 OperationResult run_check_pixel_quad_lod(const OperationContext& ctx)
 {
-    check_pixel_quad_lod(ctx.device, ctx.argv[3]);
+    check_pixel_quad_lod(ctx.device, ctx.argv[3], ctx.argc == 5 ? ctx.argv[4] : nullptr);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -1254,12 +1255,12 @@ const OperationSpec kOperations[] = {
     {"--dual-pixel-swapped", 5, 5, nullptr, kNoGate, run_dual_pixel_swapped},
     {"--sampled-coverage", 5, 5, nullptr, kNoGate, run_sampled_coverage},
     {"--check-pixel-compare", 5, 5, nullptr, kNoGate, run_check_pixel_compare},
-    {"--check-pixel-case", 5, 5, nullptr, kNoGate, run_check_pixel_case},
+    {"--check-pixel-case", 5, 6, nullptr, kNoGate, run_check_pixel_case},
     {"--check-pixel-case-rg", 5, 5, nullptr, kNoGate, run_check_pixel_case_rg},
     {"--compute-to-pixel", 6, 7, nullptr, kNoGate, run_compute_to_pixel},
     {"--check-pixel-attribute", 5, 5, nullptr, kNoGate, run_check_pixel_attribute},
     {"--check-pixel-attribute-rg", 5, 5, nullptr, kNoGate, run_check_pixel_attribute_rg},
-    {"--check-pixel-quad-lod", 4, 4, nullptr, kNoGate, run_check_pixel_quad_lod},
+    {"--check-pixel-quad-lod", 4, 5, nullptr, kNoGate, run_check_pixel_quad_lod},
     {"--spirv-minlod-quad-lod", 4, 4, nullptr, kGateSm60MinLodSmoke, run_check_pixel_quad_lod},
     // Keep the fractional point-filter fixture on its existing gate (#809).
     {"--check-pixel-mip-clamp", 5, 5, nullptr, kGateSm66MinLod, run_check_pixel_mip_clamp},

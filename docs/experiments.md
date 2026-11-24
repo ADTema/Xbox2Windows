@@ -692,7 +692,15 @@ all exported channels, including the clamped LOD of zero. Clamping the raw
 result first differs at pixel `(0, 0)`, channel 1 (`-1` expected, `0` actual).
 A two-mip draw also checks clamped LOD 1 and raw LOD 2. Removing the upper
 clamp gives 2 in the channel that should contain 1. LLVM 15 assembles both
-gfx1030 programs and round-trips them through the pixel container CLI. The GPU fixture executes the translated desktop DXIL.
+gfx1030 programs and round-trips them through the pixel container CLI.
+For each draw, the GPU fixture compiles the translated program and an
+[independent HLSL program](../tests/pixel_get_lod_direct.hlsl) and runs both
+with the same texture, sampler, viewport and constants. It compares all
+256 FP32 channels and prints the first pixel's RGBA words and a SHA-256
+of the full readback for each path. The upper-clamp readback is in the
+order `(raw LOD - 2, clamped LOD, 0, 1)`. Both paths also undergo the
+strict CPU-reference check. For driver comparisons, the `release` preset
+runs the same fixtures.
 
 ```powershell
 cmake --build --preset dev --target offscreen_check
