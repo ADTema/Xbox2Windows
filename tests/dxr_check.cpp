@@ -484,8 +484,22 @@ bool check_dxr_placed_build(ID3D12Device* device) {
     PlacedBuildScene placement;
     const auto output = trace_placed_triangle(device, nullptr, &placement);
     const std::vector<bvh_fixture::Word> expected{1,7,0,0x3f800000, 0,0,0,0, 0,0,0,0};
-    if (output != expected) throw std::runtime_error("Placed BLAS/TLAS ray output differs from hit7@1, miss, masked miss");
-    std::puts("Slot 133 placed BLAS/TLAS: hit7@1, miss, masked miss; 12/12 words matched");
+    // Word 3 is the hit distance. As in check_dxr_rays, it must be within 1e-5 of 1, because hardware
+    // intersection may round it (the RX 6600 returns 0x3f7fffff). Every other word must match exactly.
+    float distance = 0;
+    if (output.size() == expected.size()) std::memcpy(&distance, &output[3], sizeof(distance));
+    const bool matches = output.size() == expected.size() &&
+                         std::equal(output.begin(), output.begin() + 3, expected.begin()) &&
+                         std::equal(output.begin() + 4, output.end(), expected.begin() + 4) &&
+                         std::abs(distance - 1.f) < 1e-5f;
+    if (!matches) {
+        std::fprintf(stderr, "placed ray words:");
+        for (const auto word : output) std::fprintf(stderr, " %08x", word);
+        std::fputc('\n', stderr);
+        throw std::runtime_error("Placed BLAS/TLAS ray output differs from hit7@1, miss, masked miss");
+    }
+    std::printf("Slot 133 placed BLAS/TLAS: hit7@1 (distance=0x%08x), miss, masked miss; 11/11 words and the "
+                "distance matched\n", output[3]);
     return true;
 }
 

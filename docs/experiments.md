@@ -6323,7 +6323,7 @@ ctest --preset release --no-tests=error --output-on-failure -R '^dxr_address_ran
 
 `dxr_placed_build_{hardware,warp}` creates four buffers through device slot 133. The BLAS and TLAS destinations start 512 bytes into their own buffers. Each build uses a separate UAV scratch buffer at offset 768. The internal desktop build preparation shares the vertex-binding placement lookup and checks the roles and byte ranges using the device's prebuild sizes. The destination is created in the acceleration-structure state. The fixture checks the offsets against the GPU addresses resolved at the allocation bases, records both builds, and calls `DispatchRays`. An unregistered destination, swapped buffer roles and a scratch extent one byte short of the TLAS requirement are rejected before command recording. The console build command encoding remains unverified. [Microsoft DXR memory requirements](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_build_raytracing_acceleration_structure_desc)
 
-On Windows 11 build 26200.9974, the RTX 4060 Laptop (32.0.16.1656) required 2,304/1,920 result/scratch bytes for the BLAS and 2,048/2,176 bytes for the TLAS. WARP (10.0.26100.9818) required 100/120 and 168/212 respectively. Both returned all 12 expected ray result words for a hit at distance one, a spatial miss and a masked miss, with the debug layer enabled and zero errors or warnings.
+On Windows 11 build 26200.9974, the RTX 4060 Laptop (32.0.16.1656) required 2,304/1,920 result/scratch bytes for the BLAS and 2,048/2,176 bytes for the TLAS. WARP (10.0.26100.9818) required 100/120 and 168/212 respectively. Both returned all 12 expected ray result words for a hit at distance one, a spatial miss and a masked miss, with the debug layer enabled and zero errors or warnings. The check compares the hit distance within 1e-5 of 1, as `dxr_query_*` and `dxr_pipeline_*` do, and the other 11 words exactly: at `153bb5f6` on Windows 11 build 26300.9974, an AMD Radeon RX 6600 (driver 32.0.21045.29003, 720/300 and 1,424/860 bytes) returned distance `0x3f7fffff`, one ULP below 1, with the other 11 words as expected, debug layer enabled and zero errors or warnings, in 3 of 3 runs. Before the tolerance, that distance failed the test.
 
 ```powershell
 cmake --build --preset release --target offscreen_check
@@ -8552,8 +8552,13 @@ The Windows loader and `pe_map` run the same PE. The test checks that PE's hash
 against the compiled AOT executable's exported source hash. For every runner
 the successful batch builds one triangle and one instance, dispatches three
 rays, and reads 12 DWORDs. A separately built scene on the same device uses
-direct desktop addresses. Both must yield instance 7 at distance 1, a miss and
-a mask-filtered miss. The successful guest exits with 42.
+direct desktop addresses. The direct scene must yield instance 7 at a distance
+within 1e-5 of 1, a miss and a mask-filtered miss; every word but the distance
+must match exactly. The guest-addressed scene must equal the direct scene byte
+for byte, distance included. The successful guest exits with 42. At `153bb5f6`
+on Windows 11 build 26300.9974, both scenes on an AMD Radeon RX 6600 (driver
+32.0.21045.29003) returned distance `0x3f7fffff`, one ULP below 1, and the test
+passed in 3 of 3 runs on that adapter and on WARP 10.0.26100.9818.
 
 Two controls change the second scratch address. One selects a resource whose
 last required byte falls beyond its registered extent. The other supplies an
