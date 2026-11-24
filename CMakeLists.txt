@@ -597,6 +597,13 @@ target_include_directories(startup_audio_provider PRIVATE src)
 target_link_libraries(startup_audio_provider PRIVATE ole32 xaudio2)
 add_test(NAME startup_audio_provider COMMAND startup_audio_provider)
 set_tests_properties(startup_audio_provider PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+if(EXISTS "${INTAKE_PYTHON}")
+    # Audio/input alignment control: generated packet statistics through tools/startup_audio_timeline.py.
+    # It needs no audio device, no GPU and no game files.
+    add_test(NAME startup_audio_timeline COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_audio_timeline_check.py")
+    set_tests_properties(startup_audio_timeline PROPERTIES TIMEOUT 60)
+endif()
 target_compile_features(startup_dump_fence_check PRIVATE cxx_std_17)
 target_include_directories(startup_dump_fence_check PRIVATE src)
 target_link_libraries(startup_dump_fence_check PRIVATE d3d12 dxgi)
