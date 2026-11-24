@@ -9,6 +9,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+import depth_mask_aot
 from depth_mask_aot import lower
 
 VS = """
@@ -43,6 +44,25 @@ CMPX = {
 # Odd multiples of 1/64 are exactly the values v7 takes, so each threshold lands on
 # one row's value: that row tells lt from le and gt from ge.
 CMPX_CASES = ((7, 17 / 64), (29, 49 / 64))
+
+
+# One-source binary32 forms. rcp, rsq and sqrt are approximate in D3D, so each result is rounded to the nearest integer
+# (add 0.5, floor) and scaled by v7. The input is one whose exact result is an integer, and it reaches the opcode
+# through a zero the compiler cannot prove (v7 - v7), so the opcode really runs. The other forms are exact and see
+# x = 4 * (v7 - 0.5), an odd multiple of 1/16: never a tie and never an integer. Each tuple ends with its HLSL.
+APPROX = {
+    "v_rcp_f32_e32": (0x3E000000, 8, "(1.0f / value{a})"),
+    "v_rsq_f32_e32": (0x3E800000, 2, "rsqrt(value{a})"),
+    "v_sqrt_f32_e32": (0x41100000, 3, "sqrt(value{a})"),
+}
+EXACT = {
+    "v_floor_f32_e32": (math.floor, "floor(value{a})"),
+    "v_trunc_f32_e32": (math.trunc, "trunc(value{a})"),
+    "v_rndne_f32_e32": (round, "round(value{a})"),  # Python rounds a tie to even
+}
+UNARY = {**APPROX, **EXACT}
+# T < v6 discards. -0.5 tells the exact forms apart, 0.5 tells the approximate ones apart.
+UNARY_CASES = ((7, -0.5), (29, 0.5))
 
 
 def program(extended=False, op=None, cmpx=None):
@@ -93,16 +113,116 @@ TABLES = [(6, 32), (10, 16)]
 
 def decoded_stream(lines):
     sizes = [
-        8 if line.startswith(("s_load_", "s_buffer_load_", "exp ")) else 4
+        8 if line.startswith(("s_load_", "s_buffer_load_", "exp ")) or "_e64 " in line else 4
         for line in lines
     ]
     return [(sum(sizes[:i]), line) for i, line in enumerate(lines)]
+
+
+# The plain VOP3 spelling of a form. v_cvt_f32_ubyte0 is not one of the forms that accept it.
+def wide(line):
+    op, _, operands = line.partition(" ")
+    if op.startswith("v_") and op.endswith("_e32") and op != "v_cvt_f32_ubyte0_e32":
+        return f"{op[:-4]}_e64 {operands}"
+    return None
+
+
+def respell(lines, only=None):
+    """The program with its e32 forms spelled e64: every one, or just the instruction at index `only`."""
+    return [
+        (wide(line) if only in (None, i) else None) or line for i, line in enumerate(lines)
+    ]
+
+
+def modified(line):
+    """The e64 line with each VOP3 field the translator must refuse, one at a time."""
+    op, _, operands = line.partition(" ")
+    names = operands.split(", ")
+    variants = [f"{line} clamp", f"{line} mul:2", f"{line} div:2", f"{line} mul:4"]
+    for i, name in enumerate(names):
+        if not re.fullmatch(r"[vs]\d+", name) or (i == 0 and not op.startswith("v_cmpx_")):
+            continue  # the destination and a constant carry no modifier
+        for text in (f"-{name}", f"|{name}|", f"-|{name}|", f"neg({name})", f"abs({name})"):
+            variants.append(f"{op} {', '.join(names[:i] + [text] + names[i + 1:])}")
+    return variants
+
+
+def wide_text(lines, only=None):
+    return lower(decoded_stream(respell(lines, only)), TABLES)
+
+
+def every_wide(lines, expected):
+    """Each e32 form of the program, spelled e64 alone or all together, lowers to the same text;
+    any modified e64 spelling of it, or an e64 of a form that is not listed, is refused."""
+    assert wide_text(lines) == expected
+    for i, line in enumerate(lines):
+        spelled = wide(line)
+        if spelled is None:
+            continue
+        assert wide_text(lines, i) == expected, spelled
+        for bad in modified(spelled):
+            changed = decoded_stream(lines)
+            changed[i] = (changed[i][0], bad)
+            try:
+                lower(changed, TABLES)
+            except ValueError:
+                continue
+            raise AssertionError(f"Modified VOP3 form accepted: {bad}")
+    for i, line in enumerate(lines):
+        if line.startswith("v_cvt_f32_ubyte0_e32"):
+            changed = decoded_stream(lines)
+            changed[i] = (changed[i][0], line.replace("_e32", "_e64"))
+            try:
+                lower(changed, TABLES)
+            except ValueError:
+                continue
+            raise AssertionError("Unlisted e64 form accepted")
+
+
+def silent_modifiers():
+    """A normaliser that drops a modifier instead of refusing it is caught by the same refusals."""
+    keep = depth_mask_aot.plain
+
+    def lenient(line):
+        for pattern, text in (
+            (r" (?:clamp|mul:[24]|div:2)$", ""),
+            (r"-?\|([vs]\d+)\|", r"\1"),
+            (r"(?:neg|abs)\(([vs]\d+)\)", r"\1"),
+            (r"(?<![\w.])-([vs]\d+)", r"\1"),
+        ):
+            line = re.sub(pattern, text, line)
+        return keep(line)
+
+    cases = []
+    for lines in (program(extended=True, op="v_add_f32_e32", cmpx="v_cmpx_ge_f32_e32"), unary_program("v_rcp_f32_e32")):
+        for i, line in enumerate(lines):
+            if wide(line):
+                cases += [(lines, i, bad) for bad in modified(wide(line))]
+    assert len(cases) > 60
+
+    def accepted(lines, i, bad):
+        changed = decoded_stream(lines)
+        changed[i] = (changed[i][0], bad)
+        try:
+            lower(changed, TABLES)
+        except ValueError:
+            return False
+        return True
+
+    assert not any(accepted(*case) for case in cases)
+    depth_mask_aot.plain = lenient
+    try:
+        silent = [case[2] for case in cases if not accepted(*case)]
+    finally:
+        depth_mask_aot.plain = keep
+    assert not silent, silent
 
 
 def op_source(op):
     """Lower one binary32 form and pin the line it becomes, then change that one word."""
     lines = program(op=op)
     word = lines.index(f"{op} v6, 0.5, v7")
+    wide_op = op.replace("_e32", "_e64")
 
     def hlsl(name):
         return "    " + OPS[name][1].format(n=word, a=word - 1)
@@ -122,7 +242,13 @@ def op_source(op):
         f"{op} v6, 0.5, v9",  # vsrc1 was never written
         f"{op} v6, 0.5, s30",  # vsrc1 is a VGPR in every e32 form
         f"{op} v6, 0.5",  # missing operand
-        op.replace("_e32", "_e64") + " v6, 0.5, v7",  # other encoding
+        f"{wide_op} v6, 0.5, v9",  # vsrc1 was never written
+        f"{wide_op} v6, 0.5, s30",  # the e32 operand rule is kept: vsrc1 is a VGPR
+        f"{wide_op} v6, 0.5",  # missing operand
+        f"{wide_op} v6, 0.5, v7 clamp",  # VOP3 clamp
+        f"{wide_op} v6, 0.5, v7 mul:2",  # VOP3 output modifier
+        f"{wide_op} v6, 0.5, |v7|",  # VOP3 absolute value
+        f"{wide_op} v6, 0.5, -v7",  # VOP3 negation
     ):
         try:
             lowered(bad)
@@ -136,6 +262,7 @@ def cmpx_source(name):
     """Lower one compare, pin its line, then change that one instruction word."""
     lines = program(cmpx=name)
     word = lines.index(f"{name} s31, v7")
+    wide_name = name.replace("_e32", "_e64")
 
     def hlsl(form):
         return "    " + CMPX[form][1].format(a=word - 1)
@@ -155,7 +282,16 @@ def cmpx_source(name):
         name.replace("_lt_", "_nlt_").replace("_le_", "_nle_").replace("_gt_", "_ngt_").replace("_ge_", "_nge_") + " s31, v7",  # true for NaN
         name.replace("_f32_", "_f16_") + " s31, v7",  # other width
         name.replace("_f32_", "_i32_") + " s31, v7",  # integer compare
-        name.replace("_e32", "_e64") + " s31, v7",  # other encoding
+        wide_name.replace("_lt_", "_nlt_").replace("_le_", "_nle_").replace("_gt_", "_ngt_").replace("_ge_", "_nge_") + " s31, v7",
+        wide_name.replace("_f32_", "_f16_") + " s31, v7",
+        wide_name.replace("_f32_", "_i32_") + " s31, v7",
+        wide_name.replace("v_cmpx_", "v_cmp_") + " s[0:1], s31, v7",  # a scalar mask destination is another instruction
+        f"{wide_name} s31, v9",  # vsrc1 was never written
+        f"{wide_name} s31, s30",  # the e32 operand rule is kept
+        f"{wide_name} s31",  # missing operand
+        f"{wide_name} s31, v7 clamp",  # VOP3 clamp
+        f"{wide_name} -s31, v7",  # VOP3 negation
+        f"{wide_name} s31, |v7|",  # VOP3 absolute value
         f"{name} s31, v9",  # vsrc1 was never written
         f"{name} s31, s30",  # vsrc1 is a VGPR in every e32 form
         f"{name} s31",  # missing operand
@@ -165,6 +301,75 @@ def cmpx_source(name):
         except ValueError:
             continue
         raise AssertionError(f"Invalid compare accepted: {bad}")
+    return text
+
+
+def unary_line(op):
+    return f"{op} v11, v10" if op in APPROX else f"{op} v6, v8"
+
+
+def unary_program(op):
+    lines = program(extended=True)
+    at = lines.index("v_fract_f32_e32 v7, v7") + 1
+    if op in APPROX:
+        body = [
+            "v_sub_f32_e32 v9, v7, v7",
+            f"v_add_f32_e32 v10, 0x{APPROX[op][0]:08x}, v9",
+            unary_line(op),
+            "v_add_f32_e32 v11, 0.5, v11",
+            "v_floor_f32_e32 v11, v11",
+            "v_mul_f32_e32 v6, v11, v7",
+        ]
+    else:
+        body = ["v_add_f32_e32 v8, -0.5, v7", "v_mul_f32_e32 v8, 4.0, v8", unary_line(op)]
+    lines[at:at] = body
+    lines[lines.index("v_cmpx_lt_f32_e32 s31, v7")] = "v_cmpx_lt_f32_e32 s31, v6"
+    return lines
+
+
+def unary_source(op):
+    """Lower one one-source form, pin its line, then change that one instruction word."""
+    lines = unary_program(op)
+    word = lines.index(unary_line(op))
+    wide_op = op.replace("_e32", "_e64")
+    operands = unary_line(op)[len(op) + 1 :]
+    dest, src = operands.split(", ")
+
+    def hlsl(name):
+        return f"    precise float value{word} = {UNARY[name][-1].format(a=word - 1)};"
+
+    def lowered(replacement):
+        changed = decoded_stream(lines)
+        changed[word] = (changed[word][0], replacement)
+        return lower(changed, TABLES)
+
+    text = lowered(unary_line(op))
+    every_wide(lines, text)
+    assert hlsl(op) in text.splitlines()
+    for other in UNARY:
+        if other != op:
+            wrong = lowered(f"{other} {operands}")
+            assert hlsl(other) in wrong.splitlines() and hlsl(op) not in wrong, other
+    for bad in (
+        f"{op} {dest}, -{src}",  # source modifiers
+        f"{op} {dest}, |{src}|",
+        f"{op} {operands} clamp",
+        f"{op} {operands} mul:2",  # output modifier
+        f"{op} {operands}, v7",  # second source
+        f"{op} {dest}, v13",  # source was never written
+        f"{op} {dest}",  # missing operand
+        f"{wide_op} {dest}, {src}, v7",  # second source
+        f"{wide_op} {dest}, {src} clamp",  # VOP3 clamp
+        f"{wide_op} {dest}, {src} mul:2",  # VOP3 output modifier
+        f"{wide_op} {dest}, -{src}",  # VOP3 negation
+        f"{wide_op} {dest}, |{src}|",  # VOP3 absolute value
+        f"{wide_op} {dest}, v13",  # source was never written
+    ):
+        try:
+            lowered(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"Invalid one-source form accepted: {bad}")
     return text
 
 
@@ -231,7 +436,9 @@ def source(extended=False, op=None, cmpx=None):
         except ValueError:
             continue
         raise AssertionError(f"Invalid depth program accepted: {case}")
-    return lower(decoded, tables)
+    text = lower(decoded, tables)
+    every_wide(lines, text)
+    return text
 
 
 def compile_pair(dxc, tmp, shader, stem="pixel"):
@@ -243,6 +450,16 @@ def compile_pair(dxc, tmp, shader, stem="pixel"):
             [dxc, "-T", profile + "_6_0", "-E", "main", "-Fo", binary, path], check=True
         )
     return vs, ps
+
+
+def unary_picture(op, seed, threshold):
+    """Independent CPU reference: v6 = n * v7 for the rounded approximate forms, else op(4 * (v7 - 0.5))."""
+    values = bytearray()
+    for row in range(32):
+        v7 = ((row + 0.5 + ((seed + 12) & 31)) % 32) / 32
+        v6 = APPROX[op][1] * v7 if op in APPROX else EXACT[op][0]((v7 - 0.5) * 4)
+        values += struct.pack("<f", 0.9375 if threshold < v6 else 0.75) * 32
+    return bytes(values)
 
 
 def op_picture(op, seed, threshold):
@@ -292,6 +509,11 @@ def draw_cmpx(dxc, renderer, adapter, tmp):
     return draw_forms(
         dxc, renderer, adapter, tmp, CMPX, cmpx_picture, cmpx_source, CMPX_CASES
     )
+
+
+def draw_unary(dxc, renderer, adapter, tmp):
+    """Each one-source form against its CPU reference, then against every other form's."""
+    return draw_forms(dxc, renderer, adapter, tmp, UNARY, unary_picture, unary_source, UNARY_CASES)
 
 
 def draw_forms(dxc, renderer, adapter, tmp, forms, picture, lowered, cases):
@@ -450,11 +672,21 @@ def fract_nan():
 
 def binary(tmp, assembler, objcopy, library):
     fract_nan()
+    silent_modifiers()
+    # Each program is assembled and translated in its e32 spelling, then with every form spelled e64.
     translate(tmp, assembler, objcopy, library, program(), source())
+    translate(tmp, assembler, objcopy, library, respell(program()), source())
     for op in OPS:
         translate(tmp, assembler, objcopy, library, program(op=op), op_source(op))
+        translate(tmp, assembler, objcopy, library, respell(program(op=op)), op_source(op))
     for name in CMPX:
         translate(tmp, assembler, objcopy, library, program(cmpx=name), cmpx_source(name))
+        translate(tmp, assembler, objcopy, library, respell(program(cmpx=name)), cmpx_source(name))
+    for op in UNARY:
+        translate(tmp, assembler, objcopy, library, unary_program(op), unary_source(op))
+        translate(tmp, assembler, objcopy, library, respell(unary_program(op)), unary_source(op))
+    # Every form must be visible: no other form may leave the same pictures.
+    assert len({tuple(unary_picture(op, *case) for case in UNARY_CASES) for op in UNARY}) == len(UNARY)
 
 
 def translate(tmp, assembler, objcopy, library, lines, expected):
@@ -519,6 +751,8 @@ if __name__ == "__main__":
             sys.exit(0)
         if sys.argv[1] == "ops":
             sys.exit(draw_ops(*sys.argv[2:], Path(directory)))
+        if sys.argv[1] == "unary":
+            sys.exit(draw_unary(*sys.argv[2:], Path(directory)))
         if sys.argv[1] == "cmpx":
             sys.exit(draw_cmpx(*sys.argv[2:], Path(directory)))
         draw_args = (*sys.argv[1:], Path(directory))

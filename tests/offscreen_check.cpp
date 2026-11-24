@@ -23,6 +23,7 @@
 
 void check_spirv_window_atomic(ID3D12Device* device, const char* shader_path);
 void check_spirv_window_signed(ID3D12Device* device, const char* shader_path);
+void check_spirv_window_float(ID3D12Device* device, const char* shader_path);
 void check_spirv_window_qword(ID3D12Device* device, const char* shader_path);
 void check_spirv_window_qword_narrow(ID3D12Device* device, const char* shader_path);
 void check_sampler_index_control(ID3D12Device* device,
@@ -559,6 +560,12 @@ OperationResult run_spirv_address_window_signed(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+OperationResult run_spirv_address_window_float(const OperationContext& ctx)
+{
+    check_spirv_window_float(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
 OperationResult run_spirv_address_window_qword(const OperationContext& ctx)
 {
     check_spirv_window_qword(ctx.device, ctx.argv[3]);
@@ -931,6 +938,10 @@ OperationResult run_dxr_address_ranges(const OperationContext& ctx)
 {
     return skip_if_false(check_dxr_address_ranges(ctx.device));
 }
+OperationResult run_dxr_placed_build(const OperationContext& ctx)
+{
+    return skip_if_false(check_dxr_placed_build(ctx.device));
+}
 
 OperationResult run_dxr_pipeline(const OperationContext& ctx)
 {
@@ -1047,9 +1058,8 @@ OperationResult run_startup_sampler_heap(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
-// --startup-image-3d <vs.cso> <ps.cso> <z> <expected rgba bits>: draws one pixel with a gfx2hlsl pixel
-// shader that samples a 2x2x2 Texture3D at (0.75, 0.25, z) (tests/startup_image_3d.cpp). The expected
-// value is four 8-digit hex words, comma separated.
+// --startup-image-3d <vs.cso> <ps.cso> <z> <expected rgba bits> [sampler manifest line]
+// The expected value is four comma-separated hex words. Omit the sampler line for point wrap.
 OperationResult run_startup_image_3d(const OperationContext& ctx)
 {
     const float z = std::stof(ctx.argv[5]);
@@ -1057,7 +1067,8 @@ OperationResult run_startup_image_3d(const OperationContext& ctx)
     if (std::sscanf(ctx.argv[6], "%8x,%8x,%8x,%8x", &expected[0], &expected[1], &expected[2], &expected[3]) != 4)
         return {OutcomeKind::fail, "expected value is not four hex words"};
     float color[4]{};
-    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], z, color);
+    const char* sampler = ctx.argc == 8 ? ctx.argv[7] : "smp 0 0x0 0x0 0x0 0x0";
+    check_startup_image_3d(ctx.device, ctx.argv[3], ctx.argv[4], z, color, sampler);
     std::uint32_t bits[4];
     std::memcpy(bits, color, sizeof(bits));
     if (std::memcmp(bits, expected, sizeof(bits)) != 0) {
@@ -1180,13 +1191,14 @@ const OperationSpec kOperations[] = {
     // SV_DispatchThreadID build is asserted, the SV_GroupID build is recorded per swap.
     {"--sampler-index-control", 3, 3, nullptr, kGateSm60SamplerIndexControl, run_sampler_index_control},
     {"--startup-sampler-heap", 7, 9, nullptr, kNoGate, run_startup_sampler_heap},
-    {"--startup-image-3d", 7, 7, nullptr, kNoGate, run_startup_image_3d},
+    {"--startup-image-3d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-flat-param", 6, 6, nullptr, kNoGate, run_startup_flat_param},
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},
     {"--spirv-address-window", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window},
     {"--spirv-address-window-atomic", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_atomic},
     {"--spirv-address-window-signed", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_signed},
+    {"--spirv-address-window-float", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_float},
     {"--spirv-address-window-qword", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_qword},
     {"--spirv-address-window-qword-narrow", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_qword_narrow},
     {"--spirv-compare-sampler", 6, 7, nullptr, kGateSm60CompareSampler, run_spirv_compare_sampler},
@@ -1252,6 +1264,7 @@ const OperationSpec kOperations[] = {
     {"--dxr-opacity-pipeline", 3, 3, nullptr, kNoGate, run_dxr_opacity_pipeline},
     {"--ray-query", 3, 3, nullptr, kNoGate, run_ray_query},
     {"--dxr-address-ranges", 3, 3, nullptr, kNoGate, run_dxr_address_ranges},
+    {"--dxr-placed-build", 3, 3, nullptr, kNoGate, run_dxr_placed_build},
     {"--dxr-pipeline", 3, 3, nullptr, kNoGate, run_dxr_pipeline},
     {"--gpu-alias", 3, 3, nullptr, kNoGate, run_gpu_alias},
     {"--gpu-alias-window", 3, 3, nullptr, kNoGate, run_gpu_alias_window},
