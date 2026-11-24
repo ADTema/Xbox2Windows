@@ -4250,15 +4250,20 @@ any pairing. The e64 form is lowered only as plain registers: clamp, output
 scale (`mul:`, `div:`), negate and absolute value, a swapped operand order,
 a special register such as `vcc_lo` or `null`, and an inline constant are
 rejected, as are the other element types and `v_cmp_*`. A comparison with NaN
-kills no pixel. The sample is `image_sample`, `image_sample_lz` or
-`image_sample_l`, with one 2D coordinate pair, a single-channel `dmask` and
+kills no pixel. The sample is `image_sample`, `image_sample_lz`,
+`image_sample_l` or `image_sample_b`, with one 2D coordinate pair, a single-channel `dmask` and
 no other modifier. `image_sample_lz` lowers to `SampleLevel(samp,uv,0)`
 instead of `Sample(samp,uv)`. `image_sample_l` takes the level as the third
 address register, `v[u:lod]`, and lowers to `SampleLevel(samp,uv,<level>)`.
-The level register must hold a value copied by `v_mov_b32_e32 vN, sM` from a
+`image_sample_b` takes the bias as the first address register, ahead of the
+coordinates, `v[bias:u]`, and lowers to `SampleBias(samp,uv,<bias>)`. That order
+was checked against LLVM's own lowering of the `image.sample.b.2d` intrinsic,
+which places its bias argument in the first register (the assembler cannot show
+it, as both opcodes print the same range). The level or bias register must hold a value copied by `v_mov_b32_e32 vN, sM` from a
 buffered float that the program loaded and waited for; an inline constant, a
 literal, a vector or special-register source, a non-float scalar, the VOP3
-spelling and a level that was never defined are refused. One sample per
+spelling and a level or bias that was never defined are refused, as are the clamped
+(`image_sample_b_cl`) and compare (`image_sample_c_b`) forms. One sample per
 program is still required, whichever spelling it uses. The textures have one
 mip.
 
@@ -4322,6 +4327,15 @@ dimension, and `image_sample_o`-style offsets for all
 three opcodes with LLVM 19 and requires the translator command to refuse each and
 write no output. `da` and a 2D array dimension are refused at the
 translator-level check only, because LLVM 19 does not assemble them in this form.
+The `image_sample_b` program has the same readback with a bias word of 3, which
+on the single mip selects mip 0. The Linux step lowers the bias from each of four
+buffered words and evaluates the `SampleBias` argument against distinct
+constants, tells the biased program apart from the same registers read by the
+implicit, zero-level and explicit-level opcodes, and refuses a bias in the third
+register, a shifted coordinate range, and every move source and modifier listed
+for `image_sample_l`, with LLVM 19 assembling each refused program. A bias that
+the readback cannot observe (it only changes the result when a texture has
+more than one mip) is checked at the translation level only.
 There is still no readback with a mip chain: the fixture renderer builds one
 mip, so the choice between mips by an explicit level is checked at the
 translation level only, not on a GPU. The Windows readback has not been run on
