@@ -712,6 +712,10 @@ ctest --preset dev --no-tests=error -R '^spirv_address_window_' -V
 
 With SPIRV-Tools on Linux, run `python3 -B tests/spirv_window/check.py` to assemble and validate the fixture and exercise the rejection paths. This also validates a combined fixture where a lowered ballot bit controls the value stored through the address window. The adapter reserves `%x2w_` identifiers in the input and gives address and ballot temporaries separate prefixes. To use WSL tools for the GPU check, generate a logical module with `python3 tools/spirv_address_window.py tests/spirv_window/subtract.spvasm out/window.spv`, then generate HLSL with `spirv-cross out/window.spv --hlsl --shader-model 60 --output out/window.hlsl`. Compile it on Windows with `dxc -T cs_6_0 -E main -Fo out/window.dxil out/window.hlsl` and run `out/build/dev/offscreen_check.exe hardware --spirv-address-window out/window.dxil`, then repeat with `warp`.
 
+The same Linux check validates eight unsigned DWORD atomics in Vulkan 1.2 SPIR-V: `OpAtomicIAdd`, `OpAtomicExchange`, `OpAtomicUMin`, `OpAtomicUMax`, `OpAtomicAnd`, `OpAtomicOr`, `OpAtomicXor` and `OpAtomicCompareExchange`. The synthetic variant exercises a direct word cast and an indexed physical address. Each atomic is lowered into a branch taken only for an aligned, in-window address, so an invalid address issues no atomic at all (the substitute index of the plain loads and stores is never used for an atomic); the atomic keeps its operands, scope and semantics, and its result is a phi of the old value and zero. This Linux check measures SPIR-V validation and the shape of the lowering. The GPU behavior of the valid and invalid cases requires the separate readback evidence.
+
+Run `ctest --preset dev --no-tests=error -R '^spirv_address_window_atomic_' -V` to check the atomic add's returned old value and full 16-DWORD readback for valid, misaligned, out-of-window and index-wrap addresses, with the fixture mapping the substitute index to the last bound DWORD.
+
 ### SPIR-V subgroup compaction across lane widths
 
 An optional experiment starts from the optional bridge fixture and compares a source-built subgroup compaction dispatch on a physical adapter and on WARP. The [SPIR-V module](../tests/spirv_window/compaction.spvasm) is one 64-thread group. It computes a sparse predicate from a 64-bit mask, ballots it with `OpGroupNonUniformBallot`, derives the first and last active lane and each lane's compaction rank, and writes the lane index, the observed lane width, the four ballot words, the active count, the selected lane's rank and the compacted payloads into separate output words. Compacted writes go to per-wave disjoint ranges keyed by rank, so the readback does not depend on workgroup or wave scheduling order; a repeated dispatch must be word-identical. The [direct desktop-HLSL control](../tests/spirv_window/compaction.hlsl) implements the same contract independently, so the bridge path and the direct path can be compared word for word. The CPU reference in `compaction.py` is recomputed with the lane width the shader observed, from an independent Python model of the ballot, first/last lanes, ranks and compaction.
@@ -2445,7 +2449,22 @@ primitive index order and guard bytes.
 ```text
 python3 -B tests/mesh_entry_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ctest --preset dev --no-tests=error -R "^mesh_entry_draw_" -V
+ctest --preset dev --no-tests=error -R "^mesh_entry_float_draw_" -V
 ```
+
+The per-lane binary32 forms of the translator now also include `v_add_f32_e64`,
+`v_sub_f32`, `v_subrev_f32` and `v_mul_f32` (`_e32` and `_e64`; `v_subrev` is
+source 1 minus source 0). They lower to plain `precise float` expressions, so
+an IEEE multiply, unlike `v_mul_legacy_f32`, does not turn zero times infinity
+into zero. Source modifiers, `clamp` and output modifiers are refused. One
+program chains all seven encodings on binary32 values that are exact; the binary
+mode evaluates the emitted expressions in binary32 and compares the depth with
+an independent hand calculation (0.28125), and each sibling opcode (sub for
+subrev, add for mul and so on) must give a different depth. The draw
+`mesh_entry_float_draw_*` (`draw-float`) compares the exported depth word
+with that reference, and a depth one unit in the last place off, or any sibling
+opcode, must report `Mesh export trace mismatch`. The draw is written for
+Windows and has not been run on Linux; denormal handling is not exercised.
 
 A local scan based on main `933cbad` selected the shortest validated native
 stream among 9,282 MS records (832 bytes, 153 instructions). For the tested
@@ -4602,6 +4621,8 @@ Measured at commit `f847956`, Windows 11 build 26300, debug layer enabled:
 
 Before `f847956`, the interior block's search tried only the 256 MB directly below the first allocation. That search found no free block in about 1 of 40 hardware runs, and the test failed in setup ("region below the first allocation").
 
+With bottom-up ASLR off, `VirtualAlloc(nullptr, ...)` places each allocation in the lowest free range that fits, so no 64 KB block remained below `first`, and both `gpu_alias_registry` tests failed on every run (Windows 10 build 19045, RTX 3080 and WARP). The test now commits its 64 KB block before `first`. First-fit placement then always puts `first` above it; when randomized placement puts it higher, the test releases it and searches below `first` as before.
+
 Measured at commit `21a65e5`, Windows 11 build 26300, debug layer enabled:
 - The full suite passed: 149 tests, with the same 3 capability skips.
 - `era_title_gpu_alloc` handled 6 failing allocations in a first `track` and 2 in a later one. It passed 50 of 50 repeated runs.
@@ -4652,6 +4673,26 @@ ctest --test-dir out/build/w10 --no-tests=error
 In this configuration all `bvh_*_warp`, `dxr_*_warp` and `bvh_differential_warp` tests pass, and the hardware wave64 check skips at its 32-lane range with SM 6.6 available. `bvh_wave64_warp` now runs and fails at field 25, `WaveReadLaneAt(v, (lane*7+3) % 64)`. In two groups, all 128 lanes received the value of lane m where `7m+3 ≡ lane (mod 64)`, which is the inverse of the requested shuffle. Field 24's shuffle, the mirror read and the native-width run pass. At WARP's native width of 8, `7n+3 ≡ 3-n (mod 8)` is self-inverse, so the default `bvh_waves_warp` cannot show the difference. `wave_shuffle_warp` narrows the cause. WARP 1.0.22 runs a forced wave as blocks of its native 8 lanes, and it picks the source block using the request of the wrong lane: the lane of the reader's block that sits at the requested position. For this shuffle that equals the inverse permutation. A rotation by one lane gets 16 of 64 reads wrong at widths 16, 32 and 64, and none of them match its inverse. Reads where every lane of a block requests the same source block are unaffected. [Open question](https://github.com/R0Y00/Xbox2Windows/issues/145)
 
 On Windows 11 build 26200 at `1ccc326`, the in-box WARP (10.0.26100.9818) reports a 4..4 lane range with SM 6.6, so `bvh_wave64_warp` and the forced 16/32/64 variants of `wave_shuffle_warp` skip on capability; its native-width shuffle reads are all correct (affine and rotation 64/64, no block-misrouted reads, no control errors). The GTX 1660 SUPER (driver 32.0.16.1074) reports 32..32 lanes: `bvh_wave64_hardware` skips, and `wave_shuffle_hardware` passes at native and forced width 32 with every read from the requested lane. The lane-block misroute was observed in the app-local WARP 1.0.22 + Agility SDK setup above. The in-box WARP run could exercise only native width 4, because the fixture has no override for the reported lane range. [Cross-check report](https://github.com/R0Y00/Xbox2Windows/issues/145#issuecomment-7114625084)
+
+### Wave64 emulation with group-shared memory
+
+`src/wave64_emulate.hlsli` gives a 64-thread group the results of 64-lane wave operations without wave intrinsics: `Wave64ReadLaneAt`, `Wave64ReadLaneFirst`, `Wave64ActiveSum` and `Wave64ActiveBallot`. Each lane (its `SV_GroupIndex`) writes its value to a group-shared slot, the group waits on a barrier, every lane reads the slots it needs, and a second barrier frees the slots for the next call. The result does not depend on the native wave width, so it holds on 32-lane NVIDIA waves, on WARP's 8 lanes, and under a forced `[WaveSize(64)]` on WARP 1.0.22, where `WaveReadLaneAt` misroutes. The fixture needs only `cs_6_0`.
+
+Limits: the group must be exactly 64 threads, and every call must be reached by all 64 threads in uniform control flow, because a group barrier inside divergent control flow is undefined. With all 64 lanes active, the first active lane is lane 0. Values are `uint`. Prefix, min/max, bitwise and quad operations are not provided. The `wave_shuffle` and `bvh_wave64` tests still measure the adapters' own wave operations and are unchanged.
+
+`wave64_emulate_<adapter>` compares the affine, rotation and mirror reads of `wave_shuffle`, a first-lane read, a sum and a ballot (`t % 3 == 0`) on all 64 threads with a CPU reference, 448 values per run. It runs at the native width and, where SM 6.6 and the lane range allow it, at a forced width of 64. The negative control is a build whose affine read requests the next lane, and the test requires it to be reported on all 64 threads.
+
+Measured on `31f9ebb` with this change, Windows 10 build 19045, debug layer enabled:
+
+| Adapter | Native width | Forced width 64 | Negative control |
+|---|---|---|---|
+| WARP 1.0.22 (Agility SDK 1.620.2) | 0 of 448 wrong | 0 of 448 wrong; `wave_shuffle_warp` on the same adapter: 64 of 64 affine reads misrouted | 64 of 64 reported |
+| WARP 10.0.19041 (in-box) | 0 of 448 wrong | Skipped, lane range 4..4 | 64 of 64 reported |
+| NVIDIA GeForce RTX 3080 (32.0.15.9174) | 0 of 448 wrong | Skipped, lane range 32..32 | 64 of 64 reported |
+
+```powershell
+ctest --preset dev --no-tests=error -R '^wave64_emulate_' -V
+```
 
 ## Mapped DLL draw with a Windows reference
 
@@ -6565,6 +6606,8 @@ device at feature level 12.0. The fixture uses a null parameter block and the de
 interface is rejected. The negative case supplies an unsupported IID after
 adapter selection. It checks the cleared device output, release of the adapter
 and factory references, zero frame bytes and exit code 20 on all three runners.
+
+The `pe_map` run's host process is `python.exe`, so DXGI does not find an app-local WARP (`OFFSCREEN_WARP_DIR`) beside the native EXE. When `d3d10warp.dll` sits beside the EXE, `shim_startup_check.py --map` now loads that copy first, and the mapped run uses the same WARP as the native and AOT runs. With the Windows 10 app-local setup, `cpu_shim_shadow_warp` previously failed (the mapped run created the device and closed it without recording a frame: `shadow close surfaces=0 device=1`) and `cpu_shim_chain_warp` skipped; both now pass. Builds without an app-local WARP are unchanged.
 
 ## First-active-lane vector broadcast readback
 
