@@ -20,7 +20,8 @@ Word invoke(void* object, unsigned index, Word a = 0, Word b = 0, Word c = 0, Wo
 
 int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels)
 {
-    constexpr UINT width = 8, height = 4;
+    const bool bc = GetEnvironmentVariableW(L"X2W_TEST_BC_VIEW", nullptr, 0) != 0;
+    const UINT width = bc ? 4 * 128 : 8, height = bc ? 128 : 4;
     ComPtr<ID3D12Device> desktop;
     if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
@@ -47,8 +48,8 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         FAILED(static_cast<HRESULT>(invoke(guest, 36, 0, 0, arg(&__uuidof(ID3D12Fence)), arg(&fence))))) return 23;
 
     const float clear[] = {0, 0, 1, 1};
-    const D3D12_VIEWPORT viewport{0, 0, width, height, 0, 1};
-    const D3D12_RECT left{0, 0, width / 2, height};
+    const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
+    const D3D12_RECT left{0, 0, static_cast<LONG>(width / 2), static_cast<LONG>(height)};
     invoke(list, 139, arg(allocator));
     invoke(list, 52, rtv.ptr, arg(clear));
     invoke(list, 50, 1, arg(&rtv));
@@ -60,6 +61,10 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_SRV", nullptr, 0)) {
         extern int draw_address_srvs(ID3D12Device*, void*, void*);
         if (const int result = draw_address_srvs(desktop.Get(), guest, list)) return result;
+    }
+    if (bc) {
+        extern int draw_bc_address_srvs(void*, void*);
+        if (const int result = draw_bc_address_srvs(guest, list)) return result;
     }
     invoke(list, 9);
     invoke(queue, 10, 1, arg(&list));
