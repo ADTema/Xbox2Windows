@@ -8,6 +8,15 @@ This is not a port and not an emulator. No executable is playable. Every stand-i
 most answers are shortcuts that are logged as such. The open problems are tracked in the issues
 whose titles start with `startup-runtime:`.
 
+## Output window and fallback diagnostics
+
+The desktop swap chain has its own top-level window, class `X2WOutputWindow`.
+When a present cannot show its surface, the GDI fallback selects a visible,
+unowned guest window in the same process. If only the presenter is visible,
+the fallback leaves it alone. To exercise both z-orders with source-built
+windows, build `startup_overlay_window` and run
+`ctest --preset release --no-tests=error -R '^startup_overlay_window$' -V`.
+
 ## Null Texture2D descriptors
 
 When the adapter lacks typed UAV support for B5G5R5A1_UNORM or render-target support for
