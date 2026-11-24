@@ -53,7 +53,7 @@ dumpbin /imports .\out\build\dev\d3d12_sdk_check.exe
 
 Build outputs and downloaded tool sources live under `out/`. [Microsoft xbdepends documentation](https://learn.microsoft.com/en-us/samples/microsoft/xbox-gdk-samples/xbdepends/)
 
-**Optional compiler cache:** set `X2W_USE_SCCACHE=1` before `.\tools\dev.ps1` to cache compiles with [sccache](https://github.com/mozilla/sccache). When `sccache` is on `PATH`, the script fills `$X2wSccacheCmakeArgs` with four definitions: the C and C++ compiler launchers, `CMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded` (so `/Zi` PDB files do not block the cache) and `CMAKE_POLICY_DEFAULT_CMP0141=NEW` (CMake ignores the format variable otherwise). Pass them when configuring. If `sccache` is missing the script warns and sets the variable to two empty definitions, `-DCMAKE_C_COMPILER_LAUNCHER=` and `-DCMAKE_CXX_COMPILER_LAUNCHER=`, so that a build directory configured earlier with `sccache` stops calling it (`-D` updates cache entries but never deletes them). Without `X2W_USE_SCCACHE=1` the variable is removed and the script and the `cmake` commands are exactly as before; a launcher left in the cache by an earlier opt-in run is not touched, so reset the cache entries by hand or opt in once without `sccache` to clear them.
+**Optional compiler cache:** set `X2W_USE_SCCACHE=1` before `.\tools\dev.ps1` to cache compiles with [sccache](https://github.com/mozilla/sccache). When `sccache` is on `PATH`, the script fills `$X2wSccacheCmakeArgs` with four definitions: the C and C++ compiler launchers, `CMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded` (so `/Zi` PDB files do not block the cache) and `CMAKE_POLICY_DEFAULT_CMP0141=NEW` (CMake ignores the format variable otherwise). The embedded Debug format in this opt-in requires CMake 3.25 or newer; the ordinary build minimum is unchanged. Pass them when configuring. If `sccache` is missing the script warns and sets the variable to two empty definitions, `-DCMAKE_C_COMPILER_LAUNCHER=` and `-DCMAKE_CXX_COMPILER_LAUNCHER=`, so that a build directory configured earlier with `sccache` stops calling it (`-D` updates cache entries but never deletes them). Without `X2W_USE_SCCACHE=1` the variable is removed and the script and the `cmake` commands are exactly as before; a launcher left in the cache by an earlier opt-in run is not touched, so reset the cache entries by hand or opt in once without `sccache` to clear them.
 
 ```powershell
 $env:X2W_USE_SCCACHE = '1'
@@ -3237,6 +3237,39 @@ ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_subword_' -V
 python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
 ```
 
+### Indexed gfx1030 raw vector reads
+
+The compute store profile also lowers `buffer_load_dwordx2`,
+`buffer_load_dwordx3` and `buffer_load_dwordx4` from the caller's read-only
+raw `t0`. It accepts `idxen` with a verified dispatch-thread index, a zero
+scalar offset and a DWORD-aligned immediate. All components must fit in one
+explicit source record. The valid, unswizzled source records must be stable,
+in range and disjoint from the output; native descriptor bounds are not
+emulated. The index is captured before the consecutive destination VGPRs
+are marked pending, so it may alias a destination. All destinations become
+available together at `vmcnt(0)`, after an earlier `lgkmcnt(0)` for the
+descriptor. Other address modes and status or cache modifiers are refused.
+
+Each wave32 fixture reads the final two, three or four words of its source
+record and writes them to the beginning of a separate output record. The
+index register is also the second destination of every load. An independent
+CPU reference compares all 320 output words, including the gaps and any
+untouched tail, after one and two groups. A first/last channel swap must
+fail at output word 0. Rejection controls cover malformed or overflowing
+destination ranges, whole-record overruns, and using or overwriting the
+last destination before the wait. The LLVM 15 check assembles each program
+and verifies the container CLI's HLSL against direct lowering. The dispatch
+tests execute the translated desktop DXIL, not the native programs.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_vector_' -V
+```
+
+```sh
+python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
 ### Per-lane guards around compute stores
 
 A per-lane bound such as `if (gid < n) store` compiles under LLVM 15 to one exit, with no early `s_endpgm`. A `v_cmp` sets `vcc_lo`, `s_and_saveexec_b32` saves `exec_lo` and masks it, and an optional `s_cbranch_execz` skips the masked block when no lane passes. `s_or_b32 exec_lo, exec_lo, sN` then restores the mask, or the program exits with the mask still applied. The store profile lowers this form as control flow: the stores issued under the mask go inside an HLSL `if`, and stores after the restore stay outside it.
@@ -3759,6 +3792,8 @@ pixels where the two differ. LLVM CI also assembles each fixture, translates it
 through the CLI and pins the lowered line, and changing that one instruction word
 to another form must change the line. On a Linux host only the LLVM part and the
 reference arithmetic were run; no WARP or GPU readback of these six forms exists yet.
+
+`v_fract_f32_e32` lowers to `(frac(x) >= 1.0f ? asfloat(0x3f7fffffu) : frac(x))`, the cap the pixel translator uses. The cap used to be `min(frac(x), asfloat(0x3f7fffffu))`, and D3D `min` returns its other operand for a NaN, so a NaN input became the finite cap while `v_fract_f32` returns a NaN. A comparison fails for a NaN and passes it through. `fract_nan` in `tests/depth_mask_check.py` lowers the fixture and evaluates the emitted expression with D3D semantics against an independent binary32 reference (a NaN stays a NaN, -2^-30 and -2^-28 give `0x3f7fffff`). The previous `min` form must mismatch on both NaN payloads and an uncapped `frac` on both tiny negative inputs. It runs in the `binary` mode with the LLVM checks and needs no GPU or WARP readback; the draw fixtures are unchanged, so this PR adds no test outside `--preset pr`.
 
 The discard compare may be any of `v_cmpx_lt_f32_e32`, `v_cmpx_le_f32_e32`,
 `v_cmpx_gt_f32_e32` and `v_cmpx_ge_f32_e32` (scalar first source, VGPR second
@@ -5763,15 +5798,15 @@ ctest --preset dev --no-tests=error -R '^xmem_committed_memory$' -V
 
 The [startup investigation in #870](https://github.com/R0Y00/Xbox2Windows/issues/870) identified a need for reserve-and-commit allocations in addition to the existing reserve-only profile. The source-built fixture below exercises the supported request forms independently of that workload.
 
-The desktop `XMemVirtualAlloc` accepts these three configurations: a null address, a nonzero size that is a multiple of 64 KiB, and type `0x20003000` with `0x183`/`0x22004` or `0x283`/`0x2404`, or type `0x20403000` with `0x181`/`PAGE_READWRITE`. It commits a fresh private, zero-filled `PAGE_READWRITE` block of exactly the requested size, without rounding, which the caller releases with `VirtualFree`. If Windows cannot commit the block, the call returns NULL with the Windows error. This is a proposed desktop policy: no independent reference describes these attribute words.
+The desktop `XMemVirtualAlloc` accepts these four configurations: a null address, a nonzero size that is a multiple of 64 KiB, and type `0x20003000` with `0x183`/`0x22004`, `0x283`/`0x2404` or `0x283`/`0x2004`, or type `0x20403000` with `0x181`/`PAGE_READWRITE`. The `0x283`/`0x2004` pair was observed later in the same pool loop, for two blocks after the four large ones; without it those two calls returned NULL and startup stopped about 220 s in on a null resource lookup. It commits a fresh private, zero-filled `PAGE_READWRITE` block of exactly the requested size, without rounding, which the caller releases with `VirtualFree`. If Windows cannot commit the block, the call returns NULL with the Windows error. This is a proposed desktop policy: no independent reference describes these attribute words.
 
-Base alignment follows the page-size bits in the type. The Windows SDK (`winnt.h`, 10.0.26100) defines `MEM_LARGE_PAGES` as `0x20000000` and `MEM_64K_PAGES` as `MEM_LARGE_PAGES | MEM_PHYSICAL` (`0x20400000`, `era_physical::mem_64k_pages` here). So the pool type `0x20003000` asks for `MEM_LARGE_PAGES`, and `0x20403000` asks for 64 KiB pages. The large-page type gets a 2 MiB-aligned base (the x64 large-page size) from `VirtualAlloc2` with an address requirement. The 64 KiB type keeps the 64 KiB allocation granularity of `VirtualAlloc`. The size remains an exact multiple of 64 KiB. The source-built 2 MiB + 64 KiB case below distinguishes the allocation alignment from rounding the size. A size that is not a multiple of 64 KiB is refused rather than rounded to host pages. Treating `MEM_LARGE_PAGES` as a 2 MiB alignment requirement is an assumption taken from the desktop definition; the console's own alignment for this type is not established. Large pages themselves are not used, the console protection bits above `PAGE_READWRITE` (`0x2000`, `0x20000`, and write-combining `0x400` in the second pair) and whatever GPU visibility they request are not reproduced. Every other argument set keeps the existing `ERROR_INVALID_PARAMETER` refusal.
+Base alignment follows the page-size bits in the type. The Windows SDK (`winnt.h`, 10.0.26100) defines `MEM_LARGE_PAGES` as `0x20000000` and `MEM_64K_PAGES` as `MEM_LARGE_PAGES | MEM_PHYSICAL` (`0x20400000`, `era_physical::mem_64k_pages` here). So the pool type `0x20003000` asks for `MEM_LARGE_PAGES`, and `0x20403000` asks for 64 KiB pages. The large-page type gets a 2 MiB-aligned base (the x64 large-page size) from `VirtualAlloc2` with an address requirement. The 64 KiB type keeps the 64 KiB allocation granularity of `VirtualAlloc`. The size remains an exact multiple of 64 KiB. The source-built 2 MiB + 64 KiB case below distinguishes the allocation alignment from rounding the size. A size that is not a multiple of 64 KiB is refused rather than rounded to host pages. Treating `MEM_LARGE_PAGES` as a 2 MiB alignment requirement is an assumption taken from the desktop definition; the console's own alignment for this type is not established. Large pages themselves are not used, the console protection bits above `PAGE_READWRITE` (`0x2000` in the second and fourth pairs, `0x20000`, and write-combining `0x400` in the second pair) and whatever GPU visibility they request are not reproduced. Every other argument set keeps the existing `ERROR_INVALID_PARAMETER` refusal.
 
-[`tests/cpu/xmem_pool_commit.asm`](../tests/cpu/xmem_pool_commit.asm) imports `XMemVirtualAlloc` by name and starts through `exe_startup.asm`, so the same body runs under the Windows loader and from `pe_map_run`. It commits one block per configuration: 4 MiB, 2 MiB + 64 KiB and 1 MiB + 192 KiB. For each block it checks the base alignment (2 MiB for the two large-page blocks, 64 KiB for the 64 KiB-page block), the `VirtualQuery` base, allocation base, state, protection and type, a region size equal to the requested size, and that the byte just past the block belongs to no part of the same allocation. The 2 MiB + 64 KiB block shows that the reservation is not rounded up to 2 MiB. It checks the zero fill of every byte and writes a block-specific pattern to the first and last QWORD of every 64 KiB page, including the block's own first and last QWORD, and reads it back. Ten calls each change one variable of an accepted call and must return NULL with `87`: the two types without `MEM_COMMIT`, the two pool pairs crossed, each type with a pair from the other, protection `0x2004` with `0x183`, `PAGE_READONLY` with `0x181`, the live first block as the address, size 0, and a size that is not a multiple of 64 KiB. The cases without `MEM_COMMIT` and the address case are refused by the reserve-only validator, the others by the commit profile. A host allocation failure uses the first configuration with a 128 TiB size and must return NULL with a Windows error other than `87`; on Windows 10 19045 it is `ERROR_NOT_ENOUGH_MEMORY` (`8`). All three blocks keep their patterns through these calls, and each is released and then reads as `MEM_FREE`.
+[`tests/cpu/xmem_pool_commit.asm`](../tests/cpu/xmem_pool_commit.asm) imports `XMemVirtualAlloc` by name and starts through `exe_startup.asm`, so the same body runs under the Windows loader and from `pe_map_run`. It commits one block per configuration: 4 MiB, 2 MiB + 64 KiB, 1 MiB + 192 KiB and 2 MiB + 128 KiB. For each block it checks the base alignment (2 MiB for the three large-page blocks, 64 KiB for the 64 KiB-page block), the `VirtualQuery` base, allocation base, state, protection and type, a region size equal to the requested size, and that the byte just past the block belongs to no part of the same allocation. The 2 MiB + 64 KiB and 2 MiB + 128 KiB blocks show that the reservation is not rounded up to 2 MiB. It checks the zero fill of every byte and writes a block-specific pattern to the first and last QWORD of every 64 KiB page, including the block's own first and last QWORD, and reads it back. Eleven calls each change one variable of an accepted call and must return NULL with `87`: the two types without `MEM_COMMIT`, the first two pool pairs crossed, each type with a pair from the other, the 64 KiB type with the fourth pair, protection `0x2004` with `0x183`, `PAGE_READONLY` with `0x181`, the live first block as the address, size 0, and a size that is not a multiple of 64 KiB. The cases without `MEM_COMMIT` and the address case are refused by the reserve-only validator, the others by the commit profile. A host allocation failure uses the first configuration with a 128 TiB size and must return NULL with a Windows error other than `87`; on Windows 10 19045 it is `ERROR_NOT_ENOUGH_MEMORY` (`8`). All four blocks keep their patterns through these calls, and each is released and then reads as `MEM_FREE`.
 
 | CTest case | Inputs and checks |
 |---|---|
-| `cpu_native_xmem_pool_commit` | The EXE returns `0x870` under both loaders. Controls with a known failing step, under both loaders: the first block taken from the reserve-only call fails the commit check (`0xF02`), the 2 MiB check applied to the first block's base plus 64 KiB (64 KiB aligned, not 2 MiB aligned) fails (`0xF02`), one nonzero QWORD at the end of the first block fails the zero fill (`0xF03`), the accepted pair in place of the crossed one fails the refusal (`0xF0F`), a size that fits in place of the host failure is accepted and fails that step (`0xF17`), and skipping the release of the first block fails the free check (`0xF19`). A provider without `XMemVirtualAlloc` stops `pe_map` at that import before entry. |
+| `cpu_native_xmem_pool_commit` | The EXE returns `0x870` under both loaders. Controls with a known failing step, under both loaders: the first block taken from the reserve-only call fails the commit check (`0xF02`), the 2 MiB check applied to the first block's base plus 64 KiB (64 KiB aligned, not 2 MiB aligned) fails (`0xF02`), one nonzero QWORD at the end of the first block fails the zero fill (`0xF03`), the accepted pair in place of the crossed one fails the refusal (`0xF13`), a size that fits in place of the host failure is accepted and fails that step (`0xF1C`), and skipping the release of the first block fails the free check (`0xF1E`). A provider without `XMemVirtualAlloc` stops `pe_map` at that import before entry. |
 
 ```powershell
 cmake --build --preset dev
@@ -6607,6 +6642,19 @@ python -B tools/ttpf_batch_export.py $pool -o out/exported_dds --tools-path "$ru
 
 Add `--calibration path/to/profile.json` to retry strict decode failures using a local version-1 Leonida profile. This option requires NumPy and the calibration library. Use it by itself or with `--require-rust`. The separate legacy history mode uses `--allow-provisional --history`. Output produced by the local profile has `"mode": "fitted"` in the manifest.
 
+### Startup stand-in BC7 tiled upload
+
+The [startup runtime](startup-runtime.md) can upload the opt-in BC7 4 KiB tiled profile
+after an XG copy. The source-built draw fixture samples both linear and tiled backing
+through the wrapped D3D12 draw path. It checks all 4,096 pixels of a 64×64 surface
+and all 5,589 visible pixels of an 81×69 surface against a CPU reference. Bypassing
+the detile changes pixel `(4, 0)` in both tiled draws while both linear draws still match.
+
+```powershell
+$env:X2W_D3D12_DEBUG = '1'
+ctest --preset dev --no-tests=error -R '^startup_xg_bc7_draw_' -V
+```
+
 ### Drawing BC7 textures with a recompiled pixel shader
 
 `linearize_4k_s_tail(tile, width, height, tail_level)` reads a single BC7 level from a shared GFX10 4 KiB mip-tail tile. Supply the decoded tile, the requested pixel dimensions and its zero-based position within the tail. Whole-tile storage and per-slot bounds are checked before reading. [AMD mip-tail address calculation](https://github.com/GPUOpen-Drivers/pal/blob/c5e800072a32f68b6ccc4422936d96167c6e0728/src/core/imported/addrlib/src/gfx10/gfx10addrlib.cpp)
@@ -6919,8 +6967,10 @@ the host.
 The pass first looks for a directly loaded standalone sampler that feeds both kinds of
 sampling. Modules without one are returned byte-for-byte unchanged. That includes the
 indexed table above and unrelated samples on other samplers. For the sampler it splits,
-the profile covers direct float32 `Texture1D`, `Texture2D` and `TextureCube` sampling,
-including their array forms, in one compute entry point at a constant LOD of zero.
+the profile covers direct float32 `Texture1D`, `Texture2D`, `TextureCube` and `Texture3D`
+sampling, including the array forms of the first three, in one compute entry point at a
+constant LOD of zero. A `Texture3D` takes ordinary sampling only: depth comparison on it and
+an arrayed 3D image are refused, each with its own diagnostic.
 Other uses of that sampler, an occupied binding and a
 nonzero LOD are rejected with a specific diagnostic.
 
@@ -6953,6 +7003,17 @@ one) and reads it back from two-layer `Texture2DArray` resources whose layer 1 d
 module matches its own, and the layer-1 module against the layer-0 reference differs at exactly words 1 and 2.
 On layer 1 the comparison-sampler control changes only words 0 and 1 and the ordinary-sampler MinLOD control
 only word 2 (layer 1's mip, not layer 0's).
+
+The `Texture3D` case reuses the single-sampler module with the value texture as a 3D image sampled at a
+float3 coordinate (0.25, 0.25, 0.75), while the depth texture stays 2D. The Linux test splits it to the same
+bindings, validates both modules for Vulkan 1.2, checks that SPIRV-Cross emits a `Texture3D` read by one
+`SampleLevel` on the ordinary sampler, and refuses a 3D depth-comparison image, a multisampled or arrayed
+3D image and a nonzero LOD. The Windows stage checks that DXC rejects the unsplit module, then reads back a
+2x2x2 `Texture3D` whose slice 1 holds 0.3125 at the sampled texel (slice 0 holds 0.375, mip 1 holds 0.625).
+The ordinary word is 0.3125, a reference that claims slice 0 differs at word 2 only, `GREATER` on s2 changes
+only words 0 and 1, and clamping the ordinary sampler to `MinLOD` 1 changes only word 2 (to 0.625). The
+guard words stay unchanged in every readback. Not run here: that Windows GPU stage
+(`spirv_compare_sampler_warp`).
 
 The Linux check `python3 -B tests/spirv_window/check.py` generates four more
 variants, `Texture1D`, `Texture1DArray`, `TextureCube` and `TextureCubeArray`.
@@ -8286,3 +8347,52 @@ ctest --preset release --no-tests=error -R '^startup_audio_output$' -V
 ```
 
 Exit code 77 is a capability skip (no render endpoint, an endpoint that does not initialise, or an unsupported mix format); it is not a pass. A failed padding query during a case fails the run. The glitch count is reported as "not available" because the render API exposes no discontinuity flag, and it is kept apart from the drained interval and the recovery. Not covered: capture-path verification of the tone, any layout of the console audio command queue (`xapu.cpp` is not decoded), and sample-rate conversion. The result of a run on a machine with an endpoint (adapter, Windows build, commit, per-case counters) is not recorded here yet.
+
+
+### Publish a placed R8 texture SRV by its title address
+
+In the permissive Windows device wrapper, slot 70 takes a resource description, a
+texture SRV with an address at offset 0x28, and a destination view-heap CPU handle.
+The tested case uses a single-layer, single-mip R8_UNORM texture previously placed
+with slot 133. The address must uniquely identify a live texture with the same resource
+description. An invalid address or mismatched description leaves the old descriptor in place.
+
+`startup_address_srv_hardware` and `startup_address_srv_warp` compare 32 RGBA pixels
+each. Two 2×2 source-built textures have different values in both rows. The test switches
+between their addresses, compares an ordinary resource-object SRV, and tries zero,
+interior, and mismatched addresses after a successful publication.
+
+```powershell
+cmake --build --preset release --target startup_stream_consumer d3d12_xs_shim
+ctest --preset release --no-tests=error -R '^startup_address_srv_' -V
+```
+
+### Sample address-only BC3/BC7 textures in translated draws
+
+The translated draw path can sample a read-only BC3_UNORM or BC7_UNORM SRV
+published through device slot 70 without a prior resource object. The tested
+layout is 0x105, 4 KiB standard non-XOR. Width and height must be multiples of
+64 texels, with one mip, one slice, and one sample. Each tile holds 16 by 16
+compressed blocks. The runtime copies the 16-byte blocks to their desktop
+footprint rows before uploading them. Ordinary placed R8 views and the XG
+BC7 layout probe retain their existing behavior.
+
+Keep the complete tiled guest allocation readable for the view's sampling
+lifetime. The producer stores the view identity in the title heap. The
+translated sampler materializes a desktop texture on first use and copies
+changed bytes on subsequent binds. A same-address republication invalidates
+the cached upload. Direct use of the persistent desktop heap by untracked
+commands is outside this profile.
+
+Each source-built test draws four complete 128 by 128 panels per format from
+four 4 KiB tiles. The second address exchanges neighboring tiles. A zero
+address must retain that view, and publishing the first address again must
+restore the first image. On Windows 11 26200.9974 with the debug layer off,
+RTX 4060 Laptop (32.0.16.1656) and WARP (10.0.26100.9818) each matched
+65,536 RGBA pixels per format. The swapped-tile control changed 16,384
+of 16,384 pixels for BC3 and 15,360 for BC7.
+
+```powershell
+cmake --build --preset release --target startup_stream_consumer startup_stub_consumer d3d12_xs_shim
+ctest --preset release --no-tests=error --output-on-failure -R '^(startup_address_(bc_view|srv)_(hardware|warp)|startup_xg_bc7_layout|bc7_tile_swizzle)$'
+```

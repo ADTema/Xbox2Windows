@@ -43,8 +43,12 @@ def run(directory, consumer):
     env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_RENDER="1", X2W_SHADER_CACHE=str(cache))
     subprocess.run(args, env=dict(env, X2W_TEST_TRUNCATED_ONLY="1"), check=True)
     assert not list(cache.iterdir()), "truncated stream wrote a request"
+    legacy = "%016x" % gfx2hlsl.fnv(root.read_bytes(), gfx2hlsl.fnv(ps, gfx2hlsl.fnv(vs)))
+    old_manifest = cache / (legacy + ".txt")
+    old_manifest.write_text("x2w-manifest 1\ntargets 0\n")
     subprocess.run(args, env=env, check=True)
     key = "%016x" % gfx2hlsl.pipeline_key(vs, ps, root.read_bytes())
+    assert key != legacy and old_manifest.read_text() == "x2w-manifest 1\ntargets 0\n"
     name = "req_" + key
     for ext, want in ((".a", vs), (".b", ps), (".root", root.read_bytes())):
         assert (cache / (name + ext)).read_bytes() == want

@@ -38,7 +38,8 @@ def check(directory, consumer, backend):
     vs.write_bytes(vertex())
     args = [consumer, vs, ps, root]
     env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
-               X2W_D3D12_DEBUG="0", X2W_SHADER_CACHE=str(cache))
+               X2W_SHADER_CACHE=str(cache))
+    env.setdefault("X2W_D3D12_DEBUG", "0")
     observations = []
     for green in (False, True):
         ps.write_bytes(pixel(green))
@@ -46,6 +47,9 @@ def check(directory, consumer, backend):
         subprocess.run([sys.executable, "-B", gfx2hlsl.__file__, "--pending", cache], env=env, check=True)
         result = subprocess.run(args + [backend, output], env=env, capture_output=True, text=True)
         print(result.stdout, end="")
+        for line in result.stderr.splitlines():
+            if "debug layer:" in line or "x2w-d3d12-debug " in line:
+                print(line)
         if backend == "hardware" and result.returncode == 77:
             print("No D3D12 feature-level 12 hardware adapter")
             return 77
