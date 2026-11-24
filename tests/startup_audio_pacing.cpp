@@ -159,12 +159,10 @@ bool run_bursty(AudioSink& sink, const BlockFormat& source, uint32_t block_frame
 }
 }  // namespace
 
-int main()
+namespace {
+// Kept apart from main so the sink is destroyed before CoUninitialize runs.
+int run()
 {
-    if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
-        std::printf("skip: COM initialisation failed\n");
-        return skip_no_endpoint;
-    }
     AudioSink sink;
     const std::string error = sink.open();
     if (!error.empty()) {
@@ -213,4 +211,16 @@ int main()
     std::printf("PASS: same total audio, bursty feed shows a drained interval steady feed does not, recovery %.1f ms\n",
                 bursty.recovery_ms);
     return 0;
+}
+}  // namespace
+
+int main()
+{
+    if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
+        std::printf("skip: COM initialisation failed\n");
+        return skip_no_endpoint;
+    }
+    const int result = run();
+    CoUninitialize();
+    return result;
 }
