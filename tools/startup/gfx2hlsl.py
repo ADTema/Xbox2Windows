@@ -1295,9 +1295,18 @@ def main():
                 continue
             done.add(w)
             p = cap.psos.get(w)
+            seen = {w}
             while p and p['path'] == 55 and p['base']:
+                if p['base'] in seen:
+                    print('pso %x: wrapper chain loops back to %x' % (w & 0xffffff, p['base'] & 0xffffff))
+                    p = None
+                    break
+                seen.add(p['base'])
                 p = cap.psos.get(p['base'])
             if not p or p['path'] != 57:
+                continue
+            if len(p['desc']) < 96:
+                print('pso %x: pipeline desc is %d bytes, need 96' % (w & 0xffffff, len(p['desc'])))
                 continue
             q = struct.unpack_from('<12Q', p['desc'], 0)
             a, b = cap.memory.read(q[5], q[6]), cap.memory.read(q[9], q[10])

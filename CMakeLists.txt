@@ -1499,6 +1499,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     # tools/startup/capture.py against synthetic capture.bin files laid out like the writer's (#1149).
     add_test(NAME startup_capture COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_capture_check.py")
+    # gfx2hlsl.py --capture terminates and refuses malformed pipeline records (wrapper cycles, short descs).
+    add_test(NAME startup_gfx2hlsl_capture COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_capture_check.py")
+    set_tests_properties(startup_gfx2hlsl_capture PROPERTIES TIMEOUT 120)
     # VOP1/VOP2 sub-dword addressing (SDWA) in the translator (#1141), checked against the pixel AOT
     # lowering of the same selections.
     add_test(NAME startup_gfx2hlsl_sdwa COMMAND "${INTAKE_PYTHON}" -B

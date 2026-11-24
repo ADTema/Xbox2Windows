@@ -117,6 +117,7 @@ jobs:
           python -B tests/startup_image_load_mip_check.py
           python -B tests/startup_image_2d_array_check.py
           python -B tests/startup_host_cpu_check.py
+          python -B tests/startup_gfx2hlsl_capture_check.py
           python -B tests/startup_translator_check.py
           python -B tests/startup_triage_run_check.py
           python -B tests/startup_flat_param_check.py
