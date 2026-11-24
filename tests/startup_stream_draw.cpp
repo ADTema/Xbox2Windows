@@ -185,8 +185,9 @@ bool bind_bc7(ID3D12Device* desktop, void* guest, const StartupBc7Input& input, 
 int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels, const StartupBc7Input* bc7, DXGI_FORMAT format)
 {
     const bool bc = GetEnvironmentVariableW(L"X2W_TEST_BC_VIEW", nullptr, 0) != 0;
-    const UINT width = bc7 ? bc7->width : bc ? 4 * 128 : 8;
-    const UINT height = bc7 ? bc7->height : bc ? 128 : 4;
+    const bool bc_chain = GetEnvironmentVariableW(L"X2W_TEST_BC_CHAIN", nullptr, 0) != 0;
+    const UINT width = bc_chain ? 384 : bc7 ? bc7->width : bc ? 4 * 128 : 8;
+    const UINT height = bc_chain ? 32 : bc7 ? bc7->height : bc ? 128 : 4;
     ComPtr<ID3D12Device> desktop;
     if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&desktop)))) return 20;
     Bc7Binding binding;
@@ -217,7 +218,7 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         FAILED(static_cast<HRESULT>(invoke(guest, 36, 0, 0, arg(&__uuidof(ID3D12Fence)), arg(&fence))))) return 23;
 
     const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
-    const D3D12_RECT rect{0, 0, static_cast<LONG>(bc7 ? width : width / 2), static_cast<LONG>(height)};
+    const D3D12_RECT rect{0, 0, static_cast<LONG>(bc7 || bc_chain ? width : width / 2), static_cast<LONG>(height)};
     invoke(list, 139, arg(allocator));
     invoke(list, 52, rtv.ptr, arg(clear.Color));
     invoke(list, 50, 1, arg(&rtv));
@@ -227,6 +228,9 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     invoke(list, 25, arg(pso));
     if (GetEnvironmentVariableW(L"X2W_TEST_LOGICAL_VIEW", nullptr, 0)) {
         if (int result = draw_logical_tables(desktop.Get(), guest, list)) return result;
+    } else if (bc_chain) {
+        extern int draw_bc_chain(void*, void*);
+        if (const int result = draw_bc_chain(guest, list)) return result;
     } else if (GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_SRV", nullptr, 0)) {
         extern int draw_address_srvs(ID3D12Device*, void*, void*);
         if (const int result = draw_address_srvs(desktop.Get(), guest, list)) return result;
