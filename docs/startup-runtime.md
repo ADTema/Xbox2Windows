@@ -304,3 +304,23 @@ The `startup_heartbeat_commit` check starts the heartbeat before loading the pag
 maps two synthetic sections and compares the reported values with `GetProcessMemoryInfo` in the
 same process. It releases a separate commit allocation to check that a current-only change
 produces another report.
+
+## Physical pages in shared sections
+
+`XMemAllocatePhysicalPages` pages are 64 KiB slots of 256 MiB pagefile-backed sections, and
+adjacent pages of one mapping call that are adjacent slots share one view
+(`src/xmem_mapped_pages.cpp`). Before, every page had a section and a view of its own, which is
+slow for a start-up batch of about 100,000 pages (measured under Wine: 42.9 s for 100,000 pages,
+82 ms with shared sections and views).
+
+Unmapping a page inside a shared view unmaps that view and maps its other pages again. A thread
+that touches one of those pages in between takes an access violation; a vectored handler waits
+for the remap and retries the access, and answers only for a page that is mapped. A freed slot is
+zeroed when it is reused. `VirtualQuery` on a page of a shared view reports the view's base and
+size, not the page's.
+
+`ctest --preset release --no-tests=error -R '^xmem_shim_(mapped_pages|page_runs)' -V` runs the
+earlier contract check and a batch that spans two sections, with holes punched in it, pages moved
+and reused, and a second thread reading a page while its neighbour is unmapped and mapped again.
+The `no_retry_control` variant leaves the handler out and must fail.
+

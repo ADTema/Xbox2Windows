@@ -1194,6 +1194,15 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_translator_check.py")
     add_test(NAME xmem_shim_mapped_pages COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/xmem_mapped_pages_check.py" "$<TARGET_FILE:xmem_shim>")
+    # Large batches: pages as slots of shared sections, adjacent pages in one view.
+    add_test(NAME xmem_shim_page_runs COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/xmem_page_runs_check.py" "$<TARGET_FILE:xmem_shim>")
+    set_tests_properties(xmem_shim_page_runs PROPERTIES TIMEOUT 300)
+    # Control: without the fault-retry handler the reader in the same check takes an access violation.
+    add_test(NAME xmem_shim_page_runs_no_retry_control COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/xmem_page_runs_check.py" "$<TARGET_FILE:xmem_shim>")
+    set_tests_properties(xmem_shim_page_runs_no_retry_control PROPERTIES TIMEOUT 300 WILL_FAIL TRUE
+        ENVIRONMENT "X2W_XMEM_NO_FAULT_RETRY=1")
     add_test(NAME docs_links COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/docs_links_check.py")
     # Compile-only: outcome classification and GVN pass shares, no wall-time threshold (#775).

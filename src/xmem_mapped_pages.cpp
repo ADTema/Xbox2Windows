@@ -19,6 +19,7 @@ namespace {
 struct Backing {
     HANDLE section;
     ULONG_PTR views = 0;
+    ULONG64 offset = 0;  // the page is one 64 KiB slot of a shared section (see section_for)
 };
 
 // Keep grant transitions and section views serialized. A grant can outlive all its
@@ -35,13 +36,17 @@ struct PhysicalMemory {
     SIZE_T last_cpu_bytes = 0;
     ULONG_PTR mirror_cpu = 0, mirror_gpu = 0;
     SIZE_T mirror_bytes = 0;
+    std::map<ULONG_PTR, SIZE_T> runs;  // OS views: base -> bytes
+    std::vector<HANDLE> slabs;
+    ULONG64 slab_used = 0;
+    std::vector<std::pair<HANDLE, ULONG64>> free_slots;
 
     ~PhysicalMemory()
     {
         for (const auto& view : views)
             UnmapViewOfFile(reinterpret_cast<void*>(view.first));
-        for (const auto& backing : backings)
-            CloseHandle(backing.second.section);
+        for (const HANDLE slab : slabs)
+            CloseHandle(slab);
     }
 };
 
@@ -63,21 +68,40 @@ BOOL physical_result(era_physical::Status status) noexcept
     }
 }
 
+// Pages are slots of 256 MiB pagefile-backed sections rather than one section each: one handle and
+// one view per page is what makes large batches slow. A freed slot is zeroed when it is reused, as
+// a fresh section was.
 HANDLE section_for(ULONG_PTR page)
 {
     const auto existing = memory.backings.find(page);
     if (existing != memory.backings.end())
         return existing->second.section;
-    const HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
-                                              0, page_bytes, nullptr);
-    if (section) {
+    constexpr ULONG64 slab_bytes = 4096 * ULONG64{page_bytes};
+    if (!memory.free_slots.empty()) {
+        const auto [section, offset] = memory.free_slots.back();
+        void* view = MapViewOfFile(section, FILE_MAP_WRITE, static_cast<DWORD>(offset >> 32), static_cast<DWORD>(offset), page_bytes);
+        if (!view) return nullptr;
+        std::memset(view, 0, page_bytes);  // a reused slot starts zero-filled, as a fresh section did
+        UnmapViewOfFile(view);
+        memory.backings.emplace(page, Backing{section, 0, offset});
+        memory.free_slots.pop_back();
+        return section;
+    }
+    if (memory.slabs.empty() || memory.slab_used == slab_bytes) {
+        const HANDLE slab = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+                                               static_cast<DWORD>(slab_bytes >> 32), static_cast<DWORD>(slab_bytes), nullptr);
+        if (!slab) return nullptr;
         try {
-            memory.backings.emplace(page, Backing{section});
+            memory.slabs.push_back(slab);
         } catch (const std::bad_alloc&) {
-            CloseHandle(section);
+            CloseHandle(slab);
             throw;
         }
+        memory.slab_used = 0;
     }
+    const HANDLE section = memory.slabs.back();
+    memory.backings.emplace(page, Backing{section, 0, memory.slab_used});
+    memory.slab_used += page_bytes;
     return section;
 }
 
@@ -89,16 +113,44 @@ auto owned_reservation(ULONG_PTR address)
     return address - it->first < it->second ? it : memory.reservations.end();
 }
 
-bool map_view(ULONG_PTR address, HANDLE section)
+bool map_view(ULONG_PTR address, const Backing& backing)
 {
+    const HANDLE section = backing.section;
+    const ULONG64 section_offset = backing.offset;
     auto* target = reinterpret_cast<void*>(address);
     auto map = [&] {
-        return MapViewOfFile3(section, GetCurrentProcess(), target, 0,
+        return MapViewOfFile3(section, GetCurrentProcess(), target, section_offset,
                               page_bytes, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) != nullptr;
     };
     if (map()) return true;
     if (owned_reservation(address) == memory.reservations.end()) return false;
     return VirtualFree(target, page_bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) && map();
+}
+
+// Maps bytes of one section at address as a single view; falls back to one view per page when the
+// range is not inside a single placeholder.
+bool map_run(ULONG_PTR address, const Backing& backing, SIZE_T bytes, std::vector<std::pair<ULONG_PTR, SIZE_T>>& made)
+{
+    auto* target = reinterpret_cast<void*>(address);
+    auto map = [&] {
+        return MapViewOfFile3(backing.section, GetCurrentProcess(), target, backing.offset, bytes,
+                              MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) != nullptr;
+    };
+    if (map() || (owned_reservation(address) != memory.reservations.end() &&
+                  VirtualFree(target, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) && map())) {
+        memory.runs[address] = bytes;
+        made.emplace_back(address, bytes);
+        return true;
+    }
+    if (bytes == page_bytes) return false;
+    for (SIZE_T done = 0; done < bytes; done += page_bytes) {
+        Backing one = backing;
+        one.offset += done;
+        if (!map_view(address + done, one)) return false;
+        memory.runs[address + done] = page_bytes;
+        made.emplace_back(address + done, page_bytes);
+    }
+    return true;
 }
 
 bool unmap_view(ULONG_PTR address)
@@ -121,6 +173,24 @@ void coalesce_unused(const std::map<ULONG_PTR, ULONG_PTR>& batch)
     }
 }
 
+// Unmapping a page inside a run unmaps the whole run and maps its other pages again (map_pages).
+// A thread that touches one of those pages in between faults; this handler waits for the remap
+// (the mutex) and retries the access. It answers only for an address whose page is mapped.
+thread_local bool mapping_thread = false;
+LONG CALLBACK retry_remapped_page(EXCEPTION_POINTERS* e)
+{
+    const EXCEPTION_RECORD* record = e->ExceptionRecord;
+    if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2 || mapping_thread)
+        return EXCEPTION_CONTINUE_SEARCH;
+    const ULONG_PTR page = record->ExceptionInformation[1] & ~(ULONG_PTR{page_bytes} - 1);
+    const std::lock_guard guard(memory.mutex);
+    return memory.views.count(page) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+}
+struct MappingThread {
+    MappingThread() { mapping_thread = true; }
+    ~MappingThread() { mapping_thread = false; }
+};
+
 // Destinations must be caller-owned, page-sized Windows placeholders. Live views
 // are owned by this shim until it unmaps them. The caller must not replace them.
 template <typename AddressAt>
@@ -129,6 +199,12 @@ BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& addres
     if (!count || count > era_physical::capacity_pages)
         return physical_result(era_physical::Status::invalid);
     try {
+        // X2W_XMEM_NO_FAULT_RETRY=1 leaves the handler out; tests/xmem_page_runs_check.py uses it as
+        // the control that shows a reader does fault while a run is being broken.
+        static const void* const handler =
+            x2w_local::env_on("X2W_XMEM_NO_FAULT_RETRY") ? nullptr : AddVectoredExceptionHandler(1, retry_remapped_page);
+        (void)handler;
+        const MappingThread marker;
         const std::lock_guard guard(memory.mutex);
         std::map<ULONG_PTR, ULONG_PTR> batch;
         for (ULONG_PTR i = 0; i < count; ++i) {
@@ -141,50 +217,72 @@ BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& addres
             if (!batch.emplace(address, tokens ? tokens[i] : live->second).second)
                 return physical_result(era_physical::Status::invalid);
         }
+        // Adjacent pages that are adjacent slots of one section share a single view (a "run"): a
+        // multi-gigabyte batch then takes a few views instead of one per 64 KiB page.
         if (tokens) {
             for (const auto& [address, page] : batch) {
                 if (!section_for(page)) return FALSE;
             }
-            auto next = batch.begin();
-            for (; next != batch.end(); ++next) {
-                if (!map_view(next->first, memory.backings.at(next->second).section)) {
+            std::vector<std::pair<ULONG_PTR, SIZE_T>> made;
+            auto first = batch.begin();
+            while (first != batch.end()) {
+                const Backing& head = memory.backings.at(first->second);
+                SIZE_T bytes = page_bytes;
+                auto last = std::next(first);
+                for (; last != batch.end(); ++last, bytes += page_bytes) {
+                    const Backing& b = memory.backings.at(last->second);
+                    if (last->first != first->first + bytes || b.section != head.section || b.offset != head.offset + bytes) break;
+                }
+                if (!map_run(first->first, head, bytes, made)) {
                     const DWORD error = GetLastError();
-                    while (next != batch.begin()) {
-                        const auto previous = --next;
-                        if (!unmap_view(previous->first)) {
-                            ++memory.backings.at(previous->second).views;
-                            const auto position = std::next(previous);
-                            memory.views.insert(batch.extract(previous));
-                            next = position;
-                        }
+                    for (const auto& [base, size] : made) {
+                        UnmapViewOfFile2(GetCurrentProcess(), reinterpret_cast<void*>(base), MEM_PRESERVE_PLACEHOLDER);
+                        memory.runs.erase(base);
                     }
                     coalesce_unused(batch);
                     SetLastError(error);
                     return FALSE;
                 }
+                first = last;
             }
             for (const auto& [address, page] : batch)
                 ++memory.backings.at(page).views;
             memory.views.merge(batch);
         } else {
-            auto next = batch.begin();
-            for (; next != batch.end(); ++next) {
-                if (!unmap_view(next->first)) {
-                    const DWORD error = GetLastError();
-                    while (next != batch.begin()) {
-                        const auto& [address, page] = *--next;
-                        if (!map_view(address, memory.backings.at(page).section)) {
-                            --memory.backings.at(page).views;
-                            memory.views.erase(address);
-                        }
-                    }
-                    SetLastError(error);
+            // Unmap every run that holds a page of the batch, then map the surviving pages of those runs again.
+            std::map<ULONG_PTR, SIZE_T> broken;
+            for (const auto& [address, page] : batch) {
+                auto run = memory.runs.upper_bound(address);
+                if (run == memory.runs.begin()) continue;
+                --run;
+                if (address - run->first < run->second) broken.insert(*run);
+            }
+            for (const auto& [base, size] : broken) {
+                if (!UnmapViewOfFile2(GetCurrentProcess(), reinterpret_cast<void*>(base), MEM_PRESERVE_PLACEHOLDER))
                     return FALSE;
-                }
+                memory.runs.erase(base);
             }
             for (const auto& [address, page] : batch) {
                 --memory.backings.at(page).views;
                 memory.views.erase(address);
+            }
+            std::vector<std::pair<ULONG_PTR, SIZE_T>> made;
+            for (const auto& [base, size] : broken) {
+                ULONG_PTR at = base;
+                while (at < base + size) {
+                    const auto live = memory.views.find(at);
+                    if (live == memory.views.end()) { at += page_bytes; continue; }
+                    const Backing& head = memory.backings.at(live->second);
+                    SIZE_T bytes = page_bytes;
+                    for (; at + bytes < base + size; bytes += page_bytes) {
+                        const auto next = memory.views.find(at + bytes);
+                        if (next == memory.views.end()) break;
+                        const Backing& b = memory.backings.at(next->second);
+                        if (b.section != head.section || b.offset != head.offset + bytes) break;
+                    }
+                    if (!map_run(at, head, bytes, made)) return FALSE;
+                    at += bytes;
+                }
             }
             coalesce_unused(batch);
         }
@@ -387,7 +485,7 @@ BOOL free_pages(ULONG_PTR count, PULONG_PTR pages)
         for (ULONG_PTR i = 0; i < count; ++i) {
             const auto backing = memory.backings.find(pages[i]);
             if (backing != memory.backings.end()) {
-                CloseHandle(backing->second.section);
+                memory.free_slots.emplace_back(backing->second.section, backing->second.offset);
                 memory.backings.erase(backing);
             }
         }
@@ -418,12 +516,15 @@ extern "C" BOOL WINAPI x2w_xmem_write_physical(const ULONG_PTR* tokens, ULONG_PT
     while (bytes) {
         if (index >= count || (tokens[index] & 0xF)) return FALSE;
         HANDLE section = nullptr;
+        ULONG64 section_offset = 0;
         {
             const std::lock_guard guard(memory.mutex);
             section = section_for(tokens[index] >> 4);
+            if (section) section_offset = memory.backings.at(tokens[index] >> 4).offset;
         }
         if (!section) return FALSE;
-        void* view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, page_bytes);
+        void* view = MapViewOfFile(section, FILE_MAP_WRITE, static_cast<DWORD>(section_offset >> 32),
+                                   static_cast<DWORD>(section_offset), page_bytes);
         if (!view) return FALSE;
         const SIZE_T chunk = bytes < page_bytes - offset ? bytes : page_bytes - offset;
         std::memcpy(static_cast<unsigned char*>(view) + offset, source, chunk);
