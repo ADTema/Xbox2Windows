@@ -25,6 +25,7 @@ class Probe(G.Stage):
         self.lines, self.sym = [], {}
         self.used_s, self.used_v, self.uniform_v = set(), set(), set()
         self.exec_known = True
+        self.masks = set()
 
 
 def run(line, regs):
@@ -55,5 +56,18 @@ for mnemonic, want in (('s_bitcmp1_b32', 1), ('s_bitcmp0_b32', 0)):
                     failures.append((line, word, index, got, expected))
                     print('MISMATCH %s word=%#x index=%#x got=%s want=%s' % (line, word, index, got, expected))
 
-print('s_bitcmp: %s' % ('ok' if not failures else '%d mismatches' % len(failures)))
+for mnemonic in ('s_bitcmp0_b32', 's_bitcmp1_b32'):
+    for operands in ('exec_lo, 1', 'vcc_lo, 1', 's12, 1', 's44, s12', 's44, vcc_lo'):
+        stage = Probe()
+        stage.masks.add(12)
+        try:
+            stage.one(mnemonic, f'{mnemonic} {operands}')
+        except G.Unsupported as exc:
+            assert 'lane mask' in str(exc), exc
+        else:
+            raise AssertionError(f'{mnemonic} {operands} accepted a projected lane mask')
+        assert not stage.lines, stage.lines
+
+print('s_bitcmp: %s' % ('ok (216 scalar cases, 10 lane-mask refusals)' if not failures
+                       else '%d mismatches' % len(failures)))
 sys.exit(1 if failures else 0)

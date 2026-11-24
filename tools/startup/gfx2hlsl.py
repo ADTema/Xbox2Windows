@@ -405,6 +405,11 @@ class Stage:
         except ValueError:
             raise Unsupported('operand %r' % tok)
 
+    def is_lane_mask(self, tok):
+        reg = reg_range(tok)
+        return (tok in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi')
+                or bool(reg and reg[0] == 's' and reg[1] in self.masks))
+
     def u_src(self, tok):
         """uint expression for an integer-context source that the disassembler may print negated."""
         # In an integer instruction the `-` modifier is the source's sign bit flipped: the same bit
@@ -677,11 +682,7 @@ class Stage:
         word_pack = base == 's_pack_hh_b32_b16'
         if word_complement or word_pack:
             # The per-lane mask cannot supply the full word needed by these operations.
-            def lane_mask(t):
-                r = reg_range(t)
-                return (t in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi')
-                        or bool(r and r[0] == 's' and r[1] in self.masks))
-            if lane_mask(dname) or any(lane_mask(t) for t in srcs):
+            if self.is_lane_mask(dname) or any(self.is_lane_mask(t) for t in srcs):
                 raise Unsupported('%s on a lane mask' % base)
         if word_pack:
             if dname != 'm0' and (dst is None or dst[0] != 's' or dst[1] > 105):
@@ -1752,6 +1753,10 @@ for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt',
 for _bit in (0, 1):
     def _make_bitcmp(bit=_bit):
         def handler(self, ops, mods):
+            if len(ops) != 2 or mods:
+                raise Unsupported('scalar bit test requires two unmodified operands')
+            if any(self.is_lane_mask(tok) for tok in ops):
+                raise Unsupported('scalar bit test on a lane mask')
             self.emit('scc = ((%s >> (%s & 31)) & 1u) == %du;' % (self.u(ops[0]), self.u(ops[1]), bit))
         return handler
     setattr(Stage, 'op_s_bitcmp%d_b32' % _bit, _make_bitcmp())
