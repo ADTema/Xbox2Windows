@@ -1270,17 +1270,28 @@ uint class64(uint lo, uint hi) {
         "    return hi;\n"
         "}"
     ),
+    # v_cvt_flr_i32_f32 is floor(x) and v_cvt_rpi_i32_f32 the floor of the exact x + 0.5 (x - floor(x) is exact).
+    # Exceptional inputs follow the native RDNA 2 (gfx1036) and RDNA 4 raw words cited in issue #1772, not gfx1013:
+    # a NaN gives 0x7fffffff with its sign bit clear and 0x80000000 with it set, quiet or signalling, and both
+    # infinities and out-of-range values saturate to the i32 limits. The NaN is replaced before any float operation
+    # and the rounded value is clamped to [-2^31, 2^31 - 128] (2^31 - 1 is not a binary32), so every cast is in range.
     "cvt_flr_i32_f32": (
         "uint cvt_flr_i32_f32(uint bits) {\n"
-        "    float x = asfloat(bits);\n"
-        "    return asuint(int(floor(x)));\n"
+        "    bool nan = (bits & 0x7fffffffu) > 0x7f800000u;\n"
+        "    float x = asfloat(nan ? 0u : bits);\n"
+        "    float r = clamp(floor(x), -2147483648.0f, 2147483520.0f);\n"
+        "    uint word = x >= 2147483648.0f ? 0x7fffffffu : asuint(int(r));\n"
+        "    return nan ? 0x7fffffffu + (bits >> 31) : word;\n"
         "}"
     ),
     "cvt_rpi_i32_f32": (
         "uint cvt_rpi_i32_f32(uint bits) {\n"
-        "    float x = asfloat(bits);\n"
+        "    bool nan = (bits & 0x7fffffffu) > 0x7f800000u;\n"
+        "    float x = asfloat(nan ? 0u : bits);\n"
         "    float f = floor(x);\n"
-        "    return asuint(int(f + ((x - f) >= 0.5f ? 1.0f : 0.0f)));\n"
+        "    float r = clamp(f + ((x - f) >= 0.5f ? 1.0f : 0.0f), -2147483648.0f, 2147483520.0f);\n"
+        "    uint word = x >= 2147483648.0f ? 0x7fffffffu : asuint(int(r));\n"
+        "    return nan ? 0x7fffffffu + (bits >> 31) : word;\n"
         "}"
     ),
 }
@@ -1938,37 +1949,6 @@ def half16_arith_source(token, scalar, vector, pending, sample_dest, known_ssa_b
     return word, bits
 
 
-def require_proven_i32_f32_range(base, has_abs, has_neg, scalar, vector, known_ssa_bits, kind):
-    """Require a statically known binary32 input that is finite and in [-2^31, 2^31) after modifiers.
-
-    AMD RDNA 2 VOP1 opcodes 12 and 13 (v_cvt_rpi_i32_f32 and v_cvt_flr_i32_f32) document the finite
-    rounding formulas without an exceptional-input rule for NaN, infinities, or i32 overflow. Reject
-    unproven runtime inputs and out-of-range or non-finite constants until a native RDNA reference
-    establishes exceptional behavior.
-    """
-    if base.startswith("0x"):
-        raw_bits = int(base, 16)
-    elif base.startswith("s"):
-        val = scalar.get(base)
-        if not isinstance(val, int):
-            raise ValueError(f"Unproven runtime input {base} at v_cvt_{kind}_f32")
-        raw_bits = val & 0xffffffff
-    else:
-        ssa = vector.get(base)
-        if not isinstance(ssa, str) or ssa not in known_ssa_bits:
-            raise ValueError(f"Unproven runtime input {base} at v_cvt_{kind}_f32")
-        raw_bits = known_ssa_bits[ssa]
-    eff_bits = raw_bits
-    if has_abs:
-        eff_bits &= 0x7fffffff
-    if has_neg:
-        eff_bits ^= 0x80000000
-    x, = struct.unpack("<f", struct.pack("<I", eff_bits))
-    if not math.isfinite(x) or not (-2147483648.0 <= x < 2147483648.0):
-        raise ValueError(f"Unproven exceptional or out-of-range input 0x{eff_bits:08x} at v_cvt_{kind}_f32")
-    return eff_bits
-
-
 CVT_F64_F32_INLINE = {"0": 0x00000000, "0.5": 0x3f000000, "-0.5": 0xbf000000, "1.0": 0x3f800000, "-1.0": 0xbf800000,
                       "2.0": 0x40000000, "-2.0": 0xc0000000, "4.0": 0x40800000, "-4.0": 0xc0800000,
                       "0.15915494": 0x3e22f983}
@@ -2024,10 +2004,10 @@ def cvt_f32_f64_exact_bits(low, high):
 def cvt_f64_f32_source_bits(base, scalar, vector, pending, sample_dest, known_ssa_bits):
     """Return the statically known binary32 bits of the source of v_cvt_f64_f32, or raise ValueError.
 
-    The domain is the one of require_proven_i32_f32_range: a hex literal, a binary32 inline constant, a SGPR that
-    holds a tracked integer, or a VGPR whose bits known_ssa_bits records. Any other register is an unproven runtime
-    input. An integer inline constant other than 0 is a subnormal (1..64) or an all-ones NaN pattern (-16..-1),
-    never a float, and is refused with the other unlisted spellings.
+    The accepted sources are a hex literal, a binary32 inline constant, a SGPR that holds a tracked integer, or a
+    VGPR whose bits known_ssa_bits records. Any other register is an unproven runtime input. An integer inline
+    constant other than 0 is a subnormal (1..64) or an all-ones NaN pattern (-16..-1), never a float, and is refused
+    with the other unlisted spellings.
     """
     if base in CVT_F64_F32_INLINE:
         return CVT_F64_F32_INLINE[base]
@@ -4936,7 +4916,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             # no HLSL double, no runtime input. Finite normal values, +-0 and +-infinity convert exactly;
             # subnormals, NaNs and unproven registers are refused. LLVM 15 prints the unmodified VOP1 form as _e32;
             # the only VOP3 (_e64) spellings it prints for this opcode are -x, |x|, -|x| and neg(0xLITERAL), and
-            # those are accepted here (abs is applied first, then neg, as in require_proven_i32_f32_range; the order is not checked against the ISA document). An _e64 form without a
+            # those are accepted here (abs is applied first, then neg, as in the v_cvt_*_f32_e64 lowering; the order is not checked against the ISA document). An _e64 form without a
             # modifier, clamp, omod, DPP and SDWA are left to the fall-through.
             suffix, first, last, src = m.groups()
             first, last = int(first), int(last)
@@ -6117,8 +6097,6 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if src.startswith("v") and src not in vector:
                 raise ValueError(f"Unbound pixel input {src} at v_cvt_{kind}_f32_e32")
             operand = fp_operand(src, scalar, vector, pending, sample_dest)
-            if kind in ("flr_i32", "rpi_i32"):
-                require_proven_i32_f32_range(src, False, False, scalar, vector, known_ssa_bits, kind)
             helper = f"cvt_{kind}_f32"
             helpers.add(helper)
             vector[dst] = f"alu{i}"
@@ -6126,10 +6104,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         elif (m := match(r"v_cvt_(u32|i32|flr_i32|rpi_i32)_f32_e64 (v\d+), ([^,\s]+)")) and (
                 parsed := parse_cvt_f32_e64_source(m.group(3))):
             # VOP3 float-to-int (truncate, floor, round-to-+inf) with optional bitwise source
-            # abs/neg modifiers applied on the raw IEEE-754 word before conversion. Truncating u32/i32
-            # accepts arbitrary runtime inputs; flr/rpi requires a statically proven finite in-range
-            # binary32 value after modifiers until a native RDNA reference establishes exceptional
-            # NaN/infinity/overflow behavior. clamp, omod, decimal/float literals, DPP and SDWA remain rejected.
+            # abs/neg modifiers applied on the raw IEEE-754 word before conversion. Every kind accepts
+            # arbitrary runtime inputs: the helpers define NaN, infinities and out-of-range values (issue
+            # #1772 for flr/rpi). clamp, omod, decimal/float literals, DPP and SDWA remain rejected.
             kind, dst, _ = m.groups()
             base, has_abs, has_neg = parsed
             if int(dst[1:]) > 255 or (base.startswith(("v", "s")) and
@@ -6142,8 +6119,6 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if base.startswith("v") and base not in vector:
                 raise ValueError(f"Unbound pixel input {base} at v_cvt_{kind}_f32_e64")
             operand = fp_operand(base, scalar, vector, pending, sample_dest)
-            if kind in ("flr_i32", "rpi_i32"):
-                require_proven_i32_f32_range(base, has_abs, has_neg, scalar, vector, known_ssa_bits, kind)
             bits = f"asuint({operand})"
             if has_abs:
                 bits = f"({bits} & 0x7fffffffu)"

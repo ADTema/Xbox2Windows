@@ -15706,25 +15706,31 @@ def _check_controls_inline(directory):
     # Post-modifier in-range control: -(+2^31) = -2^31 is exact in signed i32.
     translate(with_constants(["v_cvt_flr_i32_f32_e64 v12, neg(0x4f000000)"]))
     translate(with_constants(["v_cvt_rpi_i32_f32_e64 v12, -|0x4f000000|"]))
-    # Explicit refusals for unproven runtime inputs and exceptional/out-of-range constants (including after modifiers).
-    for unproven in ("v_cvt_flr_i32_f32_e32 v12, s44", "v_cvt_rpi_i32_f32_e64 v12, -s44",
-                     "v_cvt_flr_i32_f32_e32 v12, v12", "v_cvt_rpi_i32_f32_e64 v12, |v12|"):
-        expect_value_error(translate, with_constants([unproven]), "Unproven runtime input")
-    expect_value_error(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s44", "v_cvt_flr_i32_f32_e32 v12, v18"]),
-                       "Unproven runtime input")
-    expect_value_error(translate_int, uncompressed_export(["v_mov_b32_e32 v18, 0x3f800000", "v_add_f32_e32 v18, v18, v18",
-                                                           "v_cvt_rpi_i32_f32_e32 v12, v18"]),
-                       "Unproven runtime input")
-    for bad_const in ("v_cvt_flr_i32_f32_e32 v12, 0x7fc00000", "v_cvt_rpi_i32_f32_e32 v12, 0xff800001",
-                      "v_cvt_flr_i32_f32_e32 v12, 0x7f800000", "v_cvt_rpi_i32_f32_e32 v12, 0xff800000",
-                      "v_cvt_flr_i32_f32_e32 v12, 0x4f000000", "v_cvt_rpi_i32_f32_e32 v12, 0xcf000001",
-                      "v_cvt_flr_i32_f32_e64 v12, |0xcf000000|", "v_cvt_rpi_i32_f32_e64 v12, neg(0xcf000000)",
-                      "v_cvt_flr_i32_f32_e64 v12, -|0x7f800000|"):
-        expect_value_error(translate, with_constants([bad_const]), "Unproven exceptional or out-of-range input")
-    expect_value_error(translate_int, uncompressed_export(["s_mov_b32 s44, 0xcf000000", "v_cvt_flr_i32_f32_e64 v12, |s44|"]),
-                       "Unproven exceptional or out-of-range input")
-    expect_value_error(translate_int, uncompressed_export(["v_mov_b32_e32 v18, 0x4f000000", "v_cvt_rpi_i32_f32_e32 v12, v18"]),
-                       "Unproven exceptional or out-of-range input")
+    # Runtime inputs and exceptional or out-of-range constants (also after modifiers) lower through the same helpers,
+    # which define NaN, infinities and overflow (issue #1772); the raw word reaches the helper unchanged.
+    for runtime, call in (("v_cvt_flr_i32_f32_e32 v12, s44", "cvt_flr_i32_f32(asuint(params[0].w))"),
+                          ("v_cvt_rpi_i32_f32_e64 v12, -s44", "cvt_rpi_i32_f32((asuint(params[0].w) ^ 0x80000000u))"),
+                          ("v_cvt_flr_i32_f32_e32 v12, v12", "cvt_flr_i32_f32(asuint(sample16.x))"),
+                          ("v_cvt_rpi_i32_f32_e64 v12, |v12|", "cvt_rpi_i32_f32((asuint(sample16.x) & 0x7fffffffu))")):
+        hlsl = translate(with_constants([runtime]))
+        assert call in hlsl.split("float4 main", 1)[1], (runtime, hlsl)
+        assert hlsl.count(f"uint {call.split('(', 1)[0]}(uint bits)") == 1, runtime
+    for body in (["v_mov_b32_e32 v18, s44", "v_cvt_flr_i32_f32_e32 v12, v18"],
+                 ["v_mov_b32_e32 v18, 0x3f800000", "v_add_f32_e32 v18, v18, v18", "v_cvt_rpi_i32_f32_e32 v12, v18"],
+                 ["s_mov_b32 s44, 0xcf000000", "v_cvt_flr_i32_f32_e64 v12, |s44|"],
+                 ["v_mov_b32_e32 v18, 0x4f000000", "v_cvt_rpi_i32_f32_e32 v12, v18"]):
+        assert "_i32_f32(" in translate_int(uncompressed_export(body)).split("uint4 main", 1)[1], body
+    for exceptional in ("v_cvt_flr_i32_f32_e32 v12, 0x7fc00000", "v_cvt_rpi_i32_f32_e32 v12, 0xff800001",
+                        "v_cvt_flr_i32_f32_e32 v12, 0x7f800000", "v_cvt_rpi_i32_f32_e32 v12, 0xff800000",
+                        "v_cvt_flr_i32_f32_e32 v12, 0x4f000000", "v_cvt_rpi_i32_f32_e32 v12, 0xcf000001",
+                        "v_cvt_flr_i32_f32_e64 v12, |0xcf000000|", "v_cvt_rpi_i32_f32_e64 v12, neg(0xcf000000)",
+                        "v_cvt_flr_i32_f32_e64 v12, -|0x7f800000|"):
+        assert "_i32_f32(" in translate(with_constants([exceptional])).split("float4 main", 1)[1], exceptional
+    # No cast in either helper reads a NaN or an out-of-range value: the NaN word is replaced and the value clamped.
+    for helper in ("cvt_flr_i32_f32", "cvt_rpi_i32_f32"):
+        text = pixel_aot.SALU_HELPERS[helper]
+        assert "float x = asfloat(nan ? 0u : bits);" in text and "return nan ? 0x7fffffffu + (bits >> 31) : word;" in text
+        assert len(re.findall(r"\bint\(", text)) == 1 and "asuint(int(r))" in text and "2147483520.0f)" in text, helper
     # e64 source modifiers apply bitwise sign-bit ops before the shared helper, never FP abs/neg.
     e64_mod_hlsl = translate_int(uncompressed_export(CVT_FLOAT_E64_I32_MOD_BODY))
     assert e64_mod_hlsl.count("uint cvt_i32_f32(uint bits)") == 1
@@ -19918,22 +19924,62 @@ def check_cvt_float_int_e64_draw(directory, compiler, renderer, backend):
                 raise AssertionError(f"Modifier mutation ({label}) escaped detection")
 
 
+def cvt_flr_rpi_saturate(word, integer):
+    """Saturate an exact integer result to i32; a NaN takes its sign bit (issue #1772, RDNA 2 gfx1036 and RDNA 4)."""
+    if integer is None:
+        return 0x80000000 if word >> 31 else 0x7FFFFFFF
+    return min(max(integer, -2**31), 2**31 - 1) & 0xFFFFFFFF
+
+
 def cvt_flr_i32_ref(word):
-    """Reference for finite in-range v_cvt_flr_i32_f32: floor(x) in [-2^31, 2^31)."""
+    """Reference for v_cvt_flr_i32_f32: floor(x), saturated to i32 (infinities included); NaN by sign bit."""
     x = struct.unpack("<f", struct.pack("<I", word))[0]
-    assert math.isfinite(x) and -2.0**31 <= x < 2.0**31, hex(word)
-    return math.floor(x) & 0xFFFFFFFF
+    if math.isinf(x):
+        return cvt_flr_rpi_saturate(word, 2**31 if x > 0 else -2**31 - 1)
+    return cvt_flr_rpi_saturate(word, None if math.isnan(x) else math.floor(x))
 
 
 def cvt_rpi_i32_ref(word):
-    """Reference for finite in-range v_cvt_rpi_i32_f32: floor(x + 0.5) in [-2^31, 2^31)."""
+    """Reference for v_cvt_rpi_i32_f32: floor of the exact x + 0.5 (binary64 holds it), saturated; NaN by sign bit."""
     x = struct.unpack("<f", struct.pack("<I", word))[0]
-    assert math.isfinite(x) and -2.0**31 <= x < 2.0**31, hex(word)
-    return math.floor(x + 0.5) & 0xFFFFFFFF
+    if math.isinf(x):
+        return cvt_flr_rpi_saturate(word, 2**31 if x > 0 else -2**31 - 1)
+    return cvt_flr_rpi_saturate(word, None if math.isnan(x) else math.floor(x + 0.5))
+
+
+# Hand-worked (word, flr, rpi) rows. Rows without "by rule" repeat raw words measured natively on RDNA 2 gfx1036
+# and RDNA 4 (the sources cited in issue #1772); rows marked "by rule" apply its saturation rule or, for 2^31 - 128,
+# the finite formula. Every row also matches a native gfx1032 readback (docs/experiments.md). None is gfx1013.
+CVT_FLR_RPI_EXCEPTIONAL = (
+    (0x7fc00000, 0x7fffffff, 0x7fffffff),  # +qNaN
+    (0xffc00000, 0x80000000, 0x80000000),  # -qNaN
+    (0x7f800001, 0x7fffffff, 0x7fffffff),  # +sNaN
+    (0xff800001, 0x80000000, 0x80000000),  # -sNaN
+    (0x7fffffff, 0x7fffffff, 0x7fffffff),  # +NaN, all payload bits set
+    (0xffffffff, 0x80000000, 0x80000000),  # -NaN, all payload bits set
+    (0x7f800000, 0x7fffffff, 0x7fffffff),  # +inf
+    (0xff800000, 0x80000000, 0x80000000),  # -inf
+    (0x4f000000, 0x7fffffff, 0x7fffffff),  # 2^31
+    (0xcf000000, 0x80000000, 0x80000000),  # -2^31, in range
+    (0x4f000001, 0x7fffffff, 0x7fffffff),  # 2^31 + 256, by rule
+    (0xcf000001, 0x80000000, 0x80000000),  # -2^31 - 256, by rule
+    (0x4effffff, 0x7fffff80, 0x7fffff80),  # 2^31 - 128, the largest in-range binary32, by rule
+    (0x5f000000, 0x7fffffff, 0x7fffffff),  # 2^63, by rule
+    (0xdf000000, 0x80000000, 0x80000000),  # -2^63, by rule
+    (0x7f7fffff, 0x7fffffff, 0x7fffffff),  # largest finite binary32, by rule
+    (0xff7fffff, 0x80000000, 0x80000000),  # most negative finite binary32, by rule
+    (0x3effffff, 0x00000000, 0x00000000),  # 0.49999997
+    (0x3f000000, 0x00000000, 0x00000001),  # 0.5
+    (0xbf000000, 0xffffffff, 0x00000000),  # -0.5
+    (0xbf000001, 0xffffffff, 0xffffffff),  # -0.50000006
+    (0x4b000001, 0x00800001, 0x00800001),  # 2^23 + 1
+    (0xcb000001, 0xff7fffff, 0xff7fffff),  # -(2^23 + 1)
+    (0x4b7fffff, 0x00ffffff, 0x00ffffff),  # 2^24 - 1
+)
 
 
 def cvt_flr_rpi_pair_body(w0, w1, *, e64):
-    """Build a proven-constant SGPR/VGPR shader converting two finite in-range binary32 words."""
+    """Build a constant-source SGPR/VGPR shader converting two binary32 words with flr and rpi."""
     suf = "_e64" if e64 else "_e32"
     return [
         f"s_mov_b32 s44, {w0:#010x}",
@@ -20061,6 +20107,87 @@ def check_cvt_flr_rpi_draw(directory, compiler, renderer, backend):
                                    capture_output=True, text=True)
             if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
                 raise AssertionError(f"{kind} modifier mutation ({label}) escaped detection")
+
+    # Exceptional inputs (issue #1772): NaN by sign bit, saturated infinities and out-of-range values.
+    for word, flr, rpi in CVT_FLR_RPI_EXCEPTIONAL:
+        assert (cvt_flr_i32_ref(word), cvt_rpi_i32_ref(word)) == (flr, rpi), hex(word)
+
+    def make_runtime_case(name, input_words, expected_words):
+        path = directory / f"cvt_flr_rpi_{name}.case"
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *input_words)
+        for word in expected_words:
+            assert struct.unpack("<I", struct.pack("<f", as_float(word)))[0] == word, hex(word)
+        write_case(path, bytes(constants), tuple(as_float(word) for word in expected_words), integer_rt=True)
+        return path
+
+    # Runtime sources: s44 and s45 come from the constant buffer, so DXC cannot fold the conversion.
+    words = [word for word, _, _ in CVT_FLR_RPI_EXCEPTIONAL]
+    pairs = list(zip(words[0::2], words[1::2]))
+    for tag, e64 in (("e32", False), ("e64", True)):
+        body = cvt_flr_rpi_pair_body(0, 0, e64=e64)[2:]
+        assert not any(line.startswith("s_mov_b32") for line in body)
+        source.write_text(translate_int(uncompressed_export(body)), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        batch = []
+        for idx, (w0, w1) in enumerate(pairs):
+            expected = (cvt_flr_i32_ref(w0), cvt_rpi_i32_ref(w0), cvt_flr_i32_ref(w1), cvt_rpi_i32_ref(w1))
+            batch.append((make_runtime_case(f"runtime_{tag}_{idx}", (w0, w1, 0, 0), expected), "pass"))
+        # Negative control: a NaN converted as v_cvt_i32_f32 does it (0) must not pass.
+        batch.append((make_runtime_case(f"runtime_{tag}_nan_zero", (0x7fc00000, 0xffc00000, 0, 0), (0, 0, 0, 0)),
+                      "mismatch"))
+        run_pixel_batch(renderer, backend, shader, batch)
+    nan_case = make_runtime_case("runtime_nan_ref", (0x7fc00000, 0xffc00000, 0, 0),
+                                 (0x7fffffff, 0x7fffffff, 0x80000000, 0x80000000))
+    inf_case = make_runtime_case("runtime_inf_ref", (0x7f800000, 0x4f000001, 0, 0), (0x7fffffff,) * 4)
+
+    # Helper mutants on the runtime e32 shader: each must fail on the NaN or the +inf case.
+    runtime_hlsl = translate_int(uncompressed_export(cvt_flr_rpi_pair_body(0, 0, e64=False)[2:]))
+    for label, old, new, case in (
+        ("drop the NaN sign select", "return nan ? 0x7fffffffu + (bits >> 31) : word;", "return word;", nan_case),
+        ("reverse the NaN sign select", "0x7fffffffu + (bits >> 31)", "0x80000000u - (bits >> 31)", nan_case),
+        ("drop the 2^31 saturation", "x >= 2147483648.0f ? 0x7fffffffu : ", "", inf_case),
+    ):
+        assert runtime_hlsl.count(old) == 2, label
+        source.write_text(runtime_hlsl.replace(old, new), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        wrong = subprocess.run([renderer, backend, "--check-pixel-case", shader, case], capture_output=True, text=True)
+        if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+            raise AssertionError(f"Helper mutation ({label}) escaped detection")
+
+    # Runtime e64 modifiers flip the sign of a NaN or an infinity before the conversion.
+    runtime_mod_sets = (
+        (0xffc00000, 0x7fc00000, 0x7f800001, 0xffffffff),  # |-qNaN|, -(+qNaN), -|+sNaN|, -(-NaN)
+        (0xff800000, 0x7f800000, 0x4f000001, 0xcf000001),  # |-inf|, -(+inf), -|2^31+256|, -(-2^31-256)
+    )
+    for kind, ref_fn in (("flr_i32", cvt_flr_i32_ref), ("rpi_i32", cvt_rpi_i32_ref)):
+        body = cvt_flr_rpi_mod_body(kind, (0, 0, 0, 0))[4:]
+        assert not any(line.startswith("s_mov_b32") for line in body)
+        source.write_text(translate_int(uncompressed_export(body)), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        cases = []
+        for idx, words in enumerate(runtime_mod_sets):
+            expected = tuple(ref_fn(apply_f32_mod(w, abs_mod=a, neg_mod=n)) for w, (a, n) in zip(words, chan_mods))
+            cases.append(make_runtime_case(f"runtime_{kind}_mod_{idx}", words, expected))
+        run_pixel_batch(renderer, backend, shader, [(case, "pass") for case in cases])
+        for old, new, label in mutations[:2]:
+            mutated = [line.replace(old, new) for line in body]
+            assert mutated != body, label
+            source.write_text(translate_int(uncompressed_export(mutated)), encoding="ascii")
+            compile_shader(compiler, source, shader)
+            wrong = subprocess.run([renderer, backend, "--check-pixel-case", shader, cases[0]],
+                                   capture_output=True, text=True)
+            if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
+                raise AssertionError(f"{kind} runtime modifier mutation ({label}) escaped detection")
+
+    # Constant sources: exceptional literal words that DXC may fold at compile time.
+    for idx, (w0, w1) in enumerate(((0x7fc00000, 0xffc00000), (0x7f800000, 0xff800000),
+                                    (0x4f000001, 0xcf000001), (0x4f000000, 0xff7fffff))):
+        source.write_text(translate_int(uncompressed_export(cvt_flr_rpi_pair_body(w0, w1, e64=False))),
+                          encoding="ascii")
+        compile_shader(compiler, source, shader)
+        expected = (cvt_flr_i32_ref(w0), cvt_rpi_i32_ref(w0), cvt_flr_i32_ref(w1), cvt_rpi_i32_ref(w1))
+        run_pixel_batch(renderer, backend, shader, [(make_case(f"const_exceptional_{idx}", expected), "pass")])
 
 
 def check_int_minmax_draws(directory, compiler, renderer, backend):
