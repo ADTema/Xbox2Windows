@@ -2692,7 +2692,7 @@ HRESULT __stdcall device_frame_event(Wrapper*, UINT type, UINT offset_us, void* 
 // title address; nothing translates title GPU addresses yet. Textures trap.
 std::mutex placed_mutex;
 std::vector<std::pair<void*, ID3D12Heap*>> existing_heaps;
-volatile LONG64 placed_buffer_calls, placed_buffer_queries;  // reported with the five-second totals
+volatile LONG64 placed_buffer_calls, placed_buffer_region_info, placed_buffer_queries;  // five-second totals
 
 HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3D12_RESOURCE_DESC* desc, UINT state,
                                           const void* clear, const GUID* iid, void** out)
@@ -2741,10 +2741,12 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         return S_OK;
     }
     // The allocation holding the address, and whether every byte from its base to the end of the
-    // buffer is committed in it: a region walk that stops at the end of the buffer.
+    // buffer is committed in it: one region-information call for a fully committed private
+    // allocation, otherwise a region walk that stops at the end of the buffer.
     x2w_startup::PlacedBufferRange range;
     const bool committed = x2w_startup::measure_placed_buffer(address, desc->Width, range);
     InterlockedIncrement64(&placed_buffer_calls);
+    if (range.region_info) InterlockedIncrement64(&placed_buffer_region_info);
     InterlockedAdd64(&placed_buffer_queries, range.queries);
     if (!committed) {
         log("x2w-d3d12 Device::slot133(CreatePlacedResourceX?) address=%p not committed -> E_INVALIDARG", address);
@@ -3310,9 +3312,9 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     if (now - last_report >= 5000) {
         last_report = now;
         log("x2w-d3d12 views noted %lld (distinct %lld), descriptors copied %lld, heaps %llu, placed buffers %lld "
-            "(region queries %lld)", views_noted, views_distinct, descriptors_copied,
+            "(region-information proofs %lld, region queries %lld)", views_noted, views_distinct, descriptors_copied,
             static_cast<u64>(heap_infos().size()), static_cast<long long>(placed_buffer_calls),
-            static_cast<long long>(placed_buffer_queries));
+            static_cast<long long>(placed_buffer_region_info), static_cast<long long>(placed_buffer_queries));
         {
             LARGE_INTEGER frequency;
             QueryPerformanceFrequency(&frequency);
