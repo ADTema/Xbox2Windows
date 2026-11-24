@@ -761,6 +761,8 @@ The same Linux check validates eight unsigned DWORD atomics in Vulkan 1.2 SPIR-V
 
 Run `ctest --preset dev --no-tests=error -R '^spirv_address_window_atomic_' -V` to check the atomic add's returned old value and full 16-DWORD readback for valid, misaligned, out-of-window and index-wrap addresses, with the fixture mapping the substitute index to the last bound DWORD.
 
+The adapter also lowers signed 32-bit accesses: `OpConvertUToPtr %_ptr_PSB_int` casts, `OpAccessChain` into a `%rt_int` array with a 4-byte stride, a plain load or store (no memory operand or `Aligned 4`), and `OpAtomicSMin` and `OpAtomicSMax`. Each access runs in a branch taken only for an aligned, in-window address whose index addition does not wrap, so a signed access never uses the substitute index: a load and an atomic yield zero, and a store changes nothing, otherwise. The heap holds unsigned words, so values are bit-cast. A signed atomic cannot be forwarded: SPIRV-Cross at `57e4efc` emits the unsigned `InterlockedMin` or `InterlockedMax` for it on a byte-address buffer, which orders a negative word above a positive one. The adapter instead emits a compare-exchange loop with `OpSLessThan` or `OpSGreaterThan`. The loop's compare-exchange failure semantics drop Release and turn AcquireRelease into Acquire, since the failure path may not release. Any other atomic or memory operand on a signed pointer is rejected, as is a guarded access in the same block as an `OpLoopMerge`, because the split would leave the loop header without its merge. `python3 -B tests/spirv_window/address_signed.py spirv-as spirv-val spirv-cross` validates the lowering, checks that each access is guarded, that the HLSL has two compare-exchange loops and no `InterlockedMin` or `InterlockedMax`, that five unsupported forms are rejected, that acquire-release semantics and a source result named like a generated store both validate, and that seven mutations of the module fail the shape check. `ctest --preset dev --no-tests=error -R '^spirv_address_window_signed_' -V` adds the D3D12 readback: 11 cases of 16 DWORDs against a separate CPU model, with negative words so a signed and an unsigned compare differ, plus misaligned, past-the-window, wrapping and out-of-view addresses, and the same seven mutations, each of which must first diverge at a named case and word. The Linux check measures the shape; the GPU behavior needs the readback, which was not run on the author's Linux machine. A signed atomic at an in-window address beyond the 64-byte view relies on D3D12 returning zero for an out-of-bounds atomic so that the loop ends.
+
 The adapter also lowers a plain 64-bit (`%ulong`) load or store through a physical pointer, either a direct `OpConvertUToPtr %_ptr_PSB_ulong` cast or an `OpAccessChain` into a `%rt_ulong` array with an 8-byte stride. Only a plain load or store with no memory operand or `Aligned 8` is accepted; an atomic, `Volatile`, another alignment or any other use of the pointer is rejected. Each access becomes two DWORD accesses (low half first) inside one branch taken only for an address that is a multiple of eight, below `0xfffffff8`, and for an indexed address does not wrap. Outside the branch a load yields zero and a store changes nothing, so, like the atomics, a QWORD access never uses the substitute index. The access splits its block, so a phi of a successor block that names the split block as a parent is rewritten to the generated merge block. The 64-byte view still returns zero for a read past its end and discards a write past its end. `python3 -B tests/spirv_window/check.py` validates the lowering with SPIRV-Tools and checks its shape, including six mutations of the lowering that must each be caught.
 
 Run `ctest --preset dev --no-tests=error -R '^spirv_address_window_qword_' -V` for the separate readback. [`qword.spvasm`](../tests/spirv_window/qword.spvasm) loads a QWORD through an indexed address, adds one (carrying from the low into the high half) and stores it through a direct address. The readback compares the whole 16-DWORD arena with an independent C++ model of the access rules for eleven cases: valid loads and stores, a load or store that is aligned to a DWORD but not to a QWORD, addresses above the window and above 4 GiB, an index addition that wraps, a store beyond the descriptor and a store to its last QWORD. A second build narrows the window to end inside the view, so an access at or past that end is visible instead of being hidden by the descriptor bounds. Six negative controls mutate the lowered module (swapped halves, a DWORD alignment guard, a dropped wrap guard, a dropped store alignment guard, a window end beyond the view, a dropped store range guard); each must fail at its predicted case and word. The Linux check measures validation and the shape of the lowering; the GPU result for the valid and invalid cases comes only from this readback, and an address inside the window but outside a real allocation still depends on the descriptors a runtime supplies.
@@ -2800,6 +2802,51 @@ of the assembled gfx1030 program.
 ```powershell
 cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^compute_store_aot_mtbuf_load_(warp|hardware)$' -V
+```
+
+### gfx1030 2D image loads
+
+The `gfx1030` compute store profile lowers one typed MIMG form:
+`image_load vD, v[x:y], s[A:A+7] dmask:0x1|0x3|0x7|0xf
+dim:SQ_RSRC_IMG_2D`, with the `unorm` flag optional. The lowering is one
+`Texture2D<uint4>.Load(int3(x, y, 0))` from `t0`; the DMASK-selected leading
+components are written to consecutive destination VGPRs in ascending channel
+order and stored to the output UAV. The accepted form requires a `gfx1030`
+target, `dim:SQ_RSRC_IMG_2D`, two consecutive known address VGPRs (x then y),
+and a contiguous DMASK. `a16`, `d16`, `tfe`, `glc`, `slc`, `dlc`, `r128` and
+the NSA address spelling are refused. The eight descriptor words must come
+from one tracked `s_load_dwordx8` at `--image-descriptor`, its scalar load
+must complete before the image load, and the loaded registers may only be
+read after `s_waitcnt vmcnt(0)`.
+
+The 8-dword image resource descriptor (T#) is runtime data. The caller
+guarantees through `--image-format R32G32B32A32_UINT` that its 9-bit GFX10
+format field (DW1[28:20]) is `32_32_32_32_UINT`, that its type (DW3[31:28])
+is `SQ_RSRC_IMG_2D`, that its swizzle mode (DW3[24:20]) is linear, that
+resource level (DW2[31]) is 1, that base and last mip are zero, and that the
+selected channels use the identity destination selects. The translator
+checks where the eight words were loaded from, not those fields. The binding
+assumes an unswizzled, in-range, single-layer image and does not emulate
+native descriptor bounds, tiling or DCC. D3D returns zero for an
+out-of-bounds typed load; the fixture keeps every coordinate in range, so
+that behavior is not measured here.
+
+The source-built wave32 fixture uses an 8x8 thread group and a 32x8
+`R32G32B32A32_UINT` source texture whose words are carried in the case file.
+Dispatches of four, two, one and one groups exercise `dmask:0x1`, `0x3`,
+`0x7` and `0xf` and fill the 320-word output UAV. The independent CPU
+reference recomputes every written word and expects the sentinel in the
+untouched words. A single flipped written word (`word=0`) and a single
+flipped untouched word (`word=300`) must both be reported. Two mutated
+translations must each differ at a named word: reordering the emitted
+components fails at word 0, and swapping the two address registers fails at
+word 4. The LLVM 15 binary check assembles and decodes each DMASK form and
+lowers the decoded program through the CLI. These are desktop DXIL
+executions, not native runs of the assembled gfx1030 program.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mimg_load_(warp|hardware)$' -V
 ```
 
 ### Bounded gfx1030 DS lane routing
@@ -8211,4 +8258,15 @@ measurement on hardware or in a Windows run backs the descriptions. `v_interp_p1
 
 ## Startup translator: explicit-LOD image sampling
 
-`tools/startup/gfx2hlsl.py` now lowers the gfx1013 `image_sample_l` form of a 2D or 3D texture sample to `tex.SampleLevel(smp, uv, level)`. The level is the last address register: the third for a contiguous 2D address, the fourth for 3D, and the last element of an NSA list. `tests/startup_image_sample_l_check.py` translates source-built fixtures (the words are checked against `llvm-mc`) and requires the level to come from that register; an address list `[v0, v1, v3]` must use `v3`, not the third consecutive register. Replacing the level with 0, replacing the call with implicit `Sample`, or reading the third register in every form each make the check fail. Offset (`_o`), compare (`_c_l`), gather, cube and the `unorm` modifier are refused with an `Unsupported` message. Not measured: no draw samples a mip level on WARP or hardware through this lowering, so the level selection is checked on the generated HLSL text only. [HLSL SampleLevel](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-to-samplelevel)
+`tools/startup/gfx2hlsl.py` now lowers the gfx1013 `image_sample_l` form of a 2D or 3D texture sample to `tex.SampleLevel(smp, uv, level)`. The level is the last address register: the third for a contiguous 2D address, the fourth for 3D, and the last element of an NSA list. `tests/startup_image_sample_l_check.py` translates source-built fixtures (the words are checked against `llvm-mc`) and requires the level to come from that register; an address list `[v0, v1, v3]` must use `v3`, not the third consecutive register. Replacing the level with 0, replacing the call with implicit `Sample`, or reading the third register in every form each make the check fail. Offset (`_o`), compare (`_c_l`), gather, 1D, array, cube and multisample dimensions, an empty `dmask`, and the `unorm`, `r128`, `tfe`, `lwe`, `a16` and `d16` modifiers or any set reserved MIMG bit are refused with an `Unsupported` message; only the cache-policy bits `glc`, `slc` and `dlc` are accepted because they do not change the sampled value. The disassembler previously read `lwe` from reserved bit 14 of word 0; `llvm-mc` (19, gfx1013) encodes it in bit 17, and the check now has one `llvm-mc`-built fixture per refused modifier plus patched reserved-bit fixtures. Not measured: no draw samples a mip level on WARP or hardware through this lowering, so the level selection is checked on the generated HLSL text only. [HLSL SampleLevel](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-to-samplelevel)
+
+## Desktop audio render sink
+
+`startup_audio_output` drives a small WASAPI shared-mode render sink ([`audio_sink.h`](../src/startup_stubs/audio_sink.h)) with generated PCM blocks. It is the first slice of [issue #1145](https://github.com/R0Y00/Xbox2Windows/issues/1145). The sink takes `submit(format, frames, bytes)`, converts the block to the endpoint mix format (32-bit float or 16-bit PCM only) and records the first accepted block, the submitted format, per-block frame counts and peaks, consumed frames (submitted minus `GetCurrentPadding`), the `IAudioClock` position, the drained interval and the recovery. The fixture runs three cases in one process: no submission; eight 40 ms blocks with distinct amplitudes, one of them intentionally silent; and a producer that withholds the next block until the queue is empty, then resumes.
+
+```powershell
+cmake --build --preset release --target startup_audio_output
+ctest --preset release --no-tests=error -R '^startup_audio_output$' -V
+```
+
+Exit code 77 is a capability skip (no render endpoint, an endpoint that does not initialise, or an unsupported mix format); it is not a pass. A failed padding query during a case fails the run. The glitch count is reported as "not available" because the render API exposes no discontinuity flag, and it is kept apart from the drained interval and the recovery. Not covered: capture-path verification of the tone, any layout of the console audio command queue (`xapu.cpp` is not decoded), and sample-rate conversion. The result of a run on a machine with an endpoint (adapter, Windows build, commit, per-case counters) is not recorded here yet.

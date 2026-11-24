@@ -2549,7 +2549,8 @@ def lds_controls():
             lines[:i + 1] + lines[i + 2:], 32, **LDS_BINDING)
 
 
-def gfx1030_binary(directory, assembler, objcopy, library, cases, prefix):
+def gfx1030_binary(directory, assembler, objcopy, library, cases, prefix, group=32):
+    dims = aot.checked_group(group)
     for name, lines, binding in cases:
         src, obj, raw = (directory / f"{name}.{ext}" for ext in ("s", "o", "bin"))
         src.write_text("\n".join(lines) + "\n", encoding="ascii")
@@ -2561,10 +2562,10 @@ def gfx1030_binary(directory, assembler, objcopy, library, cases, prefix):
                                           features=DS_FEATURES.encode()))
         assert [line for line in decoded if line.startswith(prefix)] == [
             line for line in lines if line.startswith(prefix)]
-        expected = aot.lower(lines, 32, **binding)
-        assert aot.lower(decoded, 32, **binding) == expected
+        expected = aot.lower(lines, dims, **binding)
+        assert aot.lower(decoded, dims, **binding) == expected
         container, output = directory / f"{name}.dxbc", directory / f"{name}-cli.hlsl"
-        container.write_bytes(store_container(code, (32, 1, 1)))
+        container.write_bytes(store_container(code, dims))
         options = [item for key, value in binding.items() for item in ("--" + key.replace("_", "-"), str(value))]
         subprocess.run([sys.executable, "-B", aot.__file__, container, "--output", output,
                         "--llvm", library, *options], check=True)
@@ -2962,6 +2963,13 @@ def scalar_alu_binary(directory, assembler, objcopy, library):
     assert aot.lower(decoded, 32, **READ_BINDING) == aot.lower(READ_SCALAR, 32, **READ_BINDING)
 
 
+def mimg_load_binary(directory, assembler, objcopy, library):
+    """Assemble and decode each dmask form, then lower the decoded program through the CLI."""
+    mimg_load_controls()
+    cases = [(f"mimg_load_{count}", lines, MIMG_BINDING) for count, groups, shift, lines in mimg_load_cases()]
+    gfx1030_binary(directory, assembler, objcopy, library, cases, "image_", group=(8, 8, 1))
+
+
 def binary(directory, assembler, objcopy, library):
     mubuf_subword_controls()
     gfx1030_binary(directory, assembler, objcopy, library, mubuf_subword_cases(), "buffer_load_")
@@ -2971,6 +2979,7 @@ def binary(directory, assembler, objcopy, library):
     lds_controls()
     ds_binary(directory, assembler, objcopy, library)
     mtbuf_load_controls()
+    mimg_load_binary(directory, assembler, objcopy, library)
     gfx1030_binary(directory, assembler, objcopy, library, MTBUF_LOAD_CASES, "tbuffer_")
     two_exits(directory, assembler, objcopy, library)
     for name, lines, width, binding in CASES + GUARD_CASES + READ_CASES + ALU_CASES + F32_CASES:
@@ -3385,6 +3394,165 @@ def mtbuf_load_draw(directory, compiler, renderer, backend):
         path = Path(record)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("\n".join(accepted) + "\n", encoding="utf-8")
+    return 0
+
+
+# The translated image load reads a caller-supplied R32G32B32A32_UINT texture and writes the
+# selected texel components into the output UAV. The case file appends the 32x8x4 texture words
+# after the 320 expected readback words; the runner uploads them verbatim.
+TEXTURE_WIDTH, TEXTURE_HEIGHT, TEXTURE_CHANNELS = 32, 8, 4
+TEXTURE_WORDS = [[(((channel + 1) << 28) | (y << 12) | (x << 4) | channel)
+                  for channel in range(TEXTURE_CHANNELS)]
+                 for y in range(TEXTURE_HEIGHT) for x in range(TEXTURE_WIDTH)]
+MIMG_BINDING = DS_BINDING | {"group_reg": 10, "group_reg_y": 11, "stride": 128,
+                             "image_descriptor": 0x40, "image_format": "R32G32B32A32_UINT"}
+MIMG_IMAGE = "image_load v[14:17], v[8:9], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_2D"
+
+
+def texture_word(x, y, channel):
+    return TEXTURE_WORDS[y * TEXTURE_WIDTH + x][channel]
+
+
+def mimg_load_cases():
+    """dmask x/xy/xyz/xyzw on one descriptor, with dispatch counts that fill the 320-word UAV."""
+    for count, groups, shift in ((1, 4, 2), (2, 2, 3), (3, 1, 4), (4, 1, 4)):
+        mask = (1 << count) - 1
+        data = "v14" if count == 1 else f"v[14:{13 + count}]"
+        store = "buffer_store_dword" if count == 1 else f"buffer_store_dwordx{count}"
+        lines = [
+            "s_mov_b32 s12, s7", "s_mov_b32 s13, 0",
+            "s_load_dwordx4 s[20:23], s[12:13], 0x30",
+            "s_load_dwordx8 s[24:31], s[12:13], 0x40",
+            "v_lshl_add_u32 v8, s10, 3, v0",
+            "v_lshl_add_u32 v9, s11, 3, v1",
+            "s_waitcnt lgkmcnt(0)",
+            f"image_load {data}, v[8:9], s[24:31] dmask:0x{mask:x} dim:SQ_RSRC_IMG_2D",
+            "v_mov_b32_e32 v12, v9",
+            f"v_lshlrev_b32_e32 v13, {shift}, v8",
+            "s_waitcnt vmcnt(0)",
+            f"{store} {data}, v[12:13], s[20:23], 0 idxen offen",
+            "s_endpgm",
+        ]
+        yield count, groups, shift, lines
+
+
+def mimg_load_words(count, shift, groups):
+    """Independent readback: lane (tid.x, tid.y) stores its texel at tid.y*32 + tid.x*step."""
+    step = 1 << (shift - 2)
+    words = [SENTINEL] * 320
+    for y in range(TEXTURE_HEIGHT):
+        for x in range(8 * groups):
+            base = y * 32 + x * step
+            for channel in range(count):
+                words[base + channel] = texture_word(x, y, channel)
+    return words
+
+
+def mimg_ds_program():
+    lines = ds_program("ds_bpermute_b32", 5)
+    lines.insert(lines.index("s_waitcnt lgkmcnt(0)"), "s_load_dwordx8 s[24:31], s[12:13], 0x40")
+    return variant(lines, ("ds_bpermute_b32 v5, v5, v8", "v_mov_b32_e32 v9, 0\n"
+                           "image_load v14, v[8:9], s[24:31] dmask:0x1 dim:SQ_RSRC_IMG_2D\n"
+                           "s_waitcnt vmcnt(0)\nds_bpermute_b32 v5, v5, v14"))
+
+
+def mimg_load_controls():
+    count, groups, shift, lines = next(mimg_load_cases())
+    binding = MIMG_BINDING
+    image = next(line for line in lines if line.startswith("image_load"))
+
+    def changed(old, new):
+        return [line.replace(old, new) if line == image else line for line in lines]
+
+    for old, new, diagnostic in (
+        ("dmask:0x1", "dmask:0x3", "Unsupported image load target"),
+        ("dmask:0x1", "dmask:0x0", "Unsupported image load target"),
+        ("dim:SQ_RSRC_IMG_2D", "dim:SQ_RSRC_IMG_1D", "Unsupported compute instruction"),
+        ("dim:SQ_RSRC_IMG_2D", "dim:SQ_RSRC_IMG_2D a16", "Unsupported compute instruction"),
+        ("dim:SQ_RSRC_IMG_2D", "dim:SQ_RSRC_IMG_2D d16", "Unsupported compute instruction"),
+        ("dim:SQ_RSRC_IMG_2D", "dim:SQ_RSRC_IMG_2D glc", "Unsupported compute instruction"),
+        ("s[24:31]", "s[20:27]", "Unverified image descriptor"),
+        ("v[8:9]", "v[6:7]", "Unverified image coordinates"),
+    ):
+        rejects(diagnostic, aot.lower, changed(old, new), (8, 8, 1), **binding)
+    # LLVM 15 encodes non-sampler image loads with the unorm flag; it selects integer,
+    # un-normalized addresses, which is what this lowering already assumes.
+    assert aot.lower(changed(" dim:SQ_RSRC_IMG_2D", " dim:SQ_RSRC_IMG_2D unorm"), (8, 8, 1),
+                     **binding) == aot.lower(lines, (8, 8, 1), **binding)
+    rejects("Unresolved image descriptor", aot.lower,
+            [line for line in lines if not line.startswith("s_waitcnt lgkmcnt")], (8, 8, 1), **binding)
+    rejects("before s_waitcnt vmcnt(0)", aot.lower,
+            variant(lines, ("s_waitcnt vmcnt(0)", "")), (8, 8, 1), **binding)
+    rejects("Unverified image descriptor", aot.lower,
+            [line for line in lines if not line.startswith("s_load_dwordx8")], (8, 8, 1), **binding)
+    rejects("Invalid or overlapping image descriptor binding", aot.lower, lines, (8, 8, 1),
+            **(binding | {"image_descriptor": 0x30}))
+    rejects("Invalid or overlapping image descriptor binding", aot.lower, lines, (8, 8, 1),
+            **(binding | {"image_descriptor": 0x28}))
+    rejects("Invalid or overlapping image descriptor binding", aot.lower, lines, (8, 8, 1),
+            **(binding | {"image_format": None}))
+    rejects("Unsupported image load target", aot.lower, lines, (8, 8, 1),
+            **(binding | {"cpu": "gfx1013"}))
+    rejects("Unsupported image load target", aot.lower,
+            [line for line in lines if not line.startswith("s_load_dwordx8")], (8, 8, 1),
+            **{key: value for key, value in binding.items() if key not in ("image_descriptor", "image_format")})
+    rejects("Unresolved compute descriptor load", aot.lower, lines, (8, 8, 1),
+            **{key: value for key, value in binding.items() if key not in ("image_descriptor", "image_format")})
+    # A lane route can consume a texel after vmcnt; the image temporary must be declared first.
+    mixed = aot.lower(mimg_ds_program(), 32, **(DS_BINDING | {"image_descriptor": 0x40,
+                                                            "image_format": "R32G32B32A32_UINT"}))
+    assert mixed.index("uint4 image_load_0 =") < mixed.index("= image_load_0.x;")
+
+
+def mimg_load_draw(directory, compiler, renderer, backend):
+    mimg_load_controls()
+    # Each mutation is a translation mistake that must change the readback at a named word: the
+    # dmask selects ascending texel components, and the first address dword is the x coordinate.
+    mutations = {
+        1: [("component order", "image_load_0.x", "image_load_0.y", 0)],
+        4: [("coordinate order", "int3(asint(tid.x), asint(tid.y), 0)",
+             "int3(asint(tid.y), asint(tid.x), 0)", 4),
+            ("channel order", "uint4(image_load_0.x, image_load_0.y, image_load_0.z, image_load_0.w)",
+             "uint4(image_load_0.y, image_load_0.x, image_load_0.z, image_load_0.w)", 0)],
+    }
+    texture = [word for texel in TEXTURE_WORDS for word in texel]
+    packed_texture = struct.pack(f"<{len(texture)}I", *texture)
+    for count, groups, shift, lines in mimg_load_cases():
+        src, cso, case = (directory / f"mimg_load_{count}.{ext}" for ext in ("hlsl", "cso", "case"))
+        source = aot.lower(lines, (8, 8, 1), **MIMG_BINDING)
+        src.write_text(source, encoding="ascii")
+        compile_shader = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
+        subprocess.run(compile_shader, check=True)
+        run = [renderer, backend, "--compute-texture-case", cso, case]
+        expected = mimg_load_words(count, shift, groups)
+        reference = struct.pack("<321I", groups, *expected) + packed_texture
+        case.write_bytes(reference)
+        result = subprocess.run(run)
+        if result.returncode:
+            return result.returncode
+        # The comparison itself must fail on one wrong written word and one wrong untouched word.
+        for word in (0, 300):
+            wrong = list(expected)
+            wrong[word] ^= 1
+            case.write_bytes(struct.pack("<321I", groups, *wrong) + packed_texture)
+            bad = subprocess.run(run, capture_output=True, text=True)
+            if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+                raise AssertionError(f"mimg_load_{count}: wrong word {word} escaped detection\n{bad.stderr}")
+            print(bad.stderr, end="")
+        case.write_bytes(reference)
+        for label, old, new, word in mutations.get(count, ()):
+            mutated = source.replace(old, new)
+            assert mutated != source, label
+            src.write_text(mutated, encoding="ascii")
+            subprocess.run(compile_shader, check=True)
+            bad = subprocess.run(run, capture_output=True, text=True)
+            if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+                raise AssertionError(f"mimg_load_{count}: {label} mutation escaped detection\n{bad.stderr}")
+            print(bad.stderr, end="")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("image_load\n", encoding="utf-8")
     return 0
 
 
@@ -3972,6 +4140,7 @@ if __name__ == "__main__":
         modes = {"binary": binary, "draw": draw,
                  "draw-mubuf-subword": mubuf_subword_draw,
                  "draw-mtbuf-load": mtbuf_load_draw,
+                 "draw-mimg-load": mimg_load_draw,
                  "draw-ds-route": ds_draw,
                  "draw-lds-qword": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_QWORD_CASES),
                  "draw-lds-strided": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_STRIDED_CASES),

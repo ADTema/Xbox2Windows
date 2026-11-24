@@ -96,6 +96,7 @@ After the full [Windows build](#first-build), run one comparison from the reposi
 | PE 32/64-bit base fixups against Windows | `ctest --preset dev --no-tests=error -R '^cpu_native_highlow$' -V` · [scope and controls](docs/experiments.md#highlow-and-mixed-width-base-relocations) |
 | [CPU counted cache-line zero loops](docs/experiments.md#counted-cache-line-zero-loops) | `ctest --preset release --no-tests=error -R '^cpu_counted_clzero$' -V` |
 | [Experimental startup stand-ins and debugger (trap-by-default DLLs)](docs/startup-runtime.md) | `ctest --preset release --no-tests=error -R '^startup_stubs$' -V` |
+| [Desktop audio render sink and its three-case fixture (WASAPI)](docs/experiments.md#desktop-audio-render-sink) | `ctest --preset release --no-tests=error -R '^startup_audio_output$' -V` |
 
 The control-flow CPU translator supports [source-built string memory transfers](docs/experiments.md#string-memory-transfers-in-the-control-flow-cpu-lifter). MOVS and STOS, with and without REP, copy and fill 1-, 2-, 4- and 8-byte elements in either direction.
 
@@ -115,6 +116,7 @@ The control-flow CPU translator supports [source-built string memory transfers](
 | Guarded compute ALU | Verify a raw buffer read, the [full-width multiply](docs/experiments.md#guarded-full-width-integer-multiply), and the guarded UAV store against a CPU reference. | `ctest --preset dev --no-tests=error -R '^compute_store_aot_guard_read_'` |
 | gfx1030 typed-buffer reads | Lower [indexed UINT `tbuffer_load_format_*`](docs/experiments.md#indexed-gfx1030-typed-buffer-reads) for one to four 32-bit or packed 16-bit components. | `ctest --preset dev --no-tests=error -R '^compute_store_aot_mtbuf_load_'` |
 | gfx1030 raw subword reads | Lower [indexed byte and halfword MUBUF loads](docs/experiments.md#indexed-gfx1030-raw-subword-reads) and compare sign and zero extension in the UAV readback. | `ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_subword_'` |
+| gfx1030 image loads | Lower a 2D [`image_load` with a caller-declared `R32G32B32A32_UINT` descriptor](docs/experiments.md#gfx1030-2d-image-loads) for `dmask` x through xyzw and compare the UAV readback against a CPU reference. | `ctest --preset dev --no-tests=error -R '^compute_store_aot_mimg_load_'` |
 | Shader census | [Distinguish archive records, header digests and cache-index entries](docs/experiments.md#reporting-shader-census-populations) before choosing a coverage denominator. | `ctest --preset dev --no-tests=error -R "^shader_metadata_census$" -V` |
 | Shader effect metadata | Inventory the [candidate programs for a named SGD5 effect](docs/experiments.md#candidate-programs-for-a-named-sgd5-effect) using independently located archive ranges. | `ctest --preset dev --no-tests=error -R "^sgd5_effect_candidates$" -V` |
 | Pipeline readiness | Join explicit pipeline references to the native shader manifest and optionally probe pixel and mesh lowering. [Inputs and WARP control](docs/experiments.md#pipeline-readiness-from-shader-manifests) | `ctest --preset dev -R '^pso_' -V` |
