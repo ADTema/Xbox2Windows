@@ -2929,6 +2929,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_gfx2hlsl_capture COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_capture_check.py")
     set_tests_properties(startup_gfx2hlsl_capture PROPERTIES TIMEOUT 120)
+    # archive_requests.py writes runtime-keyed shader requests from a synthetic archive.
+    add_test(NAME startup_archive_requests COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_archive_requests_check.py")
+    set_tests_properties(startup_archive_requests PROPERTIES TIMEOUT 120)
     # Two integer operations whose refusal was never reached: v_cvt_i32_f32 with an output
     # modifier, and v_readfirstlane_b32 without a proven uniform source.
     add_test(NAME startup_gfx2hlsl_op_refusals COMMAND "${INTAKE_PYTHON}" -B
