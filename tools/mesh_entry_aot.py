@@ -66,6 +66,8 @@ class Wave:
         self.pending_v = set()
         self.spill_slots = {}
         self.spill_vgprs = set()
+        # First ordinary use of each spill VGPR after a spill write. Never cleared, on purpose: any later
+        # reload of that VGPR is refused, which can only over-refuse, never return a stale word.
         self.spill_vector_uses = {}
         self.barriers = []
         self.counts = []

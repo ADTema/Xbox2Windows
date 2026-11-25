@@ -83,6 +83,20 @@ def main():
         "v_readlane_b32 s12, v10, 3",
     ], "unwritten lane spill slot v10[3]")
 
+    # EXEC words as writelane sources: a non-zero mask with bits in both halves.
+    wave = run([
+        "s_mov_b32 s22, 0x80000005",
+        "s_mov_b32 s23, 0xc0000003",
+        "s_mov_b64 exec, s[22:23]",
+        "v_writelane_b32 v12, exec_lo, 5",
+        "v_writelane_b32 v12, exec_hi, 6",
+        "s_mov_b64 exec, 0",
+        "v_readlane_b32 s30, v12, 5",
+        "v_readlane_b32 s31, v12, 6",
+        "s_endpgm",
+    ])
+    assert (wave.s[30], wave.s[31]) == (0x80000005, 0xC0000003), "exec word spill"
+
     # A register-range operand that covers the spill VGPR also counts as ordinary use.
     wave = Wave(0, [])
     try:
