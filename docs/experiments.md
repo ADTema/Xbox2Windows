@@ -5139,6 +5139,30 @@ The source-built 32-thread fixture stores four words per thread (`128` words act
 
 The fixture replaces the `umin` of the read-compute-write fixture with two `v_xor3_b32`, hand-edited in LLVM 15 spelling: `out = (p ^ key ^ gid) ^ 0x2c5a96e1 ^ -16`, where `p` is the product above and `key = params[0].y = 0xa5c30f96`. Its sources are a result, the dispatch index, an SGPR constant word, a literal and a negative inline constant. The expected words come from a Python model of the instruction definition; lane 0 is also worked by hand (`0x2d574c65`). The readback uses the read harness and its three dispatches and compares all 320 words. On five groups with `n = 150`, each of these references must fail at the first word where it differs: one word off, lane 150 also writing, OR, AND or an add instead of XOR, each source dropped, and `+16` for `-16`. So must recompiled HLSL with an OR for either XOR, the key read from `params[0].z`, the dispatch index dropped, the literal off by one bit, or the inline constant dropped. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_alu_xor3_(warp|hardware)$' -V`. The translation controls alone are `python -B tests/compute_alu_xor3_check.py controls`.
 
+#### Bit count plus addend (`v_bcnt_u32_b32`)
+
+`v_bcnt_u32_b32 vD, a, b` is `D = CountOneBits(a) + b`, the addend wrapping modulo 2^32 (RDNA2 instruction set;
+LLVM `V_BCNT_U32_B32_e64`, `ctpop(src0) + src1`; Mesa ACO selects it for `bit_count`). gfx10 has only the VOP3
+encoding, which LLVM 15 prints without a suffix and refuses as `_e32`. It lowers to `(countbits(a) + b)`. Each
+source is a VGPR, an SGPR that holds a known word, an integer inline constant or a 32-bit literal, and the result
+is data only. The `_e32` and `_e64` spellings, source modifiers (`-v`, `|v|`, `neg()`), `clamp`, a register range
+and a third source stop the lowering at the instruction. A source that is not a known word and a destination past
+`v255` are refused with `Unverified ALU operand`. `v_mbcnt_lo/hi_u32_b32` keep their own lane-mask lowering, and
+`s_bcnt1_i32_b32` stays limited to `exec_lo`.
+
+The fixture replaces the `umin` of the read-compute-write fixture with four `v_bcnt_u32_b32`, hand-edited in LLVM 15
+spelling: `out = bcnt(-16) + bcnt(0x2c5a96e1) + bcnt(gid) + bcnt(p) + key`, where `p` is the product above and
+`key = params[0].y = 0xa5c30f96`. The counted sources are a result, the dispatch index, a literal and a negative
+inline constant; the addends are an SGPR constant word and the running result. The expected words come from a
+Python model of the instruction definition; lane 0 is also worked by hand (`0xa5c30fd0`). The readback uses the
+read harness and its three dispatches and compares all 320 words. On five groups with `n = 150`, each of these
+references must fail at the first word where it differs: one word off, lane 150 also writing, a plain add or a
+count of zero bits in place of the bit count, the operands swapped, each source dropped, and `+16` for `-16`. So
+must recompiled HLSL with `firstbitlow` for a count, a count dropped, the key read from `params[0].z`, the dispatch
+index dropped, the literal off by one bit, or `+16` for the inline constant. Run
+`ctest --preset dev --no-tests=error -R '^compute_store_aot_alu_bcnt_(warp|hardware)$' -V`. The translation
+controls alone are `python -B tests/compute_alu_bcnt_check.py controls`.
+
 #### Signed add and subtract without carry-out (`v_add_nc_i32` / `v_sub_nc_i32`)
 
 `v_add_nc_i32 vD, S0, S1` and `v_sub_nc_i32 vD, S0, S1` are the VOP3 signed 32-bit add and subtract without carry-out (`D.i = S0.i + S1.i` and `D.i = S0.i - S1.i`, wrapping modulo `2^32`). Both lower on known words (`ALU_SOURCE`: VGPR, known SGPR, integer inline constant, or 32-bit literal) to `({0} + {1})` and `({0} - {1})` in `uint` arithmetic so wrap-around is exact. The `clamp` forms, `omod` (`mul:2`), source modifiers (`-v`, `|v|`, `neg()`), `_e32`/`_e64` spellings, unknown or pending sources, and destinations past `v255` are refused.
