@@ -10,8 +10,10 @@ import os
 import re
 import struct
 import sys
+import sysconfig
 import tempfile
 import time
+import traceback
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 import disasm_rdna2 as D  # noqa: E402
@@ -1765,6 +1767,8 @@ class Stage:
                     term = self.one(name, asm)
                 except Unsupported as reason:
                     if refusals is None:
+                        if not hasattr(reason, 'instruction'):
+                            reason.instruction = name  # for fail_reason(); the message itself is unchanged
                         raised_unsupported = reason
                         break
                     refusals.append((str(reason), self.kind))
@@ -5232,7 +5236,8 @@ def translate_compute(out_dir, key):
         pipe = load_compute_request(out_dir, key)
         hlsl, manifest = pipe.hlsl_cs(), pipe.manifest()
     except Unsupported as reason:
-        open(name + '.fail', 'w').write(str(reason) + '\n')
+        reason = fail_reason(reason)
+        open(name + '.fail', 'w').write(reason + '\n')
         return 'unsupported: %s' % reason
     log_unvalidated_lod(key, pipe)
     open(name + '.cs.hlsl', 'w').write(hlsl)
@@ -5334,7 +5339,8 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
         if rtv_request:
             manifest += rtv_request + '\n'
     except Unsupported as reason:
-        open(name + '.fail', 'w').write(str(reason) + '\n')
+        reason = fail_reason(reason)
+        open(name + '.fail', 'w').write(reason + '\n')
         return 'unsupported: %s' % reason
     log_unvalidated_lod(key, pipe)
     open(name + '.vs.hlsl', 'w').write(vs)
@@ -5754,12 +5760,39 @@ def watch_pass(out_dir, skip_failed):
         return False
 
 
+def fail_reason(reason):
+    """The .fail text of a refusal. An operand alone ("operand '-v30'") does not say which lowering refused it, so
+    the instruction is added when the translation loop recorded it. The record is an attribute on the exception, so
+    a refusal raised outside that loop, or rebuilt as a new Unsupported on the way here, gives the message alone."""
+    text = str(reason)
+    if text.startswith('operand ') and getattr(reason, 'instruction', None):
+        text += ' in %s' % reason.instruction
+    return text
+
+
+def raise_site(error):
+    """The traceback frame that raised error, skipping standard-library frames so an error raised inside a library
+    call (json, struct helpers, ...) names the code that made the call. None without a traceback."""
+    frames = traceback.extract_tb(error.__traceback__)
+    roots = {os.path.normcase(os.path.abspath(sysconfig.get_paths()[name])) + os.sep
+             for name in ('stdlib', 'platstdlib')}
+    for frame in reversed(frames):
+        if not os.path.normcase(os.path.abspath(frame.filename)).startswith(tuple(roots)):
+            return frame
+    return frames[-1] if frames else None
+
+
 def translate_one(out_dir, key):
     """translate_request, with an unexpected translator error recorded as <key>.fail instead of raised."""
     try:
         return translate_request(out_dir, key)
     except Exception as error:  # noqa: BLE001 - one bad request must not stop a scan or the watcher
         reason = 'translator error: %s: %s' % (type(error).__name__, error)
+        # Where it was raised (function, file name, line), so the .fail points at the fault without the program
+        # that hit it. The line number moves with unrelated edits, so this text is for reading, not a stable key.
+        frame = raise_site(error)
+        if frame:
+            reason += ' (in %s, %s line %d)' % (frame.name, os.path.basename(frame.filename), frame.lineno)
         with open(os.path.join(out_dir, '%016x.fail' % key), 'w') as fail:
             fail.write(reason + '\n')
         return reason
