@@ -36,6 +36,8 @@ def controls():
 
     for operands, diagnostic in (
         ("s4, exec", "Unsupported compute instruction"),
+        ("s4, vcc", "Unsupported compute instruction"),
+        ("s4, 5", "Unsupported compute instruction"),
         ("s4, s[5:6]", "Invalid scalar bit count register"),
         ("s4, s[4:6]", "Invalid scalar bit count register"),
         ("s4, s[106:107]", "Invalid scalar bit count register"),
