@@ -5349,6 +5349,16 @@ The `SUB_CO` fixture in `tests/compute_store_check.py` (`draw-sub-co`, `compute_
 ctest --preset dev --no-tests=error -R '^compute_store_aot_salu_i32_(warp|hardware)$' -V
 ```
 
+#### Unsigned integer dot products (`v_dot2_u32_u16` / `v_dot4_u32_u8`)
+
+`v_dot2_u32_u16` (`VOP3P 0x15`) and `v_dot4_u32_u8` (`VOP3P 0x17`) compute unsigned packed 16-bit (2-element) and 8-bit (4-element) dot products accumulated into a 32-bit unsigned integer, wrapping modulo `2^32`. Because the non-clamp forms wrap at 32 bits, they lower directly to `dot2_u32_u16` and `dot4_u32_u8` in HLSL `uint` arithmetic without 64-bit emulation. `clamp`, `op_sel`, `op_sel_hi`, `neg_lo`, `neg_hi`, `omod`, source modifiers, unknown or pending sources, and `vD > 255` are refused.
+
+The `DOT_U` fixture in `tests/compute_store_check.py` (`draw-dot-u`, `compute_store_aot_dot_u_${adapter}`) assembles on `gfx1030` (since LLVM's `gfx1013` subtarget omits `v_dot4_u32_u8`) and runs one 64-thread group (`buffer_store_dwordx4`, 256 output words plus 64 `SENTINEL` words), covering MSB=1 unsigned lanes (`0xffff`, `0x8001`, `0xff`, `0x80`, `0xfe`), SGPR and inline/literal operands, and 32-bit wrap-around on a subset of lanes (`tid.x >= 25`), comparing all 320 words against an independent Python model. Reference controls (signed `dot2` at word 0, signed `dot4` at word 2, saturated `dot2` at word 100, and sentinel modified at word 256) and recompiled-HLSL mutations (dropping `dot2` high-half product, dropping `dot4` byte-3 product) must all fail.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^compute_store_aot_dot_u_(warp|hardware)$' -V
+```
+
 ### Two- and three-dimensional thread groups
 
 The PSV0 group size can be any `numthreads(x,y,z)` within the `cs_6_0` limits
