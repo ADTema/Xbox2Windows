@@ -39,7 +39,7 @@ D3D12_BLEND_DESC opaque_shared()
 void apply(D3D12_BLEND_DESC& blend, const x2w_startup::ExportWriteMasks& masks, bool mutate)
 {
     if (!mutate) {
-        x2w_startup::apply_export_write_masks(blend, masks);
+        expect(x2w_startup::apply_export_write_masks(blend, masks, 2), "mask applies to two targets");
         return;
     }
     for (unsigned target = 0; target < 8; ++target) blend.RenderTarget[target].RenderTargetWriteMask &= masks.mask[target];
@@ -60,7 +60,8 @@ int main(int argc, char** argv)
     expect(accepts("wmask 7 0xc", &parsed) && parsed.mask[7] == 0xC && parsed.mask[0] == 0xF, "wmask 7 0xc accepted");
     expect(accepts("wmask 2 0xf"), "full mask accepted");
     for (const char* bad : {"wmask 8 0x3", "wmask 0 0x0", "wmask 0 0x10", "wmask 0 3", "wmask -1 0x3", "wmask 0", "wmask",
-                            "wmask 0 0x3 extra", "wmask0 0x3", "mask 0 0x3"})
+                            "wmask 0 0x3 extra", "wmask0 0x3", "mask 0 0x3", "wmask 4294967296 0x3",
+                            "wmask 0 0x100000003", "wmask 0 0x+3", "wmask +0 0x3"})
         expect(!accepts(bad), std::string("refused: '") + bad + "'");
     x2w_startup::ExportWriteMasks twice;
     expect(twice.read_manifest_line("wmask 1 0x3") && !twice.read_manifest_line("wmask 1 0xc"), "second line for target 1 refused");
@@ -96,6 +97,15 @@ int main(int argc, char** argv)
     apply(independent, low, mutate);
     expect(independent.RenderTarget[0].BlendEnable == TRUE, "independent blend state kept");
     expect(independent.RenderTarget[0].RenderTargetWriteMask == 0x1, "console mask 0x9 and export mask 0x3 give 0x1");
+
+    D3D12_BLEND_DESC logic = opaque_shared();
+    logic.RenderTarget[0].LogicOpEnable = TRUE;
+    logic.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_XOR;
+    expect(!x2w_startup::apply_export_write_masks(logic, low, 2) && !logic.IndependentBlendEnable &&
+           logic.RenderTarget[0].RenderTargetWriteMask == 0xF, "different masks with a shared logic op are refused");
+    expect(x2w_startup::apply_export_write_masks(logic, low, 1) && !logic.IndependentBlendEnable &&
+           logic.RenderTarget[0].RenderTargetWriteMask == 0x3 && logic.RenderTarget[0].LogicOpEnable,
+           "one masked target retains its shared logic op");
 
     std::printf("startup export write mask checks: %d failed\n", failures);
     return failures ? 1 : 0;

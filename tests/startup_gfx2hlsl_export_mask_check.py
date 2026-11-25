@@ -106,6 +106,20 @@ part = translate(exp(0, 0x5, (0, 1, 2, 3)))
 check('uncompressed red and blue translates', isinstance(part, tuple), repr(part))
 if isinstance(part, tuple):
     check('uncompressed red and blue: wmask 0 0x5', masks(part[1]) == [('0', '0x5')], repr(masks(part[1])))
+
+
+def revision_key(revision):
+    root = root_blob()
+    ps_code = exp(0, 0x5, (0, 1, 2, 3)) + S_ENDPGM
+    return G.fnv(root, G.fnv(ps_code, G.fnv(VS_WORDS, G.fnv(revision))))
+
+
+runtime = os.path.join(HERE, '..', 'src', 'startup_stubs', 'd3d12_draw.inl')
+with open(runtime, 'rb') as runtime_file:
+    revision = re.search(rb'constexpr char revision\[\] = "([^"]+)";', runtime_file.read())
+key = G.pipeline_key(VS_WORDS, exp(0, 0x5, (0, 1, 2, 3)) + S_ENDPGM, root_blob())
+check('offline and runtime use the same partial export cache key', bool(revision and key == revision_key(revision[1])))
+check('older zero-filled export cache is not reused', key != revision_key(b'x2w-startup-shader-6'))
 whole = translate(exp(0, 0xf, (0, 1, 2, 3)))
 check('uncompressed full export: no wmask line', isinstance(whole, tuple) and masks(whole[1]) == [], repr(whole))
 

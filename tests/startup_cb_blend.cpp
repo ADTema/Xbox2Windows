@@ -333,7 +333,8 @@ int check_startup_export_write_mask(ID3D12Device* device, bool unmasked)
         D3D12_BLEND_DESC blend{};
         blend.RenderTarget[0] = {FALSE, FALSE, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_BLEND_ONE,
                                  D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP, D3D12_COLOR_WRITE_ENABLE_ALL};
-        if (!unmasked) x2w_startup::apply_export_write_masks(blend, masks);
+        if (!unmasked && !x2w_startup::apply_export_write_masks(blend, masks, 1))
+            throw std::runtime_error("single-target export mask refused");
         const Color got = draw(device, root.Get(), blend.RenderTarget[0], source, destination, constant);
         Color want{};
         for (int ch = 0; ch < 4; ++ch) want[ch] = (c.mask >> ch) & 1 ? source[ch] : destination[ch];

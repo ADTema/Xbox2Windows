@@ -14,8 +14,7 @@
 #endif
 #include <d3d12.h>
 
-#include <cstdio>
-#include <cstring>
+#include <string_view>
 
 namespace x2w_startup {
 struct ExportWriteMasks {
@@ -24,13 +23,17 @@ struct ExportWriteMasks {
 
     // A 'wmask' manifest line. Returns false for a malformed line, a target above 7, a mask of no
     // channel or above 0xF, and a second line for the same target; the manifest is then rejected.
-    bool read_manifest_line(const char* line)
+    bool read_manifest_line(std::string_view line)
     {
-        unsigned target = 0, value = 0;
-        char trailing = 0;
-        if (std::strncmp(line, "wmask ", 6) != 0 || std::sscanf(line + 6, "%u 0x%x %c", &target, &value, &trailing) != 2)
-            return false;
-        if (target > 7 || value == 0 || value > 0xF || (seen & (1u << target))) return false;
+        if (line.size() != 11 || line.substr(0, 6) != "wmask " || line[6] < '0' || line[6] > '7' ||
+            line.substr(7, 3) != " 0x") return false;
+        const unsigned target = line[6] - '0';
+        const char digit = line[10];
+        unsigned value = 0;
+        if (digit >= '1' && digit <= '9') value = digit - '0';
+        if (digit >= 'a' && digit <= 'f') value = digit - 'a' + 10;
+        if (digit >= 'A' && digit <= 'F') value = digit - 'A' + 10;
+        if (value == 0 || (seen & (1u << target))) return false;
         seen |= 1u << target;
         mask[target] = static_cast<UINT8>(value);
         return true;
@@ -42,14 +45,27 @@ struct ExportWriteMasks {
 // Removes the channels each export leaves unwritten from the pipeline's blend state. A shared blend
 // state (IndependentBlendEnable FALSE) applies RenderTarget[0] to every target, so it is first
 // expanded to eight equal entries; the per-target masks then differ only where the exports differ.
-inline void apply_export_write_masks(D3D12_BLEND_DESC& blend, const ExportWriteMasks& masks)
+inline bool apply_export_write_masks(D3D12_BLEND_DESC& blend, const ExportWriteMasks& masks, UINT target_count)
 {
-    if (!masks.any()) return;
+    if (target_count > 8) return false;
+    if (!masks.any() || !target_count) return true;
     if (!blend.IndependentBlendEnable) {
+        const UINT8 original = blend.RenderTarget[0].RenderTargetWriteMask;
+        const UINT8 first = original & masks.mask[0];
+        bool same = true;
+        for (UINT target = 1; target < target_count; ++target)
+            same &= (original & masks.mask[target]) == first;
+        if (same) {
+            blend.RenderTarget[0].RenderTargetWriteMask = first;
+            return true;
+        }
+        // D3D12 requires a shared blend state when a logic operation is enabled.
+        if (blend.RenderTarget[0].LogicOpEnable) return false;
         for (unsigned target = 1; target < 8; ++target) blend.RenderTarget[target] = blend.RenderTarget[0];
         blend.IndependentBlendEnable = TRUE;
     }
-    for (unsigned target = 0; target < 8; ++target)
+    for (unsigned target = 0; target < target_count; ++target)
         blend.RenderTarget[target].RenderTargetWriteMask &= masks.mask[target];
+    return true;
 }
 }  // namespace x2w_startup

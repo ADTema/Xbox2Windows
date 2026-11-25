@@ -1250,7 +1250,10 @@ These are measured on one executable; treat them as hypotheses for others.
   there (#1674). `gfx2hlsl.py` records the written channels per target and writes
   `wmask <target> 0x<mask>` to the manifest when an export leaves any channel unwritten. The draw
   path removes the other channels from that target's `RenderTargetWriteMask`
-  (`src/startup_stubs/export_write_mask.h`), expanding a shared blend state first. A compressed export
+  (`src/startup_stubs/export_write_mask.h`). It expands a shared blend state when active targets
+  need different masks. A shared logic operation with different masks is refused because D3D12
+  requires logic operations to use a shared blend state. Startup cache revision 7 invalidates older
+  zero-filled exports. A compressed export
   lowers when it writes whole binary16 pairs (channels 0–1, 2–3 or both). A compressed mask that is not
   a whole pair, an export of no channel, two exports of one target with different masks, a packed
   integer compressed export and a partial compressed export to a vertex output stay refused
