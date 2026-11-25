@@ -2731,6 +2731,13 @@ if(EXISTS "${INTAKE_PYTHON}")
 
     add_test(NAME startup_stream_request_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
         "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_check.py" "$<TARGET_FILE:startup_stream_consumer>")
+    # Device slot 67 compute pipelines publish req_<key>.{desc,sa,sb,data,root,c67}; the control (render mode off) must fail.
+    add_test(NAME startup_compute_request_warp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_request_check.py" "$<TARGET_FILE:startup_stream_consumer>")
+    add_test(NAME startup_compute_request_disabled_control COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_request_check.py" "$<TARGET_FILE:startup_stream_consumer>" disabled)
+    set_tests_properties(startup_compute_request_warp startup_compute_request_disabled_control PROPERTIES TIMEOUT 60)
+    set_tests_properties(startup_compute_request_disabled_control PROPERTIES PASS_REGULAR_EXPRESSION "FAIL: no compute request")
     foreach(backend IN ITEMS warp hardware)
         add_test(NAME startup_stream_draw_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_draw_check.py"
@@ -2865,6 +2872,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Startup shader translator: read-only census of every refusal site (--refusals).
     add_test(NAME startup_gfx2hlsl_refusals COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_refusals_check.py")
+    # Device slot 67 compute requests offline: key vector, --pending and --refusals (pure Python).
+    add_test(NAME startup_compute_request_offline COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_request_offline_check.py")
     # Partial colour exports carry their channel mask to the manifest; compressed exports of whole pairs lower (#1674).
     add_test(NAME startup_gfx2hlsl_export_mask COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_export_mask_check.py")
