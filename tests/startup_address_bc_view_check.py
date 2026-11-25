@@ -48,9 +48,11 @@ def source_block(x, y, tile_pitch, swapped):
 
 
 def expected_panels(rgba, width, height, tile_pitch):
-    """Four panels of 128x128 texels: views of the first, swapped, first (kept) and first backing."""
+    """Four panels of 128x128 texels. A partial view with a later row write reads as null."""
     image = bytearray(4 * WIDTH * 4 * HEIGHT)
     for panel, swapped in enumerate((0, 1, 1, 0)):
+        if panel == 3 and (width % 64 or height % 64):
+            continue
         for y in range(height):
             for x in range(width):
                 bx, by = source_block(x // 4, y // 4, tile_pitch, swapped)

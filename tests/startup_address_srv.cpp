@@ -168,6 +168,9 @@ int draw_bc_address_srvs(void* guest, void* list)
     for (LONG i = 0; i < 4; ++i) {
         v.address = addresses[i];
         invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+        // Keep the already-published descriptor while the backing changes to a row layout.
+        if (i == 3 && (width % 64 || height % 64))
+            x2w_d3d12_texture_written(backing[0].data(), backing[0].size());
         const D3D12_RECT region{i * LONG(panel), 0, (i + 1) * LONG(panel), LONG(panel)};
         invoke(list, 22, 1, ptr(&region));
         invoke(list, 12, 3, 1);
@@ -179,7 +182,7 @@ int draw_bc_address_srvs(void* guest, void* list)
         auto shape = desc;
         shape.Width = w;
         shape.Height = h;
-        v.address = ptr(backing[0].data());
+        v.address = ptr(backing[1].data());
         invoke(guest, 70, ptr(&shape), ptr(&v), cpu);
     };
     refused(width - 2, height);
@@ -203,11 +206,11 @@ int draw_bc_address_srvs(void* guest, void* list)
             invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
         }
         // Published first, then overwritten by an XG row copy: a second request is refused and leaves the
-        // destination naming the view it held before (the first backing's).
+        // destination naming the view it held before (the second backing's).
         alignas(4096) static std::array<char, 4 * tile> reused{};
         v.address = ptr(reused.data());
         invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
-        v.address = ptr(backing[0].data());
+        v.address = ptr(backing[1].data());
         invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
         v.address = ptr(reused.data());
         std::array<char, 32> written{};

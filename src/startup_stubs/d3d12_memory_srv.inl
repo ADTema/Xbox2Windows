@@ -168,6 +168,20 @@ struct TiledAddressTexture {
 std::unordered_map<Wrapper*, TiledAddressTexture> tiled_srv_textures;
 std::unordered_multimap<u64, Wrapper*> tiled_srv_addresses;
 
+bool partial_tiled_bc(const D3D12_RESOURCE_DESC& desc)
+{
+    return tiled_bc_srv(desc) && (desc.Width % 64 || desc.Height % 64);
+}
+
+bool latest_texture_write_is_rows(u64 address)
+{
+    AcquireSRWLockShared(&written_lock);
+    const auto found = written_textures().find(address);
+    const bool rows = found != written_textures().end() && found->second.desktop_rows;
+    ReleaseSRWLockShared(&written_lock);
+    return rows;
+}
+
 Wrapper* publish_tiled_texture(Wrapper* device, u64 address, const D3D12_RESOURCE_DESC& desc)
 {
     const auto bytes = x2w_startup::bc64::supports(desc) ? x2w_startup::bc64::Chain(desc).bytes() : x2w_startup::Bc16Surface(desc).size();
@@ -199,6 +213,10 @@ ID3D12Resource* sampled_address_texture(Wrapper* resource)
     if (!resource->own().tiled_address_srv) return static_cast<ID3D12Resource*>(resource->own().real);
     std::lock_guard lock(tiled_srv_mutex);
     auto& sampled = tiled_srv_textures.at(resource);
+    // An already-published token can outlive a write in a different layout.
+    if (partial_tiled_bc(sampled.desc) &&
+        latest_texture_write_is_rows(reinterpret_cast<u64>(resource->own().title_memory)))
+        return nullptr;
     if (!sampled.desktop) {
         const auto desc = sanitized(sampled.desc);
         const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
@@ -269,16 +287,12 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     // rows, or when its padded tiles run past the size the stand-in reported, which the title may not own.
     bool first = false;
     const char* held = nullptr;
-    if (tiled_bc_srv(*resource) && (resource->Width % 64 || resource->Height % 64)) {
+    if (partial_tiled_bc(*resource)) {
         {
             std::lock_guard lock(tiled_srv_mutex);
             first = !tiled_srv_addresses.count(input->address);
         }
-        AcquireSRWLockShared(&written_lock);
-        const auto found = written_textures().find(input->address);
-        const bool rows = found != written_textures().end() && found->second.desktop_rows;
-        ReleaseSRWLockShared(&written_lock);
-        if (rows) held = "partial_tile_xg_rows";
+        if (latest_texture_write_is_rows(input->address)) held = "partial_tile_xg_rows";
         else if (x2w_startup::Bc16Surface(*resource).size() > xg_reported_bytes(self, *resource))
             held = "partial_tile_beyond_xg_size";
     }

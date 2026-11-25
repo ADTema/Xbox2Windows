@@ -11805,8 +11805,9 @@ A view with a partial last tile stays refused in two cases. The first is when
 the last copy the XG stand-in announced to that address wrote desktop-footprint
 rows, not tiles, whether that copy came before the first publication there or
 after it. A copy from the opt-in BC7 4 KiB layout writes tiles and does not hold
-the view. A view published before such a row copy keeps its resource and reads
-the address as tiles; only new requests are refused.
+the view. A row copy leaves previously published descriptor bytes intact,
+and the translated sampler binds a null texture while the last write is a row
+copy. It can sample the view again after a tiled write is announced.
 The second is when the padded tiles are larger than the size the XG stand-in
 reports for the description (the desktop footprint rounded to 64 KiB): the
 bytes past that size may belong to something else, and a readability probe
@@ -11839,7 +11840,8 @@ for BC3 and 1,500 for BC7. The test also requires refusals for 98 by 68 and
 100 by 66 (not whole blocks), 1028 by 1028 (past the reported size) and a
 100 by 68 view over memory announced as an XG copy, and a second request for a
 100 by 68 address after a row copy over its published view; that request must
-leave the destination descriptor naming the view it held. It requires publication of
+leave the destination descriptor naming the view it held. A draw through the
+already-published token after a row write must read zero. The test requires publication of
 a 256 by 196 view, whose padded size equals the reported 64 KiB and whose width
 is whole tiles, and of a 100 by 68 view over memory announced by the opt-in BC7
 copy. Each of these changes makes the test fail: restoring the 64-texel check,
