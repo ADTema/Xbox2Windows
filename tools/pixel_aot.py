@@ -623,6 +623,8 @@ OPERANDLESS_HINTS = ("s_icache_inv", "s_ttracedata", "s_wakeup")
 # reads the one-bit TRAPSTS.MEM_VIOL field and compares the whole register with zero). The entry value of MODE is only
 # assumed, so the read is accepted once the program has itself written the field, and the result is that known value.
 HALF_ROUNDING = {"0": "nearest even", "3": "toward zero"}
+# s_round_mode immediates that keep binary32 at nearest even (MODE[1:0] = 0), mapped to the MODE[3:2] value they write.
+ROUND_MODE_ACCEPTED = {"0x0": 0, "0xc": 3}
 # Under round toward zero no rounding binary16 or binary64 form has a lowering. These two do not depend on the
 # mode: the widening is exact and the pack always truncates.
 HALF_ROUNDING_EXEMPT = ("v_cvt_f32_f16", "v_cvt_pkrtz_f16_f32")
@@ -3433,6 +3435,18 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError(f"Unsupported binary16 rounding mode: {line}")
             half_rounding = HALF_ROUNDING[value]
             mode_rounding = int(value)
+            continue
+        # s_round_mode (SOPP) writes all of MODE[3:0]: bits 1:0 are the binary32 rounding (FP_ROUND_MODE_SP) and bits
+        # 3:2 the binary16 and binary64 rounding. Binary32 is lowered as round to nearest even only, so the immediate
+        # must leave bits 1:0 at 0; bits 3:2 then act exactly as s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2) of the
+        # same value. LLVM 15 prints the SIMM16 in hex (0x0, 0xc), and only those two spellings are accepted.
+        if line == "s_round_mode" or line.startswith("s_round_mode "):
+            if not (m := match(r"s_round_mode (0x[0-9a-f]+)")):
+                raise ValueError(f"Malformed s_round_mode operand: {line}")
+            if m[1] not in ROUND_MODE_ACCEPTED:
+                raise ValueError(f"Unsupported rounding mode: {line}")
+            mode_rounding = ROUND_MODE_ACCEPTED[m[1]]
+            half_rounding = HALF_ROUNDING[str(mode_rounding)]
             continue
         # The register forms. The source SGPR is read, so it must be bound, resolved and defined on every path; the
         # shared check at the end of the loop is skipped by `continue`, hence the explicit test here. Neither form can
