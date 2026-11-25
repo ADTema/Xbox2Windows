@@ -54,10 +54,11 @@ class Probe(G.Stage):
         self.exec_known = True
 
 
-def translate(words):
+def translate(words, masks=()):
     decoded = G.decode(words)
     assert len(decoded) == 1 and decoded[0][1] == len(words), decoded
     stage = Probe()
+    stage.masks = set(masks)
     try:
         stage.one(decoded[0][2], decoded[0][3])
     except G.Unsupported as error:
@@ -124,6 +125,10 @@ refused = [translate(sop1(n, d, s))[0] for n in ('s_cmov_b32', 's_cmov_b64')
            for d, s in ((VCC_LO, 2), (EXEC_LO, 2), (4, VCC_LO), (4, EXEC_LO), (125, 2))]
 check('s_cmov refuses lane masks and the discard destination', all(r.startswith('refused: ') for r in refused),
       str(refused))
+halves = [translate(sop1('s_cmov_b64', d, s), {m})[0] for d, s, m in ((4, 2, 3), (4, 2, 5), (4, 2, 2), (4, 2, 4))]
+check('s_cmov_b64 refuses a lane mask held in either half of either pair',
+      all(r.startswith('refused: ') for r in halves), str(halves))
+check('s_cmov_b64 still moves pairs that hold no lane mask', not translate(sop1('s_cmov_b64', 4, 2), {7})[0].startswith('refused'))
 check('s_cmovk_i32 refuses a lane-mask destination', translate(sopk('s_cmovk_i32', VCC_LO, 1))[0].startswith('refused: '))
 
 if failures:

@@ -1012,8 +1012,12 @@ class Stage:
             raise Unsupported('%s destination %s' % (name, ops[0]))
         if pair and (not src or src[0] != 's' or src[1] > 105 or src[1] % 2 or src[1] == src[2]):
             raise Unsupported('%s source %s' % (name, ops[1]))
-        if self.is_lane_mask(ops[0]) or self.is_lane_mask(ops[1]) or (
-                src and src[0] == 's' and src[1] > 105):
+        # A pair holds two words: a lane mask in either half cannot be moved as a full 32-bit scalar.
+        halves = 2 if pair else 1
+        regs = [('s%d' % (dst[1] + i)) for i in range(halves)]
+        if src and src[0] == 's':
+            regs += [('s%d' % (src[1] + i)) for i in range(halves)]
+        if self.is_lane_mask(ops[0]) or self.is_lane_mask(ops[1]) or any(self.is_lane_mask(r) for r in regs):
             raise Unsupported('%s on a lane mask' % name)
         d = dst[1]
         low = ('s%d' % src[1]) if src and src[0] == 's' else ops[1]
