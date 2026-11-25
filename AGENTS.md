@@ -180,6 +180,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_archive_requests_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_refusals_check.py
 ./out/pe-env/bin/python -B tests/startup_compute_request_offline_check.py
+./out/pe-env/bin/python -B tests/startup_shader_cache_rekey_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_scalar_m0_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_waitcnt_depctr_check.py
 ./out/pe-env/bin/python -B tests/startup_mesh57_skeleton_check.py
