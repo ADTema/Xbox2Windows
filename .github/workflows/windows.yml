@@ -205,6 +205,8 @@ jobs:
             tests/startup_live_telemetry_check.py \
             tests/startup_gfx2hlsl_cvt_alu_check.py \
             tests/startup_gfx2hlsl_int_med3_check.py \
+            tests/startup_gfx2hlsl_cselect_mask_check.py \
+            tests/startup_gfx2hlsl_mask_overwrite_check.py \
             tests/startup_gfx2hlsl_capture_check.py \
             tests/startup_gfx2hlsl_watch_check.py \
             tests/startup_translator_check.py \
@@ -224,6 +226,7 @@ jobs:
             tests/startup_gfx2hlsl_sop2_complement_check.py \
             tests/startup_gfx2hlsl_f32_lg_check.py \
             tests/startup_gfx2hlsl_f32_nan_check.py \
+            tests/startup_gfx2hlsl_sopk_signext_check.py \
             tests/startup_inline_sampler_check.py \
             tests/startup_buffer_address_check.py \
             tests/startup_smem_address_check.py \

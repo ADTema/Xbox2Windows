@@ -164,6 +164,8 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sop2_complement_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sdwa_cvt_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_int_med3_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_cselect_mask_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_mask_overwrite_check.py
 ./out/pe-env/bin/python -B tests/startup_flat_param_check.py
 ./out/pe-env/bin/python -B tests/startup_inline_sampler_check.py
 ./out/pe-env/bin/python -B tests/startup_buffer_address_check.py
@@ -184,6 +186,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_vopc_sdwa_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_f32_lg_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_f32_nan_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sopk_signext_check.py
 ./out/pe-env/bin/python -B tests/run_checks_parallel_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_handler_arity_check.py
 ```

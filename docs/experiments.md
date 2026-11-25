@@ -5309,6 +5309,12 @@ ctest --preset dev --no-tests=error -R '^compute_store_aot_salu_absdiff_warp$' -
 
 The fixture in `tests/compute_store_check.py` (`SALU_I32`, `draw-salu_i32`) runs one group of 64 threads with `buffer_store_dwordx4` (256 output words plus 64 trailing `SENTINEL` words), combining `tid.x` with `s_add_i32` (`0x7fffffff + 1`, `+ 0x80000000`, `+ -15`), `s_sub_i32` (`0x80000000 - 1`, `5 - s18`, `- -10`), and `s_abs_i32` (`0x80000000`, `-15`, `17`, `0`), and compares all 320 words against an independent Python ISA model. Four reference controls (`INT_MIN` saturated to `0x7fffffff` at word 2, `s_sub_i32` sources swapped at word 1, `s_add_i32` saturated at word 0, and sentinel modified at word 256) and three recompiled-HLSL mutations (`abs` dropped on `0x80000000`, `sub` turned into `add`, `add` turned into `sub`) must all fail.
 
+#### Carry-out and carry-in vector add (`v_add_co_u32` / `v_add_co_ci_u32`)
+
+`v_add_co_u32 vD, sDst, S0, S1` (VOP3), `v_add_co_ci_u32_e32 vD, vcc_lo, S0, vS1, vcc_lo` (VOP2), and `v_add_co_ci_u32_e64 vD, sDst, S0, S1, sCarryIn` (VOP3) implement 64-bit unsigned addition across a wave32 lane mask. Per the RDNA2 ISA, `v_add_co_u32` computes `temp = (uint64)S0 + (uint64)S1`, storing `temp[31:0]` to `vD` and `(temp >> 32) & 1` per lane to `sDst` (`vcc_lo` or `s0..s105`), while `v_add_co_ci_u32` adds `carry_in[lane]` and writes the new carry-out bit. The carry SGPR is tracked as a per-lane `("carry", expr)` value rather than a uniform scalar word: any other reader (`s_*` ALU, `v_*` ALU, `v_cndmask`, or `s_and_saveexec_b32` guard) is refused, and writing `vcc_lo` clears any prior `v_cmp` guard state. Groups larger than 32 threads require `wave_size=32` because wave64 uses a 64-bit VCC. `clamp`, `omod`, source modifiers, unknown/pending sources, unverified carry-in operands, and destinations past `v255`/`s105` are refused.
+
+The `ADD_CO` fixture in `tests/compute_store_check.py` (`draw-add-co`, `compute_store_aot_add_co_${adapter}`) runs one 64-thread group with `wave_size=32` (`buffer_store_dwordx4`, 256 output words plus 64 `SENTINEL` words), exercising both `vcc_lo` (`v_add_co_u32` + `v_add_co_ci_u32_e32`) and SGPR `s4`/`s5` (`v_add_co_u32` + `v_add_co_ci_u32_e64`) across inputs that cross `2^32` on some lanes and not on others, and compares all 320 words against an independent Python model. Reference controls (carry dropped at word 65, carry inverted at word 1, `e64` carry-in ignored at word 131, sentinel modified at word 256) and recompiled-HLSL mutations (carry comparison flipped, `e64` carry-in zeroed) must all fail. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_add_co_(warp|hardware)$' -V`.
+
 ```powershell
 ctest --preset dev --no-tests=error -R '^compute_store_aot_salu_i32_(warp|hardware)$' -V
 ```
@@ -6439,6 +6445,12 @@ symbolic descriptors and reserved scalar encodings stay refused. [Refs #1996](ht
 one. Only the low five bits of the index are used. EXEC, VCC and SGPRs tracked
 as lane masks are refused because their per-lane projections lose the other
 bits. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_bitcmp$' -V`.
+
+**Scalar immediate comparisons.** The startup translator sign-extends the
+16-bit field of `s_movk_i32` and `s_cmpk_*_i32`, and zero-extends the field
+of `s_cmpk_*_u32`. The source-built check covers all six relations against
+both signed and unsigned references and rejects values outside the encoded
+range. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_sopk_signext$' -V`.
 The fixture evaluates the emitted expression on the CPU and checks both
 operand positions for mask refusal. It does not execute a GPU draw.
 
@@ -11652,6 +11664,26 @@ Tests: `startup_gfx2hlsl_cvt_alu_controls`, `startup_gfx2hlsl_cvt_alu_warp` and 
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_int_med3_controls$' -V
 ```
 
+## Startup translator: scalar select into the wave32 lane masks
+
+In wave32, `vcc_lo` and `exec_lo` hold the whole lane mask, and the generic scalar path in `tools/startup/gfx2hlsl.py` already writes them as `vcc` and `exec`. `s_cselect_b32` went through a separate select path that assumed an SGPR destination, so `s_cselect_b32 vcc_lo, -1, 0` stopped the translation with a `TypeError` instead of a lowering or an `Unsupported` refusal. The select path now writes the lane's bit of the selected word to `vcc` or `exec` for `vcc_lo` and `exec_lo` (an `exec_lo` write clears `exec_known`, as an `exec` write does), keeps the SGPR and `m0` destinations as before, and refuses any other destination with an `Unsupported` message.
+
+`tests/startup_gfx2hlsl_cselect_mask_check.py` decodes synthetic SOP2 words, evaluates the emitted select for both SCC values with the restricted evaluator of `startup_gfx2hlsl_bit_alu_check.py`, and checks that an unreduced select (the `& 1` removed) gives a different `vcc`. It also checks the SGPR and `m0` lines and the refusal of the null SGPR as a destination. On the translator before this change the first case raises the `TypeError`. Test: `startup_gfx2hlsl_cselect_mask_controls`. Not covered: a draw through a translated pipeline, and the guard that refuses exec writes behind a fetch call, which still accepts only the `exec` spelling.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_cselect_mask_controls$' -V
+```
+
+## Startup translator: lane-mask marks after a scalar overwrite
+
+`tools/startup/gfx2hlsl.py` records the SGPRs that hold a lane mask (a `v_cmp` destination, a saveexec copy) in `Stage.masks`, and lowers a scalar logic op with a mask source as a mask op whose result is the lane's bit. The generic scalar path cleared the mark when it wrote ordinary data into such a register, but the other scalar writers did not. After `v_cmp_eq_u32_e64 s6, v0, v1` and `s_buffer_load_dword s6, s[16:19], 0x0`, s6 holds a buffer word, yet `s_or_b32 s8, s6, s7` was lowered as `s8 = (s6 | s7) & 1;`. Every write through `set_s` now clears the mark, the writers of a mask mark the register again after the write, and `s_load` clears the mark on its destination registers, also in the forms that only record a descriptor symbol.
+
+`tests/startup_gfx2hlsl_mask_overwrite_check.py` writes a mask with a compare, overwrites it with an `s_buffer_load`, an `s_load` through a root pointer, an `s_load` of a descriptor or an `s_cselect_b32`, and evaluates the following `s_or_b32` on a buffer word with the restricted evaluator of `startup_gfx2hlsl_bit_alu_check.py`. Controls: without the overwrite the OR stays a mask OR, and a compare or a mask logic op after a load marks the register again. On the translator before this change seven checks fail (the mark stays and the OR is cut to bit 0). Test: `startup_gfx2hlsl_mask_overwrite_controls`. Not covered: a draw through a translated pipeline; the other symbol-only scalar writes (for example an `s_mov` of a descriptor) still keep a mark they find.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_mask_overwrite_controls$' -V
+```
+
 ## Startup translator: explicit-LOD image sampling
 
 `tools/startup/gfx2hlsl.py` now lowers the gfx1013 `image_sample_l` form of a 2D or 3D texture sample to `tex.SampleLevel(smp, uv, level)`. The level is the last address register: the third for a contiguous 2D address, the fourth for 3D, and the last element of an NSA list. `tests/startup_image_sample_l_check.py` translates source-built fixtures (the words are checked against `llvm-mc`) and requires the level to come from that register; an address list `[v0, v1, v3]` must use `v3`, not the third consecutive register. Replacing the level with 0, replacing the call with implicit `Sample`, or reading the third register in every form each make the check fail. Offset (`_o`), compare (`_c_l`), gather, 1D, array, cube and multisample dimensions, an empty `dmask`, and the `unorm`, `r128`, `tfe`, `lwe`, `a16` and `d16` modifiers or any set reserved MIMG bit are refused with an `Unsupported` message; only the cache-policy bits `glc`, `slc` and `dlc` are accepted because they do not change the sampled value. The disassembler previously read `lwe` from reserved bit 14 of word 0; `llvm-mc` (19, gfx1013) encodes it in bit 17, and the check now has one `llvm-mc`-built fixture per refused modifier plus patched reserved-bit fixtures. Not measured: no draw samples a mip level on WARP or hardware through this lowering, so the level selection is checked on the generated HLSL text only. [HLSL SampleLevel](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-to-samplelevel)
@@ -11913,11 +11945,32 @@ ctest --preset release --no-tests=error -R '^(startup_memory_srv_report|startup_
 
 The translated draw path can sample a read-only BC3_UNORM or BC7_UNORM SRV
 published through device slot 70 without a prior resource object. The tested
-layout is 0x105, 4 KiB standard non-XOR. Width and height must be multiples of
-64 texels, with one mip, one slice, and one sample. Each tile holds 16 by 16
-compressed blocks. The runtime copies the 16-byte blocks to their desktop
-footprint rows before uploading them. Ordinary placed R8 views and the XG
-BC7 layout probe retain their existing behavior.
+layout is 0x105, 4 KiB standard non-XOR. Width and height must be whole 4x4
+blocks, with one mip, one slice, and one sample. Each tile holds 16 by 16
+compressed blocks. A partial last tile column or row is padded to a whole tile,
+as AMD addrlib does for a single-mip thin surface (Mesa
+`5c142e46f3f6e752ed745fd48912ebb8fad67145`, `src/amd/addrlib/src/gfx10/gfx10addrlib.cpp`):
+`ComputeSurfaceInfoMacroTiled` aligns pitch and height to the block size, with
+no mip tail for one mip, and `ComputeSurfaceAddrFromCoordMacroTiled` takes a
+block's tile index as its block row times the tiles per padded pitch, plus its
+block column. The runtime copies the visible 16-byte blocks to their desktop
+footprint rows before uploading them. Ordinary placed R8 views and the XG BC7
+layout probe retain their existing behavior.
+
+A view with a partial last tile stays refused in two cases. The first is when
+the last copy the XG stand-in announced to that address wrote desktop-footprint
+rows, not tiles, whether that copy came before the first publication there or
+after it. A copy from the opt-in BC7 4 KiB layout writes tiles and does not hold
+the view. A row copy leaves previously published descriptor bytes intact,
+and the translated sampler binds a null texture while the last write is a row
+copy. It can sample the view again after a tiled write is announced.
+The second is when the padded tiles are larger than the size the XG stand-in
+reports for the description (the desktop footprint rounded to 64 KiB): the
+bytes past that size may belong to something else, and a readability probe
+cannot tell. For example, 1028 by 1028 pads to 1,183,744 bytes against a
+reported 1,179,648. The first publication at an address of a partial-tile view
+logs its size, format, tiled byte count, and how many of the first and last
+4 KiB are non-zero, with a hash; a refused one logs its reason instead.
 
 Keep the complete tiled guest allocation readable for the view's sampling
 lifetime. The producer stores the view identity in the title heap. The
@@ -11934,9 +11987,30 @@ RTX 4060 Laptop (32.0.16.1656) and WARP (10.0.26100.9818) each matched
 65,536 RGBA pixels per format. The swapped-tile control changed 16,384
 of 16,384 pixels for BC3 and 15,360 for BC7.
 
+The same test draws a 100 by 68 texture of each format from the same four
+tiles, whose last tile column and row are partial. The padding blocks hold
+distinct valid blocks; texels outside the texture must load as zero, and the
+log must report 16,384 tiled bytes. A reference that uses the tile pitch of the
+unpadded width (one tile instead of two) differs from the image in 1,600 pixels
+for BC3 and 1,500 for BC7. The test also requires refusals for 98 by 68 and
+100 by 66 (not whole blocks), 1028 by 1028 (past the reported size) and a
+100 by 68 view over memory announced as an XG copy, and a second request for a
+100 by 68 address after a row copy over its published view; that request must
+leave the destination descriptor naming the view it held. A draw through the
+already-published token after a row write must read zero. The test requires publication of
+a 256 by 196 view, whose padded size equals the reported 64 KiB and whose width
+is whole tiles, and of a 100 by 68 view over memory announced by the opt-in BC7
+copy. Each of these changes makes the test fail: restoring the 64-texel check,
+dropping the height check, requiring both dimensions to be partial, refusing at
+an equal size, dropping the announced-copy refusal, ignoring which copy was
+announced, or rounding the tile rows down in `Bc16Surface`. The last also fails
+`startup_bc7_4k_s`. On Windows 11 build
+26300 with the debug layer off, RTX 5090 (32.0.16.2135) and WARP
+(10.0.26100.10068) matched all 65,536 RGBA pixels per case.
+
 ```powershell
 cmake --build --preset release --target startup_stream_consumer startup_stub_consumer d3d12_xs_shim
-ctest --preset release --no-tests=error --output-on-failure -R '^(startup_address_(bc_view|srv)_(hardware|warp)|startup_xg_bc7_layout|bc7_tile_swizzle)$'
+ctest --preset release --no-tests=error --output-on-failure -R '^(startup_address_(bc_view|srv)_(hardware|warp)|startup_xg_bc7_layout|startup_bc7_4k_s|bc7_tile_swizzle)$'
 ```
 
 ### Six BC5/BC7 mips on a 64 KiB standard layout

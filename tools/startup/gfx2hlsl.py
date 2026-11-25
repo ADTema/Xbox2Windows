@@ -30,6 +30,24 @@ SDWA_SEL = {'BYTE_0': (0, 8), 'BYTE_1': (8, 8), 'BYTE_2': (16, 8), 'BYTE_3': (24
             'WORD_0': (0, 16), 'WORD_1': (16, 16), 'DWORD': (0, 32)}
 
 
+def sopk_imm(token, signed):
+    """The 32-bit word a SOPK 16-bit immediate stands for.
+
+    RDNA 2 ISA SOPK: s_movk_i32 and the s_cmpk_*_i32 forms use signext(SIMM16[15:0]) (LLVM s16imm); the s_cmpk_*_u32
+    forms use SIMM16[15:0] zero-extended (LLVM u16imm). The disassembler prints the field as unsigned hex."""
+    m = re.fullmatch(r'(-?)(?:0x([0-9a-f]+)|(\d+))', token)
+    if not m:
+        raise Unsupported('SOPK immediate %r' % token)
+    word = int(m.group(2), 16) if m.group(2) else int(m.group(3))
+    if m.group(1):
+        word = -word
+    if not (-0x8000 if signed else 0) <= word <= 0xffff:
+        raise Unsupported('SOPK immediate %r outside 16 bits' % token)
+    if signed:
+        word = ((word & 0xffff) ^ 0x8000) - 0x8000
+    return word & 0xffffffff
+
+
 def sdwa_source(word, sel, sext):
     """The uint expression a source selection reads out of a 32-bit register."""
     offset, width = SDWA_SEL[sel]
@@ -428,20 +446,29 @@ class Stage:
         return (tok in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi')
                 or bool(reg and reg[0] == 's' and reg[1] in self.masks))
 
+    @staticmethod
+    def split_neg(tok):
+        """(negated, operand) for the `-x` sign modifier and the `neg(x)` spelling of it."""
+        # LLVM prints a lone negation of a numeric operand as neg(c), so that `-1` is not read as the
+        # integer: it is the sign bit flipped, never an integer negation.
+        m = re.fullmatch(r'neg\((.+)\)', tok)
+        if m:
+            return True, m.group(1)
+        if tok.startswith('-') and not re.match(r'-[\d.]', tok):
+            return True, tok[1:]
+        return False, tok
+
     def u_src(self, tok):
         """uint expression for an integer-context source that the disassembler may print negated."""
         # In an integer instruction the `-` modifier is the source's sign bit flipped: the same bit
         # pattern a float negation produces. Only handlers that model it ask for this; other integer
         # sources keep using u(), so an unexpected negation stays a refusal rather than a silent flip.
-        if tok.startswith('-') and not re.match(r'-[\d.]', tok):
-            return '(%s ^ 0x80000000u)' % self.u(tok[1:])
-        return self.u(tok)
+        neg, tok = self.split_neg(tok)
+        return '(%s ^ 0x80000000u)' % self.u(tok) if neg else self.u(tok)
 
     def f(self, tok):
         """float expression, with the inline neg/abs operand modifiers."""
-        neg = False
-        if tok.startswith('-') and not re.match(r'-[\d.]', tok):
-            neg, tok = True, tok[1:]
+        neg, tok = self.split_neg(tok)
         absolute = tok.startswith('|') and tok.endswith('|')
         if absolute:
             tok = tok[1:-1]
@@ -515,7 +542,10 @@ class Stage:
         self.emit('scc = %s;' % expr)
 
     def set_s(self, n, expr, sym=None, scc=None, uniform=None):
-        """Assign scalar register n at run time and/or symbolically."""
+        """Assign scalar register n at run time and/or symbolically.
+
+        Any write ends n's life as a lane mask; a caller that writes a mask marks n again after this call.
+        The uniformity of expr is judged first, while a source that is n itself still has its old mark."""
         if self.tracks_uniformity() and (sym is None or sym[0] == 'const'):
             if uniform is None:
                 uniform = self.scalar_expr_uniform(expr)
@@ -523,6 +553,7 @@ class Stage:
                 self.varying_s.discard(n)
             else:
                 self.varying_s.add(n)
+        getattr(self, 'masks', set()).discard(n)  # unit probes build a Stage without __init__
         if sym is not None:
             self.sym[n] = sym
             if sym[0] != 'const':
@@ -772,6 +803,8 @@ class Stage:
 
     # scalar ALU with descriptor-word bookkeeping
     def scalar(self, base, ops):
+        if base == 's_movk_i32' and len(ops) != 2:
+            raise Unsupported('s_movk_i32 with %d operands, expected 2' % len(ops))
         text, scc = SCA[base]
         if base in SCC_UNMODELLED and self.tracks_uniformity():
             self.scc_uniform = False
@@ -784,6 +817,8 @@ class Stage:
             return ('s%d' % r[1]) if r and r[0] == 's' and r[1] != r[2] else tok
         srcs = [low(t) for t in srcs]
         dname = low(ops[0])
+        if base == 's_movk_i32':
+            srcs = [str(sopk_imm(srcs[0], True))]  # D.i32 = signext(SIMM16)
         shift_add = base in SHIFT_ADD
         word_complement = base in ('s_nand_b32', 's_nor_b32', 's_xnor_b32')
         word_pack = base == 's_pack_hh_b32_b16'
@@ -889,9 +924,6 @@ class Stage:
             return None
         if is_mask:
             expr = '(%s) & 1' % expr
-            self.masks.add(d)
-        else:
-            self.masks.discard(d)
         if base == 's_mov_b64':
             r = reg_range(ops[1])
             high = r[2] if r and r[1] != r[2] else None
@@ -900,6 +932,8 @@ class Stage:
             high_uniform = (self.tracks_uniformity() and high != d and
                             self.uniform_source(high_source))
         self.set_s(d, expr, scc=scc)
+        if is_mask:
+            self.masks.add(d)
         if pair and base != 's_mov_b64':
             self.set_s(d + 1, '0u')
         elif pair:
@@ -965,12 +999,17 @@ class Stage:
             self.sym.pop('m0', None)
             self.emit('m0 = %s;' % expr)
             return
-        if low[0] in ('exec', 'vcc'):
-            if low[0] == 'exec':
+        if low[0] in ('exec', 'vcc', 'exec_lo', 'vcc_lo'):
+            # In wave32, exec_lo and vcc_lo hold the whole lane mask, as the generic scalar path reads them.
+            mask = 'exec' if low[0].startswith('exec') else 'vcc'
+            if mask == 'exec':
                 self.exec_known = False
-            self.emit('%s = (%s) & 1;' % (low[0], expr))
+            self.emit('%s = (%s) & 1;' % (mask, expr))
             return
-        d = reg_range(low[0])[1]
+        r = reg_range(low[0])
+        if not r or r[0] != 's':
+            raise Unsupported('s_cselect into %s' % low[0])
+        d = r[1]
         self.set_s(d, '(%s) & 1' % expr if pair else expr)
         if pair:
             self.masks.add(d)
@@ -1000,6 +1039,9 @@ class Stage:
             raise Unsupported('s_load destination %s for %d dwords' % (ops[0], count))
         if not base or base[0] != 's' or base[2] - base[1] != 1 or base[2] > 105:
             raise Unsupported('s_load base %s' % ops[1])
+        # A loaded descriptor or word is not a lane mask; some forms below only record a symbol, not set_s.
+        for n in range(dst[1], dst[2] + 1):
+            getattr(self, 'masks', set()).discard(n)
         p = self.sym.get(base[1])
         if not p or p[0] != 'ptr':
             raise Unsupported('s_load through s%d holding %s' % (base[1], p))
@@ -1750,8 +1792,7 @@ class Stage:
             x, y = self.u(a), self.u(b)
         def word(tok):
             # A float source's word before its neg/abs modifiers, as f() reads them; they keep a NaN a NaN.
-            if tok.startswith('-') and not re.match(r'-[\d.]', tok):
-                tok = tok[1:]
+            tok = self.split_neg(tok)[1]
             if tok.startswith('|') and tok.endswith('|'):
                 tok = tok[1:-1]
             return self.u(tok)
@@ -1989,7 +2030,16 @@ for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt',
                 self.set_scc((cast % op).format(self.u(ops[0]), self.u(ops[1])))
             return handler
         setattr(Stage, 'op_s_cmp_%s_%s' % (_name, _typ), _make())
-        setattr(Stage, 'op_s_cmpk_%s_%s' % (_name, _typ), _make())
+    for _typ, _cast in (('i32', 'int({0}) %s int({1})'), ('u32', '{0} %s {1}')):
+        def _make_cmpk(op=_op, cast=_cast, signed=_typ == 'i32', name='s_cmpk_%s_%s' % (_name, _typ)):
+            def handler(self, ops, mods):
+                if len(ops) != 2:
+                    raise Unsupported('%s with %d operands, expected 2' % (name, len(ops)))
+                if mods:
+                    raise Unsupported('%s with modifiers' % name)
+                self.set_scc((cast % op).format(self.u(ops[0]), '0x%08xu' % sopk_imm(ops[1], signed)))
+            return handler
+        setattr(Stage, 'op_s_cmpk_%s_%s' % (_name, _typ), _make_cmpk())
 # s_bitcmp1_b32 / s_bitcmp0_b32: SCC = S0[S1[4:0]] == 1 / == 0.
 for _bit in (0, 1):
     def _make_bitcmp(bit=_bit):
