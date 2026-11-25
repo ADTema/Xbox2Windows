@@ -72,8 +72,9 @@ counts it in `x2w_d3d12_render_target_stats`. A depth handle in no descriptor he
 depth-stencil view, refuses the whole bind (also logged and counted), so nothing is drawn onto targets the
 title did not ask for. `ctest --preset release --no-tests=error -R "^startup_draw_depth_target_" -V` draws a
 near and a far triangle with a depth-tested stream pipeline and reads back the colour and the D32 depth
-values after the fence. With the view bound, the near triangle wins, depth is 0.25 where drawn, and the
-debug layer reports no message. With a zero handle, the far triangle overwrites and depth keeps its clear
+values after the fence. With the view bound, the near triangle wins and depth is 0.25 where drawn. The
+`_debug` test also requires no debug-layer message after the fence, and reports a skip (77) when the
+debug layer is not installed. With a zero handle, the far triangle overwrites and depth keeps its clear
 value. With an unknown handle, nothing is drawn. Each unresolved handle is counted once. The `_drop_control`
 draws the bound case with a zero handle and passes only when the intended colour and depth mismatch appears.
 
