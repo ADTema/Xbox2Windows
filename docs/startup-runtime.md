@@ -1226,6 +1226,14 @@ These are measured on one executable; treat them as hypotheses for others.
   integer form against an integer reference, and the draws on WARP and hardware check 16 x 16 pixels
   that a `v_cmpx_le_i32_sdwa` on a sign-extended byte keeps or discards, with translations that drop
   the select or `sext()` as failing controls. [#1906](https://github.com/R0Y00/Xbox2Windows/issues/1906)
+- **DPP quad pair broadcasts.** The four pair permutations of a pixel stage (`quad_perm:[1,1,3,3]`, `[0,0,2,2]`, `[2,3,2,3]`, `[0,1,0,1]`, with
+  `row_mask:0xf bank_mask:0xf`, and `bound_ctrl` since no source lane is disabled) lower on any VOP1 or VOP2 whose
+  first source is a VGPR. The four lanes of the quad are read with the shader model 6.0 `QuadReadLaneAt` and the lane `quad_perm` names is selected by the parity of `SV_Position`; a stage that uses it compiles with DXC `ps_6_0` (`X2W_DXC`), and the result goes through a scratch register so a second source naming the
+  same register keeps the pixel's own word. The form needs the four lanes of a quad to run together, as in a pixel
+  shader with helper lanes, proved by `s_wqm_b64 exec, exec` on the entry mask (a restored exact mask loses the proof): vertex stages, branches and a changed EXEC are refused, as are `row_*`, `wave_*`, partial masks and `fi`. Run
+  `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_dpp_pair"`: the controls model a quad on the CPU, and the
+  draws on WARP and hardware compare 16 x 16 pixels of every pattern with a reference written from the lane table,
+  with wrong-lane, own-lane, transposed-lane-index and permuted-second-source translations as failing controls.
 - **DPP quad broadcasts.** `quad_perm:[k,k,k,k]` for k = 0, 1, 2 or 3, with full `row_mask` and
   `bank_mask` and `bound_ctrl:1` or none, lowers on `v_mov_b32` and the VOP1/VOP2 float, integer and
   integer-to-float tables as one read of lane k of the quad, `QuadReadLaneAt`. The four lanes of a pixel
@@ -1233,8 +1241,7 @@ These are measured on one executable; treat them as hypotheses for others.
   stages that ran `s_wqm exec, exec` with EXEC unchanged since, so no lane of the quad is off; without that proof the broadcast is refused. `QuadReadLaneAt` is shader model
   6.0, so such a pixel stage compiles as `ps_6_0` with DXC (set `X2W_DXC`, or put `dxc.exe` in the Windows
   Kits `bin` folder or on `PATH`), and its vertex stage as `vs_6_0` too, because D3D12 rejects a pipeline
-  state that mixes DXBC and DXIL; every other pixel stage stays `ps_5_1` with FXC. Swaps, pair broadcasts,
-  row shifts, mirrors, DPP8, partial masks, `fi`, `bound_ctrl:0`, non-VGPR sources and vertex stages stay
+  state that mixes DXBC and DXIL; every other pixel stage stays `ps_5_1` with FXC. For single-lane broadcasts, row shifts, mirrors, DPP8, partial masks, `fi`, `bound_ctrl:0`, non-VGPR sources and vertex stages stay
   refused. Run `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_dpp_quad_broadcast"`: the controls
   check the translation and every refusal, and the draws on WARP and hardware compare all 256 pixels of two
   fixtures with a CPU reference, with wrong-lane and own-lane translations as failing controls.
