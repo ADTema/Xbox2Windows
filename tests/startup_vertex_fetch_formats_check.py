@@ -87,9 +87,10 @@ def reference(name, vertex, *, swap=False, shift=False, w_zero=False, unorm_pow2
 
 
 def compared(name):
-    """Per component, whether the readback rounds v * max (a UNORM field) or keeps the bits."""
+    """Return the integer readback scale for each normalized component."""
     _, _, _, bits, kind, count = FORMATS[name]
-    return [((1 << bits) - 1) if kind in ('unorm', 'snorm') and i < count else None for i in range(4)]
+    scale = {'unorm': (1 << bits) - 1, 'snorm': (1 << (bits - 1)) - 1}.get(kind)
+    return [scale if i < count else None for i in range(4)]
 
 
 def expected(name, **wrong):
