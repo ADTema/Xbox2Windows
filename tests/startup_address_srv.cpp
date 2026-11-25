@@ -368,7 +368,8 @@ int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
 // One-texel textures published by address (X2W_TEST_SINGLE_ELEMENT=2d or 3d), one 1x4 column per draw. The texel
 // sits at offset 0 of its memory whatever the layout field says. Before column 3 the column-2 texel is rewritten
 // without a new publication, then fifteen calls are refused; each names memory holding another texel, so any of
-// them taking the descriptor would change column 3.
+// them taking the descriptor would change column 3. Each refused call must also leave the destination's 32 bytes
+// (plain memory behind a view heap created without title memory) unchanged; the first that does not returns 60+.
 int draw_single_element_srvs(void* guest, void* list)
 {
     wchar_t mode[4]{};
@@ -412,11 +413,19 @@ int draw_single_element_srvs(void* guest, void* list)
     std::memcpy(memory[0], c, 4);  // rewritten, then published again at the same address
     publish(rgba, view_of(rgba, ptr(memory[0]))); draw(2);
     std::memcpy(memory[0], d, 4);  // rewritten without a new publication: column 3 must read it
+    unsigned char published[32];
+    std::memcpy(published, reinterpret_cast<const void*>(cpu), 32);
+    int refusals = 0, changed = 0;
+    const auto unchanged = [&] {
+        ++refusals;
+        if (!changed && std::memcmp(published, reinterpret_cast<const void*>(cpu), 32)) changed = refusals;
+    };
     const auto refuse = [&](auto edit) {
         auto desc = rgba;
         auto v = view_of(desc, ptr(memory[5]));
         edit(desc, v);
         publish(desc, v);
+        unchanged();
     };
     refuse([](auto& d, auto&) { d.Width = 2; });
     refuse([](auto& d, auto&) { d.MipLevels = 2; });
@@ -449,7 +458,10 @@ int draw_single_element_srvs(void* guest, void* list)
         FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(memory[6]), ptr(&written_buffer), D3D12_RESOURCE_STATE_COMMON, 0,
                                            ptr(&__uuidof(ID3D12Resource)), ptr(&uav[1]))))) return 48;
     publish(rgba, view_of(rgba, ptr(memory[4])));
+    unchanged();
     publish(rgba, view_of(rgba, ptr(memory[7])));
+    unchanged();
+    if (changed) return 60 + changed;
     draw(3);
     const auto bgra_desc = texel(DXGI_FORMAT_B8G8R8A8_UNORM, 0x100);
     publish(bgra_desc, view_of(bgra_desc, ptr(memory[2]))); draw(4);
