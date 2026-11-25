@@ -117,7 +117,10 @@ const char* run_lifetime(ID3D12Device* device, bool overwrite_live_range)
 
     const char* failure = nullptr;
     Submission sub_a, sub_b;
-    queue->Wait(gate.Get(), 1);
+    if (FAILED(queue->Wait(gate.Get(), 1))) {
+        CloseHandle(done_event);
+        return "queue wait";
+    }
     if (FAILED(submit_copy(device, queue.Get(), a, sub_a))) failure = "A submission";
     if (!failure && FAILED(queue->Signal(done.Get(), 1))) failure = "A signal";
 
@@ -136,15 +139,18 @@ const char* run_lifetime(ID3D12Device* device, bool overwrite_live_range)
         if (overwrite_live_range) std::memset(reinterpret_cast<void*>(a.cpu), kPayloadB, kPayloadBytes);
         if (FAILED(submit_copy(device, queue.Get(), b, sub_b))) failure = "B submission";
     }
-    if (!failure && FAILED(queue->Signal(done.Get(), 2))) failure = "B signal";
+    // Queue a drain point even if an earlier check failed before submitting B.
+    const HRESULT drain_signal = queue->Signal(done.Get(), 2);
+    if (!failure && FAILED(drain_signal)) failure = "queue drain signal";
 
     // The gate is still closed, so neither copy may have run.
     Sleep(50);
     if (!failure && done->GetCompletedValue() != 0) failure = "copy ran before the gate opened";
 
-    // Always open the gate and drain the queue so no resource is released under GPU work.
-    gate->Signal(1);
-    if (SUCCEEDED(done->SetEventOnCompletion(2, done_event))) {
+    // Release the queue even after a failed check. Wait only for a successfully queued signal.
+    const HRESULT opened = gate->Signal(1);
+    if (!failure && FAILED(opened)) failure = "gate signal";
+    if (SUCCEEDED(opened) && SUCCEEDED(drain_signal) && SUCCEEDED(done->SetEventOnCompletion(2, done_event))) {
         if (WaitForSingleObject(done_event, kWaitMs) != WAIT_OBJECT_0 && !failure) failure = "GPU completion timeout";
     } else if (!failure) {
         failure = "completion event";
