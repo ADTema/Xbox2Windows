@@ -348,8 +348,14 @@ UNIFORM_VALU = frozenset((
 ))
 
 
+# DPP quad_perm selections that exchange lanes of a 2x2 pixel quad (lane = 2 * y + x), with the SM 6.0 intrinsic.
+QUAD_SWAPS = {(1, 0, 3, 2): 'QuadReadAcrossX', (2, 3, 0, 1): 'QuadReadAcrossY', (3, 2, 1, 0): 'QuadReadAcrossDiagonal'}
+
+
 class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
+
+    needs_sm6 = False   # the lowering uses a shader model 6.0 intrinsic, so the stage cannot compile as 5.1
 
     def __init__(self, pipe, kind, code, refusals=None, decoded=None):
         self.pipe, self.kind = pipe, kind
@@ -701,6 +707,8 @@ class Stage:
             return ('branch', cond, int(ops[0].split('_')[1], 16))
         if base == 'exp':
             return self.export(asm)
+        if base.endswith('_dpp'):
+            return self.dpp(base[:-len('_dpp')], ops, mods)
         handler = getattr(self, 'op_' + base, None)
         if handler:
             return handler(ops, mods)
@@ -743,6 +751,45 @@ class Stage:
             # the root signature layout, while the descriptor table is supplied at draw time.
             raise Unsupported('%s requires descriptor FORMAT and DST_SEL' % base)
         raise Unsupported(base)
+
+    # VOP1/VOP2 with a DPP16 quad_perm source (AMD RDNA 2 ISA, "Data-Parallel Primitives"): lane i of
+    # each aligned group of four reads src0 from lane quad_perm[i] of that group. The three exchanges
+    # map onto the SM 6.0 quad intrinsics, which read the other lane of the 2x2 pixel quad and keep
+    # helper lanes active. Only a pixel stage at entry EXEC qualifies: the hardware returns 0 or the old
+    # value for a source lane whose EXEC bit is off, and the intrinsics have no such case. Broadcast
+    # and pair permutations, DPP8, row shifts, partial masks and source modifiers stay refused.
+    def dpp(self, base, ops, mods):
+        perm = None
+        for m in mods:
+            match = re.fullmatch(r'quad_perm:\[([0-3]),([0-3]),([0-3]),([0-3])\]', m)
+            if match and perm is None:
+                perm = tuple(int(x) for x in match.groups())
+            elif m not in ('row_mask:0xf', 'bank_mask:0xf', 'bound_ctrl:0', 'bound_ctrl:1'):
+                raise Unsupported('%s_dpp with %s' % (base, m))
+        intrinsic = QUAD_SWAPS.get(perm)
+        if not intrinsic:
+            raise Unsupported('%s_dpp quad_perm %s: only the swaps [1,0,3,2], [2,3,0,1] and [3,2,1,0] are lowered'
+                              % (base, perm))
+        if base == 'v_mov_b32':
+            arity, text, kind = 1, '{0}', 'u'
+        elif base in VEC_U:
+            (arity, text), kind = VEC_U[base], 'u'
+        elif base in VEC_F and base not in ('v_fmac_f32', 'v_mac_f32'):
+            (arity, text), kind = VEC_F[base], 'f'
+        else:
+            raise Unsupported('%s_dpp' % base)
+        if len(ops) != arity + 1 or any(not re.fullmatch(r'v\d+', o) for o in ops):
+            raise Unsupported('%s_dpp needs VGPR operands without modifiers' % base)
+        if (getattr(self, 'kind', None) != 'ps' or getattr(self, 'has_branches', True) or getattr(self, 'blocks', True)
+                or not getattr(self, 'exec_known', False)):
+            raise Unsupported('%s_dpp requires a straight-line pixel shader with entry EXEC' % base)
+        self.needs_sm6 = True
+        # src0 is the exchanged lane; a VOP2 src1 stays this lane's own register.
+        swapped = '%s(%s)' % (intrinsic, self.u(ops[1]))
+        args = [('F(%s)' % swapped) if kind == 'f' else swapped] + \
+               [self.f(o) if kind == 'f' else self.u(o) for o in ops[2:1 + arity]]
+        expr = text.format(*args)
+        self.set_v(reg_range(ops[0])[1], 'U(%s)' % expr if kind == 'f' else expr)
 
     # VOP1/VOP2 with sub-dword addressing: select the source fields, run the same operation, then place
     # the low bits of the result in the destination field. The integer forms reuse VEC_U unchanged,
@@ -2345,6 +2392,15 @@ def find_fxc():
     return shutil.which('fxc.exe')
 
 
+def find_dxc():
+    """The dxc.exe for a stage that needs shader model 6.0: X2W_DXC, then PATH; None when neither exists."""
+    configured = os.environ.get('X2W_DXC')
+    if configured and os.path.isfile(configured):
+        return configured
+    import shutil
+    return shutil.which('dxc.exe') or shutil.which('dxc')
+
+
 def has_bytecode(path):
     try:
         return os.path.isfile(path) and os.path.getsize(path) > 0
@@ -2375,14 +2431,28 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
         return message
     manifest_path = name + '.txt'
     write_manifest = True
+    # A quad intrinsic exists from shader model 6.0 only, and a pipeline does not mix DXBC and DXIL stages.
+    sm6 = any(getattr(getattr(pipe, stage, None), 'needs_sm6', False) for stage in ('vs', 'ps'))
+    if fxc and sm6:
+        compiler = find_dxc()
+        if compiler is None:
+            message = 'dxc not found (X2W_DXC=%s): a quad swap needs shader model 6.0' % os.environ.get('X2W_DXC', '<unset>')
+            open(name + '.fail', 'w').write(message + '\n')
+            return message
+        profiles = (('vs', 'vs_6_0'), ('ps', 'ps_6_0'))
+    else:
+        compiler, profiles = fxc, (('vs', 'vs_5_1'), ('ps', 'ps_5_1'))
     if fxc:
         import subprocess
         # An existing manifest can already point at these paths. Publish only bytecode from a successful pair.
         with tempfile.TemporaryDirectory(prefix='.fxc-', dir=out_dir) as staging:
-            for stage, profile in (('vs', 'vs_5_1'), ('ps', 'ps_5_1')):
+            for stage, profile in profiles:
                 bytecode = os.path.join(staging, stage + '.cso')
-                r = subprocess.run([fxc, '/nologo', '/T', profile, '/E', 'main', '/Fo', bytecode, name + '.%s.hlsl' % stage],
-                                   capture_output=True, text=True)
+                if sm6:
+                    command = [compiler, '-Gis', '-T', profile, '-E', 'main', '-Fo', bytecode, name + '.%s.hlsl' % stage]
+                else:
+                    command = [compiler, '/nologo', '/T', profile, '/E', 'main', '/Fo', bytecode, name + '.%s.hlsl' % stage]
+                r = subprocess.run(command, capture_output=True, text=True)
                 if r.returncode or not has_bytecode(bytecode):
                     detail = r.stderr.strip() or ('?' if r.returncode else 'no bytecode produced')
                     open(name + '.fail', 'w').write('fxc %s: %s\n' % (stage, detail[-2000:]))
