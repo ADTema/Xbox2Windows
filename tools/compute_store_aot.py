@@ -54,9 +54,15 @@ ALU = {
 # shift of src0 by src1[4:0].
 SALU = {
     "s_add_u32": "({0} + {1})",
+    # RDNA2 SOP2: temp.i64 = (int64)S0.i32 + (int64)S1.i32; D.i32 = temp.i32[31:0]; SCC = (temp.i64 != (int64)D.i32) ? 1 : 0 (unread).
+    "s_add_i32": "({0} + {1})",
     # |S0.i - S1.i| on the 32-bit wrapped difference, so 0x80000000 stays 0x80000000; SCC = result != 0, unread.
     "s_absdiff_i32": "asuint(abs(asint({0} - {1})))",
+    # RDNA2 SOP1: D.i32 = (S0.i32 < 0) ? -S0.i32 : S0.i32; SCC = (D.i32 != 0) ? 1 : 0 (unread). Wraps INT_MIN (0x80000000) to 0x80000000.
+    "s_abs_i32": "asuint(abs(asint({0})))",
     "s_sub_u32": "({0} - {1})",
+    # RDNA2 SOP2: temp.i64 = (int64)S0.i32 - (int64)S1.i32; D.i32 = temp.i32[31:0]; SCC = (temp.i64 != (int64)D.i32) ? 1 : 0 (unread).
+    "s_sub_i32": "({0} - {1})",
     "s_and_b32": "({0} & {1})",
     "s_or_b32": "({0} | {1})",
     "s_xor_b32": "({0} ^ {1})",
@@ -729,8 +735,11 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 if not -(1 << 31) <= value <= 0xffffffff:
                     raise ValueError("Invalid scalar immediate")
                 scalar[dst] = value & 0xffffffff
-        elif m := re.fullmatch(rf"(s_(?:add_u32|sub_u32|and_b32|or_b32|xor_b32|lshr_b32|absdiff_i32)) s(\d+), {SALU_SOURCE}, {SALU_SOURCE}",
-                               line):
+        elif m := (
+            re.fullmatch(rf"(s_(?:add_u32|add_i32|sub_u32|sub_i32|and_b32|or_b32|xor_b32|lshr_b32|absdiff_i32)) s(\d+), {SALU_SOURCE}, {SALU_SOURCE}",
+                         line)
+            or re.fullmatch(rf"(s_abs_i32) s(\d+), {SALU_SOURCE}", line)
+        ):
             op, dst = m[1], int(m[2])
             words = [alu_word(token, scalar, vector, pending) for token in m.groups()[2:]]
             if dst > 105 or dst in pending or None in words:
@@ -765,18 +774,40 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             else:
                 raise ValueError("Unverified active lane count wave size or group size")
         elif m := re.fullmatch(r"s_ff1_i32_(b32|b64) s(\d+), (\S+)", line):
-            # First active lane of a full wave: sD = ctz(exec_lo / exec); SCC is preserved. Outside a
-            # guarded region lane 0 of every wave is active for any group of at least 1 thread, and for
+            # exec/exec_lo: first active lane of a full wave. SCC is preserved. Outside a guarded
+            # region lane 0 of every wave is active for any group of at least 1 thread, and for
             # wave32 the high half of exec is 0, so the result folds to 0.
+            # Any other source must be a tracked data word (the same words scalar ALU accepts). The
+            # result is the index of the lowest set bit, or 0xffffffff when the source is 0. b64
+            # scans both halves of an even SGPR pair. SCC stays unmodelled.
             width, dst, src = m[1], int(m[2]), m[3]
             expected_src = "exec_lo" if width == "b32" else "exec"
+            expression = None
             if src != expected_src:
-                raise ValueError("Unsupported first active lane source: " + src)
+                if width == "b32" and re.fullmatch(r"s\d+", src):
+                    word = alu_word(src, scalar, vector, pending)
+                    if word is not None:
+                        expression = f"firstbitlow({hlsl_word(word)})"
+                elif width == "b64" and (pair := re.fullmatch(r"s\[(\d+):(\d+)\]", src)):
+                    lo, hi = int(pair[1]), int(pair[2])
+                    low = scalar.get(lo) if lo <= 105 and lo not in pending else None
+                    high = scalar.get(hi) if hi <= 105 and hi not in pending else None
+                    if lo % 2 == 0 and hi == lo + 1 and hi <= 105 and is_word(low) and is_word(high):
+                        lo_text, hi_text = hlsl_word(low), hlsl_word(high)
+                        expression = (f"({lo_text} != 0u ? firstbitlow({lo_text}) : "
+                                      f"({hi_text} != 0u ? 32u + firstbitlow({hi_text}) : 0xffffffffu))")
+                if expression is None:
+                    raise ValueError("Unsupported first active lane source: " + src)
             if dst in pending or dst > 105:
                 raise ValueError("Invalid scalar destination or pending load")
-            if guard is not None:
-                raise ValueError("First active lane inside guarded region")
-            scalar[dst] = 0
+            if src == expected_src:
+                if guard is not None:
+                    raise ValueError("First active lane inside guarded region")
+                scalar[dst] = 0
+            else:
+                if len(expression) > ALU_EXPRESSION_LIMIT:
+                    raise ValueError("ALU expression too large")
+                scalar[dst] = ("alu", expression)
         elif m := re.fullmatch(r"s_bitreplicate_b64_b32 s\[(\d+):(\d+)\], (\S+)", line):
             # Each source bit fills two adjacent bits of the pair: D[2i] = D[2i + 1] = S0[i]. With an immediate
             # source both halves are known words; the low one replicates bits 0-15 and the high one bits 16-31.

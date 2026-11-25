@@ -187,6 +187,7 @@ jobs:
             tests/xgameruntime_table_check.py \
             tests/docs_links_check.py \
             tests/bidi_controls_check.py \
+            tests/pixel_denorm_vulkan_check.py \
             tests/gpu_report_format_check.py \
             tests/hardware_reports_check.py \
             tests/rectlist_topology_check.py \
@@ -217,6 +218,7 @@ jobs:
             tests/startup_gfx2hlsl_swap_check.py \
             tests/startup_gfx2hlsl_shift64_check.py \
             tests/startup_gfx2hlsl_vopc_sdwa_check.py \
+            tests/startup_gfx2hlsl_sdwa_cvt_check.py \
             tests/startup_gfx2hlsl_sop2_complement_check.py \
             tests/startup_gfx2hlsl_f32_lg_check.py \
             tests/startup_gfx2hlsl_f32_nan_check.py \
