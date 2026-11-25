@@ -672,6 +672,27 @@ add_test(NAME startup_placed_buffer_range_region_only_control COMMAND startup_pl
 add_test(NAME startup_placed_buffer_range_walk_only_control COMMAND startup_placed_buffer_range_check --mutate walk-only)
 set_tests_properties(startup_placed_buffer_range_region_only_control startup_placed_buffer_range_walk_only_control
     PROPERTIES SKIP_RETURN_CODE 77)
+# CopyTextureRegion (list slot 16): the argument checks refuse what the desktop would reject
+# (src/startup_stubs/list_copy_texture.h). The mutated run is the negative control.
+add_executable(startup_list_copy_texture_check tests/startup_list_copy_texture_check.cpp)
+target_compile_features(startup_list_copy_texture_check PRIVATE cxx_std_17)
+target_include_directories(startup_list_copy_texture_check PRIVATE src)
+add_test(NAME startup_list_copy_texture COMMAND startup_list_copy_texture_check)
+add_test(NAME startup_list_copy_texture_overflow_control COMMAND startup_list_copy_texture_check --mutate overflow)
+set_tests_properties(startup_list_copy_texture_overflow_control PROPERTIES WILL_FAIL TRUE)
+add_test(NAME startup_list_copy_texture_slice_control COMMAND startup_list_copy_texture_check --mutate slice)
+set_tests_properties(startup_list_copy_texture_slice_control PROPERTIES WILL_FAIL TRUE)
+
+# The same call through the wrapped command list: two array slices round-trip, and an out-of-range subresource
+# or a format mismatch is refused before any desktop copy.
+add_executable(startup_list_copy_texture_warp tests/startup_list_copy_texture_warp.cpp)
+target_compile_features(startup_list_copy_texture_warp PRIVATE cxx_std_17)
+target_link_libraries(startup_list_copy_texture_warp PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_list_copy_texture_${backend} COMMAND startup_list_copy_texture_warp ${backend})
+    set_tests_properties(startup_list_copy_texture_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
+endforeach()
 add_executable(startup_storage_file_range tests/startup_storage_file_range.cpp)
 target_compile_features(startup_storage_file_range PRIVATE cxx_std_17)
 target_include_directories(startup_storage_file_range PRIVATE src)

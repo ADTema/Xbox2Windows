@@ -548,7 +548,7 @@ upload the stale title memory over the result; a list discarded by Reset or a fa
 and block-compressed). A resolve format is exact against a fully typed endpoint and only family-compatible with a
 typeless one; a typeless resolve format (or an unknown one over typeless endpoints) resolves as the family's typed
 choice: half float for `R16G16B16A16`, normalised for the 8-bit and 10-bit families. Calls on a closed list are ignored.
-These slots have not been seen in a title log yet. `CopyTextureRegion` (16) and `CopyTiles` (18) are not handled.
+These slots have not been seen in a title log yet. Slot 16 is described in [Command list CopyTextureRegion](#command-list-copytextureregion-list-slot-16). Slot 18 (`CopyTiles`) is not handled.
 `ctest -R '^startup_list_copy_validation'` runs the pure checks on any host; `startup_list_copy_{warp,hardware}` copies,
 resolves and reads back through the `x2w_d3d12_list_copy_stats` export.
 
@@ -2727,3 +2727,35 @@ and console layouts. On Windows 11 Build 26100 with an AMD Radeon RX 6600M (driv
 - `ctest --preset release --no-tests=error -R '^startup_memory_srv_(report|buffer|volume)$' -V`
 - `ctest --preset release --no-tests=error -R '^startup_memory_srv_(buffer|volume)_.*_control$' -V`
 - `ctest --preset release --no-tests=error -R '^startup_address_(srv|buffer_srv|volume_srv)_' -V`
+
+## Command list CopyTextureRegion (list slot 16)
+
+Command list slot 16, `CopyTextureRegion`, maps each location's resource to its desktop resource, checks the
+call, and forwards it only when the desktop would accept it. A refused call is counted and logged
+(`x2w-d3d12 CopyTextureRegion refused: <reason>`), not forwarded. Capability, measured on the portable
+check only:
+
+- Argument checks (`src/startup_stubs/list_copy_texture.h`): footprint on both sides, empty or inverted box,
+  source and destination bounds, row pitch (multiple of 256), offset (multiple of 512), footprint end inside
+  the buffer (includes the destination origin, the source box origin and the footprint-height slice stride),
+  block alignment, every multiply and add in the footprint arithmetic checked for wrapping.
+- Subresource index: `mip + slice * mips + plane * mips * array_size` must lie inside the resource's
+  `mips * array_size * planes`; a mip-only modulo would read an out-of-range slice as mip 0
+  (`bad_subresource`). A planar format (more than one plane) is refused (`planar_unsupported`).
+- The two sides must name the same format (`format_mismatch`) and the same sample count
+  (`sample_mismatch`). Multisampled and single-plane depth-stencil copies require equally sized whole
+  subresources, destination origin 0 and a null source box (`partial_multisample`, `partial_depth_stencil`).
+  Buffer footprints are single-sample, so a multisampled texture and a buffer are refused.
+- Upload and readback footprint buffers keep their fixed heap states and get no barrier; an upload buffer as
+  destination or a readback buffer as source is refused (`bad_heap`).
+- A source or destination texture is brought up to date from its guest backing (`upload_texture`) before the
+  copy, so a later first sample does not replace the copied texels. A copied (non-aliased) source buffer is
+  refused (`stale_source`).
+- Two subresources of one resource are refused (`same_resource`): resource states are tracked per resource.
+
+Wrapped-list readback (`tests/startup_list_copy_texture_warp.cpp`): two images round-trip through array
+slices 1 and 2 of a 2-mip, 3-slice texture (upload buffer, texture, readback buffer, byte-for-byte), and a
+list with an out-of-range subresource, an index of `0xffffffff` and a footprint format mismatch is refused
+before any desktop copy, leaving a sentinel-filled readback buffer unchanged. Reproduce the portable check
+with its negative controls and the WARP and hardware runs with
+`ctest --preset dev --no-tests=error -R '^startup_list_copy_texture' -V`.

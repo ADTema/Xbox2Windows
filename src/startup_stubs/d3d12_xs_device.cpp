@@ -3310,6 +3310,7 @@ bool console_layout_srv(const D3D12_RESOURCE_DESC& desc);
 #include "startup_stubs/d3d12_draw.inl"
 #include "startup_stubs/mesh86_cache.inl"
 #include "startup_stubs/d3d12_compute_binding_trace.inl"
+#include "startup_stubs/list_copy_texture.inl"
 
 // Queue slot 10, desktop ExecuteCommandLists(count, lists).
 void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
@@ -4933,6 +4934,7 @@ void build_tables()
         list_typed[139] = reinterpret_cast<ListTyped>(&list_reset);
         list_typed[148] = reinterpret_cast<ListTyped>(&list_allocate_upload);
         list_typed[12] = reinterpret_cast<ListTyped>(&list_draw);
+        list_typed[16] = reinterpret_cast<ListTyped>(&list_copy_texture);
         list_typed[20] = reinterpret_cast<ListTyped>(&list_topology);
         list_typed[21] = reinterpret_cast<ListTyped>(&list_viewports);
         list_typed[22] = reinterpret_cast<ListTyped>(&list_scissors);
