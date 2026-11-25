@@ -1358,11 +1358,23 @@ These are measured on one executable; treat them as hypotheses for others.
   zero-valued entry constant so optimized FXC keeps denormal bit patterns. UNORM outputs still
   undergo float-to-UNORM conversion. Packed integer exports and other integer formats remain
   unsupported by this path.
+- A colour export that leaves channels `off` does not write them, so the target keeps what it held
+  there (#1674). `gfx2hlsl.py` records the written channels per target and writes
+  `wmask <target> 0x<mask>` to the manifest when an export leaves any channel unwritten. The draw
+  path removes the other channels from that target's `RenderTargetWriteMask`
+  (`src/startup_stubs/export_write_mask.h`). It expands a shared blend state when active targets
+  need different masks. A shared logic operation with different masks is refused because D3D12
+  requires logic operations to use a shared blend state. Startup cache revision 7 invalidates older
+  zero-filled exports. A compressed export
+  lowers when it writes whole binary16 pairs (channels 0–1, 2–3 or both). A compressed mask that is not
+  a whole pair, an export of no channel, two exports of one target with different masks, a packed
+  integer compressed export and a partial compressed export to a vertex output stay refused
+  (`ctest --preset release --no-tests=error -R "^startup_(gfx2hlsl_)?export_(write_)?mask"`).
 - Colour-blend registers reach the draw path for pipelines created through device slot 57 only
   (#1216): state block A holds the eight `CB_BLENDn_CONTROL` words at +0xD0, and
   `src/startup_stubs/state_block_blend.h` decodes them into the translated pipeline's blend
-  state. `CB_TARGET_MASK` is not located, so all four channels are written; no fixture covers a
-  write mask on this path. A word the decoder refuses for any of the eight targets leaves the
+  state. `CB_TARGET_MASK` is not located, so all four channels are written unless the translated
+  export leaves some unwritten (manifest `wmask`, above). A word the decoder refuses for any of the eight targets leaves the
   registers unused: the pipeline keeps the path it had before and the refusal is logged. No target
   is drawn unblended in place of a refused word
   (`ctest --preset release --no-tests=error -R "^startup_state_block_blend$"`).
