@@ -114,6 +114,11 @@ F32_HELPERS = {
     name: f"uint f32_{name}(uint a, uint b) {{ precise float r = asfloat(a) {op} asfloat(b); return asuint(r); }}\n"
     for name, op in (("add", "+"), ("sub", "-"), ("mul", "*"))
 }
+# v_mac_f32_{e32,e64} D, S0, S1 (VOP2 0x1f): D.f = S0.f * S1.f + D.f (unfused: product rounds to binary32 before add).
+F32_HELPERS["mac"] = (
+    "uint f32_mac(uint a, uint b, uint c) { precise float p = asfloat(a) * asfloat(b); "
+    "precise float r = p + asfloat(c); return asuint(r); }\n"
+)
 # v_cvt_u32_f32_e32 D, S0 (VOP1 opcode 0x06 of the RDNA 2 ISA guide):
 #   if (isnan(S0.f)) D.u = 0;
 #   else if (S0.f <= 0.0) D.u = 0;
@@ -1734,6 +1739,18 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             if dst > 255 or None in words:
                 raise ValueError("Unverified float operand")
             expression = FALU[op].format(*map(hlsl_word, words))
+            if len(expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            vector[dst] = ("alu", expression)
+        elif ((m := re.fullmatch(rf"v_mac_f32_e32 v(\d+), {FLOAT_SOURCE}, (v\d+)", line))
+              or (m := re.fullmatch(rf"v_mac_f32_e64 v(\d+), {FLOAT_SOURCE}, {FLOAT_SOURCE}", line))):
+            dst = int(m[1])
+            if dst > 255:
+                raise ValueError("Invalid vector destination")
+            words = [float_word(token, scalar, vector, pending) for token in (*m.groups()[1:], f"v{dst}")]
+            if None in words:
+                raise ValueError("Unverified float operand")
+            expression = f"f32_mac({', '.join(map(hlsl_word, words))})"
             if len(expression) > ALU_EXPRESSION_LIMIT:
                 raise ValueError("ALU expression too large")
             vector[dst] = ("alu", expression)
