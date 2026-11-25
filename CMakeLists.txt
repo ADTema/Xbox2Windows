@@ -885,6 +885,16 @@ foreach(backend IN ITEMS warp hardware)
     set_tests_properties(startup_upload_arena_${backend} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 endforeach()
 
+# Upload arena payloads must survive an arena reset while the GPU waits on a fence (Refs #1758).
+add_executable(startup_upload_lifetime tests/startup_upload_lifetime.cpp)
+target_compile_features(startup_upload_lifetime PRIVATE cxx_std_17)
+target_include_directories(startup_upload_lifetime PRIVATE src)
+target_link_libraries(startup_upload_lifetime PRIVATE d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_upload_lifetime_${backend} COMMAND startup_upload_lifetime ${backend})
+    set_tests_properties(startup_upload_lifetime_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+endforeach()
+
 # GPU writes the dispatch record that the desktop command processor consumes (Refs #1412).
 add_executable(startup_indirect_dispatch tests/startup_indirect_dispatch.cpp tests/desktop_gpu.cpp)
 target_compile_features(startup_indirect_dispatch PRIVATE cxx_std_17)
