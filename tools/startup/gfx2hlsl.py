@@ -906,6 +906,8 @@ class Stage:
         return None
 
     def op_s_and_saveexec_b64(self, ops, mods, text='exec & {0}'):
+        if len(ops) != 2:
+            raise Unsupported('saveexec with %d operands, expected 2' % len(ops))
         dst = reg_range(ops[0])
         if not dst or dst[0] != 's':
             raise Unsupported('saveexec destination %s' % ops[0])
@@ -929,6 +931,8 @@ class Stage:
         self.op_s_and_saveexec_b64(ops, mods, '{0} & ~exec')
 
     def op_s_andn2_wrexec_b64(self, ops, mods):
+        if len(ops) != 2:
+            raise Unsupported('wrexec with %d operands, expected 2' % len(ops))
         dst = reg_range(ops[0])
         if not dst or dst[0] != 's':
             raise Unsupported('wrexec destination %s' % ops[0])
@@ -950,6 +954,8 @@ class Stage:
         self.scalar_select(ops, True)
 
     def scalar_select(self, ops, pair):
+        if len(ops) != 3:
+            raise Unsupported('scalar select with %d operands, expected 3' % len(ops))
         low = [('s%d' % reg_range(t)[1]) if reg_range(t) and reg_range(t)[0] == 's' else t for t in ops]
         if pair and 'm0' in low:
             raise Unsupported('64-bit scalar operand m0')
@@ -1973,8 +1979,12 @@ SCA = {
 SHIFT_ADD = {'s_lshl1_add_u32': 1, 's_lshl2_add_u32': 2, 's_lshl3_add_u32': 3, 's_lshl4_add_u32': 4}
 for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt', '<'), ('le', '<=')):
     for _typ, _cast in (('i32', 'int({0}) %s int({1})'), ('u32', '{0} %s {1}')):
-        def _make(op=_op, cast=_cast):
+        def _make(op=_op, cast=_cast, name='s_cmp_%s_%s' % (_name, _typ)):
             def handler(self, ops, mods):
+                # A scalar compare reads exactly two sources; refusing any other count keeps a malformed
+                # instruction a refusal rather than an index error in the batch translator.
+                if len(ops) != 2:
+                    raise Unsupported('%s with %d operands, expected 2' % (name, len(ops)))
                 self.set_scc((cast % op).format(self.u(ops[0]), self.u(ops[1])))
             return handler
         setattr(Stage, 'op_s_cmp_%s_%s' % (_name, _typ), _make())
