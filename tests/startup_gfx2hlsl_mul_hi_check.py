@@ -95,20 +95,19 @@ def eval_emitted_helper(ps_text):
     m = re.search(r'uint mul_hi_u32\(uint a, uint b\) \{ (.*?) \}', ps_text)
     assert m, 'mul_hi_u32 helper missing from generated HLSL'
     body = m.group(1)
-    m_vars = re.match(r'uint al = ([^,]+), bl = ([^,]+), m = ([^;]+); return ([^;]+);$', body)
+    m_vars = re.match(r'uint la = ([^,]+), lb = ([^;]+); uint middle = ([^;]+); return ([^;]+);$', body)
     assert m_vars, body
-    al_e, bl_e, m_e, ret_e = (Expr(part) for part in m_vars.groups())
+    la_e, lb_e, middle_e, ret_e = (Expr(part) for part in m_vars.groups())
 
     def run(a, b):
         env = {'a': a & MASK, 'b': b & MASK}
-        env['al'] = al_e.run(env)[0]
-        env['bl'] = bl_e.run(env)[0]
-        env['m'] = m_e.run(env)[0]
+        env['la'] = la_e.run(env)[0]
+        env['lb'] = lb_e.run(env)[0]
+        env['middle'] = middle_e.run(env)[0]
         return ret_e.run(env)[0]
 
     return run
-
-
+  
 def controls():
     _, text = translate()
     found = re.findall(r'^\s*v(1[2-5]) = mul_hi_u32\(v(\d+), v(\d+)\);$', text, re.M)
