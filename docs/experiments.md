@@ -3497,6 +3497,21 @@ exercise the existing CPU wave model.
 
 ### Bounded runtime mesh geometry lowering
 
+The two-wave64 model follows each wave to `s_endpgm`. Section 4.3 of the
+[AMD RDNA 2 ISA](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
+specifies that later barriers wait for the remaining live waves. The static
+and runtime-geometry checks require both waves to meet at the same barrier PC
+while both are live. In the early-exit fixture both reach one barrier, wave 1
+branches to the exit, and wave 0 reaches two more barriers and emits geometry.
+Changing the branch to a different barrier makes the two live waves wait at
+different PCs and both lowerers refuse it. The triangle and quad draws below
+check 1,024 pixels each, including the area covered only by the second triangle.
+In the reverse order, wave 0 allocates 68 vertices and reaches the exit after
+exporting vertices 0–63. Wave 1 passes one more barrier and writes vertices
+64–67. The second triangle uses vertex 67 for its top-right corner. Giving
+it the position of vertex 2 collapses the triangle and changes 528 pixels.
+The CPU check also runs the waves in both host evaluation orders.
+
 [`tools/mesh_dynamic_aot.py`](../tools/mesh_dynamic_aot.py) emits one desktop
 mesh shader for a two-wave64 triangle entry. It splits runtime input cases
 at scalar equality tests and reruns the existing wave model for each case.
