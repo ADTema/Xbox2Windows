@@ -7424,7 +7424,9 @@ group. The second writer swaps the constants to `(7, 3)`. The cases are:
 - the two writers;
 - an omitted writer;
 - the unmapped, short-range and placeholder refusals from the rootless mode;
-- a guest compute root that lacks the constants.
+- a guest compute root that lacks the constants;
+- a record that starts 12 bytes before the buffer end, where only the Dispatch record would fit;
+- a signature whose stride has 4 spare bytes.
 
 ```powershell
 cmake --build --preset dev --target startup_indirect_dispatch
@@ -7438,13 +7440,17 @@ enabled, branch `runtime/indirect-root-constants` on top of `9383b531`:
   NVIDIA GeForce RTX 4090 (32.0.16.1088). All four tests passed, with no skips.
 - **Writers.** On both adapters, `(3, 7)` read back `0x31416b62` and
   `(7, 3)` read back `0x31418272`.
-- **Untouched result.** The omitted writer and all four refusals left
+- **Untouched result.** The omitted writer and all six refusals left
   `0x31415926`.
 - **Controls.** The upstream slot 41 and slot 61 code fails the first case
   with `0x31415926`. It refuses the signature as not a single rootless
   signature. A build without the root comparison also fails the root-mismatch
   case. On WARP the debug layer reports message 744, a root signature mismatch,
-  and on the RTX 4090 the consumer writes `0x31416b62`.
+  and on the RTX 4090 the consumer writes `0x31416b62`. A range check over
+  the Dispatch record alone executes the partial record. The desktop runtime
+  then fails the list's Close with `E_INVALIDARG` on both adapters. Accepting
+  a stride larger than the record executes the padded signature, and both
+  adapters write `0x31416b62`.
 - **Other indirect fixtures.** The rootless Dispatch, Draw, DrawIndexed and
   DispatchMesh tests still pass on both adapters.
 

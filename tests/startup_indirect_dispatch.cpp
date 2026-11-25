@@ -120,7 +120,9 @@ ComPtr<IUnknown> guest_pipeline(ID3D12Device* guest, ID3D12RootSignature* root)
     return result;
 }
 
-enum class Rejection { none, unmapped, short_range, placeholder, other_root };
+// partial_record (constants mode) starts the record 12 bytes before the buffer end: a Dispatch alone would fit,
+// the constants and Dispatch do not. padded_stride uses a constant signature whose stride has 4 spare bytes.
+enum class Rejection { none, unmapped, short_range, placeholder, other_root, partial_record, padded_stride };
 
 // `record` is what the writer stores after the padding word: (scale, bias) in the constants mode, then the groups.
 // The other-root control binds `other_guest_root`, which lacks the signature's constants.
@@ -189,7 +191,9 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* root, I
     list->SetComputeRootUnorderedAccessView(0, result->GetGPUVirtualAddress());
     using Execute = void (WINAPI*)(IUnknown*, IUnknown*, UINT, IUnknown*, UINT64, IUnknown*, UINT64);
     auto* argument = rejection == Rejection::unmapped ? nullptr : guest_arguments.Get();
-    const UINT64 offset = rejection == Rejection::short_range ? argument_bytes : argument_offset;
+    UINT64 offset = argument_offset;
+    if (rejection == Rejection::short_range) offset = argument_bytes;
+    if (rejection == Rejection::partial_record) offset = argument_bytes - sizeof(D3D12_DISPATCH_ARGUMENTS);
     slot<Execute>(guest_list.Get(), 61)(guest_list.Get(), signature, 1, argument, offset, nullptr, 0);
     transition(list, result.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     list->CopyBufferRegion(readback.Get(), argument_bytes, result.Get(), 0, result_bytes);
@@ -309,12 +313,18 @@ int main(int argc, char** argv) try
     const D3D12_COMMAND_SIGNATURE_DESC constant_signature_desc{
         2 * sizeof(UINT) + sizeof(D3D12_DISPATCH_ARGUMENTS), 2, constant_arguments, 0};
     ComPtr<ID3D12CommandSignature> signature;
+    ComPtr<ID3D12CommandSignature> padded;
     ComPtr<ID3D12CommandSignature> placeholder;
     ComPtr<ID3D12InfoQueue> info;
     if (debug) check(device.As(&info), "get debug message queue");
-    if (constants)
+    if (constants) {
         check(guest->CreateCommandSignature(&constant_signature_desc, guest_root.Get(), IID_PPV_ARGS(&signature)),
               "create guest root-constant command signature");
+        auto padded_desc = constant_signature_desc;
+        padded_desc.ByteStride += sizeof(UINT);
+        check(guest->CreateCommandSignature(&padded_desc, guest_root.Get(), IID_PPV_ARGS(&padded)),
+              "create padded root-constant command signature");
+    }
     else
         check(guest->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature)), "create guest command signature");
     // The desktop validation error during creation is expected. The guest call itself must be clean.
@@ -344,7 +354,9 @@ int main(int argc, char** argv) try
         !verify(writer.Get(), record, Rejection::unmapped, signature.Get()) ||
         !verify(writer.Get(), record, Rejection::short_range, signature.Get()) ||
         !verify(writer.Get(), record, Rejection::placeholder, placeholder.Get()) ||
-        (constants && !verify(writer.Get(), record, Rejection::other_root, signature.Get()))) return 1;
+        (constants && (!verify(writer.Get(), record, Rejection::other_root, signature.Get()) ||
+                       !verify(writer.Get(), record, Rejection::partial_record, signature.Get()) ||
+                       !verify(writer.Get(), record, Rejection::padded_stride, padded.Get())))) return 1;
     if (info) {
         for (UINT64 i = 0; i < info->GetNumStoredMessages(); ++i) {
             SIZE_T bytes = 0;
