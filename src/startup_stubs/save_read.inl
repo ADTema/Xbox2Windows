@@ -71,16 +71,20 @@ u64 containers(bool exact, u64* args)
     return 0;
 }
 
-// 18: EnumerateBlobInfo(container, context, callback), from one list_blobs call.
-u64 blobs(u64* args)
+// 18: EnumerateBlobInfo(container, context, callback); 19: EnumerateBlobInfoByName(container,
+// prefix, context, callback). One list_blobs call; the prefix matches case-insensitively, as the
+// store's Windows file names do.
+u64 blobs(u64* args, bool by_name)
 {
     const auto name = container_name(args[0]);
-    const auto callback = reinterpret_cast<bool(WINAPI*)(const BlobInfo*, void*)>(args[2]);
-    auto* context = reinterpret_cast<void*>(args[1]);
-    if (name.empty() || !callback) return e_invalidarg;
+    const auto callback = reinterpret_cast<bool(WINAPI*)(const BlobInfo*, void*)>(args[by_name ? 3 : 2]);
+    auto* context = reinterpret_cast<void*>(args[by_name ? 2 : 1]);
+    std::string prefix;
+    if (name.empty() || !callback || (by_name && args[1] && !read_save_name(args[1], prefix))) return e_invalidarg;
     std::vector<x2w_save::BlobEntry> entries;
     if (auto s = save_store().list_blobs(name, entries); s != x2w_save::Status::ok) return save_status(s);
     for (const auto& entry : entries) {
+        if (_strnicmp(entry.name.c_str(), prefix.c_str(), prefix.size()) != 0) continue;
         const BlobInfo info{entry.name.c_str(), static_cast<std::uint32_t>(entry.bytes)};
         if (!callback(&info, context)) break;
     }
@@ -148,7 +152,7 @@ bool save_read_call(int slot, u64* args, u64* result)
     try {
         switch (slot) {
         case 13: case 14: *result = save_read::containers(slot == 13, args); break;
-        case 18: *result = save_read::blobs(args); break;
+        case 18: case 19: *result = save_read::blobs(args, slot == 19); break;
         case 20: *result = save_read::read(args); break;
         default: return false;
         }

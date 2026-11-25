@@ -92,6 +92,11 @@ int read(Client& client, u64 p) {
         client.call(18, saved, address(&meta), address(&collect_blob)) || meta.names.size() != 2) return 4;
     std::sort(meta.names.begin(), meta.names.end());
     if (meta.names != std::vector<std::string>{"brightness","language"}) return 5;
+    // Slot 19 (by name prefix): only the matching blob, in either case; a success must call back.
+    Metadata by_prefix;
+    if (client.call(19, saved, address("LANG"), address(&by_prefix), address(&collect_blob)) ||
+        by_prefix.names != std::vector<std::string>{"language"} ||
+        by_prefix.required != sizeof(save_read::Blob) + 9 + language.size()) return 14;
     const char* names[]{meta.names[0].c_str(), meta.names[1].c_str()};
     std::vector<u64> words((meta.required + 7)/8 + 2, ~u64{});
     auto* records = reinterpret_cast<save_read::Blob*>(words.data() + 1);

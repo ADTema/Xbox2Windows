@@ -521,7 +521,7 @@ bool user_call(int slot, u64* args, u64* result)
 // Slot numbers follow the order of the public XGameSave.h (hypothesis, checked against the logged
 // argument shapes). Containers and blob writes are kept on disk (save_store.h, below
 // storage_path()/x2w-gamesave). For the verified public interface (see proxy_query), the
-// synchronous queries 13, 14, 18 and 20 return committed data (save_read.inl); other interface
+// synchronous queries 13, 14, 18, 19 and 20 return committed data (save_read.inl); other interface
 // revisions keep the empty results in save_call. Slots 21 and 22 read through the system XAsync
 // service (see async_read). The other asynchronous calls are completed by starting the real "add
 // default user silently" operation on the caller's async block: it fails quickly inside the
