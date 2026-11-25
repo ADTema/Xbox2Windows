@@ -483,9 +483,13 @@ close, next frame, frame buffers, pause, skip) are armed only with `--trace-call
 (`run.ps1 -TraceCalls`), because every hooked call stops the whole process under the debugger.
 Without it those calls are not written to `files.txt`, and the movie-player report at the end of
 `<log>.out` (call counts, movie header, frame buffers and the luma-plane PNG) is absent; with it both
-are as before. The summary states `call tracing: on` or `off`. `startup_debug` checks that a
-source-built DLL loaded under the movie-player module name is not hooked by default and that each of
-its 7 export calls is counted with `--trace-calls 1`.
+are as before. The call hooks are armed together with the file hooks, so with file tracing off
+(`--offline 0` without `--trace-files 1`) `--trace-calls 1` arms nothing. The summary states
+`call tracing: on`, `off`, or, in that case, that `--trace-calls 1` needs file tracing. The hooked
+exports are `RUNTIME_CALL_HOOKS` and `MOVIE_CALL_HOOKS` in `debug_launch.py`. `startup_debug` checks
+that its fixture's module and export are in that list, that a source-built DLL loaded under the
+movie-player module name is not hooked by default, that each of its 7 export calls is counted with
+`--trace-calls 1`, and that `--trace-calls 1` with file tracing off counts nothing and says why.
 
 A process that Windows creates under a debugger normally gets the debug heap: the loader sets the
 heap tail-check, free-check and parameter-validation flags and the low-fragmentation heap is not
