@@ -3426,8 +3426,12 @@ ctest --preset dev --no-tests=error -R '^mesh_lane_spill_cpu$' -V
 ```
 
 The profile rejects register-selected and out-of-range lanes, unwritten slots,
-and mixed VGPR use within the spill interval. The runtime geometry translator
-continues to refuse lane spills. Not measured: the fixture exercises the CPU interpreter only; no DXIL was compiled and nothing was drawn for this change.
+and mixed VGPR use within the spill interval, including a register range that
+covers the spill VGPR. Before this change the two instructions went through the
+per-lane vector path: they were refused when a lane was live, but under EXEC = 0
+they were skipped and the reload left its SGPR unwritten. The runtime geometry
+translator now refuses them explicitly. Not measured: the fixture exercises the
+CPU interpreter only; no DXIL was compiled and nothing was drawn.
 
 ## Amplification and mesh pipeline forms
 

@@ -83,6 +83,25 @@ def main():
         "v_readlane_b32 s12, v10, 3",
     ], "unwritten lane spill slot v10[3]")
 
+    # A register-range operand that covers the spill VGPR also counts as ordinary use.
+    wave = Wave(0, [])
+    try:
+        wave.run([(4 * i, line) for i, line in enumerate(
+            PREFIX + ["buffer_load_dwordx3 v[9:11], v0, s[16:19], 0 offen"] + READS + ["s_endpgm"])], {})
+    except (ValueError, KeyError):
+        pass
+    assert 10 in wave.spill_vector_uses, "register range over the spill VGPR not seen"
+
+    # The runtime geometry translator refuses lane spills even when no lane is live.
+    from mesh_dynamic_aot import Geometry, RuntimeWave
+    runtime = RuntimeWave(0, Geometry(1, ()))
+    try:
+        runtime.run([(0, "s_mov_b64 exec, 0"), (4, "v_writelane_b32 v10, s17, 3"), (8, "s_endpgm")], {})
+    except ValueError as error:
+        assert "Unsupported runtime mesh instruction v_writelane_b32" in str(error), str(error)
+    else:
+        raise AssertionError("RuntimeWave accepted a lane spill")
+
     wave = run([
         "s_mov_b32 s10, s17",
         "s_mov_b32 s11, 0",
