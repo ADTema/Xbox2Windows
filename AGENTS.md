@@ -176,6 +176,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/compute_alu_cmp_ne_check.py
 ./out/pe-env/bin/python -B tests/compute_entry_layout_check.py
 ./out/pe-env/bin/python -B tests/compute_alu_bcnt64_check.py
+./out/pe-env/bin/python -B tests/compute_load_format_check.py
 ./out/pe-env/bin/python -B tests/startup_ngg_slice_check.py
 ./out/pe-env/bin/python -B tests/mesh_dynamic_aot_check.py
 ./out/pe-env/bin/python -B tests/startup_image_gather_lz_check.py
