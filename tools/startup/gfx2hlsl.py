@@ -821,7 +821,7 @@ class Stage:
             srcs = [str(sopk_imm(srcs[0], True))]  # D.i32 = signext(SIMM16)
         shift_add = base in SHIFT_ADD
         word_complement = base in ('s_nand_b32', 's_nor_b32', 's_xnor_b32')
-        word_pack = base == 's_pack_hh_b32_b16'
+        word_pack = base in ('s_pack_hh_b32_b16', 's_sext_i32_i8', 's_sext_i32_i16')
         if shift_add or word_complement or word_pack:
             # The per-lane mask cannot supply the full word needed by these operations.
             if self.is_lane_mask(dname) or any(self.is_lane_mask(t) for t in srcs):
@@ -987,6 +987,46 @@ class Stage:
 
     def op_s_cselect_b64(self, ops, mods):
         self.scalar_select(ops, True)
+
+    def op_s_cmov_b32(self, ops, mods):
+        self.scalar_cmov(ops, mods, False)
+
+    def op_s_cmov_b64(self, ops, mods):
+        self.scalar_cmov(ops, mods, True)
+
+    def op_s_cmovk_i32(self, ops, mods):
+        # SOPK form: the 16-bit immediate is sign-extended to 32 bits.
+        if len(ops) != 2 or mods:
+            raise Unsupported('s_cmovk_i32 requires a destination and a 16-bit immediate')
+        value = sopk_imm(ops[1], True)
+        self.scalar_cmov([ops[0], '0x%x' % value], mods, False, 's_cmovk_i32')
+
+    def scalar_cmov(self, ops, mods, pair, name=None):
+        """D = SCC ? S0 : D on plain SGPR destinations; SCC is unchanged."""
+        name = name or 's_cmov_b%d' % (64 if pair else 32)
+        if len(ops) != 2 or mods:
+            raise Unsupported('%s requires two unmodified operands' % name)
+        dst, src = reg_range(ops[0]), reg_range(ops[1])
+        if not dst or dst[0] != 's' or dst[2] > 105 or dst[2] - dst[1] != int(pair) or (pair and dst[1] % 2):
+            raise Unsupported('%s destination %s' % (name, ops[0]))
+        if pair and (not src or src[0] != 's' or src[2] > 105 or src[1] % 2 or src[2] != src[1] + 1):
+            raise Unsupported('%s source %s' % (name, ops[1]))
+        # A pair holds two words: a lane mask in either half cannot be moved as a full 32-bit scalar.
+        halves = 2 if pair else 1
+        regs = [('s%d' % (dst[1] + i)) for i in range(halves)]
+        if src and src[0] == 's':
+            regs += [('s%d' % (src[1] + i)) for i in range(halves)]
+        if self.is_lane_mask(ops[0]) or self.is_lane_mask(ops[1]) or any(self.is_lane_mask(r) for r in regs):
+            raise Unsupported('%s on a lane mask' % name)
+        d = dst[1]
+        low = ('s%d' % src[1]) if src and src[0] == 's' else ops[1]
+        old = [self.S(d + i) for i in range(2 if pair else 1)]
+        new = [self.u(low)]
+        if pair:
+            new.append(self.S(src[1] + 1))
+        for i, (was, now) in enumerate(zip(old, new)):
+            self.set_s(d + i, 'scc ? %s : %s' % (now, was))
+        self.masks.discard(d)
 
     def scalar_select(self, ops, pair):
         if len(ops) != 3:
@@ -2010,6 +2050,9 @@ SCA = {
     's_min_i32': ('uint(min(int({0}), int({1})))', None), 's_max_i32': ('uint(max(int({0}), int({1})))', None),
     's_bfe_u32': ('({0} >> ({1} & 31)) & ((1u << (({1} >> 16) & 127)) - 1)', '$ != 0'),
     's_brev_b32': ('reversebits({0})', None),
+    # s_sext_i32_iN: sign-extend the low N bits of S0; SCC unchanged.
+    's_sext_i32_i8': ('uint(int({0} << 24) >> 24)', None),
+    's_sext_i32_i16': ('uint(int({0} << 16) >> 16)', None),
     's_pack_hh_b32_b16': ('({0} >> 16) | ({1} & 0xffff0000u)', None),
     # s_bfm_b32: a mask of S0[4:0] ones shifted left by S1[4:0]; SCC unchanged.
     's_bfm_b32': ('(((1u << ({0} & 31)) - 1) << ({1} & 31))', None),
