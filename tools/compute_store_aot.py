@@ -487,9 +487,10 @@ def descriptor_store_hlsl():
 def descriptor_load_hlsl():
     """One load function shared by every descriptor-format buffer_load_format opcode.
 
-    It returns the four result words of one load from the 4-byte-aligned t0 address. An unmatched format, fixed
-    bits other than the identity values, or an opcode that reads more channels than the format holds return 0 in
-    every component: the format unit's behaviour for those is not established here.
+    It returns the four result words of one load from the 4-byte-aligned t0 address and sets valid only when the
+    fixed bits are an identity value, the format is handled, and the opcode reads exactly the format's channels.
+    The format unit's results outside that are not established here, so lower() makes an invalid load suppress
+    every store of the invocation: no result is published, and zero data from a valid read stays distinguishable.
 
     Every conversion is integer arithmetic, so the result does not depend on the GPU's float division. UNORM is
     x / (2^n - 1) and SNORM16 is max(x / 32767, -1), rounded to nearest even binary32 by long division. FLOAT16
@@ -525,7 +526,7 @@ def descriptor_load_hlsl():
             if codes:
                 test = " || ".join(f"format == {code}u" for code in sorted(codes))
                 keyword = "if" if not arms else "else if"
-                arms.append(f"    {keyword} (({test}) && channels <= {channels}u) {bodies[kind]}")
+                arms.append(f"    {keyword} (({test}) && channels == {channels}u) {{ {bodies[kind]} valid = true; }}")
     return (
         "uint descriptor_ratio(uint x, uint d) {\n"
         "    // binary32 bits of x / d for 0 <= x <= d < 2^16, rounded to nearest even by long division.\n"
@@ -557,7 +558,8 @@ def descriptor_load_hlsl():
         "    uint top = firstbithigh(m);\n"
         "    return sign | ((top + 103u) << 23u) | ((m << (23u - top)) & 0x7fffffu);\n"
         "}\n"
-        "uint4 load_descriptor_format(uint formatWord, uint addr, uint channels) {\n"
+        "uint4 load_descriptor_format(uint formatWord, uint addr, uint channels, out bool valid) {\n"
+        "    valid = false;\n"
         f"    uint fixedBits = formatWord & {DESCRIPTOR_FIXED_MASK:#x}u;\n"
         f"    uint field = (formatWord >> {DESCRIPTOR_FORMAT_SHIFT}u) & {DESCRIPTOR_FORMAT_MASK:#x}u;\n"
         "    uint format = 0u;\n"
@@ -1873,9 +1875,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 raise ValueError("Unsupported read address")
             if descriptor_load is not None:
                 result = f"format_load_{format_load_index - 1}"
-                staged_steps.append((None, f"    uint4 {result} = load_descriptor_format("
+                staged_steps.append((None, f"    bool format_valid_{format_load_index - 1};\n"
+                                           f"    uint4 {result} = load_descriptor_format("
                                            f"{hlsl_word(('constant_word', descriptor_load))}, {addresses[0]}, "
-                                           f"{components}u);"))
+                                           f"{components}u, format_valid_{format_load_index - 1});"))
                 for reg in range(dst, dst + count):
                     vector.pop(reg, None)
                     loading[reg] = ("alu", f"{result}.{'xyzw'[reg - dst]}")
@@ -2341,6 +2344,11 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         raise ValueError("Unused buffer descriptor format constant")
     if load_format_words is not None and format_load_index != len(load_format_words):
         raise ValueError("Unused buffer load format constant")
+    if load_format_words is not None:
+        # Every load is staged before the stores. The format words are uniform constants, so an invalid
+        # format leaves the whole dispatch unwritten rather than publishing a placeholder result.
+        valid = " && ".join(f"format_valid_{index}" for index in range(len(load_format_words)))
+        staged_steps.append((None, f"    if (!({valid})) return;"))
     if not stores:
         raise ValueError("Expected at least one observable store")
     if guard is not None and guard["label"] is not None and not guard["at_label"]:

@@ -31,10 +31,18 @@ LOADS = (
     ("x", 32, 11, False, 72),     # 16_UINT
     ("x", 36, 12, False, 76),     # 16_SINT
     ("x", 40, 13, False, 80),     # 16_FLOAT
-    ("xyz", 44, 75, False, 84),   # 32_32_32_32_UINT, three of four channels
+    ("xyz", 44, 72, False, 84),   # 32_32_32_UINT
     ("xyz", 56, 74, True, 96),    # 32_32_32_FLOAT, legacy
     ("x", 68, 20, False, 108),    # 32_UINT
-    ("xy", 72, 22, False, 112),   # 32_FLOAT read as xy: wider than the format, so zeros
+    ("xy", 72, 64, False, 112),   # 32_32_FLOAT
+)
+# Format words that make one load invalid: load index, V# word 3. Each must leave every u0 word unwritten.
+IDENTITY_32_UINT = aot.descriptor_format_word(20)
+INVALID = (
+    ("unknown format 8_SNORM", 0, aot.DESCRIPTOR_GFX10_FIXED | (2 << 12)),
+    ("xyz opcode on a four-channel format", 10, aot.descriptor_format_word(75)),
+    ("xy opcode on a one-channel format", 13, aot.descriptor_format_word(22)),
+    ("non-identity DST_SEL", 12, IDENTITY_32_UINT ^ 1),
 )
 # Thread 0-3 t0 words: edge values per field. Threads 4-7 are pseudo-random.
 CURATED = (
@@ -113,12 +121,12 @@ def snorm16(half, *, clamp=True):
 
 
 def load(code, words, channels, *, wrong=()):
-    """Independent reference for one load: the definition of each format, from the t0 words at its offset."""
+    """Independent reference for one load: the definition of each format, from the t0 words at its offset.
+
+    The profile handles an opcode that reads exactly the format's channels; anything else is a refusal.
+    """
     _code, kind, format_channels = aot.decode_buffer_descriptor_format(aot.descriptor_format_word(code))
-    if channels > format_channels:
-        if "d3d fill" in wrong:
-            return [*load(code, words, format_channels), *([0, 0, 0, 0x3f800000][format_channels:channels])]
-        return [0] * channels
+    assert channels == format_channels, (code, channels)
     w = words[0]
     nu = dict(divisor=256) if "unorm divisor" in wrong else dict(truncate=True) if "unorm truncated" in wrong else {}
     half = (lambda h: (h & 0x8000) << 16 if "flush halves" in wrong and (h >> 10) & 31 == 0 else half_to_f32(h))
@@ -149,14 +157,17 @@ def load(code, words, channels, *, wrong=()):
     return result[:channels]
 
 
-def expected_words(groups, *, wrong=(), source=None):
+def expected_words(groups, *, wrong=(), source=None, placeholder=None):
+    """u0 after a valid dispatch. placeholder=(load index, words) publishes those words for that load instead."""
     source = source or source_words()
     words = [base.SENTINEL] * 320
     for thread in range(GROUP[0] * groups):
         index = thread + 1 if "neighbour element" in wrong else thread
         element = source[index * SOURCE_STRIDE // 4:(index + 1) * SOURCE_STRIDE // 4]
-        for suffix, src, code, legacy, dst in LOADS:
-            if legacy and "legacy ignored" in wrong:
+        for number, (suffix, src, code, legacy, dst) in enumerate(LOADS):
+            if placeholder and placeholder[0] == number:
+                values = placeholder[1](element[src // 4:])
+            elif legacy and "legacy ignored" in wrong:
                 values = [0] * len(suffix)
             else:
                 values = load(code, element[src // 4:], len(suffix), wrong=wrong)
@@ -200,26 +211,32 @@ def program():
 
 
 LINES, BINDING = program()
-FIRST_LOAD = "    uint4 format_load_0 = load_descriptor_format(params[0].x, tid.x * 80u + 0u, 4u);"
+FIRST_LOAD = ("    bool format_valid_0;\n"
+              "    uint4 format_load_0 = load_descriptor_format(params[0].x, tid.x * 80u + 0u, 4u, format_valid_0);")
 FIRST_STORE = ("    outputData.Store4(tid.x * 120u + 0u, uint4(format_load_0.x, format_load_0.y, format_load_0.z, "
                "format_load_0.w));")
-LAST_LOAD = "    uint4 format_load_13 = load_descriptor_format(params[3].y, tid.x * 80u + 72u, 2u);"
+LAST_LOAD = "    uint4 format_load_13 = load_descriptor_format(params[3].y, tid.x * 80u + 72u, 2u, format_valid_13);"
+REFUSE = "    if (!(" + " && ".join(f"format_valid_{i}" for i in range(len(LOADS))) + ")) return;"
 WRONG = (("UNORM divided by 2^n", ("unorm divisor",)), ("UNORM truncated", ("unorm truncated",)),
          ("SNORM without the clamp", ("snorm unclamped",)), ("SINT16 zero-extended", ("sint zero-extended",)),
          ("FLOAT16 halves swapped", ("swap halves",)), ("FLOAT16 denormals flushed", ("flush halves",)),
-         ("legacy format ignored", ("legacy ignored",)), ("wider opcode filled with (0, 0, 0, 1)", ("d3d fill",)),
-         ("neighbouring element", ("neighbour element",)))
+         ("legacy format ignored", ("legacy ignored",)), ("neighbouring element", ("neighbour element",)))
 FIXED = f"{aot.DESCRIPTOR_LEGACY_FIXED:#x}u"
+# label, old, new, and the run it must fail: None for the valid two-group run, else an INVALID index.
 MUTATIONS = (
-    ("ratio never rounds up", "    if ((bits & 1u) != 0u && (r != 0u || (result & 1u) != 0u)) ++result;\n", ""),
-    ("denormal halves flushed", "    if (m == 0u) return sign;\n", "    return sign;\n"),
+    ("ratio never rounds up", "    if ((bits & 1u) != 0u && (r != 0u || (result & 1u) != 0u)) ++result;\n", "", None),
+    ("denormal halves flushed", "    if (m == 0u) return sign;\n", "    return sign;\n", None),
     # Dropping the -1 clamp alone is not observable: the long division of 32768 by 32767 also gives 1.0.
-    ("SNORM sign dropped", "0x80000000u | descriptor_ratio(", "descriptor_ratio("),
-    ("SNORM divided by 32768", "descriptor_ratio((uint)value, 32767u)", "descriptor_ratio((uint)value, 32768u)"),
-    ("SINT16 zero-extended", "(uint)((int)(raw.x << 16u) >> 16u)", "(raw.x & 0xffffu)"),
-    ("legacy fixed bits ignored", f"}} else if (fixedBits == {FIXED}) {{", "} else if (false) {"),
-    ("wider opcode reads raw words", "format == 22u) && channels <= 1u)", "format == 22u) && channels <= 2u)"),
-    ("format word from params[0].y", "load_descriptor_format(params[0].x,", "load_descriptor_format(params[0].y,"),
+    ("SNORM sign dropped", "0x80000000u | descriptor_ratio(", "descriptor_ratio(", None),
+    ("SNORM divided by 32768", "descriptor_ratio((uint)value, 32767u)", "descriptor_ratio((uint)value, 32768u)", None),
+    ("SINT16 zero-extended", "(uint)((int)(raw.x << 16u) >> 16u)", "(raw.x & 0xffffu)", None),
+    ("legacy fixed bits ignored", f"}} else if (fixedBits == {FIXED}) {{", "} else if (false) {", None),
+    ("format word from params[0].y", "load_descriptor_format(params[0].x,", "load_descriptor_format(params[0].y,", None),
+    ("invalid loads still store", REFUSE, "", 0),
+    ("narrower opcode accepted", "format == 77u) && channels == 4u)", "format == 77u) && channels <= 4u)", 1),
+    ("wider opcode accepted", "format == 22u) && channels == 1u)", "format == 22u) && channels >= 1u)", 2),
+    ("selectors ignored", f"uint fixedBits = formatWord & {aot.DESCRIPTOR_FIXED_MASK:#x}u;",
+     f"uint fixedBits = formatWord & {aot.DESCRIPTOR_FIXED_MASK & ~0xfff:#x}u | 0xfacu;", 3),
 )
 
 
@@ -236,12 +253,17 @@ def controls():
     source = lower()
     lines = source.splitlines()
     assert source.count("= load_descriptor_format(") == len(LOADS)
-    assert FIRST_LOAD in lines and LAST_LOAD in lines and FIRST_STORE in lines, source
+    assert FIRST_LOAD in source and LAST_LOAD in lines and FIRST_STORE in lines and REFUSE in lines, source
     assert "outputData.Store(tid.x * 120u + 108u, format_load_12.x);" in source
     assert "outputData.Store2(tid.x * 120u + 112u, uint2(format_load_13.x, format_load_13.y));" in source
-    assert lines.index(FIRST_LOAD) < lines.index(FIRST_STORE)
+    # Every load and the refusal come before the first store.
+    assert lines.index(LAST_LOAD) < lines.index(REFUSE) < lines.index(FIRST_STORE)
+    assert "&& channels == 4u) {" in source and "channels <=" not in source and "valid = false;" in source
     # Without the load constants the profile keeps the gfx1030 caller-format path and refuses gfx1013.
     base.rejects("Unsupported formatted buffer read target or address mode", lower, load_format_constant=None)
+    for _name, old_lines, old_binding in base.mubuf_format_cases():
+        old = aot.lower(old_lines, 32, **old_binding)
+        assert "load_descriptor_format(" not in old and "inputData.Load" in old and " return;" not in old
     xyzw = LINES[12]
     assert xyzw == "buffer_load_format_xyzw v[10:13], v8, s[40:43], 0 idxen", xyzw
     wait = LINES.index("s_waitcnt lgkmcnt(0)", 7)
@@ -300,15 +322,31 @@ def draw(directory, compiler, renderer, backend):
         write(groups, expected_words(groups))
         if subprocess.run(cmd).returncode:
             return 1
-    # An unhandled format (8_SNORM) in place of the first load's returns zeros for that load only.
-    refused = constants()
-    refused[0] = aot.DESCRIPTOR_GFX10_FIXED | (2 << 12)
-    zeros = expected_words(1)
-    for thread in range(GROUP[0]):
-        zeros[thread * OUTPUT_STRIDE // 4:thread * OUTPUT_STRIDE // 4 + 4] = [0] * 4
-    write(1, zeros, refused)
-    if subprocess.run(cmd).returncode:
-        return 1
+
+    def invalid_formats(number):
+        formats = constants()
+        formats[INVALID[number][1]] = INVALID[number][2]
+        return formats
+
+    # Each invalid format must leave all of u0 at the sentinel, and so fail a reference that publishes
+    # placeholder words for that load: zeros, or the D3D (0, 0, 0, 1) fill for the wider opcode.
+    unwritten = [base.SENTINEL] * 320
+    zeros = (lambda channels: (lambda words: [0] * channels))
+    for number, (label, index, _word) in enumerate(INVALID):
+        print(f"{NAME}: refused {label}", flush=True)
+        write(2, unwritten, invalid_formats(number))
+        if subprocess.run(cmd).returncode:
+            return 1
+        channels = len(LOADS[index][0])
+        placeholders = [("published as zeros", zeros(channels))]
+        if number == 2:
+            placeholders.append(("published with the (0, 0, 0, 1) fill", lambda words: [words[0], 0]))
+        for what, values in placeholders:
+            published = expected_words(2, placeholder=(index, values))
+            write(2, published, invalid_formats(number))
+            bad = subprocess.run(cmd, capture_output=True, text=True)
+            if bad.returncode != 1 or f"word=0 expected={published[0]:08x} actual=c5c5c5c5" not in bad.stderr:
+                raise AssertionError(f"{NAME}: {label} {what} escaped detection\n{bad.stderr}")
     expected = expected_words(2)
     for label, wrong in WRONG:
         reference = expected_words(2, wrong=wrong)
@@ -319,18 +357,22 @@ def draw(directory, compiler, renderer, backend):
         bad = subprocess.run(cmd, capture_output=True, text=True)
         if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
             raise AssertionError(f"{NAME}: reference '{label}' escaped detection\n{bad.stderr}")
-    write(2, expected)
-    for label, old, new in MUTATIONS:
+    for label, old, new, run in MUTATIONS:
         mutated = source.replace(old, new, 1)
         if mutated == source:
             raise AssertionError(f"{NAME}: mutation '{label}' did not change the source")
+        if run is None:
+            write(2, expected)
+        else:
+            write(2, unwritten, invalid_formats(run))
         bad_src, bad_cso = directory / "mutated.hlsl", directory / "mutated.cso"
         bad_src.write_text(mutated, encoding="ascii")
         subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", bad_cso, bad_src], check=True)
         bad = subprocess.run([*cmd[:3], bad_cso, case], capture_output=True, text=True)
         if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
             raise AssertionError(f"{NAME}: mutation '{label}' escaped detection\n{bad.stderr}")
-    print(f"{NAME}: 3 dispatches, {len(WRONG)} wrong references and {len(MUTATIONS)} mutated sources checked")
+    print(f"{NAME}: {2 + len(INVALID)} dispatches, {len(WRONG) + len(INVALID) + 1} wrong references and "
+          f"{len(MUTATIONS)} mutated sources checked")
     return 0
 
 

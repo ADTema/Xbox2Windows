@@ -4980,13 +4980,30 @@ python3 -B tests/compute_store_check.py binary llvm-mc-15 llvm-objcopy-15 libLLV
 
 ### Descriptor-format buffer loads
 
-The gfx1013 compute store profile lowers `buffer_load_format_x`, `_xy`, `_xyz` and `_xyzw` through the t0 source binding. The format is read at run time from V# word 3. Repeat `--load-format-constant` once per formatted load, in program order. Each index names a ready `s_buffer_load` word of the constant descriptor. This is the first part of item A of #2022. The descriptor still comes from the static table offset (`--source-descriptor`, `--source-stride`), so a program that takes the descriptor from the heap at run time is still refused. The address is `idxen` only and 4-byte aligned, and four bytes per opcode channel must fit inside the stated stride. The `d16_` forms, `offen`, gfx1030 and `--source-format` stay refused with this flag.
+The gfx1013 compute store profile lowers `buffer_load_format_x`, `_xy`, `_xyz` and `_xyzw` through the t0 source binding. The format is read at run time from V# word 3. Repeat `--load-format-constant` once per formatted load, in program order. Each index names a ready `s_buffer_load` word of the constant descriptor.
+
+This is the format decoder of item A of #2022. The descriptor still comes from the static table offset (`--source-descriptor`, `--source-stride`). Taking the descriptor from the heap at run time is a separate slice, so this alone does not count as coverage of any application dispatch.
+
+The address is `idxen` only and 4-byte aligned, and four bytes per opcode channel must fit inside the stated stride. These stay refused with this flag:
+- the `d16_` forms;
+- `offen`;
+- gfx1030;
+- `--source-format`.
+
+The caller-format gfx1030 path and the static raw reads are unchanged.
 
 The fixed bits and the format set are those of the descriptor-format stores. The fixed bits must be the GFX10 identity `0x01000FAC` or the legacy identity `0x00000FAC`. The formats are:
 - 32-bit UINT and FLOAT, one to four channels;
 - `8_8_8_8_UNORM`, `16_16_UNORM` and `10_10_10_2_UNORM`;
 - `16_16_FLOAT` and `16_16_16_16_FLOAT`;
 - 16-bit UNORM, SNORM, UINT, SINT and FLOAT.
+
+A load is valid only when its opcode reads exactly the format's channel count. Each of these makes it invalid:
+- an unknown format;
+- other fixed bits, including a non-identity `DST_SEL`;
+- an opcode narrower or wider than the format.
+
+An invalid load publishes nothing. Every load is staged before the first store, and if any load of the program is invalid, the invocation returns before storing. The format words are uniform constants, so the whole dispatch leaves u0 unwritten. Zero data from a valid read therefore stays distinguishable from a refusal.
 
 The conversions are integer arithmetic, so the result does not depend on the GPU's float division:
 - UNORM is `x / (2^n - 1)`, rounded to nearest even binary32 by long division.
@@ -4996,39 +5013,41 @@ The conversions are integer arithmetic, so the result does not depend on the GPU
 
 Whether the RDNA buffer-format unit rounds the same way is not verified.
 
-An opcode that reads fewer channels than the format returns the first channels. Every component of the load is 0 for any of these:
-- an unknown format;
-- other fixed bits, including a non-identity `DST_SEL`;
-- an opcode that reads more channels than the format holds.
-
-D3D and Vulkan fill missing channels with (0, 0, 0, 1). I found no RDNA statement of what the format unit returns, so the zero result is a stated gap, not hardware behaviour.
-
-The fixture uses a group of four, an 80-byte t0 record and a 120-byte u0 record. It makes fourteen loads:
-- every format kind;
-- two legacy words;
-- an `xyz` read of a four-channel format;
-- an `xy` read of `32_FLOAT`.
+The fixture uses a group of four, an 80-byte t0 record and a 120-byte u0 record. It makes fourteen loads, one per format kind plus two legacy words, each with its matching opcode width.
 
 A `--compute-store-case` file may now end with 320 t0 words; without them, t0 keeps its generated words. Threads 0 to 3 carry edge values:
 - 0 and full scale, and `1/65535`;
 - -32768 and -32767;
-- FLOAT16 denormals, ±infinity, a quiet NaN with a payload, and -0.
+- FLOAT16 denormals, ±infinity, a quiet NaN with a payload, and -0;
+- all-zero fields.
 
-Threads 4 to 7 are pseudo-random. The expected words come from a Python model that rounds with `Fraction`. WARP and the hardware adapter compare all 320 words for one group and for two. A third run puts `8_SNORM` in place of the first format, and that load must return zeros.
+Threads 4 to 7 are pseudo-random. The expected words come from a Python model that rounds with `Fraction`. WARP and the hardware adapter compare all 320 words for one group and for two.
+
+Four more runs each make one load invalid, and each must leave all 320 words at the sentinel:
+- `8_SNORM`;
+- an `xyz` opcode on `32_32_32_32_UINT`;
+- an `xy` opcode on `32_FLOAT`;
+- a non-identity `DST_SEL`.
+
+References that publish placeholder words must fail on those runs: zeros for the invalid load, and the D3D (0, 0, 0, 1) fill for the `xy` opcode on `32_FLOAT`.
 
 The two-group run must also fail for each of these references, at the first word where it differs:
 - a UNORM divided by `2^n`, and a truncated UNORM;
 - an SNORM without the -1 clamp, and a zero-extended SINT16;
 - FLOAT16 halves swapped, and flushed denormals;
 - the legacy word ignored;
-- the wider read filled with (0, 0, 0, 1);
 - the neighbouring thread's element.
 
 So must recompiled HLSL with any of these changes:
 - a ratio that never rounds up, or flushed denormal halves;
 - the SNORM sign dropped, or SNORM divided by 32768;
 - a zero-extended SINT16, or the legacy fixed bits ignored;
-- the wider read returning raw words, or the format read from the wrong constant.
+- the format read from the wrong constant.
+
+On the invalid runs, these mutated sources must fail:
+- the refusal removed;
+- a narrower or a wider opcode accepted;
+- the selectors ignored.
 
 Dropping only the -1 clamp is not observable: long division of 32768 by 32767 also gives 1.0. With the lowering removed, or with its channel count changed, the translation controls fail. LLVM 15 assembles the fixture, and `lower` of the disassembly and the CLI output both match `lower` of the source.
 
