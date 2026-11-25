@@ -70,6 +70,7 @@ class Drawer:
         if self.prepared is None:
             self.prepared = prepare_draw_cache(self.directory, self.consumer, HLSL, modes, "srv 0 tex2d table 0 0")
         env, args, output = self.prepared
+        output.unlink(missing_ok=True)  # no case reads the previous case's pixels
         env = {key: value for key, value in env.items() if key != "X2W_TEST_BC3"}  # the consumer tests presence
         result = subprocess.run([*args, self.backend, output], env={**env, **modes}, capture_output=True, text=True)
         print(result.stdout, end="")
@@ -123,12 +124,16 @@ def check(directory, draw, backend, fmt, width, height):
         if not re.search(rf"Device::slot70 .*: reason={reason} res\{{dim=3 fmt={code} size={w}x{h}x1 ", log):
             raise AssertionError(f"{fmt}: no {reason} refusal for {w}x{h}")
     lines = re.findall(r"partial-tile BC view (\d+x\d+) format \d+ layout 0x105: (\w+), (\d+) tiled bytes", log)
-    # One line per first publication at an address (the first backing and the exchanged one), and one
-    # for the announced backing, which stays refused.
+    # One line per first publication at an address: the first backing and the exchanged one, the 256x196
+    # boundary (padded size equal to the reported size), then the backing announced as XG rows (refused)
+    # and the one announced as opt-in tiled BC7 blocks (published).
     view = f"{width}x{height}"
-    expected = [(view, "published", str(tiled_bytes))] * 2 + [(view, "partial_tile_xg_rows", str(tiled_bytes))]
-    if lines != (expected if partial else []):
-        raise AssertionError(f"{fmt}: partial-tile lines {lines}, expected {expected if partial else []}")
+    boundary = [("256x196", "published", "65536")]
+    expected = ([(view, "published", str(tiled_bytes))] * 2 + boundary +
+                [(view, "partial_tile_xg_rows", str(tiled_bytes)), (view, "published", str(tiled_bytes))]
+                if partial else boundary)
+    if lines != expected:
+        raise AssertionError(f"{fmt}: partial-tile lines {lines}, expected {expected}")
     print(f"{backend} {fmt} {width}x{height}: {4 * WIDTH * HEIGHT} RGBA pixels exact; exchanged tiles differ in "
           f"{swapped} texels; unpadded tile pitch differs in {unpadded}; {len(refusals)} refusals as expected")
     return 0

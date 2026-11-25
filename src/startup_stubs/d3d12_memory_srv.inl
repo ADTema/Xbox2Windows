@@ -276,9 +276,11 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
             first = !tiled_srv_addresses.count(input->address);
         }
         AcquireSRWLockShared(&written_lock);
-        const bool announced = written_textures().count(input->address) != 0;
+        const auto found = written_textures().find(input->address);
+        // The opt-in BC7 4 KiB copy announces tiled blocks (with their size); a plain XG copy, rows.
+        const bool rows = found != written_textures().end() && !found->second.bc7_width;
         ReleaseSRWLockShared(&written_lock);
-        if (first && announced) held = "partial_tile_xg_rows";
+        if (first && rows) held = "partial_tile_xg_rows";
         else if (x2w_startup::Bc16Surface(*resource).size() > xg_reported_bytes(self, *resource))
             held = "partial_tile_beyond_xg_size";
     }

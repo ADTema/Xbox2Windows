@@ -11729,6 +11729,9 @@ layout probe retain their existing behavior.
 A view with a partial last tile stays refused in two cases. The first is when
 the XG stand-in announced a copy to that address before the view was first
 published there, because that copy wrote desktop-footprint rows, not tiles.
+A copy from the opt-in BC7 4 KiB layout writes tiles and does not hold the
+view. The record of a copy is never cleared, so an address once written with
+rows keeps its partial-tile views refused, as all of them were before.
 The second is when the padded tiles are larger than the size the XG stand-in
 reports for the description (the desktop footprint rounded to 64 KiB): the
 bytes past that size may belong to something else, and a readability probe
@@ -11759,10 +11762,14 @@ log must report 16,384 tiled bytes. A reference that uses the tile pitch of the
 unpadded width (one tile instead of two) differs from the image in 1,600 pixels
 for BC3 and 1,500 for BC7. The test also requires refusals for 98 by 68 and
 100 by 66 (not whole blocks), 1028 by 1028 (past the reported size) and a
-100 by 68 view over memory announced as an XG copy. Each of these changes makes
-the test fail: restoring the 64-texel check, dropping the height check,
-dropping the announced-copy refusal, or rounding the tile rows down in
-`Bc16Surface`. The last also fails `startup_bc7_4k_s`. On Windows 11 build
+100 by 68 view over memory announced as an XG copy. It requires publication of
+a 256 by 196 view, whose padded size equals the reported 64 KiB and whose width
+is whole tiles, and of a 100 by 68 view over memory announced by the opt-in BC7
+copy. Each of these changes makes the test fail: restoring the 64-texel check,
+dropping the height check, requiring both dimensions to be partial, refusing at
+an equal size, dropping the announced-copy refusal, ignoring which copy was
+announced, or rounding the tile rows down in `Bc16Surface`. The last also fails
+`startup_bc7_4k_s`. On Windows 11 build
 26300 with the debug layer off, RTX 5090 (32.0.16.2135) and WARP
 (10.0.26100.10068) matched all 65,536 RGBA pixels per case.
 

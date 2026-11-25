@@ -10,6 +10,7 @@
 using Word = std::uint64_t;
 Word invoke(void*, unsigned, Word = 0, Word = 0, Word = 0, Word = 0, Word = 0, Word = 0, Word = 0, Word = 0);
 extern "C" __declspec(dllimport) void x2w_d3d12_texture_written(void* base, unsigned long long bytes);
+extern "C" __declspec(dllimport) void x2w_d3d12_bc7_4k_s_written(void* base, UINT width, UINT height);
 namespace {
 template<class T> Word ptr(T* value) { return reinterpret_cast<Word>(value); }
 struct ViewAt {
@@ -184,13 +185,23 @@ int draw_bc_address_srvs(void* guest, void* list)
     refused(width - 2, height);
     refused(width, height - 2);
     refused(1028, 1028);
-    // A partial-tile view over memory the XG stand-in announced as written (desktop-footprint rows) stays
-    // refused. A full-tile view is not affected, so only the partial size is published here.
+    // Published at the boundary: 256 x 196 (only the height partial) pads to 64 KiB, exactly the reported size.
+    alignas(4096) static std::array<char, 16 * tile> boundary{};
+    auto exact = desc;
+    exact.Width = 256;
+    exact.Height = 196;
+    v.address = ptr(boundary.data());
+    invoke(guest, 70, ptr(&exact), ptr(&v), cpu);
+    // A partial-tile view over memory the XG stand-in announced as copied rows stays refused; over blocks
+    // its opt-in BC7 4 KiB copy announced as tiled, it is published. Only partial sizes are affected.
     if (width % 64 || height % 64) {
-        alignas(4096) static std::array<char, 4 * tile> announced{};
-        x2w_d3d12_texture_written(announced.data(), announced.size());
-        v.address = ptr(announced.data());
-        invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+        alignas(4096) static std::array<std::array<char, 4 * tile>, 2> announced{};
+        x2w_d3d12_texture_written(announced[0].data(), announced[0].size());
+        x2w_d3d12_bc7_4k_s_written(announced[1].data(), width, height);
+        for (const auto& backing : announced) {
+            v.address = ptr(backing.data());
+            invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+        }
     }
     return 0;
 }
