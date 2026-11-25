@@ -214,8 +214,16 @@ def stream_interface(vs_container, ps_container):
     attributes = []
     for i in range(struct.unpack_from('<I', ps_image, IFACE_PS_COUNT)[0]):
         kind, register, mask, attr, b4, b5, again, interp = ps_image[IFACE_PS_RECORDS + 8 * i:IFACE_PS_RECORDS + 8 * i + 8]
-        if kind != 6 or attr != i or b4 or b5 or again != register or interp not in (1, 2) or not mask:
+        if (kind != 6 or attr != i or b4 or b5 or again != register or interp not in (1, 2) or not mask
+                or register in attributes):
             raise Unsupported('unverified pixel input record %s' % ps_image[IFACE_PS_RECORDS + 8 * i:IFACE_PS_RECORDS + 8 * i + 8].hex())
+        declared = 0
+        for entry in inputs:
+            if entry[0] == register:
+                declared |= entry[4]
+        if mask != declared:
+            raise Unsupported('pixel input record mask 0x%x differs from the signature mask 0x%x of register %d'
+                              % (mask, declared, register))
         attributes.append(register)
     if not attributes:
         return {}
@@ -238,12 +246,6 @@ def stream_interface(vs_container, ps_container):
             raise Unsupported('pixel attribute %d does not come from exactly one exported vertex register' % attr)
         mapping[attr] = params[next(iter(sources))]
     return mapping
-
-
-# Binary32 words for inline source encodings 240 through 248, in encoding order.
-CNDMASK_INLINE_FLOAT_BITS = (0x3f000000, 0xbf000000, 0x3f800000, 0xbf800000,
-                            0x40000000, 0xc0000000, 0x40800000, 0xc0800000,
-                            0x3e22f983)  # 1/(2*pi)
 
 
 # Binary32 words for inline source encodings 240 through 248, in encoding order.
@@ -2457,8 +2459,7 @@ def load_request(out_dir, key, refusals=None, pair_info=None):
 def translate_request(out_dir, key):
     """Translate a base shader request or an RTV variant referencing its source blobs."""
     try:
-        kinds, root, formats, request, fetch, _, *links = load_request(out_dir, key)
-        attr_map = links[0] if links else None
+        kinds, root, formats, request, fetch, _, attr_map = load_request(out_dir, key)
     except (Unsupported, OSError, UnicodeError) as reason:
         open(os.path.join(out_dir, '%016x.fail' % key), 'w').write(str(reason) + '\n')
         return 'unsupported: %s' % reason
@@ -2511,8 +2512,7 @@ def request_refusals(out_dir, key, pair_info=None):
     """Collect reached refusal sites for one request without publishing a translation."""
     refusals = []
     try:
-        kinds, root, formats, _, fetch, decoded, *links = load_request(out_dir, key, refusals, pair_info)
-        attr_map = links[0] if links else None
+        kinds, root, formats, _, fetch, decoded, attr_map = load_request(out_dir, key, refusals, pair_info)
     except Unsupported as reason:
         refusals.append((str(reason), 'pipeline'))
         return refusals

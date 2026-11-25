@@ -129,20 +129,26 @@ side of the interface in its native header:
 same components as the attribute's input register. Raw programs without signatures still pair by number. A pixel shader that declares no inputs reads no tables, and any attribute read it makes is refused.
 
 The translation is refused when:
-- a record has any other values (these forms pack two signature registers into one parameter or attribute);
-- a semantic of the attribute's register has no vertex output with the same components, or the attribute's semantics
-  come from more than one vertex register;
-- a pixel header has another size;
+- a record has any other values (these forms pack two signature registers into one parameter or attribute), or the
+  pixel table lists one register twice;
+- a pixel record's component mask differs from the input signature's mask for its register;
+- a semantic of the attribute's register has no vertex output with the same semantic index and the same components.
+  So a four-component vertex output that feeds a two-component pixel input is refused;
+- the attribute's semantics come from more than one vertex register;
+- either header has another size;
 - the code reads an attribute the table does not list.
 
 The shader cache revision is `x2w-startup-shader-8`, so translations paired by number are not reused.
 
 The record layouts were checked offline against the signatures of one title's shader archive (local files only, not
-in the repository):
-- **Vertex shaders:** 1,496 of 1,983 readable programs have only the simple records, and they match the output
-  signature register for register, with parameters in register order. The other 487 use packed records.
-- **Pixel shaders:** 3,657 readable programs have only simple records that match the input signature. 2,255 use packed
-  records or records that disagree with the signature.
+in the repository). The counts below apply the translator's own record checks.
+- **Vertex shaders:** the population is the 2,041 programs whose native image inflates. 1,536 have only simple
+  records. Of the 1,983 whose code also decodes, 1,496 have simple records that match the output signature register
+  for register, with parameters in register order. 505 use packed records and are refused when a pixel stage with
+  inputs needs them.
+- **Pixel shaders:** the population is the 10,862 programs whose image inflates and whose input signature declares
+  a non-system input. 5,975 have only simple records, and each record's mask equals the signature mask. 4,887 use
+  packed or other records and are refused. The 1,239 without inputs need no table.
 
 The translator-only cases need no device: `python -B tests/startup_stream_interface_check.py`, or
 `ctest --preset release --no-tests=error -R "^startup_stream_interface_translate$"`. They check that attribute 0

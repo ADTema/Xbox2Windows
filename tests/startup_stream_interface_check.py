@@ -90,14 +90,14 @@ def container(stage, words, base, sections, table):
     return b"DXBC" + bytes(16) + struct.pack("<3I", 1, at, len(parts)) + struct.pack("<%dI" % len(parts), *offsets) + b"".join(parts)
 
 
-def vertex(records=VS_RECORDS, outputs=(POSITION, COLOR, TEXCOORD)):
+def vertex(records=VS_RECORDS, outputs=(POSITION, COLOR, TEXCOORD), base=VS_BASE):
     table = {0x1dc: b"".join(bytes(r) for r in records), 0x29c: struct.pack("<I", len(records))}
-    return container(1, vertex_words(), VS_BASE, [signature(b"OSG1", outputs)], table)
+    return container(1, vertex_words(), base, [signature(b"OSG1", outputs)], table)
 
 
-def pixel(records=PS_RECORDS, inputs=(POSITION, COLOR, TEXCOORD), base=PS_BASE, attr=0):
-    table = {0x138: b"".join(bytes(r) for r in records), 0x238: struct.pack("<I", len(records))}
-    return container(0, pixel_words(attr), base, [signature(b"ISG1", inputs)], table)
+def pixel(records=PS_RECORDS, inputs=(POSITION, COLOR, TEXCOORD), base=PS_BASE, attr=0, count=None):
+    table = {0x138: b"".join(bytes(r) for r in records), 0x238: struct.pack("<I", len(records) if count is None else count)}
+    return container(0, pixel_words(attr), base, [signature(b"ISG1", inputs)] if inputs else [], table)
 
 
 EMPTY_ROOT = (b"DXBC" + bytes(16) + struct.pack("<4I", 1, 68, 1, 36) + b"RTS0" + struct.pack("<I", 24)
@@ -122,6 +122,12 @@ def translate_cases(directory):
     status, ps = translate(directory / "ordered", vertex(records=[(6, 2, 0, 0, 0, 0), (6, 1, 1, 0, 0, 0)]), pixel())
     assert status == "ok" and "U(i.param0.x)" in ps, (status, ps)
     print("translate: with TEXCOORD as parameter 0, attribute 0 reads parameter 0")
+    # The semantic index counts: the pixel shader reads TEXCOORD1, which the vertex shader exports as parameter 0.
+    status, ps = translate(directory / "semantic_index",
+                           vertex(outputs=(POSITION, ("TEXCOORD", 1, 1, 0, 0x3), ("TEXCOORD", 0, 2, 0, 0x3))),
+                           pixel(inputs=(POSITION, ("TEXCOORD", 0, 1, 0, 0x3), ("TEXCOORD", 1, 2, 0, 0x3))))
+    assert status == "ok" and "U(i.param0.x)" in ps, (status, ps)
+    print("translate: TEXCOORD1 links by semantic index, not by name alone")
     for label, vs, ps, want in (
             ("packed pixel record", vertex(), pixel(records=[(6, 2, 3, 0, 0, 1, 2, 26)]),
              "unverified pixel input record 0602030000010" + "21a"),
@@ -133,7 +139,20 @@ def translate_cases(directory):
              "pixel input TEXCOORD0 has no vertex output with the same components"),
             ("pixel header size", vertex(), pixel(base=0x2f8), "unverified FSSM header for the stage interface"),
             ("attribute beyond table", vertex(), pixel(attr=1),
-             "pixel stage reads attribute 1, which its interface table does not list")):
+             "pixel stage reads attribute 1, which its interface table does not list"),
+            ("record mask differs", vertex(), pixel(records=[(6, 2, 0xf, 0, 0, 0, 2, 2)]),
+             "pixel input record mask 0xf differs from the signature mask 0x3 of register 2"),
+            ("two vertex sources", vertex(outputs=(POSITION, ("TEXCOORD", 0, 1, 0, 0x3), ("TEXCOORD", 1, 2, 0, 0xc))),
+             pixel(inputs=(POSITION, ("TEXCOORD", 0, 2, 0, 0x3), ("TEXCOORD", 1, 2, 0, 0xc)),
+                   records=[(6, 2, 0xf, 0, 0, 0, 2, 2)]),
+             "pixel attribute 0 does not come from exactly one exported vertex register"),
+            ("duplicate pixel register", vertex(), pixel(records=[PS_RECORDS[0], (6, 2, 3, 1, 0, 0, 2, 2)]),
+             "unverified pixel input record 0602030100000202"),
+            ("vertex header size", vertex(base=0x2f0), pixel(), "unverified FSSM header for the stage interface"),
+            ("pixel count 0", vertex(), pixel(count=0),
+             "pixel stage reads attribute 0, which its interface table does not list"),
+            ("no pixel signature", vertex(), pixel(inputs=()),
+             "pixel stage reads attribute 0, which its interface table does not list")):
         status, _ = translate(directory / label.replace(" ", "_"), vs, ps)
         assert status == "unsupported: " + want, (label, status)
         print(f"translate: {label} refused")
