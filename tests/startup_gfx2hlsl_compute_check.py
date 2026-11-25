@@ -552,6 +552,9 @@ def check_lds():
     assert 'groupshared uint lds[8192];' in translate('F', rsrc2=base | 64 << 15).hlsl_cs()
 
     pair = '0524dcd806000006'
+    # The first result overwrites v6. Both loads must use the address saved before that write.
+    body = translate('G').hlsl_cs()
+    assert 'a = v6;\n    v6 = lds[(a + 20u) >> 2];\n    v7 = lds[(a + 144u) >> 2];' in body, body
     for other, reason in (
         ('0324dcd806000006', 'initialized span'),  # offset0 alone precedes the fill
         ('0525dcd806000006', 'initialized span'),  # offset1 alone crosses the upper end
