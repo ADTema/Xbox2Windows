@@ -5345,6 +5345,12 @@ The `ADD_CO` fixture in `tests/compute_store_check.py` (`draw-add-co`, `compute_
 
 The `SUB_CO` fixture in `tests/compute_store_check.py` (`draw-sub-co`, `compute_store_aot_sub_co_${adapter}`) runs one 64-thread group with `wave_size=32` (`buffer_store_dwordx4`, 256 output words plus 64 `SENTINEL` words), exercising both `v_sub_co_u32` + `v_sub_co_ci_u32_e32` via `vcc_lo` and `v_subrev_co_u32` + `v_subrev_co_ci_u32_e64` via `s4`/`s5` across inputs that borrow on some lanes and not on others, and compares all 320 words against an independent Python model. Reference controls (borrow dropped at word 69, `subrev` operand order swapped at word 2, `e64` borrow-in ignored at word 3, sentinel modified at word 256) and recompiled-HLSL mutations (borrow comparison flipped, `e64` borrow-in zeroed) must all fail. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_sub_co_(warp|hardware)$' -V`.
 
+#### Non-fused float multiply-accumulate (`v_mac_f32`)
+
+`v_mac_f32_e32 vD, S0, vS1` (VOP2 `0x1f`) and `v_mac_f32_e64 vD, S0, S1` (VOP3) compute `D = S0 * S1 + D` as an unfused binary32 multiply-add: the intermediate product `S0 * S1` rounds to binary32 before the addition. `D` is both an input accumulator and the destination. Lowering uses `f32_mac(a, b, c)` with separate `precise float p = asfloat(a) * asfloat(b)` and `precise float r = p + asfloat(c)` so DXC does not contract the operation to FMA. NaN/Inf/denormal literal constants, uninitialized/unknown or pending `S0`/`S1`/`D`, `vD > 255`, source modifiers (`-`, `|.|`), `clamp`, `omod`, and bare `v_mac_f32` are refused.
+
+The `MAC_F32` fixture in `tests/compute_store_check.py` (`draw-mac-f32`, `compute_store_aot_mac_f32_${adapter}`) runs one 64-thread group (`buffer_store_dwordx4`, 256 output words plus 64 `SENTINEL` words), including `4097 * 4097 + (-16785408)` and `(1 + 2^-23) * (1 + 2^-23) - (1 + 2^-22)` where unfused and fused results differ, and compares all 320 words against an independent Python model. Reference controls (fused FMA at word 0, `p - c` at word 2, accumulator zeroed at word 3, sentinel modified at word 256) and recompiled-HLSL mutations (`mad()` fused multiply-add, `p - asfloat(c)`) must all fail. Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_mac_f32_(warp|hardware)$' -V`.
+
 ```powershell
 ctest --preset dev --no-tests=error -R '^compute_store_aot_salu_i32_(warp|hardware)$' -V
 ```
