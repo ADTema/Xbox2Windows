@@ -1117,6 +1117,56 @@ class Stage:
 
     op_s_andn2_wrexec_b32 = op_s_andn2_wrexec_b64
 
+    def scalar_accumulate(self, base, ops, mods):
+        """s_addk_i32 / s_mulk_i32: D = D op signext(SIMM16), the destination is also the source.
+
+        RDNA 2 ISA 12.2 (SOPK 15, 16): addk sets SCC to the signed overflow of the sum, mulk leaves SCC
+        alone. LLVM 15 SOPInstructions.td declares Defs = [SCC] for both, so after mulk the SCC proof is
+        dropped (the emitted scc keeps its value, which is the ISA meaning).
+        """
+        if mods or len(ops) != 2:
+            raise Unsupported('%s with %d operands' % (base, len(ops)))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
+            raise Unsupported('%s destination %s' % (base, ops[0]))
+        if not re.fullmatch(r'0x[0-9a-f]{1,4}', ops[1]):
+            raise Unsupported('%s immediate %s' % (base, ops[1]))
+        d = dst[1]
+        # D is read before it is written: refuse a mask or descriptor source while the old state is intact.
+        if d in self.masks or self.sym.get(d, ('',))[0] == 'execcopy':
+            raise Unsupported('%s on a lane mask' % base)
+        sym = self.sym.get(d)
+        if sym and sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+            raise Unsupported('%s on %s data' % (base, sym[0]))
+        simm = int(ops[1], 16)
+        imm = (simm - 0x10000 if simm & 0x8000 else simm) & 0xffffffff
+        imm_text = '0x%08xu' % imm
+        old = self.S(d)
+        add = base == 's_addk_i32'
+        result = '%s %s %s' % (old, '+' if add else '*', imm_text)
+        if add:
+            # signed overflow: the operands share a sign that the sum does not keep
+            overflow = '((%s ^ (%s)) & ~(%s ^ %s) & 0x80000000u) != 0u' % (old, result, old, imm_text)
+            if sym and sym[0] == 'const':
+                total = (sym[1] + imm) & 0xffffffff
+                overflow = 'true' if ((sym[1] ^ total) & ~(sym[1] ^ imm) & 0x80000000) else 'false'
+            self.set_scc(overflow)
+        elif self.tracks_uniformity():
+            self.scc_uniform = False
+        if sym and sym[0] == 'const':
+            value = (sym[1] + imm if add else sym[1] * imm) & 0xffffffff
+            self.set_s(d, '0x%08xu' % value, ('const', value))
+        else:
+            self.set_s(d, result)
+        self.masks.discard(d)
+        return None
+
+    def op_s_addk_i32(self, ops, mods):
+        return self.scalar_accumulate('s_addk_i32', ops, mods)
+
+    def op_s_mulk_i32(self, ops, mods):
+        return self.scalar_accumulate('s_mulk_i32', ops, mods)
+
     def op_s_cselect_b32(self, ops, mods):
         self.scalar_select(ops, False)
 
