@@ -9247,7 +9247,8 @@ the root in `.root`, the pixel program (or an empty file) in `.ps57`, and
 writes the mesh program last in `.m57`. The offline reader validates the
 request key and stage exports. It translates a mesh program of one
 group-memory shape, with a pixel program, to `.ms57.hlsl` and `.ps57.hlsl`
-and compiles them as `ms_6_5` and `ps_6_0`. In that shape lane 0 of wave 0
+and compiles them as `ms_6_5` and `ps_6_0` (without a pixel program, to
+`.ms57.hlsl` alone; see below). In that shape lane 0 of wave 0
 stores the primitive and vertex counts, every wave passes a barrier, wave 0
 sends one allocation request and the other wave reads the counts back; the
 code around it is straight-line and exports vertex and primitive `thread`
@@ -9270,10 +9271,17 @@ the published bytes and key, compiles the recorded pair with its serialized
 root, and compares all 1,024 desktop readback pixels with the CPU reference.
 The one-pixel negative control uses that same published pair.
 
-The pending scan checks the DXContainer header and file length for both
-slot 57 bytecode artifacts. A missing or truncated artifact leaves the
-request pending even if its manifest exists. In manifest-only mode the
-manifest still completes the request.
+The translator also accepts the same slot 57 mesh shape with an empty
+`req_<key>.ps57`. It emits the mesh stage alone, keeping position and
+primitive exports, and records `ps none` in `<key>.ms57.txt`. A null-export
+depth-only pixel stage is still refused. Run
+`python -B tests/startup_mesh57_skeleton_check.py` for the source and cache
+checks, or run the `startup_mesh57_skeleton` CTest checks below for the DXC mode.
+
+The pending scan checks the DXContainer header and file length for every
+required slot 57 bytecode artifact. A `ps none` result needs the mesh artifact
+only. A missing or truncated required artifact leaves the request pending
+even if its manifest exists. In manifest-only mode the manifest completes it.
 
 Set `X2W_REFUSE_FIXED_MESH=1` to report unavailable fixed mesh pipelines at
 slot 57 creation. The descriptor must name a registered root, have an empty
