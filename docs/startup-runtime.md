@@ -1022,6 +1022,11 @@ existing failing-second-action control checks that the previous generation stays
 holder that ends without unlocking checks the bounded wait and the recovery. The `_unlocked` test runs
 the same checks on a generated copy of the headers whose lock does nothing and must be caught (a reader
 sees a mixed or incomplete generation). The pause points and that copy exist only in the test build.
+`ctest --preset dev --no-tests=error -R '^startup_gamesave_read_publish_'` runs the synchronous read
+(slot 20, by name and for every blob) through the provider vtable against the same paused writer.
+During the pause the read waits for the store's lock timeout and fails with its destination
+untouched. A read still waiting when the writer goes on returns the whole new generation. The
+`_unlocked` copy must be caught with a mixed or incomplete generation.
 
 Slot 28 first asks the Windows gaming runtime to accept the caller's async block. On rejection it returns before taking staged actions. Once accepted it commits the files and calls `XAsyncComplete` with the status for that block. Slot 29 retrieves the status with the matching operation identity. File publication is synchronous within slot 28. The caller's completion routine can run inline or through its selected completion queue. [XAsyncBegin](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasyncprovider/functions/xasyncbegin) · [XAsyncComplete](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasyncprovider/functions/xasynccomplete) · [PC GDK async interface slots](https://github.com/ivall/xcl/blob/64b3f35599bb7102f55d640e1a791e7d6dd3b175/crates/xcl/src/hle/xgameruntime/gdk_table.rs#L57-L64)
 
