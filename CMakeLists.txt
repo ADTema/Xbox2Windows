@@ -1063,6 +1063,7 @@ target_compile_features(startup_stream_consumer PRIVATE cxx_std_17)
 target_link_libraries(startup_stream_consumer PRIVATE d3d12_xs_shim startup_stub_xg_xs d3d12 dxgi d3dcompiler)
 target_sources(startup_stream_consumer PRIVATE tests/startup_frame_copy.cpp)
 target_sources(startup_stream_consumer PRIVATE tests/startup_root_reset.cpp)
+target_sources(startup_stream_consumer PRIVATE tests/startup_memory_srv_diag.cpp)
 
 add_executable(startup_stream_depth tests/startup_stream_depth.cpp $<TARGET_OBJECTS:startup_stream_setup_obj>)
 target_compile_features(startup_stream_depth PRIVATE cxx_std_17)
@@ -1466,6 +1467,11 @@ add_test(NAME startup_translated_sampler_bindings_shared_axis_control
 set_tests_properties(startup_translated_sampler_bindings_shared_axis_control PROPERTIES WILL_FAIL TRUE)
 # Real-draw decision for title root signatures that index descriptor heaps directly
 # (src/startup_stubs/heap_indexed_root.h), without a device. The mutated runs are the negative controls.
+# Limits of the slot 70 refusal and "token" null census (src/startup_stubs/memory_srv_census.h), without a device.
+add_executable(startup_memory_srv_census_check tests/startup_memory_srv_census_check.cpp)
+target_include_directories(startup_memory_srv_census_check PRIVATE src)
+target_compile_features(startup_memory_srv_census_check PRIVATE cxx_std_17)
+add_test(NAME startup_memory_srv_census COMMAND startup_memory_srv_census_check)
 add_executable(startup_heap_indexed_root_check tests/startup_heap_indexed_root_check.cpp)
 target_include_directories(startup_heap_indexed_root_check PRIVATE src)
 target_compile_features(startup_heap_indexed_root_check PRIVATE cxx_std_17)
@@ -3143,6 +3149,19 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_address_srv_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_address_srv_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        # Refused slot 70 calls and "token" texture nulls in the five-second report census. The WARP control
+        # publishes a supported R8 texture in place of the refused one and passes only on the exact mismatch
+        # that causes (column 0 samples the R8 texel instead of a null view).
+        add_test(NAME startup_memory_srv_diag_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_memory_srv_diag_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
+        set_tests_properties(startup_memory_srv_diag_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        if(backend STREQUAL "warp")
+            add_test(NAME startup_memory_srv_diag_supported_control_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+                "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_memory_srv_diag_check.py"
+                "$<TARGET_FILE:startup_stream_consumer>" warp --control)
+            set_tests_properties(startup_memory_srv_diag_supported_control_warp PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        endif()
         add_test(NAME startup_address_single_element_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_single_element_srv_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
