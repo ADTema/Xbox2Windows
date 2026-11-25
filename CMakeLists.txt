@@ -627,6 +627,54 @@ add_test(NAME startup_storage_refused_reuse_accept_refused_control
 set_tests_properties(startup_storage_refused_reuse startup_storage_refused_reuse_accept_refused_control PROPERTIES TIMEOUT 60)
 set_tests_properties(startup_storage_refused_reuse_accept_refused_control PROPERTIES PASS_REGULAR_EXPRESSION
     "FAIL: R1 destination taken as data matches the stream prefix in 0 of 4096 byte")
+
+# Test-only BCPack encoder (tests/bcpack_encoder.h): random synthetic streams must decode back to their
+# symbols. Interleaving with a 7-byte cycle budget is the negative control.
+add_executable(bcpack_encoder_check tests/bcpack_encoder_check.cpp)
+target_compile_features(bcpack_encoder_check PRIVATE cxx_std_17)
+target_include_directories(bcpack_encoder_check PRIVATE src)
+add_test(NAME bcpack_encoder_roundtrip COMMAND bcpack_encoder_check)
+add_test(NAME bcpack_encoder_window_control COMMAND bcpack_encoder_check --mutate window)
+set_tests_properties(bcpack_encoder_roundtrip bcpack_encoder_window_control PROPERTIES TIMEOUT 120)
+set_tests_properties(bcpack_encoder_window_control PROPERTIES WILL_FAIL TRUE)
+# Each decode_lanes path against the original cycle loop on whole, truncated and bit-flipped streams
+# (tests/bcpack_lanes_check.cpp), one test per path; 77 means this CPU lacks that path. The control
+# build takes a wrong short DRAIN step at the home state and must fail on every path.
+foreach(variant IN ITEMS check control)
+    add_executable(bcpack_lanes_${variant} tests/bcpack_lanes_check.cpp)
+    target_compile_features(bcpack_lanes_${variant} PRIVATE cxx_std_17)
+    target_include_directories(bcpack_lanes_${variant} PRIVATE src)
+    target_compile_definitions(bcpack_lanes_${variant} PRIVATE X2W_BCPACK_LANE_TESTS)
+endforeach()
+target_compile_definitions(bcpack_lanes_control PRIVATE X2W_BCPACK_LANES_CONTROL)
+set(bcpack_lane_paths scalar avx2)
+# Each path is also checked against outside anchors: the symbols stored in the repository vectors, the
+# expected bytes in tests/bcpack_mode6_vector.py and tests/startup_stub_consumer.cpp, and the vendored
+# Python decoder on a sample of streams (tests/bcpack_lanes_python_check.py).
+foreach(path IN LISTS bcpack_lane_paths)
+    add_test(NAME bcpack_lanes_${path} COMMAND bcpack_lanes_check "${CMAKE_SOURCE_DIR}/tools/_bcpack_rans/vectors"
+             --path ${path} --consumer "${CMAKE_SOURCE_DIR}/tests/startup_stub_consumer.cpp")
+    add_test(NAME bcpack_lanes_${path}_drain_control
+             COMMAND bcpack_lanes_control "${CMAKE_SOURCE_DIR}/tools/_bcpack_rans/vectors" --path ${path})
+    set(bcpack_lane_tests bcpack_lanes_${path} bcpack_lanes_${path}_drain_control)
+    if(EXISTS "${INTAKE_PYTHON}")
+        foreach(variant IN ITEMS check control)
+            set(name bcpack_lanes_python_${path})
+            if(variant STREQUAL control)
+                set(name bcpack_lanes_python_${path}_drain_control)
+            endif()
+            add_test(NAME ${name} COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/bcpack_lanes_python_check.py"
+                     "$<TARGET_FILE:bcpack_lanes_${variant}>" "${CMAKE_SOURCE_DIR}/tools/_bcpack_rans/vectors" --path ${path})
+            list(APPEND bcpack_lane_tests ${name})
+        endforeach()
+        set_tests_properties(bcpack_lanes_python_${path}_drain_control PROPERTIES
+            PASS_REGULAR_EXPRESSION "${path} path, [0-9]+ bytes, widths .*: Python accepts, C\\+\\+ rejects")
+    endif()
+    set_tests_properties(${bcpack_lane_tests} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    # Both the vector symbols and the reference sweep must catch the control build.
+    set_tests_properties(bcpack_lanes_${path}_drain_control PROPERTIES PASS_REGULAR_EXPRESSION
+        "${path} path: synthetic_11 lane [0-9]+ differs from the vector's symbols.*result: anchors failed, [1-9][0-9]* mismatches")
+endforeach()
 # A queue whose worker cannot start (both CreateThread attempts fail, or the construction of its work
 # throws std::bad_alloc) completes status entries and fences at Submit, never inside Enqueue (#1199).
 # The test compiles the stand-in's source into itself so it can redirect CreateThread and operator new.
