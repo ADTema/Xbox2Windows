@@ -4968,6 +4968,14 @@ The CPU controls reject a missing or wrong restore, a saved mask overwritten und
 
 `shader_profile_audit.py` is unchanged. It does not bind b0, so it does not try guards that read their bound from a constant, and it does not label branches.
 
+#### Integer inequality lane guards
+
+`v_cmp_ne_i32_e32 vcc_lo, src0, vSrc1` and the `_e64` form writing `vcc_lo` can feed the `s_and_saveexec_b32` guard above. Source 0 is an integer immediate or a resolved SGPR or VGPR; the `_e32` source 1 is a VGPR, and the `_e64` source 1 may also be an SGPR or an integer immediate. Operands follow the existing guard's rules for resolved words, so a word read or computed in the program is still refused. The guard emits `!=` on the 32-bit words, which is the same for signed and unsigned operands. The unsigned ordered compares now share the same operand parser. `v_cmpx`, other destinations and source modifiers stay refused. The control checks both encodings, the refusals, and a mutation that turns the predicate into equality.
+
+```sh
+python -B tests/compute_alu_cmp_ne_check.py
+```
+
 ### Lane-pattern masks from s_bitreplicate_b64_b32
 
 `s_bitreplicate_b64_b32 s[d:d+1], imm` copies each source bit into two adjacent destination bits: for i in 0..31, `D.u64[2i] = D.u64[2i+1] = S0.u32[i]`, so `0x0f0f` becomes `0x00ff00ff` and `0x3f3f3f3f` becomes `0x0fff0fff0fff0fff`. The store profile folds it when the source is an integer inline constant or a 32-bit literal. Both halves become known words: the low one replicates bits 0-15 and the high one bits 16-31. They can be copied or used by the scalar and vector ALU forms like any other known word. The destination must be an even-aligned pair at or below s105 that is not waiting for a load. An SGPR, VGPR or float source is refused with `Unverified lane mask source`, even an SGPR that holds a known word.

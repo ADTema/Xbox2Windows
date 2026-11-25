@@ -226,6 +226,7 @@ jobs:
             tests/startup_buffer_address_check.py \
             tests/startup_smem_address_check.py \
             tests/startup_stream_fetch_check.py \
+            tests/compute_alu_cmp_ne_check.py \
             tests/compute_entry_layout_check.py \
             tests/compute_alu_bcnt64_check.py \
             tests/startup_ngg_slice_check.py \
