@@ -2,7 +2,7 @@
 
 usage: startup_gfx2hlsl_s_sext_cmov_check.py
 
-Sign-extends: D = sign-extended low 8 / 16 bits of S0, SCC = (D != 0). Conditional moves: D = SCC ? S : D, SCC unchanged;
+Sign-extends: D = sign-extended low 8 / 16 bits of S0, SCC unchanged. Conditional moves: D = SCC ? S : D, SCC unchanged;
 s_cmovk_i32 sign-extends its 16-bit immediate. The emitted lines are run in order on the CPU by the evaluator of
 startup_gfx2hlsl_bit_alu_check.py; the reference is plain Python integer arithmetic. Lane-mask operands are refused.
 """
@@ -84,7 +84,7 @@ for name, bits in (('s_sext_i32_i8', 8), ('s_sext_i32_i16', 16)):
     lines = translate(sop1(name, 3, 1))
     for a in VALUES:
         out = run(lines, {'s1': a, 's3': 0x55, 'scc': SCC_UNSET})
-        want = (sext(a, bits), int(sext(a, bits) != 0))
+        want = (sext(a, bits), SCC_UNSET)
         if (out['s3'], out['scc']) != want:
             bad = (hex(a), (out['s3'], out['scc']), want)
             break

@@ -2047,9 +2047,9 @@ SCA = {
     's_min_i32': ('uint(min(int({0}), int({1})))', None), 's_max_i32': ('uint(max(int({0}), int({1})))', None),
     's_bfe_u32': ('({0} >> ({1} & 31)) & ((1u << (({1} >> 16) & 127)) - 1)', '$ != 0'),
     's_brev_b32': ('reversebits({0})', None),
-    # s_sext_i32_iN: sign-extend the low N bits of S0; SCC = result != 0.
-    's_sext_i32_i8': ('uint(int({0} << 24) >> 24)', '$ != 0'),
-    's_sext_i32_i16': ('uint(int({0} << 16) >> 16)', '$ != 0'),
+    # s_sext_i32_iN: sign-extend the low N bits of S0; SCC unchanged.
+    's_sext_i32_i8': ('uint(int({0} << 24) >> 24)', None),
+    's_sext_i32_i16': ('uint(int({0} << 16) >> 16)', None),
     's_pack_hh_b32_b16': ('({0} >> 16) | ({1} & 0xffff0000u)', None),
     # s_bfm_b32: a mask of S0[4:0] ones shifted left by S1[4:0]; SCC unchanged.
     's_bfm_b32': ('(((1u << ({0} & 31)) - 1) << ({1} & 31))', None),
