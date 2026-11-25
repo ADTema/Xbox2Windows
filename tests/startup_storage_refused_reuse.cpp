@@ -286,7 +286,7 @@ int main(int argc, char** argv)
 
     // The token array stays readable until the requests run: the stand-in reads it again then.
     const ULONG_PTR tokens[1] = {pages[0]};
-    auto enqueue = [&](unsigned slot, const std::vector<unsigned char>& stream, unsigned inflated) {
+    auto enqueue = [&](unsigned slot, const std::vector<unsigned char>& stream) {
         alignas(8) unsigned char request[0x48] = {};
         *reinterpret_cast<u64*>(request + 0x00) = zlib_page_request;
         *reinterpret_cast<const ULONG_PTR**>(request + 0x08) = tokens;
@@ -294,14 +294,15 @@ int main(int argc, char** argv)
         *reinterpret_cast<unsigned*>(request + 0x18) = destination_size;
         *reinterpret_cast<const unsigned char**>(request + 0x20) = stream.data();
         *reinterpret_cast<unsigned*>(request + 0x30) = static_cast<unsigned>(stream.size());
-        *reinterpret_cast<unsigned*>(request + 0x38) = inflated;
+        // CancellationTag is opaque and independent of the decoded length.
+        *reinterpret_cast<u64*>(request + 0x38) = 0x100000000ull + slot;
         reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, request);
         reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, slot);
         reinterpret_cast<EnqueueSignalFn>(queue->vtable[5])(queue, &fences[slot], 0x300 + slot);
     };
-    enqueue(0, stream_r1, oversized_inflated_size);
-    enqueue(1, stream_v, destination_size);
-    enqueue(2, stream_r2, oversized_inflated_size);
+    enqueue(0, stream_r1);
+    enqueue(1, stream_v);
+    enqueue(2, stream_r2);
     reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
 
     bool all_signaled = true;
