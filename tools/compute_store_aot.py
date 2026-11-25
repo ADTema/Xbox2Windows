@@ -39,6 +39,8 @@ ALU = {
     "v_subrev_nc_u32_e32": "({1} - {0})",
     "v_min_u32_e32": "min({0}, {1})",
     "v_xor3_b32": "({0} ^ {1} ^ {2})",  # VOP3 src0 ^ src1 ^ src2 (RDNA2 ISA: D.u = S0.u ^ S1.u ^ S2.u)
+    # v_bcnt_u32_b32 (VOP3 only on gfx10; RDNA2 ISA: D.u = CountOneBits(S0.u) + S1.u), the addend wrapping modulo 2^32.
+    "v_bcnt_u32_b32": "(countbits({0}) + {1})",
     "v_max_u32_e32": "max({0}, {1})",
     "v_add_nc_u32_e32": "({0} + {1})",
     # v_mad_i32_i24 is sext(src0[23:0]) * sext(src1[23:0]) + src2, modulo 2^32, multiplied as uint (same low word).
@@ -1684,7 +1686,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                                  f"    uint {value} = {source} | {hlsl_word(values[1])};"))
             vector[dst] = ("alu", value)
         elif ((m := re.fullmatch(rf"(v_(?:and_b32|lshrrev_b32|min_u32|max_u32|add_nc_u32|or_b32|xor_b32|lshlrev_b32|ashrrev_i32|sub_nc_u32|subrev_nc_u32)_e32) v(\d+), {ALU_SOURCE}, (v\d+)", line))
-              or (m := re.fullmatch(rf"(v_mul_lo_u32|v_add_nc_i32|v_sub_nc_i32) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}", line))
+              or (m := re.fullmatch(rf"(v_mul_lo_u32|v_add_nc_i32|v_sub_nc_i32|v_bcnt_u32_b32) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}", line))
               or (m := re.fullmatch(rf"(v_mad_u32_u24|v_xor3_b32|v_max3_u32|v_min3_u32|v_med3_u32|v_med3_i32|v_mad_i32_i24) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}, {ALU_SOURCE}", line))
               and None not in [alu_word(token, scalar, vector, pending) for token in m.groups()[2:]]):
             # VOP2 takes a VGPR as src1. A v_mad_u32_u24 with an address operand is a row pitch below.
@@ -1696,6 +1698,53 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             if len(expression) > ALU_EXPRESSION_LIMIT:
                 raise ValueError("ALU expression too large")
             vector[dst] = ("alu", expression)
+        elif ((m := re.fullmatch(rf"(v_sub(?:rev)?_co_u32) v(\d+), (vcc_lo|s\d+), {ALU_SOURCE}, {ALU_SOURCE}", line))
+              or (m := re.fullmatch(rf"(v_sub(?:rev)?_co_ci_u32_e32) v(\d+), (vcc_lo), {ALU_SOURCE}, (v\d+), (vcc_lo)", line))
+              or (m := re.fullmatch(rf"(v_sub(?:rev)?_co_ci_u32_e64) v(\d+), (vcc_lo|s\d+), {ALU_SOURCE}, {ALU_SOURCE}, (vcc_lo|s\d+)", line))):
+            # RDNA2 ISA:
+            #   v_sub_co_u32:       temp = (uint64)S0 - (uint64)S1; D = temp[31:0]; SDST[lane] = (S0 < S1) ? 1 : 0
+            #   v_subrev_co_u32:    temp = (uint64)S1 - (uint64)S0; D = temp[31:0]; SDST[lane] = (S1 < S0) ? 1 : 0
+            #   v_sub_co_ci_u32:    temp = (int64)S0 - (int64)S1 - (int64)borrow_in[lane]; D = temp[31:0]; SDST[lane] = (temp < 0) ? 1 : 0
+            #   v_subrev_co_ci_u32: temp = (int64)S1 - (int64)S0 - (int64)borrow_in[lane]; D = temp[31:0]; SDST[lane] = (temp < 0) ? 1 : 0
+            op, dst, sdst, src0, src1 = m[1], int(m[2]), m[3], m[4], m[5]
+            borrow_in_tok = m[6] if len(m.groups()) == 6 else None
+            if dst > 255:
+                raise ValueError("Invalid vector destination")
+            if dims[0] * dims[1] * dims[2] > 32 and wave_size != 32:
+                raise ValueError("Borrow-out subtract requires wave_size=32 for groups larger than 32 threads")
+            if sdst != "vcc_lo":
+                sdst_reg = int(sdst[1:])
+                if sdst_reg > 105 or sdst_reg in pending:
+                    raise ValueError("Unverified borrow destination")
+            words = [alu_word(token, scalar, vector, pending) for token in (src0, src1)]
+            if None in words:
+                raise ValueError("Unverified ALU operand")
+            a, b = map(hlsl_word, words)
+            if op.startswith("v_subrev_"):
+                a, b = b, a
+            diff_ab = f"({a} - {b})"
+            if borrow_in_tok is None:
+                expression = diff_ab
+                borrow_expression = f"({a} < {b} ? 1u : 0u)"
+            else:
+                if borrow_in_tok == "vcc_lo":
+                    borrow_in = vcc_carry
+                else:
+                    bin_reg = int(borrow_in_tok[1:])
+                    borrow_in = scalar.get(bin_reg) if bin_reg <= 105 and bin_reg not in pending else None
+                if not (isinstance(borrow_in, tuple) and borrow_in[0] == "borrow"):
+                    raise ValueError("Unverified borrow-in operand")
+                c = borrow_in[1]
+                expression = f"({diff_ab} - {c})"
+                borrow_expression = f"(({a} < {b} || {diff_ab} < {c}) ? 1u : 0u)"
+            if len(expression) > ALU_EXPRESSION_LIMIT or len(borrow_expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            vector[dst] = ("alu", expression)
+            if sdst == "vcc_lo":
+                vcc = None
+                vcc_carry = ("borrow", borrow_expression)
+            else:
+                scalar[sdst_reg] = ("borrow", borrow_expression)
         elif ((m := re.fullmatch(rf"(v_add_co_u32) v(\d+), (vcc_lo|s\d+), {ALU_SOURCE}, {ALU_SOURCE}", line))
               or (m := re.fullmatch(rf"(v_add_co_ci_u32_e32) v(\d+), (vcc_lo), {ALU_SOURCE}, (v\d+), (vcc_lo)", line))
               or (m := re.fullmatch(rf"(v_add_co_ci_u32_e64) v(\d+), (vcc_lo|s\d+), {ALU_SOURCE}, {ALU_SOURCE}, (vcc_lo|s\d+)", line))):

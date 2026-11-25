@@ -6826,23 +6826,28 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME compute_store_aot_cvt_u32_f32_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-cvt-u32-f32 "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
-        set_tests_properties(compute_store_aot_cvt_u32_f32_${adapter} PROPERTIES TIMEOUT 45)
+        set_tests_properties(compute_store_aot_cvt_u32_f32_${adapter} PROPERTIES TIMEOUT 45
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_cvt_u32_f32_${adapter}.txt")
         add_test(NAME compute_store_aot_mbcnt_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-mbcnt "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
-        set_tests_properties(compute_store_aot_mbcnt_${adapter} PROPERTIES TIMEOUT 45)
+        set_tests_properties(compute_store_aot_mbcnt_${adapter} PROPERTIES TIMEOUT 45
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_mbcnt_${adapter}.txt")
         add_test(NAME compute_store_aot_bcnt_exec_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-bcnt-exec "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
-        set_tests_properties(compute_store_aot_bcnt_exec_${adapter} PROPERTIES TIMEOUT 45)
+        set_tests_properties(compute_store_aot_bcnt_exec_${adapter} PROPERTIES TIMEOUT 45
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_bcnt_exec_${adapter}.txt")
         add_test(NAME compute_store_aot_writelane_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-writelane "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
-        set_tests_properties(compute_store_aot_writelane_${adapter} PROPERTIES TIMEOUT 45)
+        set_tests_properties(compute_store_aot_writelane_${adapter} PROPERTIES TIMEOUT 45
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_writelane_${adapter}.txt")
         add_test(NAME compute_store_aot_ff1_exec_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-ff1-exec "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
-        set_tests_properties(compute_store_aot_ff1_exec_${adapter} PROPERTIES TIMEOUT 45)
+        set_tests_properties(compute_store_aot_ff1_exec_${adapter} PROPERTIES TIMEOUT 45
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_ff1_exec_${adapter}.txt")
         add_test(NAME compute_store_aot_ff1_scalar_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-ff1-scalar "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -6850,16 +6855,23 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME compute_store_aot_vadd_nc_i32_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-vadd_nc_i32 "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
-        set_tests_properties(compute_store_aot_vadd_nc_i32_${adapter} PROPERTIES TIMEOUT 45)
+        set_tests_properties(compute_store_aot_vadd_nc_i32_${adapter} PROPERTIES TIMEOUT 45
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_vadd_nc_i32_${adapter}.txt")
         add_test(NAME compute_store_aot_salu_i32_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-salu_i32 "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
-        set_tests_properties(compute_store_aot_salu_i32_${adapter} PROPERTIES TIMEOUT 45)
+        set_tests_properties(compute_store_aot_salu_i32_${adapter} PROPERTIES TIMEOUT 45
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_salu_i32_${adapter}.txt")
         add_test(NAME compute_store_aot_add_co_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-add-co "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(compute_store_aot_add_co_${adapter} PROPERTIES TIMEOUT 45
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_add_co_${adapter}.txt")
+        add_test(NAME compute_store_aot_sub_co_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-sub-co "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(compute_store_aot_sub_co_${adapter} PROPERTIES TIMEOUT 45
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_sub_co_${adapter}.txt")
         add_test(NAME compute_store_aot_dot_u_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-dot-u "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -6868,7 +6880,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME compute_store_aot_bfe_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-bfe "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
-        set_tests_properties(compute_store_aot_bfe_${adapter} PROPERTIES TIMEOUT 45)
+        set_tests_properties(compute_store_aot_bfe_${adapter} PROPERTIES TIMEOUT 45
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_bfe_${adapter}.txt")
         add_test(NAME compute_store_aot_mubuf_reduction_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-mubuf-reduction "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -6920,6 +6933,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/compute_alu_xor3_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(compute_store_aot_alu_xor3_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME compute_store_aot_alu_bcnt_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/compute_alu_bcnt_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(compute_store_aot_alu_bcnt_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME compute_store_aot_mubuf_load_format_d16_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-mubuf-load-format-d16 "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -7397,6 +7414,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(pixel_aot_sopk_hwreg_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_sopk_hwreg_${adapter}.txt")
+        add_test(NAME pixel_aot_sopp_round_mode_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-sopp-round-mode "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(pixel_aot_sopp_round_mode_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/pixel_aot_sopp_round_mode_${adapter}.txt")
         add_test(NAME pixel_aot_e64_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/pixel_aot_check.py" draw-e64 "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
