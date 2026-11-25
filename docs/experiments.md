@@ -11229,14 +11229,24 @@ queue open for the caller to close after delivery.
 completion, expiration or successful queue closure. The work port has no work
 items in this profile. The
 shim keeps its state in a side table keyed by the block address and reads only
-the leading queue, context and callback fields. `XAsyncGetStatus`,
-`XUserAddAsync` and `XPackageMountWithUiAsync` remain `E_NOTIMPL` stubs.
+the leading queue, context and callback fields. `XUserAddAsync` and `XPackageMountWithUiAsync` remain `E_NOTIMPL` stubs.
+`XAsyncGetStatus` and `XAsyncGetResultSize` answer for tracked blocks only.
+Operation completion and callback dispatch stay separate: once the provider work
+has finished, both queries report the stored status (and a result size of one
+provider handle) even while the completion callback still waits for
+`XTaskQueueDispatch`, matching the installed runtime. A block whose work is
+still in flight reports `E_PENDING`; a waiting status sleeps until that work
+completes or the start fails (then `E_INVALIDARG`). A null, untracked or
+already consumed block returns `E_INVALIDARG`. `xgameruntime_async_status` covers
+this against the manual queue of #2179 and the completion-port contract of #2170,
+including Begin, query status and size before the first dispatch, then dispatch
+exactly once.
 `xgameruntime_gamesave_async` covers the positive completion, the callback and
 in-callback claim, the error paths, reuse, provider exhaustion, early result
 retrieval before dispatch, null-queue refusal and the finite dispatch wait.
 
 ```powershell
-cmake --build --preset dev --target xgameruntime_shim xgameruntime_shim_check xgameruntime_contracts_check xgameruntime_pls_xpackage_check xgameruntime_identity_check xgameruntime_gamesave_async_check
+cmake --build --preset dev --target xgameruntime_shim xgameruntime_shim_check xgameruntime_contracts_check xgameruntime_pls_xpackage_check xgameruntime_identity_check xgameruntime_gamesave_async_check xgameruntime_async_status_check
 ctest --preset dev --no-tests=error -R '^xgameruntime_' -V
 python -B tests/xgameruntime_table_check.py
 ```
