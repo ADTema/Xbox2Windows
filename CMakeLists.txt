@@ -3807,10 +3807,19 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_stage_package COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stage_package_check.py" "${STARTUP_POWERSHELL}")
     set_tests_properties(startup_stage_package PROPERTIES TIMEOUT 120)
-    add_test(NAME startup_debug COMMAND "${INTAKE_PYTHON}" -B
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_debug_check.py" "$<TARGET_FILE:startup_debug_probe>"
-        "$<TARGET_FILE:startup_debug_calls>")
-    set_tests_properties(startup_debug PROPERTIES TIMEOUT 300)
+    # One script, three groups of cases that ctest can run in parallel. startup_debug keeps the old
+    # name; select all three with -R '^startup_debug' (the anchored -R '^startup_debug$' runs only the core group).
+    foreach(group IN ITEMS core log hooks)
+        if(group STREQUAL "core")
+            set(startup_debug_test startup_debug)
+        else()
+            set(startup_debug_test startup_debug_${group})
+        endif()
+        add_test(NAME ${startup_debug_test} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_debug_check.py" "$<TARGET_FILE:startup_debug_probe>"
+            "$<TARGET_FILE:startup_debug_calls>" ${group})
+        set_tests_properties(${startup_debug_test} PROPERTIES TIMEOUT 300)
+    endforeach()
 
     add_test(NAME startup_stream_request_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
         "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_check.py" "$<TARGET_FILE:startup_stream_consumer>")
