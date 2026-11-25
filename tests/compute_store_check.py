@@ -366,6 +366,7 @@ def controls():
     f32_controls()
     scalar_alu_controls()
     salu_i32_controls()
+    sub_co_controls()
     mbcnt_controls()
     bcnt_exec_controls()
     bfe_controls()
@@ -2723,6 +2724,153 @@ def salu_i32_draw(directory, compiler, renderer, backend):
     return 0
 
 
+SUB_CO = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "v_lshl_add_u32 v3, s10, 6, v0",
+    "v_sub_co_u32 v10, vcc_lo, 16, v3",
+    "v_sub_co_ci_u32_e32 v11, vcc_lo, 0x100, v3, vcc_lo",
+    "v_subrev_co_u32 v12, s4, 32, v3",
+    "v_subrev_co_ci_u32_e64 v13, s5, 0, 10, s4",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx4 v[10:13], v3, s[12:15], 0 idxen",
+    "s_endpgm",
+]
+SUB_CO_BINDING = dict(table_reg=8, descriptor_offset=0, group_reg=10, stride=16, wave_size=32)
+
+
+def sub_co_words(*, drop_vcc_borrow=False, swap_subrev=False, drop_sgpr_borrow=False):
+    """Independent Python model for SUB_CO: 64-bit unsigned subtract with borrow-out/borrow-in."""
+    words = [SENTINEL] * 320
+    for flat in range(64):
+        lo0 = (16 - flat) & 0xffffffff
+        b0 = 0 if drop_vcc_borrow else (1 if 16 < flat else 0)
+        hi0 = (0x100 - flat - b0) & 0xffffffff
+        if swap_subrev:
+            lo1 = (32 - flat) & 0xffffffff
+            b1 = 0 if drop_sgpr_borrow else (1 if 32 < flat else 0)
+            hi1 = (0 - 10 - b1) & 0xffffffff
+        else:
+            lo1 = (flat - 32) & 0xffffffff
+            b1 = 0 if drop_sgpr_borrow else (1 if flat < 32 else 0)
+            hi1 = (10 - 0 - b1) & 0xffffffff
+        words[4 * flat:4 * flat + 4] = [lo0, hi0, lo1, hi1]
+    return words
+
+
+def sub_co_controls():
+    """Exact HLSL and refusals for v_sub_co_u32, v_subrev_co_u32, and *_ci."""
+    lines = aot.lower(SUB_CO, 64, **SUB_CO_BINDING).splitlines()
+    diff0 = "(0x00000010u - tid.x)"
+    b0 = "(0x00000010u < tid.x ? 1u : 0u)"
+    hi0 = f"((0x00000100u - tid.x) - {b0})"
+    diff1 = "(tid.x - 0x00000020u)"
+    b1 = "(tid.x < 0x00000020u ? 1u : 0u)"
+    hi1 = f"((0x0000000au - 0x00000000u) - {b1})"
+    expected_store = f"    outputData.Store4(tid.x * 16u + 0u, uint4({diff0}, {hi0}, {diff1}, {hi1}));"
+    assert lines[3] == expected_store, lines
+    # Also check v_sub_co_ci_u32_e64 and v_subrev_co_ci_u32_e32 spellings.
+    e64_sub = variant(SUB_CO, ("v_sub_co_ci_u32_e32 v11, vcc_lo, 0x100, v3, vcc_lo",
+                               "v_sub_co_ci_u32_e64 v11, s6, 0x100, v3, vcc_lo"))
+    assert aot.lower(e64_sub, 64, **SUB_CO_BINDING).splitlines()[3] == expected_store
+    e32_rev = variant(SUB_CO, ("v_subrev_co_u32 v12, s4, 32, v3", "v_subrev_co_u32 v12, vcc_lo, 32, v3"),
+                      ("v_subrev_co_ci_u32_e64 v13, s5, 0, 10, s4", "v_subrev_co_ci_u32_e32 v13, vcc_lo, 0, v3, vcc_lo"))
+    assert "((tid.x - 0x00000000u) - (tid.x < 0x00000020u ? 1u : 0u))" in aot.lower(e32_rev, 64, **SUB_CO_BINDING)
+    # Group <= 32 works without wave_size=32; > 32 requires wave_size=32.
+    single = variant(SUB_CO, ("s10, 6", "s10, 5"))
+    assert "outputData.Store4" in aot.lower(single, 32, **dict(table_reg=8, descriptor_offset=0, group_reg=10, stride=16))
+    rejects("Borrow-out subtract requires wave_size=32", aot.lower,
+            SUB_CO, 64, table_reg=8, descriptor_offset=0, group_reg=10, stride=16)
+    # Unknown or pending source, invalid destination, unverified borrow destination/input.
+    rejects("Unverified ALU operand", aot.lower,
+            variant(SUB_CO, ("16, v3", "16, v40")), 64, **SUB_CO_BINDING)
+    rejects("Unverified ALU operand", aot.lower,
+            variant(SUB_CO, ("16, v3", "s12, v3")), 64, **SUB_CO_BINDING)
+    rejects("Invalid vector destination", aot.lower,
+            variant(SUB_CO, ("v10, vcc_lo", "v256, vcc_lo")), 64, **SUB_CO_BINDING)
+    rejects("Unverified borrow destination", aot.lower,
+            variant(SUB_CO, ("v12, s4", "v12, s106")), 64, **SUB_CO_BINDING)
+    rejects("Unverified borrow destination", aot.lower,
+            variant(SUB_CO, ("v12, s4", "v12, s12")), 64, **SUB_CO_BINDING)
+    rejects("Unverified borrow-in operand", aot.lower,
+            variant(SUB_CO, ("10, s4", "10, s30")), 64, **SUB_CO_BINDING)
+    rejects("Unverified borrow-in operand", aot.lower,
+            variant(SUB_CO, ("10, s4", "10, s12")), 64, **SUB_CO_BINDING)
+    # Borrow SGPR must be refused by any reader other than _ci: s_* ALU, v_* ALU, v_cndmask, and s_and_saveexec_b32.
+    rejects("Unverified scalar ALU operand", aot.lower,
+            variant(SUB_CO, ("v_subrev_co_ci_u32_e64 v13, s5, 0, 10, s4", "s_add_u32 s6, s4, 1\nv_mov_b32_e32 v13, s6")),
+            64, **SUB_CO_BINDING)
+    rejects("Unverified ALU operand", aot.lower,
+            variant(SUB_CO, ("v_subrev_co_ci_u32_e64 v13, s5, 0, 10, s4", "v_add_nc_u32_e32 v13, s4, v3")),
+            64, **SUB_CO_BINDING)
+    rejects("Unverified lane mask", aot.lower,
+            variant(single, ("v_subrev_co_ci_u32_e64 v13, s5, 0, 10, s4", "v_cndmask_b32_e64 v13, 0, 1, s4")),
+            32, table_reg=8, descriptor_offset=0, group_reg=10, stride=16)
+    rejects("Unverified or repeated lane guard", aot.lower,
+            variant(SUB_CO, ("v_sub_co_ci_u32_e32 v11, vcc_lo, 0x100, v3, vcc_lo",
+                             "s_and_saveexec_b32 s2, vcc_lo\ns_or_b32 exec_lo, exec_lo, s2\nv_mov_b32_e32 v11, 0")),
+            64, **SUB_CO_BINDING)
+    # Modifiers and unsupported spellings are refused.
+    for bad_line in ("v_sub_co_u32 v10, vcc_lo, 16, v3 clamp",
+                     "v_sub_co_u32 v10, vcc_lo, -v3, 1",
+                     "v_sub_co_u32 v10, vcc_lo, |v3|, 1",
+                     "v_sub_co_u32_e64 v10, vcc_lo, 16, v3",
+                     "v_subrev_co_ci_u32_e64 v13, s5, 0, 10, s4 mul:2"):
+        rejects("Unsupported compute instruction", aot.lower,
+                variant(SUB_CO, ("v_sub_co_u32 v10, vcc_lo, 16, v3", bad_line)), 64, **SUB_CO_BINDING)
+
+
+def sub_co_binary(directory, assembler, objcopy, library):
+    """The assembled SUB_CO program decodes to its text and lowers to the same translation."""
+    decoded = aot.labelled(disassemble(assemble(directory, assembler, objcopy, SUB_CO), library, offsets=True))
+    assert [line for line in decoded if line.startswith(("v_sub_co_", "v_subrev_co_"))] == [
+        line for line in SUB_CO if line.startswith(("v_sub_co_", "v_subrev_co_"))], decoded
+    assert aot.lower(decoded, 64, **SUB_CO_BINDING) == aot.lower(SUB_CO, 64, **SUB_CO_BINDING)
+
+
+def sub_co_draw(directory, compiler, renderer, backend):
+    src, cso, case = [directory / x for x in ("sub_co.hlsl", "sub_co.cso", "sub_co.case")]
+    source = aot.lower(SUB_CO, 64, **SUB_CO_BINDING)
+    src.write_text(source, encoding="ascii")
+    subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+    cmd = [renderer, backend, "--compute-store-case", cso, case]
+    expected = sub_co_words()
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+    off = list(expected)
+    off[256] ^= 1
+    for label, reference, word in (
+            ("vcc borrow dropped", sub_co_words(drop_vcc_borrow=True), 69),
+            ("subrev operand order swapped", sub_co_words(swap_subrev=True), 2),
+            ("sgpr borrow-in ignored", sub_co_words(drop_sgpr_borrow=True), 3),
+            ("sentinel past group", off, 256)):
+        assert next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b) == word, label
+        case.write_bytes(struct.pack("<321I", 1, *reference))
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"sub_co: reference '{label}' escaped detection\n{bad.stderr}")
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    for label, mutated in (
+            ("vcc borrow comparison flipped", source.replace("0x00000010u < tid.x ? 1u : 0u", "0x00000010u > tid.x ? 1u : 0u")),
+            ("sgpr borrow-in zeroed", source.replace("tid.x < 0x00000020u ? 1u : 0u", "tid.x < 0x00000020u ? 0u : 0u"))):
+        if mutated == source:
+            raise AssertionError(f"sub_co: mutation '{label}' did not change the source")
+        msrc, mcso = directory / "mutated.hlsl", directory / "mutated.cso"
+        msrc.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", mcso, msrc], check=True)
+        bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"sub_co: mutation '{label}' escaped detection")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in SUB_CO if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
+    return 0
+
+
 def assemble(directory, assembler, objcopy, lines, *, cpu="gfx1013", features=None):
     src, obj, raw = [directory / x for x in ("exit.s", "exit.o", "exit.bin")]
     src.write_text("\n".join(lines) + "\n", encoding="ascii")
@@ -4909,6 +5057,7 @@ def binary(directory, assembler, objcopy, library):
     mtbuf_store_binary(directory, assembler, objcopy, library)
     scalar_alu_binary(directory, assembler, objcopy, library)
     salu_i32_binary(directory, assembler, objcopy, library)
+    sub_co_binary(directory, assembler, objcopy, library)
     mbcnt_binary(directory, assembler, objcopy, library)
     bcnt_exec_binary(directory, assembler, objcopy, library)
     bfe_binary(directory, assembler, objcopy, library)
@@ -8232,6 +8381,7 @@ if __name__ == "__main__":
                  "draw-cvt-u32-f32": cvt_u32_f32_draw,
                  "draw-mbcnt": mbcnt_draw,
                  "draw-salu_i32": salu_i32_draw,
+                 "draw-sub-co": sub_co_draw,
                  "draw-bcnt-exec": bcnt_exec_draw,
                  "draw-bfe": bfe_draw,
                  "draw-vadd_nc_i32": vadd_nc_i32_draw,
