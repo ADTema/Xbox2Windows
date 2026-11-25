@@ -3,9 +3,31 @@ project(Xbox2Windows LANGUAGES CXX)
 
 enable_testing()
 
+# Python never caches the bytecode of the script it is started with, so every start of a big
+# tests/<name>.py recompiled it. tests/pyc_main.py <name> runs that file through the import system,
+# which reuses a valid .pyc. The add_test calls below keep naming the script; this wrapper swaps in
+# the entry plus the module name in one place. Other add_test calls pass through unchanged.
+set(x2w_pyc_main_modules pixel_aot_check compute_store_check)
+function(add_test)
+  list(LENGTH ARGV x2w_test_argc)
+  if(NOT x2w_test_argc EQUAL ARGC)
+    message(FATAL_ERROR "add_test wrapper: an argument is empty or holds ';'; call _add_test directly")
+  endif()
+  set(x2w_test_args "${ARGV}")
+  foreach(x2w_module IN LISTS x2w_pyc_main_modules)
+    string(REPLACE "/tests/${x2w_module}.py" "/tests/pyc_main.py;${x2w_module}" x2w_test_args "${x2w_test_args}")
+  endforeach()
+  _add_test(${x2w_test_args})
+endfunction()
+
 # Defined before the first Python-driven test so a fresh configure registers all of them.
 set(INTAKE_PYTHON "${CMAKE_SOURCE_DIR}/out/pe-env/Scripts/python.exe" CACHE FILEPATH
     "Native x64 Python with pefile for static intake tests")
+if(EXISTS "${INTAKE_PYTHON}")
+    add_test(NAME pyc_main_entry COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/pyc_main_check.py")
+    set_tests_properties(pyc_main_entry PROPERTIES TIMEOUT 60)
+endif()
 
 set(DSTORAGE_SDK_ROOT "" CACHE PATH "Extracted Microsoft.Direct3D.DirectStorage NuGet package")
 if(DSTORAGE_SDK_ROOT)
