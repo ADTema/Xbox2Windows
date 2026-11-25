@@ -296,6 +296,12 @@ CNDMASK_INLINE_FLOAT_BITS = (0x3f000000, 0xbf000000, 0x3f800000, 0xbf800000,
 
 
 def check_encoding(code, off, n, name, asm):
+    if name in ('v_interp_p1ll_f16', 'v_interp_p2_f16'):
+        # The shared disassembler ignores op_sel (w0[14:11]) here, as LLVM 15 does. Mesa ACO's
+        # v_interp_p2_hi_f16 is p2 with op_sel bit 3 (w0[14]): it writes the high half of the destination. The
+        # attribute half `high` is a different bit (w1[8]) and is printed, so it is not refused here.
+        if struct.unpack_from('<I', code, off)[0] & 0x7800:
+            raise Unsupported('%s with op_sel: only the plain form and high are lowered' % name)
     if name == 'image_load_mip':
         # The shared disassembler does not expose these gfx10 MIMG flags.
         word0, word1 = struct.unpack_from('<2I', code, off)
@@ -447,6 +453,11 @@ UNIFORM_VALU = frozenset((
 QUAD_SWAPS = {(1, 0, 3, 2): 'QuadReadAcrossX', (2, 3, 0, 1): 'QuadReadAcrossY', (3, 2, 1, 0): 'QuadReadAcrossDiagonal'}
 
 
+# Opcodes whose first operand is a source, not a destination (interp_f16_scan must not read it as a write).
+INTERP_STORE_PREFIXES = ('buffer_store', 'tbuffer_store', 'global_store', 'flat_store', 'scratch_store', 'ds_write',
+                         'ds_store', 'image_store')
+
+
 # VALU forms whose second operand is an SGPR destination (VOP3b carry-out or scale flag), not a source.
 VOP3B_SDST = re.compile(r'v_(add|sub|subrev)_co(_ci)?_u32|v_div_scale_f(32|64)|v_mad_[iu]64_[iu]32')
 
@@ -478,6 +489,12 @@ class Stage:
     pinned_low16_v = ()       # low16_only_v live across basic-block boundaries
     whole_read_v = ()         # VGPRs read outside a proven low-16-bit consumer
     byte_float_v = ()         # VGPRs proven to hold +0.0 or an integer in 1..255 (v_cvt_f32_ubyte0..3 result)
+    # pixel: VGPR -> (attr, channel, high) of the v_interp_p1ll_f16 that wrote it. Created on first use, because
+    # unit probes build a Stage without __init__.
+    interp_p1 = None
+    # The whole-program proof of interp_f16_scan depends only on the decoded program, so it runs once per Stage
+    # (a class default keeps probes built without __init__ working).
+    interp_scanned = False
 
     def __init__(self, pipe, kind, code, refusals=None, decoded=None):
         self.pipe, self.kind = pipe, kind
@@ -493,7 +510,8 @@ class Stage:
         self.wqm_exec = False     # exec is proven whole-quad: an s_wqm of exec into itself ran while exec_known
         self.exports = {}         # 'pos0' / 'paramN' / 'mrtN' -> [4 expressions]
         self.write_masks = {}     # 'mrtN' -> channels the export writes (bit c = channel c), see export()
-        self.attrs = {}           # pixel: attr index -> 'linear' | 'flat'
+        self.attrs = {}           # pixel: attr index -> 'linear' | 'flat' | 'f16'
+        self.compr_params = set() # vertex: param indices exported with the compr flag (packed binary16 pairs)
         self.uses_pos = False
         self.masks = set()        # scalar registers currently holding lane masks
         self.fetched = False      # vertex: the entry call into the fetch routine was translated as loads
@@ -669,6 +687,8 @@ class Stage:
             self.low16_only_v.discard(n)
 
     def set_v(self, n, expr, *, low16_only=False):
+        if getattr(self, 'interp_p1', None):
+            self.interp_p1.pop(n, None)
         if self.byte_float_v:
             self.byte_float_v.discard(n)
         if hasattr(self, 'uniform_v'):
@@ -2237,6 +2257,158 @@ class Stage:
         attr, comp = self.note_attr(ops[2], 'flat')
         self.set_v(reg_range(ops[0])[1], 'i.fparam%d.%s' % (attr, comp))
 
+    def interp_f16(self, op, ops, mods, vsrc, n_ops):
+        """Common checks of v_interp_p1ll_f16 / v_interp_p2_f16: -> (attr, channel index, high).
+
+        The attribute word holds two binary16 values. The vertex stage's compr export (see export()) splits the
+        pair into float channels, so half h of attribute channel c is float channel 2 * c + h of the parameter:
+        attrN.x = (param.x, param.y), attrN.y = (param.z, param.w). Channels z and w have no such pair.
+        """
+        extra = [m for m in mods if m != 'high']
+        if extra:
+            raise Unsupported('%s with %s: only the plain form and high are lowered' % (op, ' '.join(extra)))
+        if len(ops) != n_ops:
+            raise Unsupported('%s with %d operands, expected %d' % (op, len(ops), n_ops))
+        for tok in (ops[0], ops[1]) + tuple(ops[3:]):
+            if not re.fullmatch(r'v\d+', tok):
+                raise Unsupported('%s operand %s: only plain VGPRs are lowered' % (op, tok))
+        m = re.fullmatch(r'attr(\d+)\.([xyzw])', ops[2])
+        if not m:
+            raise Unsupported('%s interpolant %s: expected attrN.x/.y/.z/.w' % (op, ops[2]))
+        chan = 'xyzw'.index(m.group(2))
+        if chan > 1:
+            raise Unsupported('%s on channel %s: a compr export fills only the x and y channels' % (op, m.group(2)))
+        high = int('high' in mods)
+        return int(m.group(1)), 2 * chan + high, high
+
+    def interp_f16_pair(self, op, ops):
+        """The entry I/J registers: the PERSP_CENTER pair of the pixel inputs, I in the first, J in the second."""
+        base = getattr(getattr(self, 'pipe', None), 'persp_center_vgpr', 0)
+        if base is None:
+            raise Unsupported('%s: the pixel inputs do not enable the PERSP_CENTER barycentrics' % op)
+        want = 'v%d' % (base + (0 if op == 'v_interp_p1ll_f16' else 1))
+        if ops[1] != want:
+            raise Unsupported('%s barycentric operand %s: only the PERSP_CENTER entry %s (%s) is lowered' % (
+                op, ops[1], 'I' if op == 'v_interp_p1ll_f16' else 'J', want))
+        return base
+
+    def interp_f16_scan(self):
+        """Whole-program proof for the f16 interpolation pair (no fixed-point analysis: any doubt is a refusal).
+
+        The lowering reads the rasterizer's interpolant, so it is only faithful if (1) the entry I/J registers are
+        never written (they still hold the entry barycentrics wherever the pair reads them), (2) v_interp_p1ll_f16,
+        which emits nothing, has no consumer but the v_interp_p2_f16 that follows it in the same straight-line run
+        and nothing reads the destination it leaves stale when p2 writes elsewhere, and (3) nothing reads the
+        upper 16 bits of the p2 destination: whether gfx10 keeps or clears them is not established by a source
+        (LLVM 15 SIInstrInfo/VOP3Instructions.td model the result as f16 only; the encoding states no
+        high-half behaviour), so only a plain v_cvt_f32_f16 reading the low half may consume it.
+        """
+        if self.interp_scanned:
+            return
+        pair = None
+        targets = set()
+        rows = []
+        for off, _, name, asm in self.ins:
+            n, ops, mods = parse(asm)
+            n = re.sub(r'_e(32|64)$', '', n)
+            rows.append((off, n, ops, mods))
+            if n.startswith('s_cbranch') or n == 's_branch':
+                target = int(ops[0].split('_')[1], 16)
+                if target <= off:
+                    raise Unsupported('a backward branch in a program with v_interp_p1ll_f16 / v_interp_p2_f16')
+                targets.add(target)
+
+        def regs(tok):
+            r = reg_range(tok)
+            return set(range(r[1], r[2] + 1)) if r and r[0] == 'v' else set()
+
+        pending, stale, high_undefined = {}, set(), set()
+        for off, n, ops, mods in rows:
+            branch_boundary = off in targets or n.startswith('s_cbranch') or n == 's_branch'
+            if branch_boundary and pending:
+                raise Unsupported('a branch between v_interp_p1ll_f16 %s and its v_interp_p2_f16: p2 could be '
+                                  'reached without the matching p1ll' % ', '.join('v%d' % r for r in sorted(pending)))
+            if branch_boundary and (stale or high_undefined):
+                raise Unsupported('unmodelled v_interp_p2_f16 result across a branch')
+            store = n == 'exp' or n.startswith(INTERP_STORE_PREFIXES)
+            # A malformed pair member is refused by its own handler; the scan models only the plain spelling.
+            interp = (n in ('v_interp_p1ll_f16', 'v_interp_p2_f16') and len(ops) == (3 if n[10] == '1' else 4) and
+                      all(re.fullmatch(r'v\d+', o) for o in ops[:2] + ops[3:]))
+            if n in ('v_interp_p1ll_f16', 'v_interp_p2_f16') and not interp:
+                return  # its own handler refuses the program; nothing after it is worth proving
+            written = regs(ops[0]) if ops and not store else set()
+            if interp:
+                read = regs(ops[1])
+                pair = self.interp_f16_pair(n, ops)
+            else:
+                read = set().union(*(regs(o) for o in ops)) if ops else set()
+            low_reader = (n == 'v_cvt_f32_f16' and not mods and len(ops) == 2 and
+                          all(re.fullmatch(r'v\d+', o) for o in ops))
+            for r in sorted(read):
+                if r in pending:
+                    raise Unsupported('v%d is the v_interp_p1ll_f16 result, which emits nothing: %s reads it before '
+                                      'the matching v_interp_p2_f16' % (r, n))
+                if r in stale:
+                    raise Unsupported('v%d is the v_interp_p1ll_f16 result, which emits nothing: %s reads it after '
+                                      'a v_interp_p2_f16 that wrote another register' % (r, n))
+                if r in high_undefined and not (low_reader and r == int(ops[1][1:])):
+                    raise Unsupported('%s reads the upper 16 bits of the v_interp_p2_f16 result v%d: not modelled' %
+                                      (n, r))
+            if n == 'v_interp_p1ll_f16' and interp:
+                pending[int(ops[0][1:])] = (ops[2], 'high' in mods)
+            elif n == 'v_interp_p2_f16' and interp:
+                d, out = int(ops[3][1:]), int(ops[0][1:])
+                if pending.get(d) != (ops[2], 'high' in mods):
+                    raise Unsupported('v_interp_p2_f16 source %s is not the v_interp_p1ll_f16 result of %s' %
+                                      (ops[3], ops[2]))
+                del pending[d]
+                if out in pending:
+                    raise Unsupported('v_interp_p2_f16 overwrites the pending v_interp_p1ll_f16 result v%d' % out)
+                stale.discard(out)
+                if out != d:
+                    stale.add(d)
+                high_undefined.add(out)
+            elif low_reader:
+                high_undefined.discard(int(ops[0][1:]))
+                stale.discard(int(ops[0][1:]))
+        # I and J: never written anywhere
+        base = pair if pair is not None else (getattr(getattr(self, 'pipe', None), 'persp_center_vgpr', 0) or 0)
+        for off, n, ops, mods in rows:
+            store = n == 'exp' or n.startswith(INTERP_STORE_PREFIXES)
+            if ops and not store and regs(ops[0]) & {base, base + 1}:
+                raise Unsupported('%s writes v%d: the entry barycentric registers must still hold the entry values '
+                                  'where v_interp_p1ll_f16 / v_interp_p2_f16 read them' % (n, min(
+                                      regs(ops[0]) & {base, base + 1})))
+            if n == 'v_swap_b32' and len(ops) == 2 and regs(ops[1]) & {base, base + 1}:
+                raise Unsupported('v_swap_b32 writes the entry barycentric registers')
+        self.interp_scanned = True
+
+    def op_v_interp_p1ll_f16(self, ops, mods):
+        # P0 + I * P10 in f32 from a binary16 attribute. The rasterizer interpolates the float channel, so the
+        # statement itself emits nothing; p2 reads the interpolated value. The destination is remembered so that
+        # p2 can be checked to continue this very pass.
+        attr, idx, high = self.interp_f16('v_interp_p1ll_f16', ops, mods, 1, 3)
+        self.interp_f16_pair('v_interp_p1ll_f16', ops)
+        self.interp_f16_scan()
+        self.attrs.setdefault(attr, set()).add('f16')
+        if self.interp_p1 is None:
+            self.interp_p1 = {}
+        self.interp_p1[int(ops[0][1:])] = (attr, idx, high)
+
+    def op_v_interp_p2_f16(self, ops, mods):
+        # P1 + J * P20, converted to binary16 into the low half of the destination (LLVM: the result is f16, the
+        # high bit selects the attribute half only). The upper half is not modelled: interp_f16_scan refuses
+        # every consumer of it, so the preserved half emitted here is never observed.
+        attr, idx, high = self.interp_f16('v_interp_p2_f16', ops, mods, 1, 4)
+        self.interp_f16_pair('v_interp_p2_f16', ops)
+        self.interp_f16_scan()
+        if (self.interp_p1 or {}).get(int(ops[3][1:])) != (attr, idx, high):
+            raise Unsupported('v_interp_p2_f16 source %s is not the v_interp_p1ll_f16 result of %s' % (ops[3], ops[2]))
+        self.attrs.setdefault(attr, set()).add('f16')
+        d = reg_range(ops[0])[1]
+        self.used_v.add(d)
+        self.set_v(d, '(v%d & 0xffff0000u) | f32tof16(i.param%d.%s)' % (d, attr, 'xyzw'[idx]))
+
     def note_attr(self, tok, how):
         m = re.fullmatch(r'attr(\d+)\.([xyzw])', tok)
         attr, component = int(m.group(1)), m.group(2)
@@ -2543,6 +2715,8 @@ class Stage:
         # what it held there; the pipeline's write mask carries that (manifest 'wmask', #1674).
         mask = sum(1 << c for c, v in enumerate(vals) if v != 'off')
         if 'compr' in flags:
+            if name.startswith('param'):
+                self.compr_params.add(int(name[5:]))
             if kind in ('uint', 'int'):
                 raise Unsupported('packed integer export %s' % name)
             # Two binary16 channels per register: the low pair (0, 1) from the first, the high pair
@@ -2826,10 +3000,14 @@ class Pipeline:
         self.ps_attr_map = ps_attr_map  # stream_interface(): pixel attribute -> (vertex parameter, component mask); None pairs by number
         self.vs_fetch = vs_fetch  # stream_fetch(): the loads the vertex stage's entry call stands for
         self.packed_position_vgpr = None
+        # First VGPR of the PERSP_CENTER I/J entry pair (SPI_PS_INPUT_ADDR bit 1, after the PERSP_SAMPLE pair when that
+        # one is enabled). Without hardware inputs the model assumes the center pair alone: v0, v1.
+        self.persp_center_vgpr = 0
         if ps_hw_inputs is not None:
             ena, addr = ps_hw_inputs
             if ena != addr or not 0 <= ena <= 0xffff:
                 raise Unsupported('unverified pixel input enable/address combination')
+            self.persp_center_vgpr = (2 if addr & 1 else 0) if addr & 2 else None
             if ena & (1 << 15):
                 # SPI PS inputs 0..6 supply IJ pairs (the pull model supplies three);
                 # line stipple through sample coverage each occupy one VGPR.
@@ -2855,6 +3033,10 @@ class Pipeline:
             self.ps = Stage(self, 'ps', ps_code, refusals=refusals, decoded=decoded.get('ps'))
         self.params = sorted(int(k[5:]) for k in self.vs.exports if k.startswith('param'))
         self.flat = sorted(a for a, how in self.ps.attrs.items() if 'flat' in how)
+        for a, how in self.ps.attrs.items():
+            if 'f16' in how and (how != {'f16'} or a not in self.vs.compr_params):
+                raise Unsupported('attribute %d is read as binary16 by the pixel stage but not only so, or not exported '
+                                  'with compr by the vertex stage' % a)
         missing = [a for a in self.ps.attrs if a not in self.params]
         if missing:
             raise Unsupported('pixel stage reads attributes %s the vertex stage does not export' % missing)
