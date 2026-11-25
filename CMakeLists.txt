@@ -730,6 +730,13 @@ target_compile_features(startup_gamesave_submit PRIVATE cxx_std_17)
 add_executable(startup_gamesave_read_async tests/startup_gamesave_read_async.cpp)
 target_include_directories(startup_gamesave_read_async PRIVATE src)
 target_compile_features(startup_gamesave_read_async PRIVATE cxx_std_17)
+add_executable(startup_runtime_local tests/startup_runtime_local.cpp)
+target_include_directories(startup_runtime_local PRIVATE src)
+target_compile_features(startup_runtime_local PRIVATE cxx_std_17)
+add_test(NAME startup_runtime_local COMMAND startup_runtime_local)
+# Control: with the local runtime switch left off, the local answers must be missing.
+add_test(NAME startup_runtime_local_control COMMAND startup_runtime_local --control)
+set_tests_properties(startup_runtime_local_control PROPERTIES PASS_REGULAR_EXPRESSION "FAIL: ")
 
 # Input for the launcher containment check (docs/startup-runtime.md): writes known bytes to both
 # streams and the trap log, reports a known exit code, or holds memory, spawns a child or stays
