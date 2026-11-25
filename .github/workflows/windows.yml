@@ -205,6 +205,7 @@ jobs:
             tests/startup_gfx2hlsl_cvt_alu_check.py \
             tests/startup_gfx2hlsl_int_med3_check.py \
             tests/startup_gfx2hlsl_capture_check.py \
+            tests/startup_gfx2hlsl_watch_check.py \
             tests/startup_translator_check.py \
             tests/startup_gfx2hlsl_smem_offset_check.py \
             tests/startup_gfx2hlsl_refusals_check.py \
