@@ -991,16 +991,19 @@ Asynchronous read (21, with its result in 22) returns committed blobs.
 
 For provider `704c3f58-e629-4cc2-b197-30511b996fe2` and interface `1bfff3af-f14a-40a3-8e35-9ada906593f9`,
 container lookup (13), container enumeration (14), blob enumeration (18) and blob enumeration by
-name prefix (19) call back with committed
-metadata; each container's blob count and size come from one listing under its shared publication
-lock. Names match case-insensitively, as the store's directories and files do. The display name is
-the container name. Synchronous read (20) reads the requested blobs (all of them for a count of 0)
-under one shared lock, checks the capacity against that snapshot, and only then writes an array of
-records followed by names, NUL terminators and payloads into the caller's buffer. The count is in
-records, the capacity in bytes. A lookup of a name with no committed container returns 0x80830010
-without calling back; that code and the absence of a callback are not verified against the platform
-(the previous stub returned 0). Slots 12 and 15 still report nothing, and other interface
-identities keep the empty results.
+name prefix (19) call back with what the store holds. Each container's blob count and size come from
+one listing under its shared publication lock, and no store lock is held while a callback runs. A
+container created through slot 16 but never submitted exists and is reported with 0 blobs. Names
+match case-insensitively, as the store's directories and files do. The display name is the
+container name. Synchronous read (20) reads the requested blobs under one shared lock (`read_blobs`);
+for a count of 0 it lists and reads every blob under one lock and checks the needed size against the
+capacity before it reads any payload. The capacity is checked against that one snapshot, and only
+then is the layout of `save_blob_pack.h` (records, then names, NUL terminators and payloads) written
+into the caller's buffer. The count is in records, the capacity in bytes. A closed container handle
+is refused (E_INVALIDARG). A lookup of a name with no container directory returns 0x80830010 without
+calling back; that code and the absence of a callback are not verified against the platform (the
+previous stub returned 0). Slots 12 and 15 still report nothing, and other interface identities keep
+the empty results.
 [PC GDK thunk mapping](https://github.com/ivall/xcl/blob/64b3f35599bb7102f55d640e1a791e7d6dd3b175/crates/xcl/src/hle/xgameruntime/gdk_table.rs#L261-L270) ·
 [enumeration and sizing sample](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesaveenumerateblobinfo) ·
 [synchronous read contract](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesavereadblobdata)
@@ -1009,7 +1012,9 @@ through the provider vtable: a writer commits two blobs under a generated name (
 through slots 28 and 29 on a Windows gaming runtime queue in `startup_gamesave_read_after_async_submit`,
 which returns 77 when that runtime is absent), and a restarted reader discovers the container, lists
 the blobs (all, and by a prefix given in another case) and reads them. It also checks early enumeration stop, an unknown interface identity, a
-short buffer and a missing blob, both leaving the destination untouched.
+short buffer (also for a count of 0) and a missing blob, both leaving the destination untouched, a
+lookup of an absent name that does not call back, a slot 18 callback that runs with no store lock
+held, and slots 18, 19 and 20 refusing a closed container handle.
 `ctest --preset dev --no-tests=error -R '^startup_gamesave_persist$' -V` checks the storage code the
 slots call, not the slots: it writes in one process and reads in a second, including a close without
 submit, a failing second action, a second process that sees only committed state, and a redirected
@@ -1025,8 +1030,13 @@ sees a mixed or incomplete generation). The pause points and that copy exist onl
 `ctest --preset dev --no-tests=error -R '^startup_gamesave_read_publish_'` runs the synchronous read
 (slot 20, by name and for every blob) through the provider vtable against the same paused writer.
 During the pause the read waits for the store's lock timeout and fails with its destination
-untouched. A read still waiting when the writer goes on returns the whole new generation. The
-`_unlocked` copy must be caught with a mixed or incomplete generation.
+untouched. A read still waiting when the writer goes on returns the whole new generation. Racing
+cases stop the reader instead, through a hook the generated copy adds to `read_blobs` and
+`list_blobs` (null unless the test sets it; production builds keep only the anchor comments):
+between two blob reads of slot 20, and at a second store read inside one slot 20 or slot 14 call,
+another process commits a whole new generation (a third blob for slot 14). The reader must return
+the old generation whole: a reader that locks per blob or lists twice mixes the two. The `_unlocked`
+copy must be caught with a mixed or incomplete generation.
 
 Slot 28 first asks the Windows gaming runtime to accept the caller's async block. On rejection it returns before taking staged actions. Once accepted it commits the files and calls `XAsyncComplete` with the status for that block. Slot 29 retrieves the status with the matching operation identity. File publication is synchronous within slot 28. The caller's completion routine can run inline or through its selected completion queue. [XAsyncBegin](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasyncprovider/functions/xasyncbegin) · [XAsyncComplete](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasyncprovider/functions/xasynccomplete) · [PC GDK async interface slots](https://github.com/ivall/xcl/blob/64b3f35599bb7102f55d640e1a791e7d6dd3b175/crates/xcl/src/hle/xgameruntime/gdk_table.rs#L57-L64)
 

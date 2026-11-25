@@ -348,10 +348,17 @@ HRESULT __stdcall proxy_query(const GUID* provider, const GUID* iid, void** out)
             auto& entry = local_proxies[local - local_pairs];
             if (!entry) entry = new Proxy{slot_table, nullptr, index, &local->iid, 0, public_save};
             proxies[index] = entry;
-        } else if (!proxies[index] || proxies[index]->real != *out || proxies[index]->public_save_interface != public_save) {
-            proxies[index] = new Proxy{slot_table, *out, index, nullptr, 0, public_save};
-            if (index == save_provider)  // whether the synchronous queries of save_read.inl answer this interface
-                x2w_local::logf("x2w-runtime game save: interface %08lx -> synchronous reads %s", iid ? iid->Data1 : 0ul, public_save ? "on" : "off");
+        } else {
+            // One cached proxy per interface kind, so alternating queries reuse them instead of
+            // allocating (and logging) a new one each time.
+            static Proxy* by_kind[2][max_providers];
+            Proxy*& cached = by_kind[public_save][index];
+            if (!cached || cached->real != *out) {
+                cached = new Proxy{slot_table, *out, index, nullptr, 0, public_save};
+                if (index == save_provider)  // whether the synchronous queries of save_read.inl answer this interface
+                    x2w_local::logf("x2w-runtime game save: interface %08lx -> synchronous reads %s", iid ? iid->Data1 : 0ul, public_save ? "on" : "off");
+            }
+            proxies[index] = cached;
         }
         proxy = proxies[index];
     }

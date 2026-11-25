@@ -38,10 +38,16 @@ bool WINAPI stop_container(const save_read::ContainerInfo*, void* count) {
     ++*static_cast<unsigned*>(count);
     return false;
 }
-struct Metadata { std::vector<std::string> names; std::size_t required{}; };
+struct Metadata { std::vector<std::string> names; std::size_t required{}; std::string container; bool lock_free = true; };
 bool WINAPI collect_blob(const save_read::BlobInfo* info, void* state) {
     auto& data = *static_cast<Metadata*>(state);
     data.names.emplace_back(info->name);
+    if (!data.container.empty()) {
+        // No store lock may be held while the caller's callback runs: a writer must be able to lock.
+        x2w_save::FileLock probe;
+        const auto file = std::filesystem::path(storage_path()) / "x2w-gamesave" / (data.container + std::string(x2w_save::lock_suffix));
+        if (probe.acquire(file, true, std::chrono::milliseconds(0)) != x2w_save::LockResult::locked) data.lock_free = false;
+    }
     data.required += sizeof(save_read::Blob) + std::strlen(info->name) + 1 + info->size;
     return true;
 }
@@ -85,11 +91,14 @@ int read(Client& client, u64 p) {
         client.call(14, p, address(&stopped), address(&stop_container)) || stopped != 1 ||
         client.call(13, p, address(found.name.c_str()), address(&exact), address(&find_container)) ||
         exact.calls != 1 || exact.name != found.name ||
-        client.call(13, p, address("absent"), address(&exact), address(&find_container)) != 0x80830010) return 3;
+        client.call(13, p, address("absent"), address(&exact), address(&find_container)) != 0x80830010 ||
+        exact.calls != 1) return 3;
     u64 saved{};
     Metadata meta;
+    meta.container = found.name;
     if (client.call(16, p, address(found.name.c_str()), address(&saved)) ||
         client.call(18, saved, address(&meta), address(&collect_blob)) || meta.names.size() != 2) return 4;
+    if (!meta.lock_free) return 15;
     std::sort(meta.names.begin(), meta.names.end());
     if (meta.names != std::vector<std::string>{"brightness","language"}) return 5;
     // Slot 19 (by name prefix): only the matching blob, in either case; a success must call back.
@@ -123,8 +132,18 @@ int read(Client& client, u64 p) {
     if (words.front() != ~u64{} || reinterpret_cast<unsigned char*>(records)[meta.required] != 0xff ||
         words.back() != ~u64{}) return 10;
     count = 0;
+    const auto filled = words;
+    if (client.call(20, saved, 0, address(&count), meta.required - 1, address(records)) != 0x80830007 ||
+        words != filled || count != 0) return 16;
     if (client.call(20, saved, 0, address(&count), meta.required, address(records)) || count != 2) return 11;
     client.call(17, saved);
+    // A closed container handle is refused by every synchronous query.
+    Metadata closed;
+    count = 2;
+    if (client.call(18, saved, address(&closed), address(&collect_blob)) != e_invalidarg ||
+        client.call(19, saved, address("lang"), address(&closed), address(&collect_blob)) != e_invalidarg ||
+        client.call(20, saved, address(names), address(&count), meta.required, address(records)) != e_invalidarg ||
+        !closed.names.empty()) return 17;
     auto other_id = interface_id;
     ++other_id.Data1;
     Client other;

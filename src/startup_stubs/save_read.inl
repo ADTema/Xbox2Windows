@@ -2,8 +2,8 @@
 // store's shared publication lock (save_store.h), so a commit from any process is seen whole or
 // not at all within one call.
 namespace save_read {
-struct BlobInfo { const char* name; std::uint32_t size; };
-struct Blob { BlobInfo info; unsigned char* data; };
+using BlobInfo = x2w_save_pack::BlobInfo;  // the caller-buffer layout shared with slots 21 and 22
+using Blob = x2w_save_pack::Blob;
 struct ContainerInfo {
     const char* name;
     const char* display_name;
@@ -12,9 +12,9 @@ struct ContainerInfo {
     std::time_t modified;
     bool needs_sync;
 };
-static_assert(sizeof(Blob) == 24 && offsetof(Blob, data) == 16);
 static_assert(sizeof(ContainerInfo) == 48 && offsetof(ContainerInfo, bytes) == 24);
-// 0x80830010 for a name with no committed container is not verified against the platform.
+// 0x80830010 for a name with no container directory is not verified against the platform. A
+// container created through slot 16 but never submitted exists, with 0 blobs.
 constexpr u64 small_buffer = 0x80830007, missing_blob = 0x80830008, missing_container = 0x80830010;
 
 // Name of an open container handle; a closed handle is empty, as for the asynchronous read.
@@ -91,58 +91,51 @@ u64 blobs(u64* args, bool by_name)
     return 0;
 }
 
-// 20: ReadBlobData(container, names, &count, capacity, records). The requested set (or, with a
-// count of 0, every blob) is read under one shared lock with read_blobs (list_blobs for all), and
-// the capacity is checked against that snapshot. The destination is written only on success.
+// 20: ReadBlobData(container, names, &count, capacity, records). The requested set is read with
+// one read_blobs call; a count of 0 means every blob, listed and read under one list_blobs call
+// whose needed size is checked against the capacity before any payload is read. Either way the
+// capacity is checked against that one snapshot, and the destination is written only on success.
 u64 read(u64* args)
 {
     const auto name = container_name(args[0]);
     const auto* names = reinterpret_cast<const u64*>(args[1]);
     auto* count = reinterpret_cast<std::uint32_t*>(args[2]);
     const auto capacity = static_cast<std::size_t>(args[3]);
-    auto* output = reinterpret_cast<Blob*>(args[4]);
     if (name.empty() || !x2w_local::writable(count, sizeof(*count))) return e_invalidarg;
     const auto requested = *count;
     if (requested > capacity / sizeof(Blob)) return small_buffer;
     if (requested && !x2w_local::readable(names, sizeof(*names) * u64{requested})) return e_invalidarg;
-    std::vector<std::string> selected;
-    for (std::uint32_t i = 0; i < requested; ++i) {
-        std::string wanted;
-        if (!read_save_name(names[i], wanted) || !x2w_save::valid_name(wanted)) return e_invalidarg;
-        selected.push_back(std::move(wanted));
-    }
+    std::vector<x2w_save_pack::Piece> pieces(requested);
+    std::vector<std::string> wanted(requested);
+    for (std::uint32_t i = 0; i < requested; ++i)
+        if (!read_save_name(names[i], wanted[i]) || !x2w_save::valid_name(wanted[i])) return e_invalidarg;
     const auto store = save_store();
     std::vector<std::vector<unsigned char>> data;
-    x2w_save::Status status;
     if (requested) {
-        status = store.read_blobs(name, selected, data);
+        if (auto s = store.read_blobs(name, wanted, data); s != x2w_save::Status::ok) return save_status(s);
+        for (std::uint32_t i = 0; i < requested; ++i) pieces[i].name = std::move(wanted[i]);
     } else {
         std::vector<x2w_save::BlobEntry> all;
-        status = store.list_blobs(name, all, &data);
-        for (auto& entry : all) selected.push_back(std::move(entry.name));
+        bool fits = false;
+        const auto s = store.list_blobs(name, all, &data, [&](const std::vector<x2w_save::BlobEntry>& listing) {
+            std::vector<x2w_save_pack::PieceSize> sizes;
+            for (const auto& entry : listing) sizes.push_back({entry.name.size(), static_cast<std::size_t>(entry.bytes)});
+            std::size_t needed = 0;
+            fits = x2w_save_pack::bytes_needed(sizes.data(), sizes.size(), needed) && needed <= capacity;
+            return fits;
+        });
+        if (s != x2w_save::Status::ok) return save_status(s);
+        if (!fits) return small_buffer;
+        pieces.resize(all.size());
+        for (std::size_t i = 0; i < all.size(); ++i) pieces[i].name = std::move(all[i].name);
     }
-    if (status != x2w_save::Status::ok) return save_status(status);
-    if (data.size() != selected.size() || selected.size() > UINT32_MAX) return e_fail;
-    std::size_t bytes = selected.size() * sizeof(Blob);
-    for (std::size_t i = 0; i < selected.size(); ++i) {
-        const auto extra = selected[i].size() + 1 + data[i].size();
-        if (extra > SIZE_MAX - bytes) return small_buffer;
-        bytes += extra;
-    }
-    if (bytes > capacity) return small_buffer;
-    if (bytes && (!x2w_local::writable(output, bytes) || args[4] % alignof(Blob))) return e_invalidarg;
-    if (!selected.empty()) {
-        auto* cursor = reinterpret_cast<unsigned char*>(output + selected.size());
-        for (std::size_t i = 0; i < selected.size(); ++i) {
-            auto* saved_name = reinterpret_cast<char*>(cursor);
-            std::memcpy(cursor, selected[i].c_str(), selected[i].size() + 1);
-            cursor += selected[i].size() + 1;
-            output[i] = {{saved_name, static_cast<std::uint32_t>(data[i].size())}, cursor};
-            if (!data[i].empty()) std::memcpy(cursor, data[i].data(), data[i].size());
-            cursor += data[i].size();
-        }
-    }
-    *count = static_cast<std::uint32_t>(selected.size());
+    if (data.size() != pieces.size() || pieces.size() > UINT32_MAX) return e_fail;
+    for (std::size_t i = 0; i < pieces.size(); ++i) pieces[i].bytes = std::move(data[i]);
+    std::size_t bytes = 0;
+    if (!x2w_save_pack::bytes_needed(pieces, bytes) || bytes > capacity) return small_buffer;
+    if (bytes && (!x2w_local::writable(reinterpret_cast<void*>(args[4]), bytes) || args[4] % alignof(Blob))) return e_invalidarg;
+    x2w_save_pack::write(pieces, reinterpret_cast<void*>(args[4]));
+    *count = static_cast<std::uint32_t>(pieces.size());
     return 0;
 }
 }
