@@ -29,7 +29,9 @@ void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path,
 int check_startup_image_store(ID3D12Device* device, const char* vertex_path, const char* pixel_path, UINT x, UINT y,
                               const std::uint32_t expected[4]);
 void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
-                              std::uint32_t* words, UINT width = 1, UINT height = 1);
+                              std::uint32_t* words, UINT width = 1, UINT height = 1,
+                              D3D12_CULL_MODE cull = D3D12_CULL_MODE_NONE, BOOL front_ccw = FALSE,
+                              UINT vertices = 3);
 void dump_raw_uav(ID3D12Device* device, const char* shader_path, const char* groups,
                   const char* bytes, const char* out_path);
 void check_spirv_window(ID3D12Device* device, const char* shader_path);
