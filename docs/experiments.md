@@ -7401,6 +7401,59 @@ exact merged candidate on WARP and an RTX 4060 Laptop. Both readbacks passed.
 [Windows verification](https://github.com/avt0m4t48/Xbox2Windows/actions/runs/45473674036)
 · [Physical adapter report](https://github.com/R0Y00/Xbox2Windows/issues/1759#issuecomment-7142831918)
 
+#### Root constants in an indirect dispatch signature
+
+Device slot 41 also accepts a compute signature with a root signature, whose
+arguments are one or more `CONSTANT` arguments followed by a final `DISPATCH`.
+Its stride must be exactly the constants plus the 12-byte Dispatch record.
+Slot 61 checks that the whole record fits in the placed argument buffer. It
+executes the record only when the desktop compute root that slot 33 bound is
+the signature's root. Otherwise it refuses with
+`signature root constants require the bound compute root` before recording
+anything. Root views, vertex and index buffer views, and graphics commands
+with root arguments are still refused. Console-only argument types are
+unchanged.
+
+The `constants` mode of
+[`startup_indirect_dispatch.cpp`](../tests/startup_indirect_dispatch.cpp)
+uses a root with the result UAV and two 32-bit constants (`scale`, `bias`) at
+`b0`. The GPU writer stores `(3, 7)` and the groups `(4, 3, 2)` after the
+padding word. The consumer adds `scale * (1 + x + 10y + 100z) + bias` for each
+group. The second writer swaps the constants to `(7, 3)`. The cases are:
+
+- the two writers;
+- an omitted writer;
+- the unmapped, short-range and placeholder refusals from the rootless mode;
+- a guest compute root that lacks the constants.
+
+```powershell
+cmake --build --preset dev --target startup_indirect_dispatch
+ctest --preset dev --no-tests=error -R '^startup_indirect_(dispatch|root_constants)_(warp|hardware)$' -V
+```
+
+Results on Windows 11 build 26300.9974, MSVC 14.44, `dev` preset, debug layer
+enabled, branch `runtime/indirect-root-constants` on top of `9383b531`:
+
+- **Adapters.** WARP (Microsoft Basic Render Driver 10.0.26100.9818) and an
+  NVIDIA GeForce RTX 4090 (32.0.16.1088). All four tests passed, with no skips.
+- **Writers.** On both adapters, `(3, 7)` read back `0x31416b62` and
+  `(7, 3)` read back `0x31418272`.
+- **Untouched result.** The omitted writer and all four refusals left
+  `0x31415926`.
+- **Controls.** The upstream slot 41 and slot 61 code fails the first case
+  with `0x31415926`. It refuses the signature as not a single rootless
+  signature. A build without the root comparison also fails the root-mismatch
+  case. On WARP the debug layer reports message 744, a root signature mismatch,
+  and on the RTX 4090 the consumer writes `0x31416b62`.
+- **Other indirect fixtures.** The rootless Dispatch, Draw, DrawIndexed and
+  DispatchMesh tests still pass on both adapters.
+
+This fixture covers source-built desktop pipelines only. The application's
+signatures recorded in [#1412](https://github.com/R0Y00/Xbox2Windows/issues/1412)
+used argument types 0, 1, 2 and 10 plus one console-only type, so this slice
+completes part 2 of [#1759](https://github.com/R0Y00/Xbox2Windows/issues/1759)'s
+contract. It does not follow an observed application call.
+
 #### GPU-written indirect indexed draw arguments
 
 List slot 61 also forwards one rootless desktop `DRAW_INDEXED` record without
