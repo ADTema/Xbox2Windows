@@ -1947,8 +1947,9 @@ memory-type and state rules are unchanged. The five-second `x2w-d3d12 views note
   between placements would show up as a mismatch. A 512 MiB committed block with one touched page per
   64 KiB must be proven without any `VirtualQuery` call; the check prints the time per placement of
   the full walk, the bounded walk and the proof. `_region_only_control` trusts the allocation size
-  without the committed-bytes check and must fail only in the partly committed cases;
-  `_walk_only_control` never uses the region information and must fail only that call count. A
+  without the committed-bytes check and passes only when its decisions differ in the partly committed
+  cases and nowhere else; `_walk_only_control` never uses the region information and passes only when
+  that call count is its sole failure. Neither is `WILL_FAIL`, so a crash cannot pass them. A
   refused allocation or mapping is a capability skip (77) in the controls.
 
 ## Buffer memory SRVs (device slot 70)
