@@ -12,8 +12,8 @@ from resource_inventory import parts
 
 CONSTANT_WORDS = 16
 AXES = "xyz"
-# Unsigned VOPC compares a lane guard may use: v_cmp_<op>_u32 a, b is (a <op> b) per lane.
-GUARD_COMPARES = {"gt": ">", "lt": "<", "ge": ">=", "le": "<="}
+# Integer compares a lane guard may use. Inequality is the same for signed and unsigned words.
+GUARD_COMPARES = {"gt": ">", "lt": "<", "ge": ">=", "le": "<=", "ne": "!="}
 # The data ALU subset: the unsigned 32-bit operations the LLVM 15 code generator emits for the
 # read-compute-write fixture, on known words only. v_and_b32, v_or_b32, v_xor_b32 and v_lshrrev_b32 (src1 >> src0[4:0])
 # reuse the pixel profile's integer templates, as does v_mul_lo_u32. v_lshlrev_b32 and v_ashrrev_i32 shift src1
@@ -666,20 +666,17 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         elif image_output and stores and line == "s_waitcnt_vscnt null, 0x0":
             # The single image write becomes visible when the dispatch completes.
             continue
-        elif m := re.fullmatch(r"v_cmp_(gt|lt|ge|le)_u32_e32 vcc_lo, (s\d+|v\d+|-?\d+|0x[0-9a-f]+), v(\d+)", line):
-            op, src, right = m[1], m[2], int(m[3])
-            if src[0] in "sv":
-                n = int(src[1:])
-                left = (None if src[0] == "s" and (n > 105 or n in pending) or src[0] == "v" and n > 255
-                        else (scalar if src[0] == "s" else vector).get(n))
-            else:
-                value = int(src, 0)
-                left = value & 0xffffffff if -(1 << 31) <= value <= 0xffffffff else None
+        elif ((m := re.fullmatch(rf"v_cmp_(gt|lt|ge|le)_u32_e32 vcc_lo, {ALU_SOURCE}, (v\d+)", line))
+              or (m := re.fullmatch(rf"v_cmp_(ne)_i32_e32 vcc_lo, {ALU_SOURCE}, (v\d+)", line))
+              or (m := re.fullmatch(rf"v_cmp_(ne)_i32_e64 vcc_lo, {ALU_SOURCE}, {ALU_SOURCE}", line))):
+            op, src0, src1 = m.groups()
+            operands = (src0, src1)
+            words = [alu_word(token, scalar, vector, pending) for token in operands]
             # A word read or computed in the program is not a verified guard operand.
-            if (right > 255 or not all(is_word(word) and not (isinstance(word, tuple) and word[0] in ("source", "alu"))
-                                       for word in (left, vector.get(right)))):
+            if (any(token.startswith("v") and int(token[1:]) > 255 for token in operands)
+                    or any(word is None or isinstance(word, tuple) and word[0] in ("source", "alu") for word in words)):
                 raise ValueError("Unverified lane guard compare")
-            vcc = (op, left, vector[right])
+            vcc = (op, *words)
         elif m := re.fullmatch(r"s_and_saveexec_b32 s(\d+), vcc_lo", line):
             saved = int(m[1])
             if guard_span is not None or vcc is None or saved > 105 or saved in pending:
