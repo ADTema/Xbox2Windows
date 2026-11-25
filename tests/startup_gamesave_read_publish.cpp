@@ -66,6 +66,7 @@ fs::path hook_sync;  // set in a racing reader process only
 unsigned store_reads, blob_reads;
 void reader_hook(int point, unsigned long long)
 {
+    if (point == 2 && store_reads == 0) touch(hook_sync / "store-read");  // the call went through the seams
     if (point == 2 && ++store_reads == 2) {  // a second store read inside one provider call
         touch(hook_sync / "second-read");
         if (!wait_for(hook_sync / "writer-done")) std::_Exit(exit_other);
@@ -236,6 +237,9 @@ void racing_reader(const std::string& self, const fs::path& base, const char* mo
         expect(committed == 0, label + ": the second process commits");
     }
     read_thread.join();
+    // Not vacuous: the read passed the store seam, and a slot 20 read stopped between two blobs.
+    expect(fs::exists(sync / "store-read", ec), label + ": the reader reached the store read seam");
+    if (next == 2) expect(fs::exists(sync / "between", ec), label + ": the reader stopped between two blob reads");
     if (code == exit_mixed) std::fprintf(stderr, "FAIL: reader saw a mixed generation at %s\n", label.c_str());
     expect(code == exit_old, label + ": the reader sees one whole generation, the one before the commit (exit " + std::to_string(code) + ")");
 }
