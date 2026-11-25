@@ -1632,9 +1632,15 @@ class Stage:
         # v_cmp_class_f32 / v_cmpx_class_f32 test the binary32 class of the value in SRC0 against the
         # class-bit mask in SRC1 (the ISA order: the float operand first, the integer mask second).
         name = base.removesuffix('_sdwa')
-        if name in ('v_cmp_class_f32', 'v_cmpx_class_f32'):
-            writes_exec = name == 'v_cmpx_class_f32'
+        if name in ('v_cmp_class_f32', 'v_cmpx_class_f32', 'v_cmp_class_f16', 'v_cmpx_class_f16'):
+            # The half form (issue #1855) takes the raw binary16 pattern in the low half of the operand
+            # word: its classes follow the half layout (exponent 5 bits, mantissa 10, quiet bit 0x0200)
+            # and abs/neg act on bit 15, so the value is never converted to float here.
+            f16 = name.endswith('_f16')
+            writes_exec = name in ('v_cmpx_class_f32', 'v_cmpx_class_f16')
             sdwa = name != base
+            if f16 and sdwa:
+                raise Unsupported('SDWA form of %s' % name)
             if sdwa:
                 self.check_compare_sdwa_destination(base, writes_exec, ops)
             if len(ops) == 3:
@@ -1646,9 +1652,34 @@ class Stage:
                 raise Unsupported('%s with %d operands' % (base, len(ops)))
             if sdwa:
                 value, mask = self.compare_sdwa_sources(base, 'u32', [value, mask], mods, float_src0=True)
+            elif f16:
+                # abs() and - apply to bit 15 of the half, before the class test.
+                # The decoder prints an absolute source as |v4| and a negated one as -v4, so both
+                # spellings are accepted here as well as abs(...).
+                token = value
+                if re.fullmatch(r'-[1-9]\d*', token):
+                    raise Unsupported('%s source %s: ambiguous signed inline half' % (base, value))
+                negative = token.startswith('-')
+                if negative:
+                    token = token[1:]
+                absolute = (token.startswith('|') and token.endswith('|')) or (
+                    token.startswith('abs(') and token.endswith(')'))
+                if absolute:
+                    token = token[4:-1] if token.startswith('abs(') else token[1:-1]
+                if token in FLOATS or re.fullmatch(r'-[1-9]\d*', token):
+                    # A float-printed operand would otherwise be lowered as its binary32 bit pattern.
+                    raise Unsupported('%s source %s: f16 class compares need the raw half' % (base, value))
+                bits = self.u(token)
+                if absolute:
+                    bits = '(%s & 0x7fffu)' % bits
+                if negative:
+                    bits = '(%s ^ 0x8000u)' % bits
+                if mask in FLOATS:
+                    raise Unsupported('%s mask %s: expected an integer class mask' % (base, mask))
+                value, mask = bits, self.u(mask)
             else:
                 value, mask = self.f(value), self.u(mask)
-            cond = '(class32(%s) & %s) != 0u' % (value, mask)
+            cond = '(%s(%s) & %s) != 0u' % ('class16' if f16 else 'class32', value, mask)
             predicate = '((%s) ? 1u : 0u)' % cond
             # A narrowed EXEC must stay narrowed: intersect with it, as the generic compare path does.
             if not self.exec_known:
@@ -1659,7 +1690,10 @@ class Stage:
             elif dst in ('vcc', 'vcc_lo'):
                 self.emit('vcc = %s;' % predicate)
             else:
-                d = reg_range(dst)[1]
+                reg = reg_range(dst)
+                if not reg or reg[0] != 's':
+                    raise Unsupported('%s into %s' % (base, dst))
+                d = reg[1]
                 self.set_s(d, predicate)
                 self.masks.add(d)
             return None
@@ -2090,6 +2124,15 @@ class Pipeline:
                ' if (magnitude > 0x7f800000u) return (bits & 0x00400000u) != 0u ? 0x2u : 0x1u;'
                ' if (magnitude == 0x7f800000u) return negative ? 0x4u : 0x200u;'
                ' if (magnitude >= 0x00800000u) return negative ? 0x8u : 0x100u;'
+               ' if (magnitude != 0u) return negative ? 0x10u : 0x80u;'
+               ' return negative ? 0x20u : 0x40u; }',
+               # The ten binary16 classes v_cmp_class_f16 tests, from the raw encoding (issue #1855):
+               # signaling NaN, quiet NaN, -inf, -normal, -denormal, -0, +0, +denormal, +normal, +inf.
+               'uint class16(uint bits) { uint h = bits & 0xffffu, magnitude = h & 0x7fffu;'
+               ' bool negative = h >= 0x8000u;'
+               ' if (magnitude > 0x7c00u) return (h & 0x0200u) != 0u ? 0x2u : 0x1u;'
+               ' if (magnitude == 0x7c00u) return negative ? 0x4u : 0x200u;'
+               ' if (magnitude >= 0x0400u) return negative ? 0x8u : 0x100u;'
                ' if (magnitude != 0u) return negative ? 0x10u : 0x80u;'
                ' return negative ? 0x20u : 0x40u; }',
                # The 64-bit shifts (issue #1815): a pair of words, so the count never reaches 32 in a 32-bit
