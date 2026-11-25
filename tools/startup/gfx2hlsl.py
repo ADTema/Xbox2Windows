@@ -515,7 +515,10 @@ class Stage:
         self.emit('scc = %s;' % expr)
 
     def set_s(self, n, expr, sym=None, scc=None, uniform=None):
-        """Assign scalar register n at run time and/or symbolically."""
+        """Assign scalar register n at run time and/or symbolically.
+
+        Any write ends n's life as a lane mask; a caller that writes a mask marks n again after this call.
+        The uniformity of expr is judged first, while a source that is n itself still has its old mark."""
         if self.tracks_uniformity() and (sym is None or sym[0] == 'const'):
             if uniform is None:
                 uniform = self.scalar_expr_uniform(expr)
@@ -523,6 +526,7 @@ class Stage:
                 self.varying_s.discard(n)
             else:
                 self.varying_s.add(n)
+        getattr(self, 'masks', set()).discard(n)  # unit probes build a Stage without __init__
         if sym is not None:
             self.sym[n] = sym
             if sym[0] != 'const':
@@ -889,9 +893,6 @@ class Stage:
             return None
         if is_mask:
             expr = '(%s) & 1' % expr
-            self.masks.add(d)
-        else:
-            self.masks.discard(d)
         if base == 's_mov_b64':
             r = reg_range(ops[1])
             high = r[2] if r and r[1] != r[2] else None
@@ -900,6 +901,8 @@ class Stage:
             high_uniform = (self.tracks_uniformity() and high != d and
                             self.uniform_source(high_source))
         self.set_s(d, expr, scc=scc)
+        if is_mask:
+            self.masks.add(d)
         if pair and base != 's_mov_b64':
             self.set_s(d + 1, '0u')
         elif pair:
@@ -1000,6 +1003,9 @@ class Stage:
             raise Unsupported('s_load destination %s for %d dwords' % (ops[0], count))
         if not base or base[0] != 's' or base[2] - base[1] != 1 or base[2] > 105:
             raise Unsupported('s_load base %s' % ops[1])
+        # A loaded descriptor or word is not a lane mask; some forms below only record a symbol, not set_s.
+        for n in range(dst[1], dst[2] + 1):
+            getattr(self, 'masks', set()).discard(n)
         p = self.sym.get(base[1])
         if not p or p[0] != 'ptr':
             raise Unsupported('s_load through s%d holding %s' % (base[1], p))
