@@ -419,8 +419,11 @@ public:
     // a commit from any process is listed whole or not at all. Regular files only, by name (byte
     // order), with their sizes; links, directories and names valid_name refuses are not listed.
     // not_found: no such container. busy: the publication point stayed locked for the whole lock
-    // timeout. too_large: a blob is over max_blob_bytes. `out` is replaced only on ok.
-    Status list_blobs(std::string_view container, std::vector<BlobEntry>& out) const
+    // timeout. too_large: a blob is over max_blob_bytes. `out` is replaced only on ok. With
+    // `payloads`, the listed blobs are also read under the same lock (one generation for names,
+    // sizes and bytes); it is replaced only on ok, in the order of `out`.
+    Status list_blobs(std::string_view container, std::vector<BlobEntry>& out,
+                      std::vector<std::vector<unsigned char>>* payloads = nullptr) const
     {
         const fs::path dir = container_dir(container);
         if (dir.empty()) return Status::bad_name;
@@ -456,6 +459,14 @@ public:
         }
         if (ec) return Status::io_error;
         std::sort(found.begin(), found.end(), [](const BlobEntry& a, const BlobEntry& b) { return a.name < b.name; });
+        if (payloads) {
+            std::vector<std::vector<unsigned char>> all(found.size());
+            for (std::size_t i = 0; i < found.size(); ++i) {
+                if (const Status status = read_file(dir / found[i].name, all[i]); status != Status::ok) return status;
+                found[i].bytes = all[i].size();
+            }
+            *payloads = std::move(all);
+        }
         out = std::move(found);
         return Status::ok;
     }

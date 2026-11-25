@@ -724,6 +724,9 @@ target_include_directories(startup_gamesave_lock_errors_keep PRIVATE "${CMAKE_CU
 target_compile_features(startup_gamesave_lock_errors_keep PRIVATE cxx_std_17)
 add_test(NAME startup_gamesave_lock_errors_reacquire_control COMMAND startup_gamesave_lock_errors_keep)
 set_tests_properties(startup_gamesave_lock_errors_reacquire_control PROPERTIES PASS_REGULAR_EXPRESSION "FAIL: re-acquire")
+add_executable(startup_gamesave_read tests/startup_gamesave_read.cpp)
+target_include_directories(startup_gamesave_read PRIVATE src)
+target_compile_features(startup_gamesave_read PRIVATE cxx_std_17)
 add_executable(startup_gamesave_submit tests/startup_gamesave_submit.cpp)
 target_include_directories(startup_gamesave_submit PRIVATE src)
 target_compile_features(startup_gamesave_submit PRIVATE cxx_std_17)
@@ -2140,6 +2143,13 @@ if(FFX_UPSCALER_IMAGE)
 endif()
 if(EXISTS "${INTAKE_PYTHON}")
     # Startup stand-ins: exports, named traps and permissive answers (docs/startup-runtime.md).
+    # Synchronous save reads after a restart; the second test commits through slots 28 and 29 first.
+    add_test(NAME startup_gamesave_read COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gamesave_read_check.py"
+        "$<TARGET_FILE:startup_gamesave_read>")
+    set_tests_properties(startup_gamesave_read PROPERTIES TIMEOUT 30)
+    add_test(NAME startup_gamesave_read_after_async_submit COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gamesave_read_check.py" "$<TARGET_FILE:startup_gamesave_read>" write-async)
+    set_tests_properties(startup_gamesave_read_after_async_submit PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
     foreach(scheduler IN ITEMS controlled system)
         add_test(NAME startup_gamesave_submit_${scheduler} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gamesave_submit_check.py" "$<TARGET_FILE:startup_gamesave_submit>" ${scheduler})

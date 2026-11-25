@@ -987,8 +987,28 @@ can then hold some blobs of the new generation and some of the old one, with `.x
 The slot numbers and argument layouts follow the public header order and stay a hypothesis.
 Persisted: create container (16), delete container (10, 11), create and close update (23, 24), blob
 write and delete staged in an update (25, 26) and published by submit (27, 28 with its result in 29).
-Asynchronous read (21, with its result in 22) returns committed blobs. Slot 20 still reports no blob.
-The enumerations and queries (12 to 15, 18, 19) still report nothing.
+Asynchronous read (21, with its result in 22) returns committed blobs.
+
+For provider `704c3f58-e629-4cc2-b197-30511b996fe2` and interface `1bfff3af-f14a-40a3-8e35-9ada906593f9`,
+container lookup (13), container enumeration (14) and blob enumeration (18) call back with committed
+metadata; each container's blob count and size come from one listing under its shared publication
+lock. Names match case-insensitively, as the store's directories and files do. The display name is
+the container name. Synchronous read (20) reads the requested blobs (all of them for a count of 0)
+under one shared lock, checks the capacity against that snapshot, and only then writes an array of
+records followed by names, NUL terminators and payloads into the caller's buffer. The count is in
+records, the capacity in bytes. A lookup of a name with no committed container returns 0x80830010
+without calling back; that code and the absence of a callback are not verified against the platform
+(the previous stub returned 0). Slots 12, 15 and 19 still report nothing, and other interface
+identities keep the empty results.
+[PC GDK thunk mapping](https://github.com/ivall/xcl/blob/64b3f35599bb7102f55d640e1a791e7d6dd3b175/crates/xcl/src/hle/xgameruntime/gdk_table.rs#L261-L270) ·
+[enumeration and sizing sample](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesaveenumerateblobinfo) ·
+[synchronous read contract](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesavereadblobdata)
+`ctest --preset dev --no-tests=error -R '^startup_gamesave_read(_after_async_submit)?$'` runs two source-built processes
+through the provider vtable: a writer commits two blobs under a generated name (through slot 27, or
+through slots 28 and 29 on a Windows gaming runtime queue in `startup_gamesave_read_after_async_submit`,
+which returns 77 when that runtime is absent), and a restarted reader discovers the container, lists
+the blobs and reads them. It also checks early enumeration stop, an unknown interface identity, a
+short buffer and a missing blob, both leaving the destination untouched.
 `ctest --preset dev --no-tests=error -R '^startup_gamesave_persist$' -V` checks the storage code the
 slots call, not the slots: it writes in one process and reads in a second, including a close without
 submit, a failing second action, a second process that sees only committed state, and a redirected
