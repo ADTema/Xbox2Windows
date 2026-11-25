@@ -1395,6 +1395,40 @@ These are measured on one executable; treat them as hypotheses for others.
   before the gate opens and must read B back from A's copy. The fixture does not cover
   refusal after a normal Close or any command-buffer interaction. Run
   `ctest --preset release --no-tests=error -R '^startup_upload_lifetime_' -V`.
+- **Slot 148 acceptance client.** This client tests the upload allocation that the title's
+  acceleration-structure builder requests (#1758). It drives the stand-in's actual list and
+  queue, uses whichever slot 148 the build installs, and keeps no upload page of its own.
+  - **Request:** the traced shape, `(list, 0x280, 0x10)`, returning a pointer.
+  - **Resolver:** the module that installs the slot advertises it by exporting
+    `x2w_d3d12_upload_gpu_address(list, cpu, bytes)`. This is a fixture-only adapter to the
+    production address resolver, outside the guest ABI, and it holds no page reference for the
+    client. It returns the desktop GPU address only for a complete, non-empty range inside one
+    allocation of that list's open recording. A closed list, a range from before the list's last
+    Reset, or a range of another list resolves to 0.
+  - **Reads:** each submitted list records its own GPU read of its allocation through the guest
+    consumer. Slots 25 and 33 bind a guest compute pipeline and root signature, and slot 43 binds
+    the upload pointer as a root SRV. Before slot 43 runs, a sentinel buffer is bound, so a
+    refused binding reads the sentinel. Separately, an observer queue reads the resolved GPU
+    ranges while the submissions are held.
+  - **Held submissions:** A is submitted behind a gate fence. The list is Reset with another
+    allocator, and B is written and submitted. Each range is filled with a stale pattern before
+    its read is recorded and with its payload after, so only a read at execution sees the
+    payload. After the gate opens, both reads of A and B must match byte for byte. The
+    payloads are non-uniform: they mix the byte index with the lifetime fixture's A and B
+    values. A read off by 4 or 16 bytes therefore differs at every byte.
+  - **Other cases:**
+    - a Reset on A's own allocator after that allocator's Reset;
+    - the overwrite control;
+    - an early-reuse control on an unsubmitted list;
+    - wrong-list and stale-generation controls for slot 43 and the resolver;
+    - refusal after a successful Close;
+    - invalid arguments, including zero alignment.
+  - **Failures:** a missing slot (no resolver export and a null result) prints
+    `slot 148 not implemented (missing slot)` and exits 10. A null for the valid request from an
+    advertised slot exits 21, on the first call too. Both are failures. Only a missing physical
+    adapter skips (77).
+  - **Run:** `cmake --build --preset release --target startup_slot148_acceptance` and
+    `ctest --preset release --no-tests=error -R '^startup_slot148_acceptance_' -V`.
 - **Inline samplers.** Pixel shaders build sampler descriptors from constants (`s_movk_i32`,
   `s_bfm_b32`, 64-bit moves); the translator folds those into static samplers. A source-built
   pixel stage checks all four manifest words, rejects a mask width from a root constant, and

@@ -1088,6 +1088,22 @@ foreach(backend IN ITEMS warp hardware)
     set_tests_properties(startup_upload_lifetime_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
 endforeach()
 
+# Acceptance client for command-list slot 148, the upload allocation of the title's acceleration-structure builder
+# (Refs #1758, #2216). It drives the real list and queue, reads A and B on their own submitted lists through list
+# slot 43 and checks the fixture resolver x2w_d3d12_upload_gpu_address. A missing or refusing slot is a failure.
+# Only a missing physical adapter skips (77).
+add_executable(startup_slot148_acceptance tests/startup_slot148_acceptance.cpp)
+target_compile_features(startup_slot148_acceptance PRIVATE cxx_std_17)
+target_link_libraries(startup_slot148_acceptance PRIVATE d3d12_xs_shim d3d12 dxgi d3dcompiler)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_slot148_acceptance_${backend} COMMAND startup_slot148_acceptance ${backend})
+    set_tests_properties(startup_slot148_acceptance_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=1")
+    add_test(NAME startup_slot148_acceptance_nodebug_${backend} COMMAND startup_slot148_acceptance ${backend})
+    set_tests_properties(startup_slot148_acceptance_nodebug_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_LIST_NOOP=1;X2W_D3D12_RENDER=1;X2W_D3D12_DEBUG=0")
+endforeach()
+
 # GPU writes the dispatch record that the desktop command processor consumes (Refs #1412).
 add_executable(startup_indirect_dispatch tests/startup_indirect_dispatch.cpp tests/desktop_gpu.cpp)
 target_compile_features(startup_indirect_dispatch PRIVATE cxx_std_17)
