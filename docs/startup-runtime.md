@@ -63,6 +63,24 @@ error, and it leaves one query open at Close. `startup_list_queries_default_{war
 without the switch: the slots stay no-ops and it must report the untouched sentinel in the first word.
 `command_list_slot_names.h` still names 56 to 58 as the query methods by the plus-four rule.
 
+## Depth target on translated draws
+
+List slot 50 (`OMSetRenderTargets`) passes a bound depth-stencil view to the desktop list in the same call
+as the colour targets, and the translated pipeline takes its `DSVFormat` from that view. A depth handle that
+holds 0 maps to no descriptor: the colour targets are bound without depth, and the stand-in logs it and
+counts it in `x2w_d3d12_render_target_stats`. A depth handle in no descriptor heap, or one that is not a
+depth-stencil view, refuses the whole bind (also logged and counted), so nothing is drawn onto targets the
+title did not ask for. `ctest --preset release --no-tests=error -R "^startup_draw_depth_target_" -V` draws a
+near and a far triangle with a depth-tested stream pipeline and reads back the colour and the D32 depth
+values after the fence. With the view bound, the near triangle wins, depth is 0.25 where drawn, and the
+debug layer reports no message. With a zero handle, the far triangle overwrites and depth keeps its clear
+value. With an unknown handle, nothing is drawn. Each unresolved handle is counted once. The `_drop_control`
+draws the bound case with a zero handle and passes only when the intended colour and depth mismatch appears.
+
+Mesh pipelines reach the stand-in only as native desktop-bytecode streams, which must have a pixel stage
+and no depth format. A depth-only mesh pass (no colour target, no pixel stage) is therefore refused when
+the pipeline is created, and no fixture binds a depth target for one.
+
 ## Default viewport and scissor
 
 A desktop command list that never sets a viewport or scissor rectangle draws no pixel. A translated
