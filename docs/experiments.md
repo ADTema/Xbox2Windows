@@ -8958,6 +8958,12 @@ pixels and four clear pixels. Replacing the argument page between recording
 and submission left the entire target clear. Restoring the page restored the
 draw. Both adapters ran with the D3D12 debug layer enabled.
 
+The ordered fixture also keeps the target clear when only the SRV writer has
+been submitted and when the SRV page is remapped before submission. A gated
+DIRECT consumer still paints eight red pixels after the guest unmaps both
+pages. Neither physical page can be reused until the consumer fence finishes.
+Both pages are reusable afterward.
+
 ```powershell
 ctest --preset release --no-tests=error -j1 -R '^startup_indirect_mesh_lease_(warp|hardware)_dual' -V
 ```
