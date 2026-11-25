@@ -2579,7 +2579,11 @@ def fma_mix_operand(token, is_f16, is_hi, scalar, vector, pending, sample_dest):
     if m := re.fullmatch(r"abs\(([^()|]+)\)|\|([^()|]+)\|", token):
         use_abs = True
         token = m.group(1) or m.group(2)
-    if is_f16:
+    if re.fullmatch(r"-\d+", token) and -16 <= int(token) <= -1:
+        raise ValueError(f"Ambiguous mixed-precision inline constant {token}")
+    if token == "-0":
+        expr = "asfloat(0x80000000u)"
+    elif is_f16:
         if token in INLINE_F16:
             word = f"{INLINE_F16[token]}u"
         elif re.fullmatch(r"[vs]\d+", token):
@@ -2616,6 +2620,7 @@ def fma_mix_operand(token, is_f16, is_hi, scalar, vector, pending, sample_dest):
 
 
 def parse_fma_mix(rest):
+    """Parse LLVM selectors: op_sel_hi enables f16 and op_sel picks its high half."""
     parts_ = rest.split(", ")
     if len(parts_) != 3:
         raise ValueError("Invalid mixed-precision operand count")
@@ -2637,7 +2642,7 @@ def parse_fma_mix(rest):
             raise ValueError(f"Unsupported mixed-precision modifier {mod}")
     op_sel = opts.get("op_sel", [0, 0, 0])
     op_sel_hi = opts.get("op_sel_hi", [0, 0, 0])
-    if any(hi and not f16 for f16, hi in zip(op_sel, op_sel_hi)):
+    if any(hi and not f16 for hi, f16 in zip(op_sel, op_sel_hi)):
         raise ValueError("High-half selection requires an f16 operand")
     return operands, op_sel, op_sel_hi, clamp
 
@@ -6077,7 +6082,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Write overlaps an outstanding sample")
             tokens, op_sel, op_sel_hi, clamp = parse_fma_mix(rest)
             args = [fma_mix_operand(t, f16, hi, scalar, vector, pending, sample_dest)
-                    for t, f16, hi in zip(tokens, op_sel, op_sel_hi)]
+                    for t, f16, hi in zip(tokens, op_sel_hi, op_sel)]
             expr = f"mad({args[0]}, {args[1]}, {args[2]})"
             if clamp:
                 expr = f"saturate({expr})"

@@ -10361,8 +10361,8 @@ FMA_MIX_BODY = [
     "v_mov_b32_e32 v20, s46",
     "v_mov_b32_e32 v21, s47",
     "v_mov_b32_e32 v22, 0x40003c00",
-    "v_fma_mix_f32 v12, |s44|, -v19, v20 op_sel:[1,1,0] op_sel_hi:[1,0,0]",
-    "v_fma_mixlo_f16 v22, s44, 0.5, v21 op_sel:[1,1,0]",
+    "v_fma_mix_f32 v12, |s44|, -v19, v20 op_sel:[1,0,0] op_sel_hi:[1,1,0]",
+    "v_fma_mixlo_f16 v22, s44, 0.5, v21 op_sel_hi:[1,1,0]",
     "v_fma_mix_f32 v23, v22, 1.0, 0 op_sel:[1,0,0] op_sel_hi:[1,0,0]",
     "v_fma_mixhi_f16 v22, -|v19|, v23, v20 op_sel:[1,0,0] op_sel_hi:[1,0,0] clamp",
     "v_cvt_f32_f16_e32 v13, v22",
@@ -10371,7 +10371,7 @@ FMA_MIX_BODY = [
 ]
 
 FMA_MIX_SETS = (
-    # Set 1: mixed f16/f32 with |.|, -, op_sel_hi, and untouched-half preservation on both mixlo & mixhi.
+    # Set 1: mixed f16/f32 with |.|, -, op_sel, and untouched-half preservation on both mixlo & mixhi.
     (pack_f16_pair(1.5, -2.0), pack_f16_pair(0.5, -0.25), 0.75, 0.25),
     # Set 2: saturates both v_fma_mixhi_f16 clamp and v_fma_mix_f32 clamp to [0, 1].
     (pack_f16_pair(3.0, -4.0), pack_f16_pair(-0.5, 0.5), 2.5, -1.0),
@@ -10411,7 +10411,7 @@ def check_fma_mix_draw(directory, compiler, renderer, backend):
     for set_idx, old, new, label in (
         (0, "v_fma_mix_f32 v12, |s44|, -v19, v20", "v_fma_mix_f32 v12, s44, -v19, v20", "abs modifier"),
         (0, "v_fma_mix_f32 v12, |s44|, -v19, v20", "v_fma_mix_f32 v12, |s44|, v19, v20", "neg modifier"),
-        (0, "op_sel:[1,1,0] op_sel_hi:[1,0,0]", "op_sel:[1,1,0]", "op_sel_hi half select"),
+        (0, "op_sel:[1,0,0] op_sel_hi:[1,1,0]", "op_sel_hi:[1,1,0]", "op_sel half select"),
         (0, "v_fma_mixhi_f16 v22, -|v19|", "v_fma_mixlo_f16 v22, -|v19|", "mixhi half preservation"),
         (1, "v_fma_mixhi_f16 v22, -|v19|, v23, v20 op_sel:[1,0,0] op_sel_hi:[1,0,0] clamp",
          "v_fma_mixhi_f16 v22, -|v19|, v23, v20 op_sel:[1,0,0] op_sel_hi:[1,0,0]", "mixhi clamp"),
