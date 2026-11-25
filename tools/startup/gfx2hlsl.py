@@ -462,7 +462,7 @@ class Stage:
         self.used_v.add(n)
         self.emit('v%d = %s;' % (n, expr) if self.exec_known else 'if (exec & 1) v%d = %s;' % (n, expr))
 
-    def set_vf(self, n, expr, mods=()):
+    def f_mods(self, expr, mods=()):
         # The hardware applies the output modifier before the clamp, but the disassembler prints `clamp`
         # first, so the order of `mods` is not the order of the operations: scale first, saturate last.
         scale = 1.0
@@ -485,7 +485,10 @@ class Stage:
             expr = '(%s) * %s' % (expr, factor)
         if clamp:
             expr = 'saturate(%s)' % expr
-        self.set_v(n, 'U(%s)' % expr)
+        return expr
+
+    def set_vf(self, n, expr, mods=()):
+        self.set_v(n, 'U(%s)' % self.f_mods(expr, mods))
 
     def scalar_expr_uniform(self, expr):
         # These identifiers are runtime inputs in the scalar expressions emitted below.
@@ -714,22 +717,26 @@ class Stage:
         raise Unsupported(base)
 
     # VOP1/VOP2 with sub-dword addressing: select the source fields, run the same operation, then place
-    # the low bits of the result in the destination field. The integer forms reuse VEC_U unchanged;
-    # float forms are not lowered yet, and dst_unused UNUSED_SEXT has no lowering.
+    # the low bits of the result in the destination field. The integer forms reuse VEC_U unchanged,
+    # VEC_U_TO_F conversions apply output modifiers before dst_sel, VEC_F forms stay refused, and
+    # dst_unused UNUSED_SEXT has no lowering.
     def sdwa(self, base, ops, mods):
         fields = {}
+        out_mods = []
+        float_result = base in VEC_U_TO_F
         for m in mods:
-            key, _, value = m.partition(':')
-            if key in ('src0_sel', 'src1_sel', 'src2_sel', 'dst_sel', 'dst_unused') and value:
-                fields[key] = value
+            if float_result and m in ('clamp', 'mul:2', 'mul:4', 'div:2'):
+                out_mods.append(m)
             else:
-                raise Unsupported('%s with SDWA modifier %s' % (base, m))
-        if base in VEC_U_TO_F:
+                key, _, value = m.partition(':')
+                if key in ('src0_sel', 'src1_sel', 'src2_sel', 'dst_sel', 'dst_unused') and value:
+                    fields[key] = value
+                else:
+                    raise Unsupported('%s with SDWA modifier %s' % (base, m))
+        if float_result:
             arity, text = VEC_U_TO_F[base]
-            float_result = True
         elif base in VEC_U:
             arity, text = VEC_U[base]
-            float_result = False
         else:
             raise Unsupported('SDWA form of %s' % base)
         sources = []
@@ -744,8 +751,8 @@ class Stage:
             sources.append(sdwa_source(self.u(token), selection, sext))
         result = text.format(*sources)
         if float_result:
-            # The table holds the float value; the destination selection writes its bit pattern.
-            result = 'U(%s)' % result
+            # Output modifiers scale and then clamp the float value; dst_sel writes its bit pattern.
+            result = 'U(%s)' % self.f_mods(result, out_mods)
         select = fields.get('dst_sel')
         if not select:
             raise Unsupported('%s SDWA without dst_sel' % base)

@@ -6237,9 +6237,18 @@ rather than silently ignored, and a uint-result conversion such as `v_cvt_f16_f3
 modifiers. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_vcvt_omod$' -V`.
 
 The SDWA forms of those conversions read the same table: after the split, `sdwa()` still looked only at the
-uint-result table, so every `v_cvt_f32_*_sdwa` was refused until it was pointed at both (#1727). The
-restored path keeps the source selection, the `dst_sel`/`dst_unused` write and the `U(...)` wrapper, and a
-conversion's output modifier inside an SDWA form is still refused rather than dropped.
+uint-result table, so every `v_cvt_f32_*_sdwa` was refused until it was pointed at both (#1727). `sdwa()` now
+also applies output modifiers (`clamp`, `mul:2`, `mul:4` and `div:2`) on `VEC_U_TO_F` conversions before `U(...)`
+and `dst_sel`/`dst_unused` bit placement (#2023 item E), scaling before clamping even when disassembly prints
+`clamp` first. Integer and uint-result SDWA forms (`VEC_U`, including `v_cvt_f16_f32_sdwa` and
+`v_cvt_u32_f32_sdwa`) still refuse output modifiers. `VEC_F` SDWA forms, float source modifiers on
+`v_cvt_f32_f16_sdwa`, and `UNUSED_SEXT` stay refused. Verified on commit base `06cdc47d`,
+Windows 11 26H2 (build `26300.9974`), with FXC (`ps_5_1`) and
+DXC (`ps_6_0`), D3D12 debug layer enabled (`debug_errors=0 debug_warnings=0`), across Microsoft Basic Render
+Driver (`1414:008c`, driver `10.0.26100.9818`) and AMD Radeon RX 9070 XT (`1002:7550`, driver `32.0.32029.2010`):
+all 2,376 CPU evaluations and all 1,024 exported 32-bit words of the 16 x 16 pixel fixture match the RDNA 2 ISA
+reference, while five mutated HLSL controls fail against the reference and match their own models. Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_sdwa_cvt(_warp|_hardware)?$' -V`.
 
 **The binary32 class comparison.** `v_cmp_class_f32` and `v_cmpx_class_f32` had no lowering, so both census
 forms were refused - 2 of the remaining refused shaders in the first main-game loading-screen cache (#870,
