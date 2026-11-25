@@ -26,6 +26,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
@@ -359,24 +360,29 @@ struct alignas(void*) Subobject {
 
 enum class StreamDepth { none, writable, read_only };
 
-template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Stage>
+template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Stage, bool CacheControl = false>
 ComPtr<IUnknown> guest_pipeline(ID3D12Device* guest, ID3D12RootSignature* root,
                                D3D12_SHADER_BYTECODE source, D3D12_SHADER_BYTECODE pixel,
                                D3D12_SHADER_BYTECODE amplification = {}, UINT targets = 1, StreamDepth depth = StreamDepth::none)
 {
+    using Depth = std::conditional_t<CacheControl, D3D12_DEPTH_STENCIL_DESC1, D3D12_DEPTH_STENCIL_DESC>;
+    constexpr auto depth_type = CacheControl ? D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1
+                                             : D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL;
     struct {
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature*> root;
         Subobject<Stage, D3D12_SHADER_BYTECODE> source;
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC> raster;
-        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, D3D12_DEPTH_STENCIL_DESC> depth;
+        Subobject<depth_type, Depth> depth;
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE> topology;
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> targets;
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, DXGI_SAMPLE_DESC> samples;
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, DXGI_FORMAT> dsv;
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, D3D12_SHADER_BYTECODE> as;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, D3D12_BLEND_DESC> blend;
+        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, UINT> sample_mask;
     } stream;
-    static_assert(sizeof(stream) == 16 + 24 + 24 + 48 + 56 + 8 + 40 + 16 + 8 + 24);
+    static_assert(offsetof(decltype(stream), as) == 16 + 24 + 24 + 48 + (CacheControl ? 64 : 56) + 8 + 40 + 16 + 8);
     stream.root.value = root;
     stream.source.value = source;
     stream.ps.value = pixel;
@@ -397,12 +403,40 @@ ComPtr<IUnknown> guest_pipeline(ID3D12Device* guest, ID3D12RootSignature* root,
     stream.targets.value.NumRenderTargets = targets;
     stream.samples.value.Count = 1;
     stream.as.value = amplification;
-    const D3D12_PIPELINE_STATE_STREAM_DESC desc{
-        amplification.pShaderBytecode ? sizeof(stream) : sizeof(stream) - sizeof(stream.as), &stream};
     using Create = HRESULT (WINAPI*)(IUnknown*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
     ComPtr<IUnknown> result;
-    check(slot<Create>(guest, 86)(guest, &desc, __uuidof(ID3D12PipelineState),
-                                 reinterpret_cast<void**>(result.GetAddressOf())), "create guest graphics pipeline");
+    const auto create = [&](void* bytes, std::size_t size) {
+        const D3D12_PIPELINE_STATE_STREAM_DESC desc{size, bytes};
+        check(slot<Create>(guest, 86)(guest, &desc, __uuidof(ID3D12PipelineState),
+                                     reinterpret_cast<void**>(result.GetAddressOf())), "create guest graphics pipeline");
+    };
+    if constexpr (CacheControl) {
+        constexpr auto masks = offsetof(Depth, StencilWriteMask) + 1;
+        constexpr auto faces = offsetof(Depth, FrontFace);
+        constexpr auto write_mask = offsetof(D3D12_RENDER_TARGET_BLEND_DESC, RenderTargetWriteMask) + 1;
+        const int padding = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_PADDING", nullptr, 0) ? 0xa5 : 0;
+        std::memset(reinterpret_cast<unsigned char*>(&stream.depth.value) + masks, padding, faces - masks);
+        for (auto& blend : stream.blend.value.RenderTarget) {
+            blend.SrcBlend = blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+            blend.DestBlend = blend.DestBlendAlpha = D3D12_BLEND_ZERO;
+            blend.BlendOp = blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+            blend.LogicOp = D3D12_LOGIC_OP_NOOP;
+            blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+            std::memset(reinterpret_cast<unsigned char*>(&blend) + write_mask, padding, sizeof(blend) - write_mask);
+        }
+        stream.sample_mask.value = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_SAMPLE_MASK", nullptr, 0)
+            ? UINT_MAX ^ 1u : UINT_MAX;
+
+        // Omit the amplification record from this cache profile.
+        constexpr auto prefix = offsetof(decltype(stream), as);
+        constexpr auto suffix = offsetof(decltype(stream), blend);
+        alignas(void*) std::array<unsigned char, sizeof(stream) - sizeof(stream.as)> bytes;
+        std::memcpy(bytes.data(), &stream, prefix);
+        std::memcpy(bytes.data() + prefix, &stream.blend, sizeof(stream) - suffix);
+        create(bytes.data(), bytes.size());
+    } else {
+        create(&stream, amplification.pShaderBytecode ? offsetof(decltype(stream), blend) : offsetof(decltype(stream), as));
+    }
     return result;
 }
 
@@ -1503,9 +1537,12 @@ int main(int argc, char** argv) try
         const D3D12_COMMAND_SIGNATURE_DESC signature_desc{sizeof(D3D12_DISPATCH_MESH_ARGUMENTS), 1, &argument, 0};
         ComPtr<ID3D12CommandSignature> signature;
         check(guest->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature)), "create cached mesh signature");
-        const auto pso = guest_pipeline<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS>(
-            guest.Get(), root.Get(), {ms.data(), ms.size()}, {ps.empty() ? nullptr : ps.data(), ps.size()},
-            {}, depth_only ? 0 : lease_fixture ? 1 : 3, depth);
+        const D3D12_SHADER_BYTECODE ms_code{ms.data(), ms.size()};
+        const D3D12_SHADER_BYTECODE ps_code{ps.empty() ? nullptr : ps.data(), ps.size()};
+        const auto pso = lease_fixture
+            ? guest_pipeline<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS>(guest.Get(), root.Get(), ms_code, ps_code, {}, 1, depth)
+            : guest_pipeline<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, true>(guest.Get(), root.Get(), ms_code, ps_code, {},
+                                                                         depth_only ? 0 : 3, depth);
         if (dual_lease) {
             const bool init_only = GetEnvironmentVariableA("X2W_MESH86_FIXTURE_INIT_ONLY", nullptr, 0) != 0;
             const auto initialize = writer_pipeline(device.Get(), writer.Get(), "initialize_mesh_record");
