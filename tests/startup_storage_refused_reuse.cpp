@@ -265,7 +265,8 @@ int main(int argc, char** argv)
     std::memcpy(view, sentinel.data(), page_bytes);
 
     void *status_ptr = nullptr, *queue_ptr = nullptr;
-    unsigned char description[0x20] = {};
+    // The stand-in logs the first 40 bytes of the descriptor.
+    alignas(8) unsigned char description[0x28] = {};
     *reinterpret_cast<std::uint16_t*>(description + 8) = 16;
     if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, slot_count, "RefusedReuse", nullptr, &status_ptr) != 0 ||
         reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, description, nullptr, &queue_ptr) != 0) {
