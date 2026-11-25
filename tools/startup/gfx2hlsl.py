@@ -3854,8 +3854,6 @@ class Pipeline:
                '    precise float sum = product + ftz32(c);',
                '    return ftz32(sum);',
                '}',
-               'uint mul_hi_u32(uint a, uint b) { uint al = a & 0xffffu, bl = b & 0xffffu, m = (a >> 16) * bl + ((al * bl) >> 16); '
-               'return (a >> 16) * (b >> 16) + (m >> 16) + (((m & 0xffffu) + al * (b >> 16)) >> 16); }',
                'float med3(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }',
                # High half of an unsigned 32x32 product, by halfword products so it fits 32-bit HLSL.
                'uint mul_hi_u32(uint a, uint b) { uint la = a & 0xffffu, lb = b & 0xffffu;'
