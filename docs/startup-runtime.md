@@ -2096,6 +2096,81 @@ R24G8 or the added colour families.
   desktop texture that does not alias the address, so this shows the answered size is accepted by
   the creation path, not that the console layout fits in it.
 
+## 4 KiB allocation answers for small textures
+
+A console executable asks the allocation-info entries (slots 25 and 108) with `Alignment` 0x1000 for
+a texture that is not a render or depth target and whose top level, padded to 4 KiB blocks, holds at
+most 0x80007 bits. It keeps the answer only when the returned alignment is 0x1000, and otherwise asks
+again with alignment 0. The stand-in used to drop the 4 KiB request (`sanitized()`) and forward the
+desktop answer, 64 KiB at 64 KiB alignment. The executable then recorded 16 pages for a texture the
+console sizes at one, and its streaming read for that texture ran 64 KiB through the following
+resources' compressed chunks. It ended inside one of them, which the executable's own check rejects
+before the request is submitted. The storage stand-in then refused the request as destination
+capacity exceeded.
+
+For a description in scope the stand-in now answers the console size at 4 KiB alignment
+(`src/startup_stubs/small_texture_4k.h`): the GFX10 4 KiB thin-block layout as AMD addrlib computes it.
+Each level is padded to whole blocks (128 x 64 texels at 4 bits a texel, 64 x 64 at 8, 64 x 32 at 16,
+32 x 32 at 32, 32 x 16 at 64, 16 x 16 at 128; block-compressed formats count 4 x 4 blocks) until the
+first level no wider than half a block and no taller than a block. That level and every smaller one
+share one block. (addrlib also caps a tail at 8 levels; a 4 KiB thin tail never holds more than 7.) The first eight uses are logged as
+`x2w-d3d12 allocation info: 4 KiB answer ...`. Desktop D3D12 asked with a 4 KiB alignment is not a
+substitute: on the adapter measured it answered 0x2000 for a 128 x 4 R16G16B16A16 texture, where the
+4 KiB layout takes 0x4000.
+
+Scope: a 2D texture with layout UNKNOWN, `Alignment` 0x1000, one sample, one array slice, power-of-two
+width and height up to 16384, `MipLevels` 0 (full chain) up to the full chain, no render-target or
+depth flag, a single-plane format of 4, 8, 16, 32, 64 or 128 bits a texel (`small_texture_4k_bits`;
+depth with stencil is not answered), the executable's 0x80007-bit bound, and a desktop answer that is
+not a failure. Any other description, arrays, other layouts and 1D or 3D textures included, keeps the
+desktop answer.
+
+The executable's memory for such a texture is then only the answered size. The desktop linear footprint
+(256-byte rows, 512-byte level placement) can be larger: a 32 x 32 R8G8B8A8 texture takes 0x1f80 bytes.
+So for a description that got the 4 KiB answer (`Alignment` 0x1000 and in scope) the stand-in uses one
+compact linear plan (`small_texture_4k_plan`) in every call that touches that memory:
+
+- XG slot 2 reports the answered size at 4 KiB alignment and, per level, the plan's offset, row bytes and
+  size;
+- XG slot 8 writes every row of a level there, or nothing: a row pitch shorter than a row or a level past
+  the last one fails without writing or announcing a write;
+- texture upload (`upload_texture`) reads the same rows from there.
+
+In the plan, every row has its exact byte width (a row of texels, or of 4 x 4 blocks), and the levels
+follow each other from the top level with no padding. Its size never exceeds the answer:
+`startup_small_texture_4k` checks this for every accepted shape. The texels are linear, not the console's
+4 KiB swizzle. Data the executable streams in its own 4 KiB layout is therefore read in the wrong order,
+as it already was with the desktop layout. A GFX10 4 KiB tiling plan, such as `Gfx10Texture` in #1469,
+can replace the compact plan in all three calls at once. At alignment 0 nothing changes: the desktop
+answer and the desktop footprint.
+
+Measured on one console executable under the startup debugger: 18 such reads failed during
+first-run setup in every run, each with the executable's check firing once. With this answer both
+counts were 0 to the same screen. Over the executable's archives, every resource of the family it
+places in 4 KiB blocks starts exactly the size above after the previous one.
+
+- `ctest --preset release --no-tests=error -R '^startup_small_texture_4k(_whole_width_tail_control)?$' -V`
+  checks literal sizes and the refused descriptions without a device; the control expects a tail one
+  block wide and must fail.
+- `ctest --preset release --no-tests=error -R '^startup_small_texture_4k_addrlib$' -V` compares every
+  accepted power-of-two shape and mip count, for one format of each bit depth, with addrlib's
+  `ADDR_SW_4KB_S` size (Mesa 25.1.0, `tools/fetch_addrlib.py`); it skips (77) without addrlib.
+- `ctest --preset release --no-tests=error -R '^startup_small_texture_4k_device_' -V` goes through the
+  wrapper: slots 25 and 108 must give the 4 KiB answer, and controls the desktop answer.
+- `ctest --preset release --no-tests=error -R '^startup_small_texture_4k_xg' -V` covers a two-mip 32 x 32
+  R8G8B8A8 texture at `Alignment` 0x1000:
+  - slot 2's size, alignment and level records;
+  - slot 8 into exactly the answered size in front of a no-access guard page, with distinct rows and a
+    different sentinel per level, checked byte for byte;
+  - refused copies that leave memory unchanged;
+  - alignment 0 unchanged: slot 2 reports 0x10000 and slot 8 writes all 32 rows.
+
+  The `_no_limit_control` run asks at an explicit 64 KiB alignment, which gets no compact plan, and must
+  fail.
+- `ctest --preset release --no-tests=error -R '^startup_small_texture_4k_draw_' -V` writes the same
+  texture through slot 8 in front of a guard page, places it (slot 133), draws both levels through the
+  translated path on WARP and on the hardware adapter, and compares all 48 x 32 read-back pixels.
+
 ## Physical pages in shared sections
 
 `XMemAllocatePhysicalPages` pages are 64 KiB slots of 256 MiB pagefile-backed sections. With
