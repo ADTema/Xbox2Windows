@@ -15046,6 +15046,7 @@ check and requires the old exception to come back:
 The checks are `tests/startup_gfx2hlsl_handler_arity_check.py`, `…_image_arity_check.py`,
 `…_operand_count_check.py` and `…_scalar_arity_check.py`. They run on Linux and Windows without D3D12 or game
 data, because a refusal is observable at the `Stage` entry point.
+
 ## Startup translator: v_sad_u8, v_sad_u16 and v_sad_u32
 
 [`tools/startup/gfx2hlsl.py`](../tools/startup/gfx2hlsl.py) now lowers the gfx1013 VOP3A unsigned sum-of-absolute-differences instructions `v_sad_u8` (`0x15a`), `v_sad_u16` (`0x15c`) and `v_sad_u32` (`0x15d`) in `VEC_U` to three on-demand preamble helpers emitted in `Pipeline.common()` only when referenced by a stage (`sad_u8`, `sad_u16`, `sad_u32`):
@@ -15059,4 +15060,19 @@ data, because a refusal is observable at the `Stage` entry point.
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_sad_(controls|warp|hardware)$' -V
+```
+
+## Opt-in release of retired slot-133 title-memory textures (Slice 2)
+
+Building on #2443 (Slice 1), `X2W_D3D12_RELEASE_RETIRED=1` extends desktop object retirement to device slot 133 (`CreatePlacedResourceX`) committed 2D textures with `title_memory` (non-RT/DS/UAV, 1-sample, `DEFAULT` heap), while keeping slot 127 `__XMemAllocationHooks__` resources out of the class:
+
+- `drain_retired_resources()` erases the retired wrapper from `resource_address_index()` (under `note_lock`), erases its desktop pointer from `texture_uploads()` (under `draw_lock`), and cleans stale `written_textures()` entries whose generation was not bumped by a newer allocation/write at the same title address (also cleared immediately on final `Release` when no view or live sibling shares the address).
+- `list_copy_texture.inl` calls `upload_texture()` for a subresource copy only when the resource is not in the retire class or has title memory (`!retire_when_idle || title_memory`), so with the switch off every resource uploads exactly as before; `texture_uploads()` accesses in `list_copy.inl` / `list_copy_texture.inl` are guarded with `draw_lock`.
+- `view_slot` records a view only when the desktop created it: desktop view creation returns `void`, so a removed device is the only failure it reports, and a failed slot is recorded unmaterialized (releasing its previous view reference and adding none). `retire_hold` reads the wrapper's desktop pointer under the retire lock and marks a use it cannot record, which makes the drain keep that desktop object for the process instead of dropping one a list still names.
+- `view_slot<18>` (SRV) tracks descriptor slots via `HeapInfo::shadow` across `note_view`, `note_copy`, and heap destruction (falling back to `retire_leave_class` for untracked slots or slots 19–21), and `draw_translated` holds bound textures with `retire_hold`.
+
+[`tests/startup_resource_retire_title.cpp`](../tests/startup_resource_retire_title.cpp) (`startup_resource_retire_title_{warp,hardware}_debug0` and `_off_`) verifies slot 133 copy/upload holds and readbacks, same-address slot 70 (`existing_memory_texture`) reuse under `X2W_RESOURCE_INDEX_CHECK=1`, stale `bc7_width` `written_textures` cleanup on RGBA8 reuse, `CopyDescriptorsSimple` / overwrite / heap-release SRV retirement, the switch-off control that an ordinary committed texture (no title memory) copy still records its upload, and that a newer `written_textures` generation survives the older generation's retirement across WARP (`Microsoft Basic Render Driver`) and `NVIDIA GeForce GTX 1660 SUPER`. Case 7 closes the fixture's draw-path gap (review finding B1): a host-built translated pixel shader samples a slot 133 title-memory texture through a descriptor table, its view token must resolve to that texture (a skipped resolve binds a null view and the readback reports `pixel (0,0) got 00000000`), and `retire_hold` in the draw keeps the released texture retained while the closed recording names it (removed, the budget reports `retained=0/0 expected=65536/1` before the recording is dropped); the readback holds the exact sampled words plus a clear sentinel row and column throughout, including after the texture leaves the budget.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_resource_(retire|budget)' -V
 ```
