@@ -3407,6 +3407,34 @@ all 1,024 pixels for each of the eight cases. Physical hardware and startup
 pipeline integration remain open in [#1760](https://github.com/R0Y00/Xbox2Windows/issues/1760).
 [Windows verification](https://github.com/avt0m4t48/Xbox2Windows/actions/runs/45485172952)
 
+### Constant-lane scalar spills in bounded mesh
+
+The bounded mesh translator models two wave64s and follows each wave's concrete
+forward control flow. A constant-lane `v_writelane_b32` saves one scalar word
+and `v_readlane_b32` recovers it regardless of EXEC. Each slot belongs to one
+wave and is identified by the VGPR and lane. A reload requires a preceding write
+on the modeled path. Ordinary use of the VGPR between its first spill write and
+a subsequent reload is rejected.
+
+`tests/mesh_lane_spill_check.py` is a hand-authored wave64 fixture. It writes
+and reads lanes 3 and 63 with EXEC cleared, reuses lane 63 for the saved high
+EXEC word, then checks that only lanes 32 through 63 export the expected words.
+It also checks that a uniform expression survives the reload and that swapping
+the two scalar reload lanes fails the value check.
+
+```sh
+python -B tests/mesh_lane_spill_check.py
+ctest --preset dev --no-tests=error -R '^mesh_lane_spill_cpu$' -V
+```
+
+The profile rejects register-selected and out-of-range lanes, unwritten slots,
+and mixed VGPR use within the spill interval, including a register range that
+covers the spill VGPR. Before this change the two instructions went through the
+per-lane vector path: they were refused when a lane was live, but under EXEC = 0
+they were skipped and the reload left its SGPR unwritten. The runtime geometry
+translator now refuses them explicitly. Not measured: the fixture exercises the
+CPU interpreter only; no DXIL was compiled and nothing was drawn.
+
 ## Amplification and mesh pipeline forms
 
 `tests/mesh_amplified_check.py` builds an amplification shader (`as_6_5`) and a
