@@ -135,7 +135,7 @@ The translation is refused when:
 - a pixel header has another size;
 - the code reads an attribute the table does not list.
 
-The shader cache revision is `x2w-startup-shader-7`, so translations paired by number are not reused.
+The shader cache revision is `x2w-startup-shader-8`, so translations paired by number are not reused.
 
 The record layouts were checked offline against the signatures of one title's shader archive (local files only, not
 in the repository):
