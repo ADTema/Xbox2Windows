@@ -33,6 +33,8 @@ def controls():
         ("v_cmp_ne_i32_e32 vcc_lo, s4, v0", "Unverified lane guard compare"),
         ("v_cmp_ne_i32_e32 vcc_lo, s3, v256", "Unverified lane guard compare"),
         ("v_cmp_ne_i32_e32 vcc_lo, 0x100000000, v0", "Unverified lane guard compare"),
+        # A word computed in the program is not a verified guard operand, including in _e64 source 1.
+        ("s_add_u32 s20, s3, 1\nv_cmp_ne_i32_e64 vcc_lo, v0, s20", "Unverified lane guard compare"),
     ):
         base.rejects(diagnostic, lower, compare)
 
