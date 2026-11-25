@@ -6439,6 +6439,12 @@ symbolic descriptors and reserved scalar encodings stay refused. [Refs #1996](ht
 one. Only the low five bits of the index are used. EXEC, VCC and SGPRs tracked
 as lane masks are refused because their per-lane projections lose the other
 bits. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_bitcmp$' -V`.
+
+**Scalar immediate comparisons.** The startup translator sign-extends the
+16-bit field of `s_movk_i32` and `s_cmpk_*_i32`, and zero-extends the field
+of `s_cmpk_*_u32`. The source-built check covers all six relations against
+both signed and unsigned references and rejects values outside the encoded
+range. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_sopk_signext$' -V`.
 The fixture evaluates the emitted expression on the CPU and checks both
 operand positions for mask refusal. It does not execute a GPU draw.
 

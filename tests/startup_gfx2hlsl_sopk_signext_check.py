@@ -91,7 +91,7 @@ check('s_cmpk_lt_i32 s0=0, -1', bool(run(['s_cmpk_lt_i32 s5, -1'], {'s5': 0})['s
 
 # negative controls: the translator must refuse what the encoding cannot hold, and what has no lowering
 refused = 0
-for program in (['s_movk_i32 s0, 0x10000'], ['s_movk_i32 s0, -0x8001'], ['s_movk_i32 s0, -32769'], ['s_movk_i32 s0, s1'],
+for program in (['s_movk_i32'], ['s_movk_i32 s0, 0x10000'], ['s_movk_i32 s0, -0x8001'], ['s_movk_i32 s0, -32769'], ['s_movk_i32 s0, s1'],
                 ['s_cmpk_lt_i32 s5, 0x10000'], ['s_cmpk_lt_i32 s5, -32769'], ['s_cmpk_lt_i32 s5, s6'],
                 ['s_cmpk_lt_u32 s5, 0x10000'], ['s_cmpk_lt_u32 s5, -1'],
                 ['s_cmovk_i32 s0, 0xffff']):

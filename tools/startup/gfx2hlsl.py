@@ -794,6 +794,8 @@ class Stage:
 
     # scalar ALU with descriptor-word bookkeeping
     def scalar(self, base, ops):
+        if base == 's_movk_i32' and len(ops) != 2:
+            raise Unsupported('s_movk_i32 with %d operands, expected 2' % len(ops))
         text, scc = SCA[base]
         if base in SCC_UNMODELLED and self.tracks_uniformity():
             self.scc_uniform = False
@@ -807,8 +809,6 @@ class Stage:
         srcs = [low(t) for t in srcs]
         dname = low(ops[0])
         if base == 's_movk_i32':
-            if len(srcs) != 1:
-                raise Unsupported('s_movk_i32 with %d operands' % len(srcs))
             srcs = [str(sopk_imm(srcs[0], True))]  # D.i32 = signext(SIMM16)
         shift_add = base in SHIFT_ADD
         word_complement = base in ('s_nand_b32', 's_nor_b32', 's_xnor_b32')
@@ -2018,10 +2018,12 @@ for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt',
             return handler
         setattr(Stage, 'op_s_cmp_%s_%s' % (_name, _typ), _make())
     for _typ, _cast in (('i32', 'int({0}) %s int({1})'), ('u32', '{0} %s {1}')):
-        def _make_cmpk(op=_op, cast=_cast, signed=_typ == 'i32'):
+        def _make_cmpk(op=_op, cast=_cast, signed=_typ == 'i32', name='s_cmpk_%s_%s' % (_name, _typ)):
             def handler(self, ops, mods):
-                if len(ops) != 2 or mods:
-                    raise Unsupported('s_cmpk requires a register and a 16-bit immediate')
+                if len(ops) != 2:
+                    raise Unsupported('%s with %d operands, expected 2' % (name, len(ops)))
+                if mods:
+                    raise Unsupported('%s with modifiers' % name)
                 self.set_scc((cast % op).format(self.u(ops[0]), '0x%08xu' % sopk_imm(ops[1], signed)))
             return handler
         setattr(Stage, 'op_s_cmpk_%s_%s' % (_name, _typ), _make_cmpk())
