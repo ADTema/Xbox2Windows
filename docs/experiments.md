@@ -9166,7 +9166,15 @@ Run `cmake --build --preset dev --target unified_buffer_paths_check` and `ctest 
 
 #### A lease for committed XMem section pages (#1914)
 
-The in-process lease API requires version 1 and the exact output structure size. It clears a correctly sized output before checking the request. It checks the mirrored and CPU mappings under the XMem lock, accepts only committed pages backed by consecutive slots of one section, and duplicates the section handle within the caller's process. The caller maps the selected span with `MapViewOfFile` and opens that view with `OpenExistingHeapFromAddress`. The returned byte offset identifies the requested start inside the placed buffer. The lease holds the slots until the caller releases it after its last GPU fence. Freeing the original title grant is allowed after unmapping. Its slots stay out of the reuse pool until the lease retires.
+Version 2 of the same three exports pins a byte range within one committed 64 KiB
+page. It also accepts ordinary CPU addresses tracked by XMem. Callers can read
+late writes through the returned section and check the current mapping against
+the pin before consuming the data. An address remapped to another grant fails
+that check while the original pinned bytes remain readable. Acquire, match and
+release take the same version. Run the CPU-only record and remap check with
+`ctest --preset release --no-tests=error -R '^xmem_section_lease_single_page$'`.
+
+The version 1 mirrored-range API requires the exact output structure size. It clears a correctly sized output before checking the request. It checks the mirrored and CPU mappings under the XMem lock, accepts only committed pages backed by consecutive slots of one section, and duplicates the section handle within the caller's process. The caller maps the selected span with `MapViewOfFile` and opens that view with `OpenExistingHeapFromAddress`. The returned byte offset identifies the requested start inside the placed buffer. The lease holds the slots until the caller releases it after its last GPU fence. Freeing the original title grant is allowed after unmapping. Its slots stay out of the reuse pool until the lease retires.
 
 The fixture maps two pages from the shim's `SEC_RESERVE` pool and copies a 4 KiB span across their boundary. A GPU write appears in both title views. A second copy sees the original pages' late CPU updates after the title frees and remaps the same virtual addresses. Readback compares all 4,096 bytes and checks the replacement pages retain their own data. A later allocation gets the retired slot and sees zeroes. The checks also refuse holes, reversed section order, a CPU address passed to the mirrored address API, an invalid output size and a repeated release.
 
