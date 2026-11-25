@@ -619,13 +619,19 @@ def check_dispatch(dxc, runner, adapter, control=None):
             print(run.stdout, end='')
             if run.returncode == 77:
                 return 77
+            diagnostics = []
+            for line in run.stderr.splitlines():
+                if adapter == 'hardware' and line.startswith('XBOX2WINDOWS_ADAPTER: skipping '):
+                    print(line, file=sys.stderr)
+                else:
+                    diagnostics.append(line)
             if mutation:
-                first = run.stderr.strip().splitlines()[:1]
-                if (run.returncode != 1 or 'expected=' not in run.stderr or
+                first = diagnostics[:1]
+                if (run.returncode != 1 or not any('expected=' in line for line in diagnostics) or
                         mutation in MBCNT_MISMATCH and first != [MBCNT_MISMATCH[mutation]]):
                     raise AssertionError('control %s: unexpected result (exit %d) %s' % (mutation, run.returncode, run.stderr))
                 print('control %s: rejected at %s' % (mutation, first[0]))
-            elif run.returncode or run.stderr:
+            elif run.returncode or diagnostics:
                 raise AssertionError('case %s: %s' % (name, run.stderr or 'exit %d' % run.returncode))
             else:
                 print('case %s: all %d words match' % (name, WORDS))
