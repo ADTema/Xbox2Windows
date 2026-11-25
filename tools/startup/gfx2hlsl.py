@@ -1559,7 +1559,7 @@ class Stage:
     def note_attr(self, tok, how):
         m = re.fullmatch(r'attr(\d+)\.([xyzw])', tok)
         attr = int(m.group(1))
-        links = getattr(self.pipe, 'ps_attr_map', None)
+        links = getattr(getattr(self, 'pipe', None), 'ps_attr_map', None)  # unit probes may have no pipe
         if links is not None:  # stream pipelines: the vertex parameter the attribute is linked to
             if attr not in links:
                 raise Unsupported('pixel stage reads attribute %d, which its interface table does not list' % attr)
@@ -2391,7 +2391,8 @@ def load_request(out_dir, key, refusals=None, pair_info=None):
 def translate_request(out_dir, key):
     """Translate a base shader request or an RTV variant referencing its source blobs."""
     try:
-        kinds, root, formats, request, fetch, _, attr_map = load_request(out_dir, key)
+        kinds, root, formats, request, fetch, _, *links = load_request(out_dir, key)
+        attr_map = links[0] if links else None
     except (Unsupported, OSError, UnicodeError) as reason:
         open(os.path.join(out_dir, '%016x.fail' % key), 'w').write(str(reason) + '\n')
         return 'unsupported: %s' % reason
@@ -2444,7 +2445,8 @@ def request_refusals(out_dir, key, pair_info=None):
     """Collect reached refusal sites for one request without publishing a translation."""
     refusals = []
     try:
-        kinds, root, formats, _, fetch, decoded, attr_map = load_request(out_dir, key, refusals, pair_info)
+        kinds, root, formats, _, fetch, decoded, *links = load_request(out_dir, key, refusals, pair_info)
+        attr_map = links[0] if links else None
     except Unsupported as reason:
         refusals.append((str(reason), 'pipeline'))
         return refusals
