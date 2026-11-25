@@ -204,10 +204,11 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-The shader cache revision is `x2w-startup-shader-16`. Earlier translations lower `v_fract_f32`
-through a bare `frac` instead of the clamped `fract32` helper. The matching compute
-(`x2w-startup-shader-16cs`) and fixed slot 57 mesh (`x2w-startup-mesh-57-2`) keys advance
+The shader cache revision is `x2w-startup-shader-17`. Earlier translations lower `v_med3_f32` through a
+branchless median, which returns the smaller of the other two operands when a source is NaN. The matching
+compute (`x2w-startup-shader-17cs`) and fixed slot 57 mesh (`x2w-startup-mesh-57-2`) keys advance
 because those stages use the shared lowering.
+Revisions before 16 lower `v_fract_f32` through a bare `frac` instead of the clamped `fract32` helper.
 Revisions before 15 lower `v_cvt_pk_u8_f32` with a float clamp and accept `s_setreg_imm32_b32` writes of the
 rounding mode.
 Revisions before 14 evaluate constant `s_brev_b32` at run time instead of folding it into a known word.
