@@ -235,11 +235,14 @@ def stream_interface(vs_container, ps_container):
     if (struct.unpack_from('<Q', vs_image, 192)[0] != FETCH_HEADER_BASE or
             struct.unpack_from('<Q', ps_image, 192)[0] != IFACE_PS_HEADER_BASE):
         raise Unsupported('unverified FSSM header for the stage interface')
-    attributes = []
-    for i in range(struct.unpack_from('<I', ps_image, IFACE_PS_COUNT)[0]):
+    attributes = {}
+    count = struct.unpack_from('<I', ps_image, IFACE_PS_COUNT)[0]
+    if count > (IFACE_PS_COUNT - IFACE_PS_RECORDS) // 8:
+        raise Unsupported('pixel input table exceeds its header range')
+    for i in range(count):
         kind, register, mask, attr, b4, b5, again, interp = ps_image[IFACE_PS_RECORDS + 8 * i:IFACE_PS_RECORDS + 8 * i + 8]
         if (kind != 6 or attr != i or b4 or b5 or again != register or interp not in (1, 2) or not mask
-                or register in attributes):
+                or mask & ~0xf or register in attributes):
             raise Unsupported('unverified pixel input record %s' % ps_image[IFACE_PS_RECORDS + 8 * i:IFACE_PS_RECORDS + 8 * i + 8].hex())
         declared = 0
         for entry in inputs:
@@ -248,27 +251,36 @@ def stream_interface(vs_container, ps_container):
         if mask != declared:
             raise Unsupported('pixel input record mask 0x%x differs from the signature mask 0x%x of register %d'
                               % (mask, declared, register))
-        attributes.append(register)
+        attributes[register] = mask
     if not attributes:
         return {}
     params = {}
-    for i in range(struct.unpack_from('<I', vs_image, IFACE_VS_COUNT)[0]):
+    count = struct.unpack_from('<I', vs_image, IFACE_VS_COUNT)[0]
+    if count > (IFACE_VS_COUNT - IFACE_VS_RECORDS) // 6:
+        raise Unsupported('vertex output table exceeds its header range')
+    for i in range(count):
         kind, register, param, *rest = vs_image[IFACE_VS_RECORDS + 6 * i:IFACE_VS_RECORDS + 6 * i + 6]
         if kind != 6 or param != i or any(rest) or register in params:
             raise Unsupported('unverified vertex output record %s' % vs_image[IFACE_VS_RECORDS + 6 * i:IFACE_VS_RECORDS + 6 * i + 6].hex())
         params[register] = param
-    outputs = {(name, index): (register, mask) for register, name, index, system, mask in signature_entries(vs[b'OSG1']) if not system}
+    outputs = {}
+    for register, name, index, system, mask in signature_entries(vs[b'OSG1']):
+        if system:
+            continue
+        if (name, index) in outputs:
+            raise Unsupported('duplicate vertex output semantic %s%d' % (name, index))
+        outputs[name, index] = register, mask
     mapping = {}
-    for attr, register in enumerate(attributes):
+    for attr, (register, mask) in enumerate(attributes.items()):
         sources = set()
-        for _, name, index, _, mask in (e for e in inputs if e[0] == register):
+        for _, name, index, _, semantic_mask in (e for e in inputs if e[0] == register):
             output = outputs.get((name, index))
-            if not output or output[1] != mask:
+            if not output or output[1] != semantic_mask:
                 raise Unsupported('pixel input %s%d has no vertex output with the same components' % (name, index))
             sources.add(output[0])
         if len(sources) != 1 or next(iter(sources)) not in params:
             raise Unsupported('pixel attribute %d does not come from exactly one exported vertex register' % attr)
-        mapping[attr] = params[next(iter(sources))]
+        mapping[attr] = (params[next(iter(sources))], mask)
     return mapping
 
 
@@ -1616,14 +1628,17 @@ class Stage:
 
     def note_attr(self, tok, how):
         m = re.fullmatch(r'attr(\d+)\.([xyzw])', tok)
-        attr = int(m.group(1))
+        attr, component = int(m.group(1)), m.group(2)
         links = getattr(getattr(self, 'pipe', None), 'ps_attr_map', None)  # unit probes may have no pipe
         if links is not None:  # stream pipelines: the vertex parameter the attribute is linked to
             if attr not in links:
                 raise Unsupported('pixel stage reads attribute %d, which its interface table does not list' % attr)
-            attr = links[attr]
+            parameter, mask = links[attr]
+            if not mask & (1 << 'xyzw'.index(component)):
+                raise Unsupported('pixel stage reads undeclared component %s of attribute %d' % (component, attr))
+            attr = parameter
         self.attrs.setdefault(attr, set()).add(how)
-        return attr, m.group(2)
+        return attr, component
 
     def mix(self, ops, mods, high):
         """v_fma_mix{lo,hi}_f16: fma of operands that are f32 or f16 halves; the f16 result goes to one half."""
@@ -2159,7 +2174,7 @@ class Pipeline:
     def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None, vs_fetch=None,
                  refusals=None, decoded=None, ps_attr_map=None):
         self.root = parse_root(root_blob)
-        self.ps_attr_map = ps_attr_map  # stream_interface(): pixel attribute -> vertex parameter; None pairs by number
+        self.ps_attr_map = ps_attr_map  # stream_interface(): pixel attribute -> (vertex parameter, component mask); None pairs by number
         self.vs_fetch = vs_fetch  # stream_fetch(): the loads the vertex stage's entry call stands for
         self.packed_position_vgpr = None
         if ps_hw_inputs is not None:
