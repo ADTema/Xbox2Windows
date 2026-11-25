@@ -6714,18 +6714,19 @@ In the baseline, query 65 was empty after the 64 one-pixel draws. In the
 adjacent run, query 65 enclosed a second full draw immediately after the
 first, before any one-pixel draws. Intel ran each case twice per mode.
 
-| Adapter and driver | First full count, in each mode | Second adjacent full count | One-pixel sum, in each mode |
-|---|---|---|---|
-| Intel UHD 770 (`8086:a780`), 32.0.101.5973 | 64 on 26/26 draws, 8/26 match | 26/26 match | 26/26 match |
-| RTX 4060 (`10de:2882`), 32.0.15.9579 | 13/13 match | 13/13 match | 13/13 match |
-| WARP (`1414:008c`), 10.0.26100.9711 | 13/13 match | 13/13 match | 13/13 match |
+| Adapter and driver | First full count | First matches per mode | Second adjacent matches | One-pixel sums matching per mode |
+|---|---|---|---|---|
+| Intel UHD 770 (`8086:a780`), 32.0.101.5973 | Always 64 | 8/26 | 26/26 | 26/26 |
+| RTX 4060 (`10de:2882`), 32.0.15.9579 | 0–64, by case | 13/13 | 13/13 | 13/13 |
+| WARP (`1414:008c`), 10.0.26100.9711 | 0–64, by case | 13/13 | 13/13 | 13/13 |
 
 For example, the first slot-0 case expected 26 samples. Intel returned 64
 and then 26 on adjacent full draws, and the 64 one-pixel queries summed to
 26. The baseline empty query returned zero on every adapter. The fixture
 retained its strict first-query assertion and failed 18/26 cases per Intel
-mode. All runs used Windows build 26100.9711, Agility SDK 1.620.2 and DXC
-1.9.2609.5 with the D3D12 debug layer unavailable. The
+mode. The desktop ran Windows build 26100.9711, Agility SDK 1.620.2 and DXC
+1.9.2609.5. The laptop baseline above had the D3D12 debug layer enabled.
+On this desktop it was unavailable for all three adapters. The
 [hardware report](https://github.com/R0Y00/Xbox2Windows/issues/737#issuecomment-7161728975)
 includes the per-case counts, instrumentation and replay commands.
 
