@@ -119,8 +119,8 @@ def controls():
                      if helper(a, b) != ref_mul_hi_u32(a, b)), None)
     check('v_mul_hi_u32: emitted helper matches reference on %d edge pairs' % len(GRID), mismatch is None)
 
-    # Carry-drop negative control on the helper itself: dropping ((al * bl) >> 16) must fail on 0xffffffff * 0xffffffff.
-    dropped = text.replace('+ ((al * bl) >> 16)', '+ 0u')
+    # Carry-drop negative control on the helper itself: dropping ((la * lb) >> 16) must fail on 0xffffffff * 0xffffffff.
+    dropped = text.replace('+ ((la * lb) >> 16)', '+ 0u')
     assert dropped != text
     bad_helper = eval_emitted_helper(dropped)
     check('v_mul_hi_u32: dropping low-half carry mismatches 0xffffffff * 0xffffffff',
