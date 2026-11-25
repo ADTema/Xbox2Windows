@@ -1000,9 +1000,8 @@ for a count of 0 it lists and reads every blob under one lock and checks the nee
 capacity before it reads any payload. The capacity is checked against that one snapshot, and only
 then is the layout of `save_blob_pack.h` (records, then names, NUL terminators and payloads) written
 into the caller's buffer. The count is in records, the capacity in bytes. A closed container handle
-is refused (E_INVALIDARG). A lookup of a name with no container directory returns 0x80830010 without
-calling back; that code and the absence of a callback are not verified against the platform (the
-previous stub returned 0). Slots 12 and 15 still report nothing, and other interface identities keep
+is refused (E_INVALIDARG). A lookup of a name with no container directory keeps the stand-in's
+empty result (S_OK, zero callbacks). Slots 12 and 15 still report nothing, and other interface identities keep
 the empty results.
 [PC GDK thunk mapping](https://github.com/ivall/xcl/blob/64b3f35599bb7102f55d640e1a791e7d6dd3b175/crates/xcl/src/hle/xgameruntime/gdk_table.rs#L261-L270) ·
 [enumeration and sizing sample](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesaveenumerateblobinfo) ·

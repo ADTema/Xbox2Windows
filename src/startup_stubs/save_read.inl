@@ -13,9 +13,7 @@ struct ContainerInfo {
     bool needs_sync;
 };
 static_assert(sizeof(ContainerInfo) == 48 && offsetof(ContainerInfo, bytes) == 24);
-// 0x80830010 for a name with no container directory is not verified against the platform. A
-// container created through slot 16 but never submitted exists, with 0 blobs.
-constexpr u64 small_buffer = 0x80830007, missing_blob = 0x80830008, missing_container = 0x80830010;
+constexpr u64 small_buffer = 0x80830007, missing_blob = 0x80830008;
 
 // Name of an open container handle; a closed handle is empty, as for the asynchronous read.
 std::string container_name(u64 handle)
@@ -62,7 +60,7 @@ u64 containers(bool exact, u64* args)
         for (const auto& blob : blobs) bytes += blob.bytes;
         snapshots.push_back({entry.name, static_cast<std::uint32_t>(blobs.size()), bytes, modified_time(entry.name)});
     }
-    if (exact && snapshots.empty()) return missing_container;
+    // A missing name retains the stand-in's empty lookup result.
     for (const auto& item : snapshots) {
         const char* name = item.name.c_str();
         const ContainerInfo info{name, name, item.count, item.size, item.modified, false};

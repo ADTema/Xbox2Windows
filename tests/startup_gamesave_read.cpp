@@ -91,7 +91,7 @@ int read(Client& client, u64 p) {
         client.call(14, p, address(&stopped), address(&stop_container)) || stopped != 1 ||
         client.call(13, p, address(found.name.c_str()), address(&exact), address(&find_container)) ||
         exact.calls != 1 || exact.name != found.name ||
-        client.call(13, p, address("absent"), address(&exact), address(&find_container)) != 0x80830010 ||
+        client.call(13, p, address("absent"), address(&exact), address(&find_container)) != S_OK ||
         exact.calls != 1) return 3;
     u64 saved{};
     Metadata meta;
