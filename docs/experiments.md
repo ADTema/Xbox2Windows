@@ -8851,11 +8851,16 @@ of console shader programs and support for other console mesh paths are tracked 
 
 Slot 86 publishes complete Xbox mesh containers under a separate cache key. The
 key frames the original MS, the optional PS, the creation root signature and the
-pipeline-state stream with its pointers cleared. The shim writes `.m86` last,
+pipeline-state stream with its pointers and known padding cleared. A request that
+previously contained nonzero blend or depth-stencil padding gets a new key and
+must be published once under that key. The shim writes `.m86` last,
 after `.ps86`, `.root` and `.stream86`. An empty `.ps86` records a stream
 without a pixel shader. Use the cache tool with a desktop pair independently
 validated for that exact source and root. The ready marker records both output
-shader hashes so an incomplete or mixed update cannot reach PSO creation.
+shader hashes so an incomplete or mixed update cannot reach PSO creation. The
+cache fixture changes only blend and depth-stencil padding and reuses the cached
+PSO, then changes one sample-mask bit and checks for a new request and clear
+attachments.
 
 ```powershell
 python -B tools/startup/mesh86_cache.py <cache> <key> --mesh <desktop-ms.cso> --pixel <desktop-ps.cso>
