@@ -138,6 +138,9 @@ ULONG WINAPI fixture_release(void* self)
 
 HRESULT WINAPI fixture_query(const GUID* provider, const GUID* iid, void** out)
 {
+    if ((out && !x2w_local::writable(out, sizeof(*out))) ||
+        (provider && !x2w_local::readable(provider, sizeof(*provider))) ||
+        (iid && !x2w_local::readable(iid, sizeof(*iid)))) return E_POINTER;
     // Leave a non-null output on failure to check whether each phase preserves or clears it.
     if (out) *out = &async_service;
     if (provider && *provider == async_provider) {
@@ -256,6 +259,21 @@ const char* run()
     for (const auto& pair : providers)
         if (!query_fails(query, pair, &async_service)) return "fake user off still returned a local object";
     if (!set_switch("X2W_FAKE_USER", true)) return "could not re-enable fake user";
+    void* inaccessible = VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
+    if (!inaccessible) return "could not allocate the inaccessible query fixture";
+    auto* no_guid = static_cast<const GUID*>(inaccessible);
+    void* rejected = &async_service;
+    const int published = provider_count;
+    const auto bad_provider = query(no_guid, &user_pair.iid, &rejected);
+    const bool provider_cleared = rejected == nullptr;
+    rejected = &async_service;
+    const auto bad_iid = query(&storage_fixture_pair.provider, no_guid, &rejected);
+    const auto bad_output = query(&storage_fixture_pair.provider, &storage_fixture_pair.iid,
+                                  static_cast<void**>(inaccessible));
+    VirtualFree(inaccessible, 0, MEM_RELEASE);
+    if (bad_provider != E_POINTER || !provider_cleared || bad_iid != E_POINTER || rejected ||
+        bad_output != E_POINTER || provider_count != published)
+        return "invalid query arguments changed the real failure or published a local provider";
     if (!query_fails(query, unknown_provider, unknown_provider, nullptr)) return "unlisted provider did not keep the real failure";
     if (!query_fails(query, user_pair.provider, unsupported_iid, nullptr))
         return "known provider with an unknown IID returned a local object";

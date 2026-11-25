@@ -284,7 +284,10 @@ void fill_slots(std::index_sequence<I...>)
 HRESULT __stdcall proxy_query(const GUID* provider, const GUID* iid, void** out)
 {
     const HRESULT hr = real_query(provider, iid, out);
-    if (FAILED(hr) && out && fake_user() && matches_pair(storage_pair, provider, iid)) {
+    const bool output_writable = FAILED(hr) && fake_user() && x2w_local::writable(out, sizeof(*out));
+    const bool pair_readable = output_writable && x2w_local::readable(provider, sizeof(*provider)) &&
+                               x2w_local::readable(iid, sizeof(*iid));
+    if (pair_readable && matches_pair(storage_pair, provider, iid)) {
         // Persistent local storage: the system runtime has none for an unpackaged process.
         static LONG logged;
         if (x2w_local::first_calls(logged, 2)) x2w_local::logf("x2w-runtime persistent local storage: local object instead of 0x%08lx", static_cast<unsigned long>(hr));
@@ -292,9 +295,9 @@ HRESULT __stdcall proxy_query(const GUID* provider, const GUID* iid, void** out)
         return S_OK;
     }
     const ApiPair* local = nullptr;
-    if (FAILED(hr) && out && fake_user() && InterlockedCompareExchange(&local_active, 0, 0) &&
-        x2w_local::writable(out, sizeof(*out))) {
+    if (output_writable && InterlockedCompareExchange(&local_active, 0, 0)) {
         *out = nullptr;
+        if (!pair_readable) return hr;
         for (const auto& pair : local_pairs) {
             if (matches_pair(pair, provider, iid)) {
                 local = &pair;
