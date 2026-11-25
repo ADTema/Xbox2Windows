@@ -368,6 +368,7 @@ class Stage:
         self.sym = {}             # scalar register -> symbolic value
         self.used_s, self.used_v = set(), set()
         self.exec_known = True    # exec still equals the entry mask (the lane is active)
+        self.wqm_exec = False     # exec is proven whole-quad: an s_wqm of exec into itself ran while exec_known
         self.exports = {}         # 'pos0' / 'paramN' / 'mrtN' -> [4 expressions]
         self.write_masks = {}     # 'mrtN' -> channels the export writes (bit c = channel c), see export()
         self.attrs = {}           # pixel: attr index -> 'linear' | 'flat'
@@ -689,6 +690,8 @@ class Stage:
                                                 (base in ('s_cselect_b32', 's_cselect_b64') and ops[0] == 'exec'))):
                 raise Unsupported('%s into %s after a fetch call' % (base, ops[0]))
         if base in ('s_wqm_b32', 's_wqm_b64'):
+            if ops[0] in ('exec', 'exec_lo') and ops[1:] == ops[:1] and getattr(self, 'exec_known', False):
+                self.wqm_exec = True   # every lane of a touched quad is now active, helper lanes included
             if hasattr(self, 'uniform_v'):
                 self.uniform_v.clear()
             if hasattr(self, 'scc_uniform'):
@@ -755,8 +758,9 @@ class Stage:
     # VOP1/VOP2 with a DPP16 quad_perm source (AMD RDNA 2 ISA, "Data-Parallel Primitives"): lane i of
     # each aligned group of four reads src0 from lane quad_perm[i] of that group. The three exchanges
     # map onto the SM 6.0 quad intrinsics, which read the other lane of the 2x2 pixel quad and keep
-    # helper lanes active. Only a pixel stage at entry EXEC qualifies: the hardware returns 0 or the old
-    # value for a source lane whose EXEC bit is off, and the intrinsics have no such case. Broadcast
+    # helper lanes active. Only a pixel stage at entry EXEC qualifies, and only after `s_wqm exec, exec`
+    # proved whole-quad EXEC: the hardware returns 0 or the old value for a source lane whose EXEC bit
+    # is off (an uncovered pixel of an edge quad), and the intrinsics have no such case. Broadcast
     # and pair permutations, DPP8, row shifts, partial masks and source modifiers stay refused.
     def dpp(self, base, ops, mods):
         perm = None
@@ -783,6 +787,9 @@ class Stage:
         if (getattr(self, 'kind', None) != 'ps' or getattr(self, 'has_branches', True) or getattr(self, 'blocks', True)
                 or not getattr(self, 'exec_known', False)):
             raise Unsupported('%s_dpp requires a straight-line pixel shader with entry EXEC' % base)
+        if not getattr(self, 'wqm_exec', False):
+            raise Unsupported('%s_dpp requires whole-quad EXEC (s_wqm of exec first): a partly covered quad has '
+                              'inactive source lanes that the hardware masks and QuadReadAcross does not' % base)
         self.needs_sm6 = True
         # src0 is the exchanged lane; a VOP2 src1 stays this lane's own register.
         swapped = '%s(%s)' % (intrinsic, self.u(ops[1]))
@@ -933,6 +940,7 @@ class Stage:
                 copy = base in ('s_mov_b64', 's_mov_b32') and self.exec_known and (syms[0] == ('execcopy',))
                 if copy:
                     # A restored copy can re-activate lanes a WQM added: drop every VGPR proof.
+                    self.wqm_exec = False  # and the copy can be older than the WQM
                     if hasattr(self, 'uniform_v'):
                         self.uniform_v.clear()
                     return None

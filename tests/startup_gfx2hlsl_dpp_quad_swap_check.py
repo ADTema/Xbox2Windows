@@ -38,7 +38,9 @@ from startup_image_3d_check import FULLSCREEN_VS, VS_WORDS, compile_hlsl, root_b
 
 WIDTH = HEIGHT = 16
 MASK = 0xffffffff
-FLAG = 0x40000000
+FLAG = 0x40000000  # binary32 2.0, which the assembler encodes as the inline constant 244
+WQM = struct.pack('<I', 0xbefe0a7e)  # s_wqm_b64 exec, exec
+WQM_TEXT = 's_wqm_b64 exec, exec\n'
 PACKED = (0x8000, 0x8000)  # SPI_PS_INPUT_ENA/ADDR: the packed screen position only, in v0
 V_OR = 0x1c
 SWAPS = {(1, 0, 3, 2): ('X', 1, 0), (2, 3, 0, 1): ('Y', 0, 1), (3, 2, 1, 0): ('Diagonal', 1, 1)}
@@ -71,8 +73,8 @@ def vop2_dpp(op, vdst, src0, vsrc1, perm, bank=0xf, row=0xf, bound=0):
                        src0 | ctrl(perm) << 8 | bound << 19 | bank << 24 | row << 28)
 
 
-def vop1_mov_literal(vdst, value):
-    return struct.pack('<2I', 0x7e000000 | vdst << 17 | 1 << 9 | 255, value)
+def vop1_mov_flag(vdst):
+    return struct.pack('<I', 0x7e000000 | vdst << 17 | 1 << 9 | 244)
 
 
 def vop2_plain(op, vdst, src0, vsrc1):
@@ -81,13 +83,14 @@ def vop2_plain(op, vdst, src0, vsrc1):
 
 EXPORT = struct.pack('<3I', 0xf800180f, 0x04030201, 0xbf810000)  # exp mrt0 v1, v2, v3, v4 done vm; s_endpgm
 EXPORT_TEXT = 'exp mrt0 v1, v2, v3, v4 done vm\ns_endpgm\n'
-FLAG_TEXT = 'v_mov_b32_e32 v9, 0x%x\n' % FLAG
+FLAG_TEXT = 'v_mov_b32_e32 v9, 2.0\n'
 
 
-def fixture(name):
+def fixture(name, wqm=True):
     """-> (assembly text, machine words). 'or': VOP2 DPP v_or_b32 with the flag in v9 as the own-lane source.
     'mov': VOP1 DPP v_mov_b32 into v5..v7, then a plain OR with v9. v4 is always the own-lane position | flag."""
-    text, words = FLAG_TEXT, vop1_mov_literal(9, FLAG)
+    text, words = (WQM_TEXT, WQM) if wqm else ('', b'')
+    text, words = text + FLAG_TEXT, words + vop1_mov_flag(9)
     perms = list(SWAPS)
     for i, perm in enumerate(perms):
         if name == 'or':
@@ -131,11 +134,12 @@ def pipeline(words):
 class Probe(G.Stage):
     """A Stage with no pipeline: enough state for DPP instructions to be translated one at a time."""
 
-    def __init__(self, kind='ps', exec_known=True):
+    def __init__(self, kind='ps', exec_known=True, wqm_exec=True):
         self.kind = kind
         self.lines, self.sym = [], {}
         self.used_s, self.used_v, self.uniform_v = set(), set(), set()
         self.exec_known = exec_known
+        self.wqm_exec = wqm_exec
         self.has_branches, self.blocks = False, []
 
 
@@ -192,6 +196,7 @@ def controls():
         ('operation without a table entry', 'v_cvt_f64_f32_dpp v[5:6], v0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf', {}),
         ('vertex stage', base, {'kind': 'vs'}),
         ('EXEC no longer the entry mask', base, {'exec_known': False}),
+        ('entry EXEC not proven whole-quad (partly covered quads)', base, {'wqm_exec': False}),
     ]
     for label, asm, kwargs in cases:
         reason = refused(asm, **kwargs)
@@ -203,6 +208,22 @@ def controls():
         check('refused: a shader with branches', False)
     except G.Unsupported:
         check('refused: a shader with branches', True)
+
+    # 4b. Whole-quad EXEC comes only from s_wqm of exec into itself, seen on the real translation path.
+    for name in ('or', 'mov'):
+        try:
+            pipeline(fixture(name, wqm=False)[1]).hlsl_ps()
+            check('%s fixture without s_wqm exec is refused' % name, False)
+        except G.Unsupported as reason:
+            check('%s fixture without s_wqm exec is refused (%s)' % (name, reason), 'whole-quad' in str(reason))
+    # A copy of EXEC taken before the s_wqm and restored after it narrows EXEC again: the proof must go.
+    narrowing = struct.pack('<3I', 0xbe80047e, 0xbefe0a7e, 0xbefe0400)  # mov s[0:1], exec; wqm exec; mov exec, s[0:1]
+    words = narrowing + fixture('mov', wqm=False)[1]
+    try:
+        pipeline(words).hlsl_ps()
+        check('refused: whole-quad proof dropped by a restored exec copy', False)
+    except G.Unsupported as reason:
+        check('refused: whole-quad proof dropped by a restored exec copy (%s)' % reason, 'whole-quad' in str(reason))
 
     # 5. A float VOP2 keeps its second source in its own lane.
     stage = Probe()
