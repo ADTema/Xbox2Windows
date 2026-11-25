@@ -653,7 +653,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     # s_or_b32 restoring exec or the final exit. An optional s_cbranch_execz must land exactly
     # where the guarded stores end. The guarded stores become an HLSL if.
     vcc = guard = None
-    vcc_borrow = None
+    vcc_carry = None
     guard_span = None
     if not instructions or instructions[-1] != "s_endpgm":
         raise ValueError("Missing final program exit")
@@ -712,12 +712,12 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                     or any(word is None or isinstance(word, tuple) and word[0] in ("source", "alu") for word in words)):
                 raise ValueError("Unverified lane guard compare")
             vcc = (op, *words)
-            vcc_borrow = None
+            vcc_carry = None
         elif m := re.fullmatch(r"s_and_saveexec_b32 s(\d+), vcc_lo", line):
             saved = int(m[1])
             if guard_span is not None or vcc is None or saved > 105 or saved in pending:
                 raise ValueError("Unverified or repeated lane guard")
-            guard = dict(label=None, at_label=False, holders=None, vcc_borrow=vcc_borrow,
+            guard = dict(label=None, at_label=False, holders=None, vcc_carry=vcc_carry,
                          scalar=dict(scalar), vector=dict(vector), pending=set(pending), loading=dict(loading))
             scalar[saved] = ("exec",)
             guard_span = [len(stores), None, vcc]
@@ -748,8 +748,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 for reg in [reg for reg, value in state.items() if reg not in before or before[reg] != value]:
                     del state[reg]
             pending |= guard["pending"]
-            if vcc_borrow != guard["vcc_borrow"]:
-                vcc_borrow = None
+            if vcc_carry != guard["vcc_carry"]:
+                vcc_carry = None
             guard = None
             guard_span[1] = len(stores)
         elif line in ("s_mov_b32 m0, 0", "s_mov_b32 m0, 0x0"):
@@ -1696,7 +1696,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 borrow_expression = f"({a} < {b} ? 1u : 0u)"
             else:
                 if borrow_in_tok == "vcc_lo":
-                    borrow_in = vcc_borrow
+                    borrow_in = vcc_carry
                 else:
                     bin_reg = int(borrow_in_tok[1:])
                     borrow_in = scalar.get(bin_reg) if bin_reg <= 105 and bin_reg not in pending else None
@@ -1710,9 +1710,52 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             vector[dst] = ("alu", expression)
             if sdst == "vcc_lo":
                 vcc = None
-                vcc_borrow = ("borrow", borrow_expression)
+                vcc_carry = ("borrow", borrow_expression)
             else:
                 scalar[sdst_reg] = ("borrow", borrow_expression)
+        elif ((m := re.fullmatch(rf"(v_add_co_u32) v(\d+), (vcc_lo|s\d+), {ALU_SOURCE}, {ALU_SOURCE}", line))
+              or (m := re.fullmatch(rf"(v_add_co_ci_u32_e32) v(\d+), (vcc_lo), {ALU_SOURCE}, (v\d+), (vcc_lo)", line))
+              or (m := re.fullmatch(rf"(v_add_co_ci_u32_e64) v(\d+), (vcc_lo|s\d+), {ALU_SOURCE}, {ALU_SOURCE}, (vcc_lo|s\d+)", line))):
+            # RDNA2 ISA:
+            #   v_add_co_u32:    temp = (uint64)S0 + (uint64)S1; D = temp[31:0]; SDST[lane] = (temp >> 32) & 1
+            #   v_add_co_ci_u32: temp = (uint64)S0 + (uint64)S1 + (uint64)carry_in[lane]; D = temp[31:0]; SDST[lane] = (temp >> 32) & 1
+            dst, sdst, src0, src1 = int(m[2]), m[3], m[4], m[5]
+            carry_in_tok = m[6] if len(m.groups()) == 6 else None
+            if dst > 255:
+                raise ValueError("Invalid vector destination")
+            if dims[0] * dims[1] * dims[2] > 32 and wave_size != 32:
+                raise ValueError("Carry-out add requires wave_size=32 for groups larger than 32 threads")
+            if sdst != "vcc_lo":
+                sdst_reg = int(sdst[1:])
+                if sdst_reg > 105 or sdst_reg in pending:
+                    raise ValueError("Unverified carry destination")
+            words = [alu_word(token, scalar, vector, pending) for token in (src0, src1)]
+            if None in words:
+                raise ValueError("Unverified ALU operand")
+            a, b = map(hlsl_word, words)
+            sum_ab = f"({a} + {b})"
+            if carry_in_tok is None:
+                expression = sum_ab
+                carry_expression = f"({sum_ab} < {a} ? 1u : 0u)"
+            else:
+                if carry_in_tok == "vcc_lo":
+                    carry_in = vcc_carry
+                else:
+                    cin_reg = int(carry_in_tok[1:])
+                    carry_in = scalar.get(cin_reg) if cin_reg <= 105 and cin_reg not in pending else None
+                if not (isinstance(carry_in, tuple) and carry_in[0] == "carry"):
+                    raise ValueError("Unverified carry-in operand")
+                c = carry_in[1]
+                expression = f"({sum_ab} + {c})"
+                carry_expression = f"(({sum_ab} < {a} || {expression} < {c}) ? 1u : 0u)"
+            if len(expression) > ALU_EXPRESSION_LIMIT or len(carry_expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            vector[dst] = ("alu", expression)
+            if sdst == "vcc_lo":
+                vcc = None
+                vcc_carry = ("carry", carry_expression)
+            else:
+                scalar[sdst_reg] = ("carry", carry_expression)
         elif m := re.fullmatch(r"v_mad_u32_u24 v(\d+), (v\d+|-?\d+|0x[0-9a-f]+), (v\d+|-?\d+|0x[0-9a-f]+), v(\d+)", line):
             dst, column = int(m[1]), int(m[4])
             # The literal pitch may be either multiplicand; LLVM 15 places it in src0.

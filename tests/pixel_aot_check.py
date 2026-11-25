@@ -8730,6 +8730,118 @@ def check_sopk_hwreg_draw(directory, compiler, renderer, backend):
     run_pixel_batch(renderer, backend, shader, cases)
 
 
+# s_round_mode (SOPP) writes MODE[3:0]. 0x0 and 0xc keep binary32 at nearest even and write 0 or 3 into MODE[3:2], the
+# field s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2) writes. The body writes round toward zero, reads the field, restores
+# nearest even, reads it, writes round toward zero again and reads it into a sum with s45, then restores nearest even
+# and reads it into a sum with s46: the channels are those of SOPK_HWREG_BODY, (3, 0, 3 + s45, 0 + s46).
+ROUND_RTZ = "s_round_mode 0xc"
+ROUND_RNE = "s_round_mode 0x0"
+SOPP_ROUND_MODE_BODY = [
+    ROUND_RTZ,
+    "s_getreg_b32 s49, hwreg(HW_REG_MODE, 2, 2)",
+    ROUND_RNE,
+    "s_getreg_b32 s51, hwreg(HW_REG_MODE, 2, 2)",
+    ROUND_RTZ,
+    "s_getreg_b32 s52, hwreg(HW_REG_MODE, 2, 2)",
+    "s_add_u32 s53, s52, s45",
+    ROUND_RNE,
+    "s_getreg_b32 s54, hwreg(HW_REG_MODE, 2, 2)",
+    "s_add_u32 s55, s54, s46",
+    "v_mov_b32_e32 v12, s49",
+    "v_mov_b32_e32 v13, s51",
+    "v_mov_b32_e32 v14, s53",
+    "v_mov_b32_e32 v15, s55",
+]
+
+
+def check_sopp_round_mode_controls():
+    """s_round_mode 0x0 and 0xc as MODE[3:2] writes, and every refusal."""
+    plain = with_constants(NARROW_BODY)
+    packed = with_constants(VOP3P_BODY)
+    # Nearest even is the assumed entry state, so 0x0 lowers like no write. 0xc is round toward zero for binary16 and
+    # binary64: every rounding form of those is refused by name, as after the immediate MODE[3:2] write.
+    assert translate([ROUND_RNE] + plain) == translate(["s_nop 0"] + plain)
+    expect_value_error(translate, [ROUND_RTZ] + plain, "under round toward zero: v_cvt_f16_f32_e32")
+    expect_value_error(translate, [ROUND_RTZ] + packed, "under round toward zero: v_pk_add_f16")
+    expect_value_error(translate, with_constants([ROUND_RTZ, "v_cvt_f32_f64_e32 v12, v[12:13]"]),
+                       "under round toward zero: v_cvt_f32_f64_e32")
+    assert translate([ROUND_RTZ] + with_constants(HALF_BODY)) == translate(["s_nop 0"] + with_constants(HALF_BODY))
+    # The last write wins, across s_round_mode and both s_setreg forms.
+    for first, last in ((ROUND_RTZ, ROUND_RNE), (HALF_RTZ, ROUND_RNE), (ROUND_RTZ, HALF_RNE),
+                        (ROUND_RTZ, SOPK_SET)):
+        before = [sopk_mov(0), first, last]
+        assert translate(before + plain) == translate([sopk_mov(0), "s_nop 0", "s_nop 0"] + plain), (first, last)
+        assert translate(before + packed) == translate([sopk_mov(0), "s_nop 0", "s_nop 0"] + packed), (first, last)
+    for first in (ROUND_RNE, HALF_RNE):
+        expect_value_error(translate, [first, ROUND_RTZ] + plain, "under round toward zero: v_cvt_f16_f32_e32")
+    # A read of MODE[3:2] after the write returns the value written, right-aligned: it translates like a move of 3 or
+    # 0 and unlike the unshifted 0xc or any other value. The write counts as a write of the field for the first read,
+    # and a read before it is still refused.
+    for write, written in ((ROUND_RTZ, 3), (ROUND_RNE, 0)):
+        program = sopk_read(write)
+        assert translate_int(program) == translate_int(sopk_constant(written, "s_nop 0")), write
+        for wrong in (3 - written, 1, 2, 12, 0x80000003, 0xffffffff):
+            assert translate_int(program) != translate_int(sopk_constant(wrong, "s_nop 0")), (write, wrong)
+    expect_value_error(translate, [SOPK_GET, ROUND_RTZ] + plain, SOPK_NOT_READ)
+    # The draw body translates exactly like the same program with the writes as no-ops and each read replaced by a
+    # move of the value it returns.
+    values = iter((3, 0, 3, 0))
+    moved = [f"s_mov_b32 {line.split()[1].rstrip(',')}, {next(values)}" if line.startswith("s_getreg_b32")
+             else "s_nop 0" if line in (ROUND_RTZ, ROUND_RNE) else line for line in SOPP_ROUND_MODE_BODY]
+    assert translate_int(uncompressed_export(SOPP_ROUND_MODE_BODY)) == translate_int(uncompressed_export(moved))
+    # Only immediates that keep binary32 at nearest even and write 0 or 3 are accepted: a directed or truncating
+    # binary32 mode (bits 1:0), a directed binary16 mode (bits 3:2 of 1 or 2), set bits above bit 3, and a hex
+    # spelling LLVM 15 does not print are refused by value.
+    for value in ("0x1", "0x2", "0x3", "0x4", "0x5", "0x8", "0x9", "0xd", "0xe", "0xf", "0x10", "0x1c", "0x8000",
+                  "0xffff", "0x00", "0x0c", "0x000c"):
+        expect_value_error(translate, [f"s_round_mode {value}"] + plain, "Unsupported rounding mode")
+    # Every other spelling is malformed: decimal (LLVM 15 prints hex), upper case, a register, no or two operands.
+    for operands in ("12", "0", "3", "0xC", "0XC", "s0", "m0", "-1", "0xc, 0x0", "0xc 0x0", "", "hwreg(HW_REG_MODE)"):
+        expect_value_error(translate, [f"s_round_mode {operands}".rstrip()] + plain, "Malformed s_round_mode operand")
+    # Like the s_setreg forms it may not sit between the color export and s_endpgm, in a masked region or in a uniform
+    # skip block; a write ahead of a skip is the value read after its join.
+    for line in (ROUND_RNE, ROUND_RTZ):
+        expect_value_error(translate, plain[:-1] + [line, plain[-1]], "Unexpected instruction after color export")
+        for opener in REGION_WAIT_OPENERS:
+            expect_value_error(translate, region_scalar_alu_program(opener=opener, body=(line,)),
+                               "Instruction cannot run in a masked region")
+        expect_value_error(translate, scc_skip(body=(*SCC_SKIP_BODY, line)),
+                           "Instruction cannot run in a uniform skip block")
+    for write, value in ((ROUND_RNE, 0), (ROUND_RTZ, 3)):
+        skip = scc_skip(before=[write], after=(SOPK_GET, "v_mov_b32_e32 v15, s49"))
+        assert translate_int(skip) == translate_int(scc_skip(
+            before=["s_nop 0"], after=(f"s_mov_b32 s49, {value}", "v_mov_b32_e32 v15, s49")))
+
+
+def check_sopp_round_mode_draw(directory, compiler, renderer, backend):
+    """Read MODE[3:2] back after each s_round_mode write and export the values through the lossless integer target,
+    mixed with constant-buffer words. Each deviation (the immediate left unshifted as 12, a write not seen, a stale
+    read) must report a pixel_mismatch."""
+    source = directory / "sopp_round_mode.hlsl"
+    shader = directory / "sopp_round_mode.cso"
+    source.write_text(translate_int(uncompressed_export(SOPP_ROUND_MODE_BODY)), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    cases = []
+    for index, words in enumerate(SOPK_HWREG_SETS):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words, 0)
+        expected = sopk_hwreg_expected(words)
+        # 0xc unshifted, the first write not seen, the restore not seen, the second 0xc not seen (0 plus s45) and the
+        # last restore not seen (3 plus s46).
+        wrongs = ((0, 12), (0, 0), (1, 3), (2, words[1]), (3, (words[2] + 3) & 0xffffffff))
+        for channel, value in wrongs:
+            assert value != expected[channel]
+            wrong = list(expected)
+            wrong[channel] = value
+            path = directory / f"sopp_round_mode-{index}-{channel}-{len(cases)}.case"
+            write_case(path, bytes(constants), tuple(as_float(word) for word in wrong), integer_rt=True)
+            cases.append((path, "mismatch"))
+        path = directory / f"sopp_round_mode-{index}.case"
+        write_case(path, bytes(constants), tuple(as_float(word) for word in expected), integer_rt=True)
+        cases.append((path, "pass"))
+    run_pixel_batch(renderer, backend, shader, cases)
+
+
 def check_sopk_hwreg_binary(directory, assembler, objcopy, library):
     """LLVM 15 gfx1013 encodings and spellings of the register forms: SIMM16 is the id in bits 5:0, the offset in 10:6
     and the width minus one in 15:11 (MODE[3:2] is 0x0881); a full-width field prints as the bare register and a
@@ -8759,7 +8871,12 @@ def check_sopk_hwreg_binary(directory, assembler, objcopy, library):
             ("s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), m0", "8108fcb9", "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), m0"),
             ("s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), null", "8108fdb9", "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), null"),
             ("s_getreg_b32 vcc_lo, hwreg(HW_REG_MODE, 2, 2)", "81086ab9", "s_getreg_b32 vcc_lo, hwreg(HW_REG_MODE, 2, 2)"),
-            ("s_getreg_b32 m0, hwreg(HW_REG_MODE, 2, 2)", "81087cb9", "s_getreg_b32 m0, hwreg(HW_REG_MODE, 2, 2)")):
+            ("s_getreg_b32 m0, hwreg(HW_REG_MODE, 2, 2)", "81087cb9", "s_getreg_b32 m0, hwreg(HW_REG_MODE, 2, 2)"),
+            # s_round_mode is SOPP opcode 0x24 with the mode in SIMM16; LLVM 15 prints the immediate in hex.
+            ("s_round_mode 0x0", "0000a4bf", "s_round_mode 0x0"),
+            ("s_round_mode 0xc", "0c00a4bf", "s_round_mode 0xc"),
+            ("s_round_mode 12", "0c00a4bf", "s_round_mode 0xc"),
+            ("s_round_mode 3", "0300a4bf", "s_round_mode 0x3")):
         assert assemble(line) == (encoded, text), (line, assemble(line))
     for line in ("s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), 3", "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s[0:1]",
                  "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s106"):
@@ -9730,7 +9847,7 @@ def check_dpp_f16_contract_controls():
                                            half_denorm=state), valid, "Invalid binary16 denormal entry state")
     expect_value_error(translate_f16, [HALF_RTZ, *valid], "under round toward zero: v_cvt_f16_f32_dpp")
     assert translate_f16([HALF_RTZ, HALF_RNE, *valid]) == translate_f16(["s_nop 0", "s_nop 0", *valid])
-    for write, message in (("s_denorm_mode 15", "Unsupported instruction"), ("s_round_mode 3", "Unsupported instruction"),
+    for write, message in (("s_denorm_mode 15", "Unsupported instruction"), ("s_round_mode 0x3", "Unsupported rounding mode"),
                            ("s_setreg_imm32_b32 hwreg(HW_REG_MODE, 6, 2), 3", "Unsupported hardware register write")):
         expect_value_error(translate_f16, [write, *valid], message)
     # DPP encoding refusals and out-of-slice binary16 DPP opcodes (including FMAC and transcendentals).
@@ -14217,7 +14334,7 @@ def check_f16_arith_controls(*, run_reference=True):
                            f"under round toward zero: {spelling}")
         assert translate_f16(uncompressed_export([HALF_RTZ, HALF_RNE, *prefix, line])) == translate_f16(
             uncompressed_export(["s_nop 0", "s_nop 0", *prefix, line]))
-    for write, message in (("s_denorm_mode 15", "Unsupported instruction"), ("s_round_mode 3", "Unsupported instruction"),
+    for write, message in (("s_denorm_mode 15", "Unsupported instruction"), ("s_round_mode 0x3", "Unsupported rounding mode"),
                            ("s_setreg_imm32_b32 hwreg(HW_REG_MODE, 6, 2), 3", "Unsupported hardware register write"),
                            ("s_setreg_imm32_b32 hwreg(HW_REG_MODE, 4, 4), 15", "Unsupported hardware register write"),
                            ("s_setreg_b32 hwreg(HW_REG_MODE, 6, 2), s48", "Unsupported hardware register write")):
@@ -15047,7 +15164,7 @@ def check_f16_round_controls():
                            f"under round toward zero: {spelling}")
         assert translate_f16(uncompressed_export([HALF_RTZ, HALF_RNE, *prefix, line])) == translate_f16(
             uncompressed_export(["s_nop 0", "s_nop 0", *prefix, line]))
-    for write, message in (("s_denorm_mode 15", "Unsupported instruction"), ("s_round_mode 3", "Unsupported instruction"),
+    for write, message in (("s_denorm_mode 15", "Unsupported instruction"), ("s_round_mode 0x3", "Unsupported rounding mode"),
                            ("s_setreg_imm32_b32 hwreg(HW_REG_MODE, 6, 2), 3", "Unsupported hardware register write")):
         for lines in ([write, *prefix, "v_floor_f16 v24, v18"], [*prefix, "v_floor_f16 v24, v18", write]):
             expect_value_error(translate_f16, uncompressed_export(lines), message)
@@ -15475,7 +15592,7 @@ def check_f16_cvt_int_controls():
                            f"under round toward zero: {spelling}")
         assert translate_f16(uncompressed_export([HALF_RTZ, HALF_RNE, *prefix, line])) == translate_f16(
             uncompressed_export(["s_nop 0", "s_nop 0", *prefix, line]))
-    for write, message in (("s_denorm_mode 15", "Unsupported instruction"), ("s_round_mode 3", "Unsupported instruction"),
+    for write, message in (("s_denorm_mode 15", "Unsupported instruction"), ("s_round_mode 0x3", "Unsupported rounding mode"),
                            ("s_setreg_imm32_b32 hwreg(HW_REG_MODE, 6, 2), 3", "Unsupported hardware register write")):
         for lines in ([write, *prefix, "v_cvt_f16_i16 v24, v18"], [*prefix, "v_cvt_f16_i16 v24, v18", write]):
             expect_value_error(translate_f16, uncompressed_export(lines), message)
@@ -15848,7 +15965,7 @@ def check_f16_to_int_controls():
                            f"under round toward zero: {spelling}")
         assert translate_f16(uncompressed_export([HALF_RTZ, HALF_RNE, *prefix, line])) == translate_f16(
             uncompressed_export(["s_nop 0", "s_nop 0", *prefix, line]))
-    for write, message in (("s_denorm_mode 15", "Unsupported instruction"), ("s_round_mode 3", "Unsupported instruction"),
+    for write, message in (("s_denorm_mode 15", "Unsupported instruction"), ("s_round_mode 0x3", "Unsupported rounding mode"),
                            ("s_setreg_imm32_b32 hwreg(HW_REG_MODE, 6, 2), 3", "Unsupported hardware register write")):
         for lines in ([write, *prefix, "v_cvt_i16_f16 v24, v18"], [*prefix, "v_cvt_i16_f16 v24, v18", write]):
             expect_value_error(translate_f16, uncompressed_export(lines), message)
@@ -17928,6 +18045,7 @@ _CONTROL_SUBCHECKS = (
     "check_scheduling_hints",
     "check_mode_register_controls",
     "check_sopk_hwreg_controls",
+    "check_sopp_round_mode_controls",
     "check_constant_descriptor_bounds",
     "check_scalar_constant_reads",
     "check_three_constant_buffers",
@@ -18521,6 +18639,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((with_constants(NARROW_BODY), translate))
     fixtures.append((mode_program(), translate))
     fixtures.append((uncompressed_export(SOPK_HWREG_BODY), translate_int))
+    fixtures.append((uncompressed_export(SOPP_ROUND_MODE_BODY), translate_int))
     fixtures.append((dual_program(swap_weights=True), translate_dual))
     fixtures.extend((with_constants(body), translate) for body, *_ in E64_ARITH)
     fixtures.append((with_constants(APPROX_E64_BODY), translate))
@@ -24726,7 +24845,7 @@ def main():
                     "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-cmpx-regions", "draw-cmpx-e64", "draw-scc-skip",
                     "draw-region-body", "draw-region-waits", "draw-region-scalar-alu", "draw-region-scalar-load", "draw-div-fmas",
                     "draw-cmp64", "draw-cmp-f64", "draw-shift64",
-                    "draw-f16-arith", "draw-f16-round", "draw-f16-fmac-ldexp", "draw-f16-cvt-int16", "draw-f16-to-int16", "draw-flat-scratch", "draw-smem-pointers", "draw-sopk-hwreg",
+                    "draw-f16-arith", "draw-f16-round", "draw-f16-fmac-ldexp", "draw-f16-cvt-int16", "draw-f16-to-int16", "draw-flat-scratch", "draw-smem-pointers", "draw-sopk-hwreg", "draw-sopp-round-mode",
                     "draw-dpp-cvt", "draw-dpp-movrel", "draw-plain-movrel", "draw-swaprel", "draw-sdwa-movrel", "draw-smovrel", "draw-dpp-f16", "draw-dpp-extra", "draw-pk-fmac"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
@@ -24785,6 +24904,7 @@ def main():
                         "draw-pk-fmac": check_pk_fmac_draw,
                         "draw-flat-scratch": check_flat_scratch_draws,
                         "draw-sopk-hwreg": check_sopk_hwreg_draw,
+                        "draw-sopp-round-mode": check_sopp_round_mode_draw,
                         "draw-smem-pointers": check_smem_pointer_draw,
                         "draw-dpp-f16": check_dpp_f16_draw}[mode]
                 return draw(directory, *args)
