@@ -446,20 +446,29 @@ class Stage:
         return (tok in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi')
                 or bool(reg and reg[0] == 's' and reg[1] in self.masks))
 
+    @staticmethod
+    def split_neg(tok):
+        """(negated, operand) for the `-x` sign modifier and the `neg(x)` spelling of it."""
+        # LLVM prints a lone negation of a numeric operand as neg(c), so that `-1` is not read as the
+        # integer: it is the sign bit flipped, never an integer negation.
+        m = re.fullmatch(r'neg\((.+)\)', tok)
+        if m:
+            return True, m.group(1)
+        if tok.startswith('-') and not re.match(r'-[\d.]', tok):
+            return True, tok[1:]
+        return False, tok
+
     def u_src(self, tok):
         """uint expression for an integer-context source that the disassembler may print negated."""
         # In an integer instruction the `-` modifier is the source's sign bit flipped: the same bit
         # pattern a float negation produces. Only handlers that model it ask for this; other integer
         # sources keep using u(), so an unexpected negation stays a refusal rather than a silent flip.
-        if tok.startswith('-') and not re.match(r'-[\d.]', tok):
-            return '(%s ^ 0x80000000u)' % self.u(tok[1:])
-        return self.u(tok)
+        neg, tok = self.split_neg(tok)
+        return '(%s ^ 0x80000000u)' % self.u(tok) if neg else self.u(tok)
 
     def f(self, tok):
         """float expression, with the inline neg/abs operand modifiers."""
-        neg = False
-        if tok.startswith('-') and not re.match(r'-[\d.]', tok):
-            neg, tok = True, tok[1:]
+        neg, tok = self.split_neg(tok)
         absolute = tok.startswith('|') and tok.endswith('|')
         if absolute:
             tok = tok[1:-1]
@@ -1783,8 +1792,7 @@ class Stage:
             x, y = self.u(a), self.u(b)
         def word(tok):
             # A float source's word before its neg/abs modifiers, as f() reads them; they keep a NaN a NaN.
-            if tok.startswith('-') and not re.match(r'-[\d.]', tok):
-                tok = tok[1:]
+            tok = self.split_neg(tok)[1]
             if tok.startswith('|') and tok.endswith('|'):
                 tok = tok[1:-1]
             return self.u(tok)
