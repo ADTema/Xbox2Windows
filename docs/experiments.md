@@ -8852,13 +8852,22 @@ ctest --preset release --no-tests=error -R '^startup_indirect_mesh_cache_' -V
 
 The executable subset uses the original root and PSO state. It accepts root
 constants captured on the list, single-sample color attachments in exact format
-order and a matching depth view when the stream declares one. A mesh stream
-without a pixel stage requires zero color attachments, a writable matching
-depth view and a physical adapter. The depth-only fixture removed the device
-on WARP when dispatched, so the shim refuses it there. Untracked descriptor
-tables, heap indexing, root descriptors,
+order and a matching depth view when the stream declares one. A cached mesh
+stream with zero color attachments requires a writable matching depth view.
+It can include a depth-only pixel stage. The mesh-only depth path still
+requires a physical adapter because its fixture removed the device on WARP.
+Untracked descriptor tables, heap indexing, root descriptors,
 stencil state and depth bounds are refused. A shader accepted individually can still
 fail PSO creation or lack a consumable root binding.
+
+The depth-only pixel fixture publishes a source-built mesh and pixel pair, binds
+zero color targets and a writable D16 depth view, and uses the guest
+`ExecuteIndirect` entry point. The pixel shader writes `SV_Depth = 0.25` on
+the left half and discards the right half. Readback checks four `0x4000` depth
+words and four unchanged `0xffff` clear words. A missing DSV format and a
+zero depth-write mask each leave the cached PSO unavailable. Missing draw
+attachments and incomplete root constants also leave depth clear. The MS-only
+depth and three-color-target controls still run in the same test.
 
 The fixture writes its group counts at byte offset four on the GPU and checks
 all eight pixels and the surrounding argument words. One group paints the
