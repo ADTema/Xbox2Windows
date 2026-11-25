@@ -699,6 +699,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     Its fifth argument is the writable byte extent of u0. Root UAV descriptors carry no length.
     gfx1013 uses RGBA32 FLOAT for full-mask image_store or image_load_mip. When
     both are used, image_srv_descriptor supplies the separate t0 descriptor.
+    One full-mask plain image_load can read the same mip-zero UAV texel its
+    lane will write. This path requires a dispatch with one Z group.
     A full-mask 2D D16 image_store requires an RGBA16 FLOAT UAV.
     mubuf_d16_xyz_mode opts into a caller-verified W-preserving RGBA16 store.
     wave_size is the caller's statement that the program runs as wave32 (32). A lane index is only
@@ -859,6 +861,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     staged_steps = []
     ds_step_count = 0
     image_step_count = 0
+    image_uav_address = None
     lds_enabled = ds_group and 128 <= lds_bytes <= 65536
     lds_word = None
     lds_strided_words = {}
@@ -2266,6 +2269,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             data_words = 2 if d16 else len(channels)
             data = [int(n) for n in re.findall(r"\d+", m["data"])]
             first, last = data[0], data[-1]
+            uav_load = rgba32_float_image and image_output and m["kind"] == "load" and not mip
             if d16:
                 if not write or a16 or mip or m["packed"]:
                     raise ValueError("Unsupported compute instruction: D16 requires a 2D image_store "
@@ -2281,15 +2285,26 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                     raise ValueError("D16 image_store requires exactly two consecutive data VGPRs")
             elif rgba16_float_image:
                 raise ValueError("RGBA16 FLOAT image UAV requires a D16 image_store")
+            elif uav_load:
+                if a16 or m["packed"] or image_uav_mip != 0:
+                    raise ValueError("Unsupported image load target: image UAV load requires full-width mip-zero access")
+                if dmask != 0xf:
+                    raise ValueError("Unsupported image load target: image UAV load requires full DMASK 0xf")
+                if stores:
+                    raise ValueError("Image UAV load must precede the image store")
+                if image_uav_address is not None:
+                    raise ValueError("Only one image UAV load is supported")
             elif cpu == "gfx1013" and (not rgba32_float_image or a16 or m["packed"]
                                      or (m["kind"], mip) not in (("store", False), ("load", True))):
                 raise ValueError(f"Unsupported image {m['kind']} target: "
                                  "gfx1013 requires full-width 2D RGBA32 FLOAT image_store or image_load_mip")
             if rgba32_float_image and write and dmask != 0xf:
                 raise ValueError("gfx1013 RGBA32 FLOAT image_store requires full DMASK 0xf")
-            separate_srv = not write and image_srv_descriptor is not None
+            separate_srv = not write and not uav_load and image_srv_descriptor is not None
+            if rgba32_float_image and image_output and m["kind"] == "load" and mip and not separate_srv:
+                raise ValueError("Unsupported image load target: image_load_mip requires a separate SRV")
             if ((image_format not in IMAGE_FORMATS and not float_image) or guard_span is not None
-                    or (write != image_output and not separate_srv)
+                    or (write != image_output and not separate_srv and not uav_load)
                     or len(vaddr) != min(address_words, 2) or vaddr[-1] != vaddr[0] + address_words - 1
                     or vaddr[-1] > 255 or last != first + data_words - 1
                     or not 0 < dmask < (1 << (4 if float_image else IMAGE_FORMATS[image_format][1]))
@@ -2321,6 +2336,13 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 level = coordinates[-1] if mip else 0
                 if not isinstance(level, int) or (level & 0xffff if a16 else level) != image_uav_mip:
                     raise ValueError("Image store mip does not match the UAV view")
+                if image_uav_address is not None:
+                    if image_uav_address != (vaddr, coordinates):
+                        raise ValueError("Image UAV load and store must use the same coordinate VGPRs and values")
+                    # Dispatch X/Y are injective in a single Z plane. The caller must
+                    # dispatch one Z group, and the shader must have one local Z lane.
+                    if coordinates != [("thread", 0), ("thread", 1)] or dims[2] != 1:
+                        raise ValueError("Image UAV load/store requires unique dispatch X/Y coordinates and local Z size 1")
                 values = [vector.get(first + index) for index in range(data_words)]
                 if not all(is_word(value) for value in values):
                     raise ValueError("Unverified image store data")
@@ -2348,13 +2370,16 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 staged_steps.append((None, f"    uint4 {name};\n"
                                      f"    imageData.GetDimensions({level}, {name}.x, {name}.y, {name}.w);"))
             else:
-                lod = "0"
-                if mip:
-                    mip_word = hlsl_word(coordinates[-1])
-                    lod = f"asint({mip_word}{' & 0xffffu' if a16 else ''})"
-                address = f"int3(asint({x}), asint({y}), {lod})"
                 name = f"image_load_{image_step_count}"
-                load = f"imageData.Load({address})"
+                if uav_load:
+                    image_uav_address = (vaddr, coordinates)
+                    load = f"outputData[uint2({x}, {y})]"
+                else:
+                    lod = "0"
+                    if mip:
+                        mip_word = hlsl_word(coordinates[-1])
+                        lod = f"asint({mip_word}{' & 0xffffu' if a16 else ''})"
+                    load = f"imageData.Load(int3(asint({x}), asint({y}), {lod}))"
                 if rgba32_float_image:
                     staged_steps.append((None, f"    uint4 {name} = asuint({load});"))
                 else:
