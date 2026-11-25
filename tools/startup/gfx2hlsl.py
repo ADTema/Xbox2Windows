@@ -477,6 +477,7 @@ class Stage:
     low16_only_v = ()         # VGPRs whose upper 16 bits are undefined after odd-dmask d16 image_load
     pinned_low16_v = ()       # low16_only_v live across basic-block boundaries
     whole_read_v = ()         # VGPRs read outside a proven low-16-bit consumer
+    byte_float_v = ()         # VGPRs proven to hold +0.0 or an integer in 1..255 (v_cvt_f32_ubyte0..3 result)
 
     def __init__(self, pipe, kind, code, refusals=None, decoded=None):
         self.pipe, self.kind = pipe, kind
@@ -668,6 +669,8 @@ class Stage:
             self.low16_only_v.discard(n)
 
     def set_v(self, n, expr, *, low16_only=False):
+        if self.byte_float_v:
+            self.byte_float_v.discard(n)
         if hasattr(self, 'uniform_v'):
             self.uniform_v.discard(n)
         self.last_v = (n, expr)
@@ -1044,9 +1047,18 @@ class Stage:
             # accepted here, because ignoring them would silently change the operand.
             if any(m not in ('clamp', 'mul:2', 'mul:4', 'div:2') for m in mods):
                 raise Unsupported('%s with %s' % (base, mods))
+            dst = reg_range(ops[0])[1]
             low16 = base in ('v_cvt_f32_f16', 'v_cvt_f32_ubyte0', 'v_cvt_f32_ubyte1')
-            return self.set_vf(reg_range(ops[0])[1],
-                               text_f.format(*[self.u(o, low16_only=low16) for o in ops[1:1 + arity]]), mods)
+            self.set_vf(dst, text_f.format(*[self.u(o, low16_only=low16) for o in ops[1:1 + arity]]), mods)
+            if (base.startswith('v_cvt_f32_ubyte') and not mods and self.exec_known and
+                    not getattr(self, 'has_branches', True)):
+                # The whole register now holds float(0..255), exactly +0.0 or an integer in 1..255, until the next write.
+                # Every VGPR write goes through set_v, which drops the proof; a path writing a VGPR without set_v
+                # would have to drop it too.
+                if not isinstance(self.byte_float_v, set):
+                    self.byte_float_v = set()
+                self.byte_float_v.add(dst)
+            return None
         if base in VEC_U:
             arity, text = VEC_U[base]
             if mods:
@@ -2116,6 +2128,44 @@ class Stage:
         dst = reg_range(ops[0])[1]
         self.set_v(dst, 'uint(int(F(%s)))' % self.u(ops[1]))
 
+    def op_v_cvt_pk_u8_f32(self, ops, mods):
+        # VOP3A opcode 350 of the RDNA 1.0 and RDNA 2 ISA guides:
+        #   D = (S2 & ~(0xff << 8 * S1[1:0])) | ((flt32_to_uint8(S0) & 0xff) << 8 * S1[1:0])
+        # The guides leave flt32_to_uint8 undefined (rounding, bounds, NaN and negative results are not
+        # stated), so S0 must be +0.0 or an integer in [1, 255], where every reading gives the same byte.
+        # A constant S0 outside that set is refused. A register is accepted only when proven: it was written
+        # by v_cvt_f32_ubyte0..3 (no modifier, straight-line code, full exec) with no write since. Any other
+        # register is refused unless the caller selects the pk_u8_s0_contract of the Pipeline, which states
+        # that every S0 register holds +0.0 or an integer in 1..255. The clamp only keeps the HLSL
+        # conversion defined.
+        if mods:
+            raise Unsupported('v_cvt_pk_u8_f32 with modifiers')
+        if len(ops) != 4:
+            raise Unsupported('v_cvt_pk_u8_f32 with %d operands, expected 4' % len(ops))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 'v' or dst[1] != dst[2]:
+            raise Unsupported('v_cvt_pk_u8_f32 destination %s' % ops[0])
+        if not reg_range(ops[1]):
+            src = self.u(ops[1])
+            bits = int(src[:-1], 16)
+            value = struct.unpack('<f', struct.pack('<I', bits))[0]
+            if bits != 0 and not (value.is_integer() and 1 <= value <= 255):
+                raise Unsupported('v_cvt_pk_u8_f32 with constant source %s outside +0.0 and 1..255' % ops[1])
+        else:
+            src = reg_range(ops[1])
+            if src[0] != 'v' or src[1] != src[2]:
+                raise Unsupported('v_cvt_pk_u8_f32 source %s' % ops[1])
+            if src[1] not in self.byte_float_v:
+                if not getattr(getattr(self, 'pipe', None), 'pk_u8_s0_contract', False):
+                    raise Unsupported('v_cvt_pk_u8_f32 source %s is not proven to be +0.0 or an integer in 1..255'
+                                      % ops[1])
+                self.pipe.notes.add('v_cvt_pk_u8_f32 source registers assumed +0.0 or integers in 1..255 '
+                                    '(pk_u8_s0_contract)')
+        value, select, rest = self.u(ops[1]), self.u(ops[2]), self.u(ops[3])
+        shift = '((%s & 3u) << 3u)' % select
+        self.set_v(dst[1], '((%s & ~(0xffu << %s)) | ((uint(clamp(F(%s), 0.0, 255.0)) & 0xffu) << %s))'
+                   % (rest, shift, value, shift))
+
     def op_v_readfirstlane_b32(self, ops, mods):
         src, dst = reg_range(ops[1]), reg_range(ops[0])
         past_entry = getattr(self, 'past_entry', True)
@@ -2768,7 +2818,10 @@ class Pipeline:
     srv_formats = ()
 
     def __init__(self, vs_code, ps_code, root_blob, sampler_heap=None, rtv_formats=(), ps_hw_inputs=None, vs_fetch=None,
-                 refusals=None, decoded=None, ps_attr_map=None, srv_formats=()):
+                 refusals=None, decoded=None, ps_attr_map=None, srv_formats=(), pk_u8_s0_contract=False):
+        # pk_u8_s0_contract: the caller guarantees that every v_cvt_pk_u8_f32 S0 register not proven in domain
+        # holds +0.0 or an integer in 1..255 (fixtures only; ordinary translation never selects it).
+        self.pk_u8_s0_contract = pk_u8_s0_contract
         self.root = parse_root(root_blob)
         self.ps_attr_map = ps_attr_map  # stream_interface(): pixel attribute -> (vertex parameter, component mask); None pairs by number
         self.vs_fetch = vs_fetch  # stream_fetch(): the loads the vertex stage's entry call stands for
