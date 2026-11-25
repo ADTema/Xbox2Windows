@@ -611,6 +611,20 @@ add_test(NAME startup_storage_consumer_pair_accept_refused_control
 set_tests_properties(startup_storage_consumer_pair startup_storage_consumer_pair_accept_refused_control PROPERTIES TIMEOUT 60)
 set_tests_properties(startup_storage_consumer_pair_accept_refused_control PROPERTIES PASS_REGULAR_EXPRESSION
     "FAIL: after both fences: R destination taken as data differs from the stream prefix in 4096 byte\\(s\\), first at 0xf000")
+# The same page followed through a refused request, a later valid write and a later refused write, without
+# a release in between (#1198). Statuses stay per entry (R1 stays E_FAIL after V succeeds); the refused R2
+# leaves V's bytes untouched. The accept-refused control takes R1's destination as data and must fail.
+add_executable(startup_storage_refused_reuse tests/startup_storage_refused_reuse.cpp)
+target_compile_features(startup_storage_refused_reuse PRIVATE cxx_std_17)
+add_dependencies(startup_storage_refused_reuse startup_stub_xcrdapi xmem_shim)
+add_test(NAME startup_storage_refused_reuse
+         COMMAND startup_storage_refused_reuse "$<TARGET_FILE:startup_stub_xcrdapi>" "$<TARGET_FILE:xmem_shim>")
+add_test(NAME startup_storage_refused_reuse_accept_refused_control
+         COMMAND startup_storage_refused_reuse "$<TARGET_FILE:startup_stub_xcrdapi>" "$<TARGET_FILE:xmem_shim>"
+                 --mutate accept-refused)
+set_tests_properties(startup_storage_refused_reuse startup_storage_refused_reuse_accept_refused_control PROPERTIES TIMEOUT 60)
+set_tests_properties(startup_storage_refused_reuse_accept_refused_control PROPERTIES PASS_REGULAR_EXPRESSION
+    "FAIL: R1 destination taken as data matches the stream prefix in 0 of 4096 byte")
 # A queue whose worker cannot start (both CreateThread attempts fail, or the construction of its work
 # throws std::bad_alloc) completes status entries and fences at Submit, never inside Enqueue (#1199).
 # The test compiles the stand-in's source into itself so it can redirect CreateThread and operator new.
