@@ -9209,6 +9209,12 @@ The request fixture checks paired and mesh-only requests, duplicate
 publication, a mismatched root, a populated vertex slot, and an incomplete
 pixel span.
 
+The `startup_mesh57_skeleton_exchange_` tests pass the same source-built
+shader pair through the guest request publisher. The offline reader checks
+the published bytes and key, compiles the recorded pair with its serialized
+root, and compares all 1,024 desktop readback pixels with the CPU reference.
+The one-pixel negative control uses that same published pair.
+
 The pending scan checks the DXContainer header and file length for both
 slot 57 bytecode artifacts. A missing or truncated artifact leaves the
 request pending even if its manifest exists. In manifest-only mode the
