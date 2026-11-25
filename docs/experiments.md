@@ -9778,6 +9778,37 @@ On Windows 10 22H2 build 19045.6456 with MSVC 19.44 x64, both Debug and Release 
 
 Build the same `xg_swizzle_select_check` target and run both factory tests with `ctest --preset dev --no-tests=error -R '^xg_swizzle_factory' -V`. Repeat with the `release` preset. Both tests return 77 when the optional AddrLib dependency is absent.
 
+## Cached mesh root SRV in ordinary XMem
+
+Set X2W_MESH86_LOOSE_XMEM_SRV=1 to allow a cached mesh pipeline's proved
+raw t0/space0 Load(0) from an ordinary XMem address without a placed
+buffer. The existing cache publication proof supplies the one-DWORD
+shader read. The shim requires a 16-byte aligned address and a version 2
+section lease for the four bytes. It opens the pinned section view as a
+desktop buffer while continuing to restrict the root read to the proved
+DWORD. A placed resource stays on the existing submitted-writer path.
+
+The input is an ordinary CPU-backed XMem word. Synchronize CPU writes with
+the command queue as for other CPU-visible GPU inputs. The shim revalidates
+the original page identity at submission, serializes shared lease use
+across queues, and keeps the physical page pinned through the completion
+fence. Independently mapped physical aliases with competing GPU writers in
+a different backing are outside this path. This opt-in does not establish
+a view of a larger allocation or support arbitrary GPU root pointers.
+
+Build startup_indirect_draw_indexed using the existing mesh-agility
+configuration above, then run:
+
+    ctest --test-dir out/build/mesh-agility --no-tests=error -j1 -R '^startup_indirect_mesh_lease_(warp|hardware)_loose-root$' -V
+
+The fixture submits the cached mesh pipeline through slot 61 and reads
+back its pixels. It checks a source-owned ordinary XMem page, a write
+after Close, and a new recording after a remap at the same address. The
+stale recording, unmapped page, untracked readable memory, misaligned SRV and registered resource
+without a published writer must leave the target at its clear color.
+Windows build 26200.9974 with D3D12 debug enabled passed on WARP
+10.0.26100.9818 and RTX 4060 Laptop 32.0.16.1656.
+
 ## Offscreen rendering and readback
 
 `offscreen_hardware` selects a high-performance adapter. `offscreen_warp` selects Microsoft's software rasterizer. Both draw the same DXC-compiled triangle to a 64×64 RGBA8 texture. After GPU completion the test reads the texture using its row pitch and compares colors and coverage pixel by pixel. Outputs are `triangle_hardware.bmp` and `triangle_warp.bmp` in the build directory. `ctest --preset dev -V` reports the adapter, driver, debug layer and pixel differences. Error or corruption messages from an available debug layer fail the test.
