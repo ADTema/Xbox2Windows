@@ -42,17 +42,10 @@ SHAPES = (
 PENDING = (
     'buffer_load_dword', 'buffer_load_dwordx2', 'buffer_load_dwordx3', 'buffer_load_dwordx4',
     'image_load', 'image_load_mip', 'image_sample', 'image_sample_l', 'image_sample_lz',
-    's_and_saveexec_b32', 's_and_saveexec_b64', 's_andn2_saveexec_b64', 's_andn2_wrexec_b32',
-    's_andn2_wrexec_b64', 's_bfm_b32',
-    's_cmp_eq_i32', 's_cmp_eq_u32', 's_cmp_ge_i32', 's_cmp_ge_u32', 's_cmp_gt_i32', 's_cmp_gt_u32',
-    's_cmp_le_i32', 's_cmp_le_u32', 's_cmp_lg_i32', 's_cmp_lg_u32', 's_cmp_lt_i32', 's_cmp_lt_u32',
-    's_cmpk_eq_i32', 's_cmpk_eq_u32', 's_cmpk_ge_i32', 's_cmpk_ge_u32', 's_cmpk_gt_i32', 's_cmpk_gt_u32',
-    's_cmpk_le_i32', 's_cmpk_le_u32', 's_cmpk_lg_i32', 's_cmpk_lg_u32', 's_cmpk_lt_i32', 's_cmpk_lt_u32',
-    's_cselect_b32', 's_cselect_b64', 's_or_saveexec_b32', 's_or_saveexec_b64',
-    'tbuffer_load_format_x', 'tbuffer_load_format_xy', 'tbuffer_load_format_xyz',
-    'tbuffer_load_format_xyzw',
-    'v_cndmask_b32', 'v_cvt_i32_f32', 'v_cvt_pkrtz_f16_f32', 'v_fma_mixhi_f16', 'v_fma_mixlo_f16',
-    'v_interp_mov_f32', 'v_interp_p1_f32', 'v_interp_p2_f32', 'v_mov_b32', 'v_readfirstlane_b32',
+    's_bfm_b32', 'tbuffer_load_format_x', 'tbuffer_load_format_xy', 'tbuffer_load_format_xyz',
+    'tbuffer_load_format_xyzw', 'v_cndmask_b32', 'v_cvt_i32_f32', 'v_cvt_pkrtz_f16_f32',
+    'v_fma_mixhi_f16', 'v_fma_mixlo_f16', 'v_interp_mov_f32', 'v_interp_p1_f32',
+    'v_interp_p2_f32', 'v_mov_b32', 'v_readfirstlane_b32',
 )
 
 
