@@ -131,6 +131,17 @@ check('s_cmov_b64 refuses a lane mask held in either half of either pair',
 check('s_cmov_b64 still moves pairs that hold no lane mask', not translate(sop1('s_cmov_b64', 4, 2), {7})[0].startswith('refused'))
 check('s_cmovk_i32 refuses a lane-mask destination', translate(sopk('s_cmovk_i32', VCC_LO, 1))[0].startswith('refused: '))
 
+for instruction in ('s_cmovk_i32 s3, 0x10000', 's_cmovk_i32 s3, -32769',
+                    's_cmov_b64 s[104:106], s[2:3]', 's_cmov_b64 s[4:5], s[104:106]',
+                    's_cmov_b32 s[4:5], s2'):
+    stage = Probe()
+    try:
+        stage.one(instruction.split()[0], instruction)
+    except G.Unsupported:
+        check(instruction + ' refused', True)
+    else:
+        check(instruction + ' refused', False)
+
 if failures:
     print('FAILED: %s' % ', '.join(failures))
     sys.exit(1)

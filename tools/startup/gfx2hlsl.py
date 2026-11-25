@@ -996,10 +996,9 @@ class Stage:
 
     def op_s_cmovk_i32(self, ops, mods):
         # SOPK form: the 16-bit immediate is sign-extended to 32 bits.
-        if len(ops) != 2 or mods or not re.fullmatch(r'-?(0x[0-9a-f]+|\d+)', ops[1]):
+        if len(ops) != 2 or mods:
             raise Unsupported('s_cmovk_i32 requires a destination and a 16-bit immediate')
-        value = int(ops[1], 0) & 0xffff
-        value = (value - 0x10000 if value & 0x8000 else value) & 0xffffffff
+        value = sopk_imm(ops[1], True)
         self.scalar_cmov([ops[0], '0x%x' % value], mods, False, 's_cmovk_i32')
 
     def scalar_cmov(self, ops, mods, pair, name=None):
@@ -1008,9 +1007,9 @@ class Stage:
         if len(ops) != 2 or mods:
             raise Unsupported('%s requires two unmodified operands' % name)
         dst, src = reg_range(ops[0]), reg_range(ops[1])
-        if not dst or dst[0] != 's' or dst[1] > 105 or (pair and dst[1] % 2):
+        if not dst or dst[0] != 's' or dst[2] > 105 or dst[2] - dst[1] != int(pair) or (pair and dst[1] % 2):
             raise Unsupported('%s destination %s' % (name, ops[0]))
-        if pair and (not src or src[0] != 's' or src[1] > 105 or src[1] % 2 or src[1] == src[2]):
+        if pair and (not src or src[0] != 's' or src[2] > 105 or src[1] % 2 or src[2] != src[1] + 1):
             raise Unsupported('%s source %s' % (name, ops[1]))
         # A pair holds two words: a lane mask in either half cannot be moved as a full 32-bit scalar.
         halves = 2 if pair else 1
