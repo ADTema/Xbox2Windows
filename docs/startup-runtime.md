@@ -204,10 +204,13 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-The shader cache revision is `x2w-startup-shader-15`. Older translations evaluate `s_brev_b32` of a
-constant at run time instead of folding it into a known word, which changes the emitted HLSL.
+The shader cache revision is `x2w-startup-shader-16`. Earlier translations lower `v_fract_f32`
+through a bare `frac` instead of the clamped `fract32` helper. The matching compute
+(`x2w-startup-shader-16cs`) and fixed slot 57 mesh (`x2w-startup-mesh-57-2`) keys advance
+because those stages use the shared lowering.
 Revisions before 15 lower `v_cvt_pk_u8_f32` with a float clamp and accept `s_setreg_imm32_b32` writes of the
 rounding mode.
+Revisions before 14 evaluate constant `s_brev_b32` at run time instead of folding it into a known word.
 Revisions before 12 can overwrite the source mask when a save-EXEC instruction uses the
 same source and destination register.
 Earlier revisions can also carry a stale scalar symbol across a join, read a stale SCC after
