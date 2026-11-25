@@ -574,6 +574,12 @@ After the change is merged, step 3 on the next run shows whether draws moved.
 
 ## Launcher check
 
+`tools/startup/launch.py` validates timeout and job limits before creating the log directory or
+starting a process. The timeout is at least one millisecond and stays below the Win32 infinite
+wait sentinel. A nonzero memory limit must fit in `size_t` as bytes. The process limit must fit
+in a DWORD. A zero memory or process limit disables that limit. Run
+`ctest --preset release --no-tests=error -R '^startup_launch_cli_check$' -V` for the input checks.
+
 `tests/startup_launch_check.py` (ctest `startup_launch`) drives `tools/startup/launch.py` on the
 source-built `tests/startup_launch_probe.cpp`. A finished run reports the child's exit code and saves
 its stdout, stderr and trap log; a child that outlives `--timeout` is terminated; `--memory-gib` and
