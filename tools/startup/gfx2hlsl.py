@@ -990,12 +990,17 @@ class Stage:
             self.sym.pop('m0', None)
             self.emit('m0 = %s;' % expr)
             return
-        if low[0] in ('exec', 'vcc'):
-            if low[0] == 'exec':
+        if low[0] in ('exec', 'vcc', 'exec_lo', 'vcc_lo'):
+            # In wave32, exec_lo and vcc_lo hold the whole lane mask, as the generic scalar path reads them.
+            mask = 'exec' if low[0].startswith('exec') else 'vcc'
+            if mask == 'exec':
                 self.exec_known = False
-            self.emit('%s = (%s) & 1;' % (low[0], expr))
+            self.emit('%s = (%s) & 1;' % (mask, expr))
             return
-        d = reg_range(low[0])[1]
+        r = reg_range(low[0])
+        if not r or r[0] != 's':
+            raise Unsupported('s_cselect into %s' % low[0])
+        d = r[1]
         self.set_s(d, '(%s) & 1' % expr if pair else expr)
         if pair:
             self.masks.add(d)
