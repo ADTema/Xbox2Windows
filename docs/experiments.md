@@ -7434,7 +7434,7 @@ ctest --preset dev --no-tests=error -R '^startup_indirect_(dispatch|root_constan
 ```
 
 Results on Windows 11 build 26300.9974, MSVC 14.44, `dev` preset, debug layer
-enabled, branch `runtime/indirect-root-constants` on top of `9383b531`:
+enabled, branch `runtime/indirect-root-constants` on top of `6218beb2`:
 
 - **Adapters.** WARP (Microsoft Basic Render Driver 10.0.26100.9818) and an
   NVIDIA GeForce RTX 4090 (32.0.16.1088). All four tests passed, with no skips.
