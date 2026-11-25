@@ -29,6 +29,24 @@ SDWA_SEL = {'BYTE_0': (0, 8), 'BYTE_1': (8, 8), 'BYTE_2': (16, 8), 'BYTE_3': (24
             'WORD_0': (0, 16), 'WORD_1': (16, 16), 'DWORD': (0, 32)}
 
 
+def sopk_imm(token, signed):
+    """The 32-bit word a SOPK 16-bit immediate stands for.
+
+    RDNA 2 ISA SOPK: s_movk_i32 and the s_cmpk_*_i32 forms use signext(SIMM16[15:0]) (LLVM s16imm); the s_cmpk_*_u32
+    forms use SIMM16[15:0] zero-extended (LLVM u16imm). The disassembler prints the field as unsigned hex."""
+    m = re.fullmatch(r'(-?)(?:0x([0-9a-f]+)|(\d+))', token)
+    if not m:
+        raise Unsupported('SOPK immediate %r' % token)
+    word = int(m.group(2), 16) if m.group(2) else int(m.group(3))
+    if m.group(1):
+        word = -word
+    if not (-0x8000 if signed else 0) <= word <= 0xffff:
+        raise Unsupported('SOPK immediate %r outside 16 bits' % token)
+    if signed:
+        word = ((word & 0xffff) ^ 0x8000) - 0x8000
+    return word & 0xffffffff
+
+
 def sdwa_source(word, sel, sext):
     """The uint expression a source selection reads out of a 32-bit register."""
     offset, width = SDWA_SEL[sel]
@@ -783,6 +801,10 @@ class Stage:
             return ('s%d' % r[1]) if r and r[0] == 's' and r[1] != r[2] else tok
         srcs = [low(t) for t in srcs]
         dname = low(ops[0])
+        if base == 's_movk_i32':
+            if len(srcs) != 1:
+                raise Unsupported('s_movk_i32 with %d operands' % len(srcs))
+            srcs = [str(sopk_imm(srcs[0], True))]  # D.i32 = signext(SIMM16)
         shift_add = base in SHIFT_ADD
         word_complement = base in ('s_nand_b32', 's_nor_b32', 's_xnor_b32')
         word_pack = base == 's_pack_hh_b32_b16'
@@ -1978,7 +2000,14 @@ for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt',
                 self.set_scc((cast % op).format(self.u(ops[0]), self.u(ops[1])))
             return handler
         setattr(Stage, 'op_s_cmp_%s_%s' % (_name, _typ), _make())
-        setattr(Stage, 'op_s_cmpk_%s_%s' % (_name, _typ), _make())
+    for _typ, _cast in (('i32', 'int({0}) %s int({1})'), ('u32', '{0} %s {1}')):
+        def _make_cmpk(op=_op, cast=_cast, signed=_typ == 'i32'):
+            def handler(self, ops, mods):
+                if len(ops) != 2 or mods:
+                    raise Unsupported('s_cmpk requires a register and a 16-bit immediate')
+                self.set_scc((cast % op).format(self.u(ops[0]), '0x%08xu' % sopk_imm(ops[1], signed)))
+            return handler
+        setattr(Stage, 'op_s_cmpk_%s_%s' % (_name, _typ), _make_cmpk())
 # s_bitcmp1_b32 / s_bitcmp0_b32: SCC = S0[S1[4:0]] == 1 / == 0.
 for _bit in (0, 1):
     def _make_bitcmp(bit=_bit):

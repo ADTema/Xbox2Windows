@@ -2235,6 +2235,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # The scalar shift-and-add forms s_lshl1..4_add_u32 (Run 20 census #16).
     add_test(NAME startup_gfx2hlsl_s_lshl_add COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_lshl_add_check.py")
+    # SOPK 16-bit immediates: s_movk_i32 and s_cmpk_*_i32 sign-extend, s_cmpk_*_u32 zero-extend.
+    add_test(NAME startup_gfx2hlsl_sopk_signext COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sopk_signext_check.py")
     # SDWA forms of the float-result conversions (#1727).
     add_test(NAME startup_gfx2hlsl_sdwa_cvt COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sdwa_cvt_check.py")
