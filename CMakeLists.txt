@@ -532,7 +532,7 @@ set_tests_properties(startup_placement_publish_shrink_control PROPERTIES WILL_FA
 # stops at the end of the buffer; every alias or refusal must equal the full walk's on the same memory,
 # including a decommitted page before the buffer and a block replaced at the same base, and a large
 # touched block must need no VirtualQuery (src/startup_stubs/placed_buffer_range.h). The mutated runs
-# are the negative controls.
+# are the negative controls; each passes only when it fails exactly for its stated reason.
 add_executable(startup_placed_buffer_range_check tests/startup_placed_buffer_range_check.cpp)
 target_compile_features(startup_placed_buffer_range_check PRIVATE cxx_std_17)
 target_include_directories(startup_placed_buffer_range_check PRIVATE src)
@@ -540,7 +540,7 @@ add_test(NAME startup_placed_buffer_range COMMAND startup_placed_buffer_range_ch
 add_test(NAME startup_placed_buffer_range_region_only_control COMMAND startup_placed_buffer_range_check --mutate region-only)
 add_test(NAME startup_placed_buffer_range_walk_only_control COMMAND startup_placed_buffer_range_check --mutate walk-only)
 set_tests_properties(startup_placed_buffer_range_region_only_control startup_placed_buffer_range_walk_only_control
-    PROPERTIES WILL_FAIL TRUE SKIP_RETURN_CODE 77)
+    PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(startup_storage_file_range tests/startup_storage_file_range.cpp)
 target_compile_features(startup_storage_file_range PRIVATE cxx_std_17)
 target_include_directories(startup_storage_file_range PRIVATE src)
