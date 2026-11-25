@@ -405,6 +405,7 @@ class Stage:
         self.used_s, self.used_v = set(), set()
         self.exec_known = True    # exec still equals the entry mask (the lane is active)
         self.exports = {}         # 'pos0' / 'paramN' / 'mrtN' -> [4 expressions]
+        self.write_masks = {}     # 'mrtN' -> channels the export writes (bit c = channel c), see export()
         self.attrs = {}           # pixel: attr index -> 'linear' | 'flat'
         self.uses_pos = False
         self.masks = set()        # scalar registers currently holding lane masks
@@ -482,6 +483,11 @@ class Stage:
         except ValueError:
             raise Unsupported('operand %r' % tok)
 
+    def is_lane_mask(self, tok):
+        reg = reg_range(tok)
+        return (tok in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi')
+                or bool(reg and reg[0] == 's' and reg[1] in self.masks))
+
     def u_src(self, tok):
         """uint expression for an integer-context source that the disassembler may print negated."""
         # In an integer instruction the `-` modifier is the source's sign bit flipped: the same bit
@@ -522,7 +528,7 @@ class Stage:
         self.used_v.add(n)
         self.emit('v%d = %s;' % (n, expr) if self.exec_known else 'if (exec & 1) v%d = %s;' % (n, expr))
 
-    def set_vf(self, n, expr, mods=()):
+    def f_mods(self, expr, mods=()):
         # The hardware applies the output modifier before the clamp, but the disassembler prints `clamp`
         # first, so the order of `mods` is not the order of the operations: scale first, saturate last.
         scale = 1.0
@@ -545,7 +551,10 @@ class Stage:
             expr = '(%s) * %s' % (expr, factor)
         if clamp:
             expr = 'saturate(%s)' % expr
-        self.set_v(n, 'U(%s)' % expr)
+        return expr
+
+    def set_vf(self, n, expr, mods=()):
+        self.set_v(n, 'U(%s)' % self.f_mods(expr, mods))
 
     def scalar_expr_uniform(self, expr):
         # These identifiers are runtime inputs in the scalar expressions emitted below.
@@ -774,22 +783,26 @@ class Stage:
         raise Unsupported(base)
 
     # VOP1/VOP2 with sub-dword addressing: select the source fields, run the same operation, then place
-    # the low bits of the result in the destination field. The integer forms reuse VEC_U unchanged;
-    # float forms are not lowered yet, and dst_unused UNUSED_SEXT has no lowering.
+    # the low bits of the result in the destination field. The integer forms reuse VEC_U unchanged,
+    # VEC_U_TO_F conversions apply output modifiers before dst_sel, VEC_F forms stay refused, and
+    # dst_unused UNUSED_SEXT has no lowering.
     def sdwa(self, base, ops, mods):
         fields = {}
+        out_mods = []
+        float_result = base in VEC_U_TO_F
         for m in mods:
-            key, _, value = m.partition(':')
-            if key in ('src0_sel', 'src1_sel', 'src2_sel', 'dst_sel', 'dst_unused') and value:
-                fields[key] = value
+            if float_result and m in ('clamp', 'mul:2', 'mul:4', 'div:2'):
+                out_mods.append(m)
             else:
-                raise Unsupported('%s with SDWA modifier %s' % (base, m))
-        if base in VEC_U_TO_F:
+                key, _, value = m.partition(':')
+                if key in ('src0_sel', 'src1_sel', 'src2_sel', 'dst_sel', 'dst_unused') and value:
+                    fields[key] = value
+                else:
+                    raise Unsupported('%s with SDWA modifier %s' % (base, m))
+        if float_result:
             arity, text = VEC_U_TO_F[base]
-            float_result = True
         elif base in VEC_U:
             arity, text = VEC_U[base]
-            float_result = False
         else:
             raise Unsupported('SDWA form of %s' % base)
         sources = []
@@ -804,8 +817,8 @@ class Stage:
             sources.append(sdwa_source(self.u(token), selection, sext))
         result = text.format(*sources)
         if float_result:
-            # The table holds the float value; the destination selection writes its bit pattern.
-            result = 'U(%s)' % result
+            # Output modifiers scale and then clamp the float value; dst_sel writes its bit pattern.
+            result = 'U(%s)' % self.f_mods(result, out_mods)
         select = fields.get('dst_sel')
         if not select:
             raise Unsupported('%s SDWA without dst_sel' % base)
@@ -831,16 +844,15 @@ class Stage:
             return ('s%d' % r[1]) if r and r[0] == 's' and r[1] != r[2] else tok
         srcs = [low(t) for t in srcs]
         dname = low(ops[0])
+        shift_add = base in SHIFT_ADD
         word_complement = base in ('s_nand_b32', 's_nor_b32', 's_xnor_b32')
         word_pack = base == 's_pack_hh_b32_b16'
-        if word_complement or word_pack:
+        if shift_add or word_complement or word_pack:
             # The per-lane mask cannot supply the full word needed by these operations.
-            def lane_mask(t):
-                r = reg_range(t)
-                return (t in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi')
-                        or bool(r and r[0] == 's' and r[1] in self.masks))
-            if lane_mask(dname) or any(lane_mask(t) for t in srcs):
+            if self.is_lane_mask(dname) or any(self.is_lane_mask(t) for t in srcs):
                 raise Unsupported('%s on a lane mask' % base)
+        if shift_add and dname != 'm0' and (not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105):
+            raise Unsupported('%s destination %s' % (base, dname))
         if word_pack:
             if dname != 'm0' and (dst is None or dst[0] != 's' or dst[1] > 105):
                 raise Unsupported('%s destination %s' % (base, dname))
@@ -859,7 +871,7 @@ class Stage:
         if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
             if scc and self.tracks_uniformity():
                 self.scc_uniform = False  # nothing is emitted here, so the run-time scc is stale
-            if word_complement:
+            if shift_add or word_complement:
                 raise Unsupported('scc from descriptor data')
             if word_pack:
                 raise Unsupported('%s on descriptor data' % base)
@@ -890,6 +902,10 @@ class Stage:
             return None
         values = [self.u(t) for t in srcs]
         expr = text.format(*values)
+        if shift_add:
+            # carry = bits shifted out of S0, or a wrap of the 32-bit sum; read before the destination is written
+            n = SHIFT_ADD[base]
+            self.set_scc('(%s >> %d) != 0 || (%s) < %s' % (values[0], 32 - n, expr, values[1]))
         if dname == 'm0':
             self.sym.pop('m0', None)
             self.emit('m0 = %s;' % expr)
@@ -1781,8 +1797,15 @@ class Stage:
             self.masks.add(d)
 
     def export(self, asm):
-        m = re.fullmatch(r'exp (\w+) (.*?)((?: done| compr| vm)*)', asm)
+        # disasm_rdna2 prints a compressed EN that is not a whole channel pair (0x0, 0x3, 0xC or 0xF) as
+        # an explicit en:0x.. flag. As in pixel_aot, such a mask is refused rather than guessed.
+        m = re.fullmatch(r'exp (\w+) (.*?)((?: done| compr| vm| en:0x[0-9a-f]+)*)', asm)
+        if not m:
+            raise Unsupported('export form %r' % asm)
         target, vals, flags = m.group(1), [v.strip() for v in m.group(2).split(',')], m.group(3).split()
+        if any(f.startswith('en:') for f in flags):
+            raise Unsupported('compressed export enable mask %s does not select whole channel pairs'
+                              % next(f for f in flags if f.startswith('en:'))[3:])
         if 'vm' in flags and not self.exec_known:
             self.emit('if (!(exec & 1)) discard;')
         if target == 'mrtz':
@@ -1797,12 +1820,26 @@ class Stage:
         if not re.fullmatch(r'pos|param\d+|mrt[0-7]', name):
             raise Unsupported('export target %s' % target)
         kind = self.pipe.mrt_kind(int(name[3:])) if name.startswith('mrt') else 'float'
+        if len(vals) != 4:
+            raise Unsupported('export with %d operands' % len(vals))
+        # The channels the export writes. An 'off' channel is not written, so a render target keeps
+        # what it held there; the pipeline's write mask carries that (manifest 'wmask', #1674).
+        mask = sum(1 << c for c, v in enumerate(vals) if v != 'off')
         if 'compr' in flags:
             if kind in ('uint', 'int'):
                 raise Unsupported('packed integer export %s' % name)
-            a, b = self.u(vals[0]), self.u(vals[2])
-            exprs = ['f16tof32(%s)' % a, 'f16tof32(%s >> 16)' % a, 'f16tof32(%s)' % b, 'f16tof32(%s >> 16)' % b]
-            words = ['U(%s)' % e for e in exprs]
+            # Two binary16 channels per register: the low pair (0, 1) from the first, the high pair
+            # (2, 3) from the second, each printed twice or as 'off', 'off'.
+            if vals[1] != vals[0] or vals[3] != vals[2]:
+                raise Unsupported('compressed export operands %s' % ', '.join(vals))
+            if mask != 0xF and not name.startswith('mrt'):
+                raise Unsupported('partial compressed export to %s' % name)
+            pairs = []
+            for v in (vals[0], vals[2]):
+                r = self.u(v) if v != 'off' else None
+                pairs += ['f16tof32(%s)' % r, 'f16tof32(%s >> 16)' % r] if r else ['0.0', '0.0']
+            exprs = pairs
+            words = ['0u' if e == '0.0' else 'U(%s)' % e for e in exprs]
         elif kind in ('uint', 'int'):
             exprs = ['0u' if v == 'off' else self.u(v) for v in vals]
             words = exprs
@@ -1813,6 +1850,14 @@ class Stage:
         else:
             exprs = ['0.0' if v == 'off' else 'F(%s)' % self.u(v) for v in vals]
             words = ['0u' if v == 'off' else self.u(v) for v in vals]
+        if name.startswith('mrt'):
+            # One pipeline write mask per target: an export of no channel, or two exports of one target
+            # with different channels, cannot be represented and is refused.
+            if not mask:
+                raise Unsupported('export to %s writes no channel' % name)
+            known = self.write_masks.setdefault(name, mask)
+            if known != mask:
+                raise Unsupported('exports to %s write channel masks 0x%x and 0x%x' % (name, known, mask))
         self.exports[name] = True
         expr = '%s(%s)' % ('uint4' if kind in ('uint', 'int') else 'float4', ', '.join(exprs))
         self.emit('o.%s = %s;' % (name, 'asint(%s)' % expr if kind == 'int' else expr))
@@ -1952,7 +1997,12 @@ SCA = {
     's_pack_hh_b32_b16': ('({0} >> 16) | ({1} & 0xffff0000u)', None),
     # s_bfm_b32: a mask of S0[4:0] ones shifted left by S1[4:0]; SCC unchanged.
     's_bfm_b32': ('(((1u << ({0} & 31)) - 1) << ({1} & 31))', None),
+    # s_lshlN_add_u32: low 32 bits of (S0 << N) + S1. SHIFT_ADD also supplies SCC for wide overflow.
+    's_lshl1_add_u32': ('({0} << 1) + {1}', None), 's_lshl2_add_u32': ('({0} << 2) + {1}', None),
+    's_lshl3_add_u32': ('({0} << 3) + {1}', None), 's_lshl4_add_u32': ('({0} << 4) + {1}', None),
 }
+# shift amount of the scalar shift-and-add forms; their SCC is a carry from the sources, not a rule over the result
+SHIFT_ADD = {'s_lshl1_add_u32': 1, 's_lshl2_add_u32': 2, 's_lshl3_add_u32': 3, 's_lshl4_add_u32': 4}
 for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt', '<'), ('le', '<=')):
     for _typ, _cast in (('i32', 'int({0}) %s int({1})'), ('u32', '{0} %s {1}')):
         def _make(op=_op, cast=_cast):
@@ -1961,6 +2011,17 @@ for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt',
             return handler
         setattr(Stage, 'op_s_cmp_%s_%s' % (_name, _typ), _make())
         setattr(Stage, 'op_s_cmpk_%s_%s' % (_name, _typ), _make())
+# s_bitcmp1_b32 / s_bitcmp0_b32: SCC = S0[S1[4:0]] == 1 / == 0.
+for _bit in (0, 1):
+    def _make_bitcmp(bit=_bit):
+        def handler(self, ops, mods):
+            if len(ops) != 2 or mods:
+                raise Unsupported('scalar bit test requires two unmodified operands')
+            if any(self.is_lane_mask(tok) for tok in ops):
+                raise Unsupported('scalar bit test on a lane mask')
+            self.set_scc('((%s >> (%s & 31)) & 1u) == %du' % (self.u(ops[0]), self.u(ops[1]), bit))
+        return handler
+    setattr(Stage, 'op_s_bitcmp%d_b32' % _bit, _make_bitcmp())
 
 
 def parse_root(blob):
@@ -2210,6 +2271,11 @@ class Pipeline:
             lines.append('smpheap %d %d fallback %d' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE, SAMPLER_HEAP_FALLBACK))
         lines.append('params %d' % (max(self.params) + 1 if self.params else 0))
         lines.append('targets %s' % ' '.join(k[3:] for k in sorted(self.ps.exports) if k.startswith('mrt')))
+        # 'wmask <target> <mask>': the export leaves the channels outside the mask unwritten, so the
+        # runtime keeps them out of that target's RenderTargetWriteMask. Full masks are not written.
+        for name, mask in sorted(self.ps.write_masks.items(), key=lambda kv: int(kv[0][3:])):
+            if mask != 0xF:
+                lines.append('wmask %d 0x%x' % (int(name[3:]), mask))
         return '\n'.join(lines) + '\n'
 
 
