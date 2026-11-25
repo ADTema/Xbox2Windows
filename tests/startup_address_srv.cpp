@@ -367,7 +367,7 @@ int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
 
 // One-texel textures published by address (X2W_TEST_SINGLE_ELEMENT=2d or 3d), one 1x4 column per draw. The texel
 // sits at offset 0 of its memory whatever the layout field says. Before column 3 the column-2 texel is rewritten
-// without a new publication, then fifteen calls are refused; each names memory holding another texel, so any of
+// without a new publication, then sixteen calls are refused; each names memory holding another texel, so any of
 // them taking the descriptor would change column 3. Each refused call must also leave the destination's 32 bytes
 // (plain memory behind a view heap created without title memory) unchanged; the first that does not returns 60+.
 int draw_single_element_srvs(void* guest, void* list)
@@ -443,7 +443,7 @@ int draw_single_element_srvs(void* guest, void* list)
     refuse([](auto&, auto& v) { v.view.Texture2D.MipLevels = 2; });
     refuse([](auto&, auto& v) { v.address = 0; });
     // Placed UAV resources are written on the desktop side. A flagless view at the base of a 1x1 UAV texture,
-    // and one 256 bytes into a 512-byte UAV buffer, stay refused.
+    // one 256 bytes into a 512-byte UAV buffer, and one that straddles the buffer base stay refused.
     auto written = rgba;
     written.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     D3D12_RESOURCE_DESC written_buffer{};
@@ -460,6 +460,8 @@ int draw_single_element_srvs(void* guest, void* list)
     publish(rgba, view_of(rgba, ptr(memory[4])));
     unchanged();
     publish(rgba, view_of(rgba, ptr(memory[7])));
+    unchanged();
+    publish(rgba, view_of(rgba, ptr(memory[5] + 254)));  // two texel bytes precede the UAV buffer base
     unchanged();
     if (changed) return 60 + changed;
     draw(3);

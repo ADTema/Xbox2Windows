@@ -86,10 +86,9 @@ Wrapper* existing_memory_texture(u64 address, const D3D12_RESOURCE_DESC& desc)
     return match;
 }
 
-// A live render-target, depth or UAV resource covering the address is written on the desktop side, so title
-// memory there does not hold its texels. A resource covers its base address, and the bytes after it when its
-// allocation size (or a buffer's width) is known.
-bool gpu_written_at(u64 address)
+// A live render-target, depth or UAV resource overlapping the texel is written on the desktop side, so its
+// title memory does not hold the texel. For a resource of unknown size, its base is the only known byte.
+bool gpu_written_overlap(u64 address, UINT texel_bytes)
 {
     constexpr UINT gpu_written = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
                                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
@@ -98,7 +97,8 @@ bool gpu_written_at(u64 address)
     for (const auto& [wrapper, info] : resource_infos()) {
         const u64 base = reinterpret_cast<u64>(wrapper->own().title_memory);
         const u64 bytes = info.bytes ? info.bytes : info.console.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? info.console.Width : 0;
-        if (base && (address == base || (address > base && address - base < bytes)) &&
+        const bool overlap = address <= base ? base - address < texel_bytes : address - base < bytes;
+        if (base && overlap &&
             (static_cast<UINT>(info.console.Flags) & gpu_written) && InterlockedCompareExchange(&wrapper->own().refs, 0, 0) > 0) {
             found = true;
             break;
@@ -239,7 +239,7 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     }
     // A single-element texture is published by address like a tiled view: its texel is read at offset 0.
     if (x2w_startup::supports_single_element_srv(*resource, input->view)) {
-        if (gpu_written_at(input->address)) {
+        if (gpu_written_overlap(input->address, x2w_startup::single_element_bytes(*resource))) {
             if (first_calls(refused, 8))
                 log_refused_memory_srv("GPU-written resource at the supplied address", "gpu_written_resource", resource, input, destination);
         } else if (Wrapper* texture = publish_tiled_texture(self, input->address, *resource))
