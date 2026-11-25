@@ -545,8 +545,8 @@ def descriptor_load_hlsl():
         "    if ((bits & 1u) != 0u && (r != 0u || (result & 1u) != 0u)) ++result;\n"
         "    return result;\n"
         "}\n"
-        "uint descriptor_snorm16_load(uint half) {\n"
-        "    int value = (int)(half << 16u) >> 16;\n"
+        "uint descriptor_snorm16_load(uint bits16) {\n"
+        "    int value = (int)(bits16 << 16u) >> 16;\n"
         "    if (value <= -32767) return 0xbf800000u;\n"
         "    return value < 0 ? 0x80000000u | descriptor_ratio((uint)(-value), 32767u) : descriptor_ratio((uint)value, 32767u);\n"
         "}\n"
@@ -2465,8 +2465,8 @@ def main():
                    cpu=args.cpu, lds_bytes=args.lds_bytes,
                    lds_f32_mode=args.lds_f32_mode, lds_f64_mode=args.lds_f64_mode,
                    mubuf_d16_xyz_mode=args.mubuf_d16_xyz_mode, image_srv_descriptor=args.image_srv_descriptor,
-descriptor_format_constant=args.descriptor_format_constant,
-rsrc2=args.rsrc2, wave_size=args.wave_size, load_format_constant=args.load_format_constant)
+                   descriptor_format_constant=args.descriptor_format_constant,
+                   rsrc2=args.rsrc2, wave_size=args.wave_size, load_format_constant=args.load_format_constant)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(source, encoding="ascii")
     print(json.dumps({"container_sha256": hashlib.sha256(blob).hexdigest(),
