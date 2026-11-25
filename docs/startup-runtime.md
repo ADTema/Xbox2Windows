@@ -1410,6 +1410,18 @@ These are measured on one executable; treat them as hypotheses for others.
   reason of each refusal. Its `_dest_alpha_control` run, which expects a destination alpha factor
   in its colour form, is the negative control
   (`ctest --preset dev --no-tests=error -R "^startup_cb_blend_decode" -V`).
+- Depth-stencil registers are decoded but not applied yet (#1999, item A). State block A of a
+  slot 57 pipeline holds `DB_DEPTH_CONTROL` at +0xB8, `DB_STENCIL_CONTROL` at +0xBC and
+  `DB_STENCILREFMASK` / `_BF` at +0xC0 / +0xC4, measured locally. Other pipeline layouts are not
+  covered. `src/startup_stubs/pipeline_state_decode.h`
+  reads the four words and decodes them into a `D3D12_DEPTH_STENCIL_DESC` and a stencil reference
+  with the field layouts of Mesa's `src/amd/registers/gfx10.json`. It refuses stencil ops D3D12
+  can't express (`ONES`, `REPLACE_OP`, the logic ops, add or subtract by other than one) and colour
+  writes tied to the depth result. It flags, without applying, `DEPTH_BOUNDS_ENABLE` and back-face
+  masks or references that differ from the front. A device-free check decodes hand-built words for
+  each compare function and each stencil op with a D3D12 form, the refusals and a synthetic block.
+  Its `_offset_control` run (words one word later) is the negative control
+  (`ctest --preset dev --no-tests=error -R "^startup_pipeline_state" -V`).
 - Audio produces no output from the console audio path. A separate desktop render sink exists
   (see "Audio output"); nothing connects the console path to it yet.
 
