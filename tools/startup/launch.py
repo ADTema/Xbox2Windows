@@ -130,6 +130,9 @@ def inheritable_file(path):
 
 
 VALID_OPTIONS = ("--timeout", "--memory-gib", "--max-processes")
+DWORD_MAX = (1 << 32) - 1
+GIB = 1 << 30
+SIZE_T_LIMIT = 1 << (ctypes.sizeof(ctypes.c_size_t) * 8)
 
 
 def _parse_finite_float(raw, flag, allow_zero):
@@ -188,6 +191,13 @@ def parse_args(argv):
     timeout = _parse_finite_float(opts.get("--timeout", "15"), "--timeout", allow_zero=False)
     memory_gib = _parse_finite_float(opts.get("--memory-gib", "16"), "--memory-gib", allow_zero=True)
     max_processes = _parse_non_negative_int(opts.get("--max-processes", "1"), "--max-processes")
+    # INFINITE (DWORD_MAX) is reserved. A positive cap must not round to zero.
+    if not 1 <= timeout * 1000 < DWORD_MAX:
+        raise ValueError("--timeout must be at least 1 ms and below the Windows INFINITE sentinel")
+    if memory_gib and not 1 <= memory_gib * GIB < SIZE_T_LIMIT:
+        raise ValueError("--memory-gib must be 0 or represent at least one byte within the Windows size_t limit")
+    if max_processes > DWORD_MAX:
+        raise ValueError("--max-processes exceeds the Windows DWORD limit")
     return exe, cwd, logdir, timeout, memory_gib, max_processes, extra
 
 
@@ -203,7 +213,7 @@ def main(argv=None):
         print("error: kernel32 is required to launch processes", file=sys.stderr)
         return 2
 
-    memory = int(memory_gib * 2**30)
+    memory = int(memory_gib * GIB)
     job = None
     out = None
     err = None

@@ -278,19 +278,25 @@ class LaunchCliNegativeTests(unittest.TestCase):
                 self._assert_exit_2([*base, unknown], "unknown option")
 
             # Invalid --timeout (non-numeric, <= 0, NaN, inf).
-            for bad_timeout in ("abc", "", "0", "-1", "-0.5", "nan", "NaN", "inf", "-inf"):
+            for bad_timeout in ("abc", "", "0", "-1", "-0.5", "nan", "NaN", "inf", "-inf",
+                                "0.0009", "4294967.295", "1e300"):
                 self._assert_exit_2([*base, "--timeout", bad_timeout], "--timeout")
 
             # Invalid --memory-gib (non-numeric, < 0, NaN, inf).
-            for bad_mem in ("abc", "", "-1", "-0.01", "nan", "inf", "-inf"):
+            for bad_mem in ("abc", "", "-1", "-0.01", "nan", "inf", "-inf", "1e-20", "1e300",
+                            str(launch.SIZE_T_LIMIT // launch.GIB)):
                 self._assert_exit_2([*base, "--memory-gib", bad_mem], "--memory-gib")
 
             # Invalid --max-processes (non-int, < 0).
-            for bad_procs in ("abc", "", "1.5", "-1", "nan", "inf", "True"):
+            for bad_procs in ("abc", "", "1.5", "-1", "nan", "inf", "True", "4294967296"):
                 self._assert_exit_2([*base, "--max-processes", bad_procs], "--max-processes")
 
             # Failed validation must not create logdir.
             self.assertFalse((root / "logs").exists())
+            accepted = launch.parse_args([*base, "--timeout", "4294967.294", "--memory-gib", "0",
+                                          "--max-processes", "4294967295"])
+            self.assertEqual(int(accepted[3] * 1000), launch.DWORD_MAX - 1)
+            self.assertEqual(accepted[4:6], (0, launch.DWORD_MAX))
 
     def test_stubbed_create_process_and_job_failures_clean_up(self):
         with tempfile.TemporaryDirectory() as tmp:
