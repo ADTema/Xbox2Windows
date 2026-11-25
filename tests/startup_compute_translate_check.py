@@ -101,8 +101,21 @@ def check_requests(directory):
     assert (cache / ('%016x.fail' % key)).read_text().startswith('dxc cs: '), (cache / ('%016x.fail' % key)).read_text()
     assert not (cache / ('%016x.txt' % key)).exists(), 'a manifest was left next to the failure'
     assert key in G.pending_keys(str(cache), skip_failed=False)
+    # With compilation on (X2W_FXC unset), a compute request is done only with its manifest and non-empty
+    # <key>.cs.cso; graphics bytecode names do not count.
+    (cache / ('%016x.fail' % key)).unlink()
+    (cache / ('%016x.txt' % key)).write_text('x2w-manifest 2\nstage cs\n')
+    assert key in G.pending_keys(str(cache), skip_failed=False), 'a manifest alone made the request done'
+    for stage in ('vs', 'ps'):
+        (cache / ('%016x.%s.cso' % (key, stage))).write_bytes(b'DXBC')
+    assert key in G.pending_keys(str(cache), skip_failed=False), 'graphics bytecode made a compute request done'
+    (cache / ('%016x.cs.cso' % key)).write_bytes(b'')
+    assert key in G.pending_keys(str(cache), skip_failed=False), 'an empty .cs.cso made the request done'
+    (cache / ('%016x.cs.cso' % key)).write_bytes(b'DXBC')
+    assert key not in G.pending_keys(str(cache), skip_failed=False), 'manifest and .cs.cso did not make it done'
     print('compute request translation: case A manifest, %d malformed requests refused with no manifest, '
-          'renamed and incomplete requests refused, done test, failed compile withdraws the manifest' % len(cases))
+          'renamed and incomplete requests refused, done test, failed compile withdraws the manifest, '
+          'compiled done test' % len(cases))
 
 
 def check_e2e(directory, consumer, dxc, runner, adapter, wrong_group):
