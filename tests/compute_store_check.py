@@ -371,6 +371,7 @@ def controls():
     vadd_nc_i32_controls()
     cvt_u32_f32_controls()
     ff1_exec_controls()
+    ff1_scalar_controls()
     writelane_controls()
 
 
@@ -1867,6 +1868,177 @@ def ff1_exec_draw(directory, compiler, renderer, backend):
     bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
     if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
         raise AssertionError("ff1_exec: mutation escaped detection")
+    return 0
+
+
+def ff1_scalar_index(value, width):
+    """Lowest set bit of a width-bit word, or 0xffffffff when no bit is set. Independent of the lowering."""
+    value &= (1 << width) - 1
+    return 0xffffffff if value == 0 else (value & -value).bit_length() - 1
+
+
+# b32 zero, b32 bit 0, b32 bit 31, and a b64 whose only set bit is bit 63 (high word only).
+FF1_SCALAR = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "s_mov_b32 s4, 0",
+    "s_mov_b32 s5, 1",
+    "s_mov_b32 s6, 0x80000000",
+    "s_mov_b32 s16, 0",
+    "s_mov_b32 s17, 0x80000000",
+    "s_ff1_i32_b32 s20, s4",
+    "s_ff1_i32_b32 s21, s5",
+    "s_ff1_i32_b32 s22, s6",
+    "s_ff1_i32_b64 s23, s[16:17]",
+    "v_mov_b32_e32 v4, s20",
+    "v_mov_b32_e32 v5, s21",
+    "v_mov_b32_e32 v6, s22",
+    "v_mov_b32_e32 v7, s23",
+    "v_lshl_add_u32 v3, s10, 5, v0",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx4 v[4:7], v3, s[12:15], 0 idxen",
+    "s_endpgm",
+]
+FF1_SCALAR_BINDING = dict(table_reg=8, descriptor_offset=0, group_reg=10, stride=16)
+FF1_SCALAR_RESULTS = (
+    ff1_scalar_index(0, 32),
+    ff1_scalar_index(1, 32),
+    ff1_scalar_index(0x80000000, 32),
+    ff1_scalar_index(0x80000000 << 32, 64),
+)
+FF1_SCALAR_STORE = (
+    "    outputData.Store4(tid.x * 16u + 0u, uint4("
+    "firstbitlow(0x00000000u), firstbitlow(0x00000001u), firstbitlow(0x80000000u), "
+    "(0x00000000u != 0u ? firstbitlow(0x00000000u) : "
+    "(0x80000000u != 0u ? 32u + firstbitlow(0x80000000u) : 0xffffffffu))));"
+)
+
+
+def ff1_scalar_words():
+    """One 32-thread group: four uniform results per thread, then the sentinel past the group."""
+    words = [SENTINEL] * 320
+    for flat in range(32):
+        words[4 * flat:4 * flat + 4] = FF1_SCALAR_RESULTS
+    return words
+
+
+def ff1_scalar_controls():
+    """s_ff1 of a tracked scalar: exact HLSL, and one rejection for each source this slice does not lower."""
+    assert FF1_SCALAR_RESULTS == (0xffffffff, 0, 31, 63), FF1_SCALAR_RESULTS
+    lines = aot.lower(FF1_SCALAR, 32, **FF1_SCALAR_BINDING).splitlines()
+    assert lines[-2] == FF1_SCALAR_STORE, lines
+    # An ALU result is a tracked data word, not only an s_mov immediate.
+    alu = aot.lower(variant(FF1_SCALAR, ("s_mov_b32 s5, 1", "s_mov_b32 s5, 0\ns_or_b32 s5, s5, 1")),
+                    32, **FF1_SCALAR_BINDING)
+    assert "firstbitlow((0x00000000u | 0x00000001u))" in alu, alu
+    # exec stays the full-wave fold, including when the same program also scans data words.
+    folded = aot.lower(variant(FF1_SCALAR, ("s20, s4", "s20, exec_lo")), 32, **FF1_SCALAR_BINDING)
+    assert "firstbitlow(0x00000000u), firstbitlow" not in folded and "uint4(0x00000000u, firstbitlow" in folded, folded
+    # A low bit wins over a set high half.
+    low_wins = aot.lower(variant(FF1_SCALAR,
+                                 ("s_mov_b32 s16, 0", "s_mov_b32 s16, 4"),
+                                 ("s_mov_b32 s17, 0x80000000", "s_mov_b32 s17, 1")),
+                         32, **FF1_SCALAR_BINDING)
+    assert ("(0x00000004u != 0u ? firstbitlow(0x00000004u) : "
+            "(0x00000001u != 0u ? 32u + firstbitlow(0x00000001u) : 0xffffffffu))") in low_wins, low_wins
+    for bad_src in ("s30", "s10", "s12", "0", "0x1", "v0", "vcc", "exec", "exec_hi", "s[4:5]"):
+        rejects("Unsupported first active lane source: " + bad_src, aot.lower,
+                variant(FF1_SCALAR, ("s20, s4", f"s20, {bad_src}")), 32, **FF1_SCALAR_BINDING)
+    for bad_src in ("s16", "s[17:18]", "s[16:18]", "exec_lo", "vcc", "0"):
+        rejects("Unsupported first active lane source: " + bad_src, aot.lower,
+                variant(FF1_SCALAR, ("s23, s[16:17]", f"s23, {bad_src}")), 32, **FF1_SCALAR_BINDING)
+    # The saved exec mask is not a data word.
+    saved = [
+        "s_mov_b32 s9, 0",
+        "s_load_dwordx4 s[12:15], s[8:9], null",
+        "s_mov_b32 s4, 1",
+        "v_lshl_add_u32 v3, s10, 5, v0",
+        "v_cmp_lt_u32_e32 vcc_lo, 4, v3",
+        "s_and_saveexec_b32 s2, vcc_lo",
+        "s_ff1_i32_b32 s5, s2",
+        "s_or_b32 exec_lo, exec_lo, s2",
+        "v_mov_b32_e32 v1, s5",
+        "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dword v1, v3, s[12:15], 0 idxen",
+        "s_endpgm",
+    ]
+    rejects("Unsupported first active lane source: s2", aot.lower, saved, 32, **FF1_SCALAR_BINDING)
+    # A descriptor word stays opaque after the load completes.
+    descriptor = [
+        "s_mov_b32 s9, 0",
+        "s_load_dwordx4 s[12:15], s[8:9], null",
+        "s_waitcnt lgkmcnt(0)",
+        "s_ff1_i32_b32 s20, s12",
+        "v_mov_b32_e32 v4, s20",
+        "v_lshl_add_u32 v3, s10, 5, v0",
+        "buffer_store_dword v4, v3, s[12:15], 0 idxen",
+        "s_endpgm",
+    ]
+    rejects("Unsupported first active lane source: s12", aot.lower, descriptor, 32, **FF1_SCALAR_BINDING)
+    rejects("Invalid scalar destination or pending load", aot.lower,
+            variant(FF1_SCALAR, ("s20, s4", "s106, s4")), 32, **FF1_SCALAR_BINDING)
+    rejects("Invalid scalar destination or pending load", aot.lower,
+            variant(FF1_SCALAR, ("s20, s4", "s12, s4")), 32, **FF1_SCALAR_BINDING)
+    rejects("Unsupported compute instruction: s_ff0_i32_b32", aot.lower,
+            variant(FF1_SCALAR, ("s_ff1_i32_b32 s20, s4", "s_ff0_i32_b32 s20, s4")), 32, **FF1_SCALAR_BINDING)
+    rejects("Unsupported compute instruction: s_cselect_b32", aot.lower,
+            variant(FF1_SCALAR, ("s_ff1_i32_b32 s20, s4", "s_ff1_i32_b32 s20, s4\ns_cselect_b32 s24, s20, 0")),
+            32, **FF1_SCALAR_BINDING)
+
+
+def ff1_scalar_binary(directory, assembler, objcopy, library):
+    """The assembled scalar FF1 program decodes to its text and lowers to the same translation."""
+    decoded = aot.labelled(disassemble(assemble(directory, assembler, objcopy, FF1_SCALAR), library, offsets=True))
+    assert [line for line in decoded if line.startswith("s_ff1_i32_")] == [
+        line for line in FF1_SCALAR if line.startswith("s_ff1_i32_")], decoded
+    assert aot.lower(decoded, 32, **FF1_SCALAR_BINDING) == aot.lower(FF1_SCALAR, 32, **FF1_SCALAR_BINDING)
+
+
+def ff1_scalar_draw(directory, compiler, renderer, backend):
+    src, cso, case = [directory / x for x in ("ff1_scalar.hlsl", "ff1_scalar.cso", "ff1_scalar.case")]
+    source = aot.lower(FF1_SCALAR, 32, **FF1_SCALAR_BINDING)
+    src.write_text(source, encoding="ascii")
+    subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+    cmd = [renderer, backend, "--compute-store-case", cso, case]
+    expected = ff1_scalar_words()
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+    off = list(expected)
+    off[128] ^= 1
+    wrong = {
+        "zero reads 0": (0, 0),
+        "bit 0 reads 1": (1, 1),
+        "bit 31 reads 0": (0, 2),
+        "high word reads 31": (31, 3),
+    }
+    for label, (value, word) in wrong.items():
+        reference = ff1_scalar_words()
+        for flat in range(32):
+            reference[4 * flat + word] = value
+        assert next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b) == word, label
+        case.write_bytes(struct.pack("<321I", 1, *reference))
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"ff1_scalar: reference '{label}' escaped detection\n{bad.stderr}")
+    case.write_bytes(struct.pack("<321I", 1, *off))
+    bad = subprocess.run(cmd, capture_output=True, text=True)
+    if bad.returncode != 1 or "word=128 expected=" not in bad.stderr:
+        raise AssertionError(f"ff1_scalar: sentinel escaped detection\n{bad.stderr}")
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    for label, old, new in (
+            ("zero folded to 0", "firstbitlow(0x00000000u)", "0u"),
+            ("high half not shifted", "32u + firstbitlow", "firstbitlow")):
+        mutated = source.replace(old, new)
+        if mutated == source:
+            raise AssertionError(f"ff1_scalar: mutation '{label}' did not change the source")
+        msrc, mcso = directory / "mutated.hlsl", directory / "mutated.cso"
+        msrc.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", mcso, msrc], check=True)
+        bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"ff1_scalar: mutation '{label}' escaped detection")
     return 0
 
 
@@ -4556,6 +4728,7 @@ def binary(directory, assembler, objcopy, library):
     vadd_nc_i32_binary(directory, assembler, objcopy, library)
     cvt_u32_f32_binary(directory, assembler, objcopy, library)
     ff1_exec_binary(directory, assembler, objcopy, library)
+    ff1_scalar_binary(directory, assembler, objcopy, library)
     writelane_binary(directory, assembler, objcopy, library)
     mubuf_subword_store_controls()
     gfx1030_binary(directory, assembler, objcopy, library, mubuf_subword_store_cases(), "buffer_store_")
@@ -7875,6 +8048,7 @@ if __name__ == "__main__":
                  "draw-bcnt-exec": bcnt_exec_draw,
                  "draw-vadd_nc_i32": vadd_nc_i32_draw,
                  "draw-ff1-exec": ff1_exec_draw,
+                 "draw-ff1-scalar": ff1_scalar_draw,
                  "draw-writelane": writelane_draw,
                  "draw-mtbuf-store": mtbuf_store_draw,
                  "draw-mubuf-subword-store": mubuf_subword_store_draw,
