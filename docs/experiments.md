@@ -5193,6 +5193,14 @@ The LLVM 15 round trip assembles and disassembles the fixture as for the other f
 
 Run `ctest --preset dev --no-tests=error -R '^compute_store_aot_bcnt_exec_(warp|hardware)$' -V`.
 
+#### Scalar pair population count
+
+`s_bcnt1_i32_b64 sD, s[lo:hi]` writes the number of set bits in both words of an even-aligned, consecutive SGPR pair to `sD`. With two known words the count is folded; with runtime words the translator emits `countbits(lo) + countbits(hi)`. Both words are read before `sD` is written, so `sD` may alias either half of the pair. The instruction sets `SCC` to `sD != 0`; this profile has no `SCC` reader, and a following `s_cbranch_scc*` stays refused. Unaligned or out-of-range pairs, pending destinations and unverified source words are refused. The control covers zero, 64 set bits, aliasing, a runtime word, the refusals, and a mutation that drops the high word.
+
+```sh
+python -B tests/compute_alu_bcnt64_check.py
+```
+
 #### First active lane of a full wave
 
 `s_ff1_i32_b64 sD, exec` and `s_ff1_i32_b32 sD, exec_lo` return the index of the lowest set bit of `exec` (64-bit) or `exec_lo` (32-bit) in the single 32-bit SGPR `sD`, preserving `SCC`. Outside a guarded region, lane 0 of every wave is active for any group of at least 1 thread (and for wave32 the high half of `exec` is 0), so both forms fold to the known scalar word `0`. Uses inside a guarded region (`s_and_saveexec_b32` through `exec` restore), any other exec-mask source (`vcc`, `exec_hi`, or the wrong width), a literal, an SGPR that does not hold a known data word, and invalid or pending destinations (`s106`, `s12`, or an SGPR pair) are refused. A tracked general SGPR is a separate case below and is not folded to the active lane.

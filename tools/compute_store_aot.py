@@ -801,6 +801,21 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 scalar[dst] = 32
             else:
                 raise ValueError("Unverified active lane count wave size or group size")
+        elif m := re.fullmatch(r"s_bcnt1_i32_b64 s(\d+), s\[(\d+):(\d+)\]", line):
+            # SOP1 counts both words and sets SCC to D != 0. The profile has no SCC readers.
+            dst, lo, hi = map(int, m.groups())
+            if dst > 105 or dst in pending or lo % 2 or hi != lo + 1 or hi > 105:
+                raise ValueError("Invalid scalar bit count register or pending destination")
+            words = [alu_word(f"s{reg}", scalar, vector, pending) for reg in (lo, hi)]
+            if None in words:
+                raise ValueError("Unverified scalar bit count source")
+            if all(isinstance(word, int) for word in words):
+                scalar[dst] = sum(word.bit_count() for word in words)
+            else:
+                expression = "(countbits({}) + countbits({}))".format(*map(hlsl_word, words))
+                if len(expression) > ALU_EXPRESSION_LIMIT:
+                    raise ValueError("ALU expression too large")
+                scalar[dst] = ("alu", expression)
         elif m := re.fullmatch(r"s_ff1_i32_(b32|b64) s(\d+), (\S+)", line):
             # exec/exec_lo: first active lane of a full wave. SCC is preserved. Outside a guarded
             # region lane 0 of every wave is active for any group of at least 1 thread, and for
