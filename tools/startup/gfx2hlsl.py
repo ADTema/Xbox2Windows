@@ -11,6 +11,7 @@ import re
 import struct
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 import disasm_rdna2 as D  # noqa: E402
@@ -2635,15 +2636,92 @@ def main():
             for ext, blob in (('.a', a), ('.b', b), ('.root', root)):
                 open(os.path.join(out_dir, 'req_%016x%s' % (key, ext)), 'wb').write(blob)
             print('pso %x -> request %016x' % (w & 0xffffff, key))
+    if sys.argv[1] == '--watch':
+        # --watch <dir> [seconds]: translate requests as a running title writes them, until stopped
+        interval = float(sys.argv[3]) if len(sys.argv) > 3 else 2.0
+        # The first pass retries earlier failures once (the runtime never rewrites a request, so a
+        # translator fix would otherwise not reach them); later passes skip failures already written.
+        skip_failed = False
+        while True:
+            if watch_pass(out_dir, skip_failed):
+                skip_failed = True
+            time.sleep(interval)
+    translate_pending(out_dir)
+
+
+
+
+def watch_pass(out_dir, skip_failed):
+    """One --watch pass. A worker killed from outside (out of memory) breaks the pool; the pass is
+    reported and its requests are retried on the next pass instead of ending the watcher."""
+    from concurrent.futures.process import BrokenProcessPool
+    try:
+        translate_pending(out_dir, skip_failed=skip_failed)
+        return True
+    except BrokenProcessPool as error:
+        print('translation pass interrupted, retrying: %s' % error, file=sys.stderr, flush=True)
+        return False
+
+
+def translate_one(out_dir, key):
+    """translate_request, with an unexpected translator error recorded as <key>.fail instead of raised."""
+    try:
+        return translate_request(out_dir, key)
+    except Exception as error:  # noqa: BLE001 - one bad request must not stop a scan or the watcher
+        reason = 'translator error: %s: %s' % (type(error).__name__, error)
+        with open(os.path.join(out_dir, '%016x.fail' % key), 'w') as fail:
+            fail.write(reason + '\n')
+        return reason
+
+
+def translation_jobs():
+    try:
+        jobs = int(os.environ.get('X2W_TRANSLATE_JOBS') or 0)
+    except ValueError:
+        jobs = 0
+    jobs = jobs if jobs > 0 else os.cpu_count() or 1
+    return min(jobs, 61) if os.name == 'nt' else jobs  # ProcessPoolExecutor refuses more than 61 on Windows
+
+
+def translate_pending(out_dir, skip_failed=False, jobs=None):
+    """Translate every request that has no result yet. The runtime writes .a and .rtv last, as ready markers.
+
+    Requests are independent (each writes only its own <key>.* files), so several run in parallel
+    processes; X2W_TRANSLATE_JOBS (default: the processor count, at most 61 on Windows) sets how many.
+    """
+    keys = pending_keys(out_dir, skip_failed)
+    jobs = min(jobs or translation_jobs(), len(keys))
+    if jobs < 2:
+        for key in keys:
+            print('%016x: %s' % (key, translate_one(out_dir, key)), flush=True)
+        return
+    from concurrent.futures import ProcessPoolExecutor
+    chunk = max(1, len(keys) // (jobs * 4))  # small batches keep every worker busy
+    with ProcessPoolExecutor(max_workers=jobs) as pool:
+        for key, result in zip(keys, pool.map(translate_one, [out_dir] * len(keys), keys, chunksize=chunk)):
+            print('%016x: %s' % (key, result), flush=True)
+
+
+def pending_keys(out_dir, skip_failed):
+    keys = []
     manifest_only = os.environ.get('X2W_FXC') == ''
-    for key in request_keys(out_dir):
-        name = os.path.join(out_dir, '%016x' % key)
-        if os.path.isfile(name + '.txt') and (
-            manifest_only or (has_bytecode(name + '.vs.cso') and has_bytecode(name + '.ps.cso'))
+    for name in sorted(os.listdir(out_dir)):
+        m = re.fullmatch(r'req_([0-9a-f]{16})\.(?:a|rtv)', name)
+        if not m:
+            continue
+        key = int(m.group(1), 16)
+        result = os.path.join(out_dir, '%016x' % key)
+        # A published manifest with bytecode (or manifest-only mode) is done; otherwise resume (#2008).
+        if os.path.isfile(result + '.txt') and (
+            manifest_only or (has_bytecode(result + '.vs.cso') and has_bytecode(result + '.ps.cso'))
         ):
             continue
-        print('%016x: %s' % (key, translate_request(out_dir, key)))
-
+        fail = os.path.join(out_dir, '%016x.fail' % key)
+        # A repeated pass retries a failure only once its request is rewritten.
+        if skip_failed and os.path.exists(fail) and os.path.getmtime(fail) >= os.path.getmtime(os.path.join(out_dir, name)):
+            continue
+        keys.append(key)
+    return keys
 
 if __name__ == '__main__':
     main()
