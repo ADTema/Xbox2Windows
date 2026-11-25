@@ -13955,6 +13955,40 @@ ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_compute_' -V
 python -B tests/startup_gfx2hlsl_compute_check.py binary llvm-mc-15
 ```
 
+### Startup compute formatted buffer reads
+
+The offline compute translator lowers `buffer_load_format_x`, `_xy`, `_xyz` and `_xyzw` using
+the existing FORMAT and DST_SEL decode. The instruction must use four untouched words from a
+fixed native table entry. After a branch, the descriptor must come from a local table load with
+a proven root pointer. The manifest binds `srv <slot> buf table <param> <offset>` and requests
+`udsrc <n> descword3 <slot>`. Indexed addressing also requests `udsrc <n> stride <slot>`.
+
+The dispatch caller must resolve the native descriptor to a raw SRV whose byte offset zero is
+the descriptor's base. It supplies word 3 and, when requested, the byte stride from the same
+descriptor snapshot. It must refuse missing or unresolved native descriptors, unsupported FORMAT
+codes, reserved DST_SEL values for the components read, and descriptor features that change the
+byte address, such as swizzling or adding the lane ID. The caller must establish that each
+executed access is within the native descriptor range without address wrap and that every
+desktop dword read is aligned and backed by the SRV. Packed reads can fetch an adjacent dword
+even when only one byte is used. The lowering does not model native out-of-range results.
+
+Cases `L-uint` and `L-unorm` in `startup_gfx2hlsl_compute_check.py` supply different word 3
+values to the same translated shader. They compare an unaligned UINT16 pair and an UNORM8
+field, with permuted channels and both integer and floating-point forms of the constant one.
+The WARP and hardware fixture uses a root SRV and passes the stride and word 3 directly.
+Each dispatch checks 320 output words, including untouched sentinels. Mutations that remove
+the byte offset, change a selector or replace integer one with float one must mismatch. The
+pure-Python checks cover the manifest, all four load widths, a local load after a branch and
+refusals for overwritten descriptor words or missing local provenance.
+
+On Windows build 26200.9974 with the D3D12 debug layer enabled, WARP 10.0.26100.9818 and an
+NVIDIA GeForce RTX 4060 Laptop GPU with driver 32.0.16.1656 matched all 320 words in each
+case. The three mutations mismatched 32, 8 and 16 words respectively on both adapters.
+
+```powershell
+ctest --preset dev --no-tests=error -j 1 -R '^startup_gfx2hlsl_compute_(controls|warp|hardware)$' -V
+```
+
 ### First active lane at compute entry
 
 The startup compute translator accepts `s_ff1_i32_b32 sN, exec_lo` in the
