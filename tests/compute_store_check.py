@@ -366,6 +366,7 @@ def controls():
     f32_controls()
     scalar_alu_controls()
     salu_i32_controls()
+    dot_u_controls()
     add_co_controls()
     mbcnt_controls()
     bcnt_exec_controls()
@@ -2864,6 +2865,154 @@ def add_co_draw(directory, compiler, renderer, backend):
     return 0
 
 
+DOT_U = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "s_mov_b32 s16, 0x80010002",
+    "s_mov_b32 s17, 0x80000010",
+    "v_lshl_add_u32 v3, s10, 6, v0",
+    "v_add_nc_u32_e32 v4, 0x1ffe0, v3",
+    "v_mov_b32_e32 v5, 0xffff0003",
+    "v_dot2_u32_u16 v10, 0xffff0002, v5, v4",
+    "v_dot2_u32_u16 v11, s16, 0x40005, v4",
+    "v_mov_b32_e32 v6, 0xfe030405",
+    "v_dot4_u32_u8 v12, 0xff800201, v6, v4",
+    "v_mov_b32_e32 v7, 0xffffffe0",
+    "v_dot4_u32_u8 v13, s17, 0x1020304, v7",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx4 v[10:13], v3, s[12:15], 0 idxen",
+    "s_endpgm",
+]
+DOT_U_BINDING = dict(table_reg=8, descriptor_offset=0, group_reg=10, stride=16)
+
+
+def _py_dot2_u32_u16(a, b, c, *, signed=False, sat=False):
+    if signed:
+        s16 = lambda x: x - 0x10000 if x & 0x8000 else x
+        total = s16(a & 0xffff) * s16(b & 0xffff) + s16((a >> 16) & 0xffff) * s16((b >> 16) & 0xffff) + c
+    else:
+        total = (a & 0xffff) * (b & 0xffff) + ((a >> 16) & 0xffff) * ((b >> 16) & 0xffff) + c
+    if sat:
+        return min(total, 0xffffffff)
+    return total & 0xffffffff
+
+
+def _py_dot4_u32_u8(a, b, c, *, signed=False):
+    s8 = lambda x: x - 0x100 if x & 0x80 else x
+    total = c
+    for k in range(4):
+        ak = (a >> (8 * k)) & 0xff
+        bk = (b >> (8 * k)) & 0xff
+        total += (s8(ak) * s8(bk)) if signed else (ak * bk)
+    return total & 0xffffffff
+
+
+def dot_u_words(*, signed_dot2=False, signed_dot4=False, sat_dot2=False):
+    """Independent Python model for DOT_U."""
+    words = [SENTINEL] * 320
+    for flat in range(64):
+        v4 = (0x0001ffe0 + flat) & 0xffffffff
+        w0 = _py_dot2_u32_u16(0xffff0002, 0xffff0003, v4, signed=signed_dot2, sat=sat_dot2)
+        w1 = _py_dot2_u32_u16(0x80010002, 0x00040005, v4, signed=signed_dot2, sat=sat_dot2)
+        w2 = _py_dot4_u32_u8(0xff800201, 0xfe030405, v4, signed=signed_dot4)
+        w3 = _py_dot4_u32_u8(0x80000010, 0x01020304, 0xffffffe0, signed=signed_dot4)
+        words[4 * flat:4 * flat + 4] = [w0, w1, w2, w3]
+    return words
+
+
+def dot_u_controls():
+    """Exact HLSL and refusals for v_dot2_u32_u16 and v_dot4_u32_u8."""
+    hlsl = aot.lower(DOT_U, 64, **DOT_U_BINDING)
+    assert "uint dot2_u32_u16(uint a, uint b, uint c)" in hlsl
+    assert "uint dot4_u32_u8(uint a, uint b, uint c)" in hlsl
+    expected_store = (
+        "    outputData.Store4(tid.x * 16u + 0u, uint4("
+        "dot2_u32_u16(0xffff0002u, 0xffff0003u, (0x0001ffe0u + tid.x)), "
+        "dot2_u32_u16(0x80010002u, 0x00040005u, (0x0001ffe0u + tid.x)), "
+        "dot4_u32_u8(0xff800201u, 0xfe030405u, (0x0001ffe0u + tid.x)), "
+        "dot4_u32_u8(0x80000010u, 0x01020304u, 0xffffffe0u)));"
+    )
+    assert hlsl.splitlines()[-2] == expected_store, hlsl.splitlines()[-5:]
+    # Per-helper emission: only the referenced helper is emitted.
+    dot2_only = aot.lower(variant(DOT_U,
+                                  ("v_dot4_u32_u8 v12, 0xff800201, v6, v4", "v_mov_b32_e32 v12, 0"),
+                                  ("v_dot4_u32_u8 v13, s17, 0x1020304, v7", "v_mov_b32_e32 v13, 0")),
+                          64, **DOT_U_BINDING)
+    assert "dot2_u32_u16(" in dot2_only and "dot4_u32_u8(" not in dot2_only
+    # Unknown/pending sources and invalid destination.
+    rejects("Unverified ALU operand", aot.lower,
+            variant(DOT_U, ("v5, v4", "v40, v4")), 64, **DOT_U_BINDING)
+    rejects("Unverified ALU operand", aot.lower,
+            variant(DOT_U, ("v5, v4", "v5, s12")), 64, **DOT_U_BINDING)
+    rejects("Invalid vector destination", aot.lower,
+            variant(DOT_U, ("v10, 0xffff0002", "v256, 0xffff0002")), 64, **DOT_U_BINDING)
+    # clamp, op_sel, neg, omod, and other spellings are refused.
+    for bad_line in (
+            "v_dot2_u32_u16 v10, 0xffff0002, v5, v4 clamp",
+            "v_dot4_u32_u8 v12, 0xff800201, v6, v4 clamp",
+            "v_dot2_u32_u16 v10, 0xffff0002, v5, v4 op_sel:[1,0,0] op_sel_hi:[0,1,0]",
+            "v_dot2_u32_u16 v10, 0xffff0002, v5, v4 neg_lo:[1,0,0]",
+            "v_dot2_u32_u16 v10, -v4, v5, v4",
+            "v_dot4_u32_u8 v12, |v4|, v6, v4",
+            "v_dot2_u32_u16 v10, 0xffff0002, v5, v4 mul:2",
+            "v_dot2_i32_i16 v10, 0xffff0002, v5, v4"):
+        rejects("Unsupported compute instruction", aot.lower,
+                variant(DOT_U, ("v_dot2_u32_u16 v10, 0xffff0002, v5, v4", bad_line)),
+                64, **DOT_U_BINDING)
+
+
+def dot_u_binary(directory, assembler, objcopy, library):
+    """The assembled DOT_U program decodes on gfx1030 and lowers to the same HLSL."""
+    decoded = aot.labelled(disassemble(assemble(directory, assembler, objcopy, DOT_U, cpu="gfx1030"),
+                                       library, offsets=True, cpu=b"gfx1030"))
+    assert [line for line in decoded if line.startswith("v_dot")] == [
+        line for line in DOT_U if line.startswith("v_dot")], decoded
+    assert aot.lower(decoded, 64, **DOT_U_BINDING) == aot.lower(DOT_U, 64, **DOT_U_BINDING)
+
+
+def dot_u_draw(directory, compiler, renderer, backend):
+    src, cso, case = [directory / x for x in ("dot_u.hlsl", "dot_u.cso", "dot_u.case")]
+    source = aot.lower(DOT_U, 64, **DOT_U_BINDING)
+    src.write_text(source, encoding="ascii")
+    subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+    cmd = [renderer, backend, "--compute-store-case", cso, case]
+    expected = dot_u_words()
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+    off = list(expected)
+    off[256] ^= 1
+    for label, reference, word in (
+            ("dot2 treated as signed i16", dot_u_words(signed_dot2=True), 0),
+            ("dot4 treated as signed i8", dot_u_words(signed_dot4=True), 2),
+            ("dot2 saturated instead of wrapped", dot_u_words(sat_dot2=True), 100),
+            ("sentinel past group", off, 256)):
+        assert next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b) == word, label
+        case.write_bytes(struct.pack("<321I", 1, *reference))
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"dot_u: reference '{label}' escaped detection\n{bad.stderr}")
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    for label, mutated in (
+            ("dot2 drops high-half product", source.replace("+ (a >> 16) * (b >> 16)", "")),
+            ("dot4 drops byte-3 product", source.replace("+ (a >> 24) * (b >> 24)", ""))):
+        if mutated == source:
+            raise AssertionError(f"dot_u: mutation '{label}' did not change the source")
+        msrc, mcso = directory / "mutated.hlsl", directory / "mutated.cso"
+        msrc.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", mcso, msrc], check=True)
+        bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"dot_u: mutation '{label}' escaped detection")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        opcodes = sorted({line.split()[0] for line in DOT_U if line.strip()})
+        path.write_text("".join(f"{op}\n" for op in opcodes), encoding="utf-8")
+    return 0
+
+
 def assemble(directory, assembler, objcopy, lines, *, cpu="gfx1013", features=None):
     src, obj, raw = [directory / x for x in ("exit.s", "exit.o", "exit.bin")]
     src.write_text("\n".join(lines) + "\n", encoding="ascii")
@@ -5050,6 +5199,7 @@ def binary(directory, assembler, objcopy, library):
     mtbuf_store_binary(directory, assembler, objcopy, library)
     scalar_alu_binary(directory, assembler, objcopy, library)
     salu_i32_binary(directory, assembler, objcopy, library)
+    dot_u_binary(directory, assembler, objcopy, library)
     add_co_binary(directory, assembler, objcopy, library)
     mbcnt_binary(directory, assembler, objcopy, library)
     bcnt_exec_binary(directory, assembler, objcopy, library)
@@ -8374,6 +8524,7 @@ if __name__ == "__main__":
                  "draw-cvt-u32-f32": cvt_u32_f32_draw,
                  "draw-mbcnt": mbcnt_draw,
                  "draw-salu_i32": salu_i32_draw,
+                 "draw-dot-u": dot_u_draw,
                  "draw-add-co": add_co_draw,
                  "draw-bcnt-exec": bcnt_exec_draw,
                  "draw-bfe": bfe_draw,

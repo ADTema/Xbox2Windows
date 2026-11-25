@@ -123,6 +123,24 @@ CVT_U32_F32_HELPER = (
     "uint cvt_u32_f32(uint bits) { float x = asfloat((bits & 0x7fffffffu) > 0x7f800000u ? 0u : bits); "
     "float finite = clamp(x, 0.0f, 4294967040.0f); return x >= 4294967296.0f ? 0xffffffffu : uint(finite); }\n"
 )
+# v_dot2_u32_u16 D, S0, S1, S2 (VOP3P 0x15):
+#   D = (uint32)(((uint64)S0[15:0] * S1[15:0] + (uint64)S0[31:16] * S1[31:16] + (uint64)S2) & 0xffffffff)
+# v_dot4_u32_u8 D, S0, S1, S2 (VOP3P 0x17):
+#   D = (uint32)(((uint64)S0[7:0]*S1[7:0] + S0[15:8]*S1[15:8] + S0[23:16]*S1[23:16] + S0[31:24]*S1[31:24] + S2) & 0xffffffff)
+# Non-clamp forms wrap modulo 2^32, so unsigned 32-bit HLSL arithmetic matches without 64-bit emulation.
+DOT_U_HELPERS = {
+    "dot2_u32_u16": (
+        "uint dot2_u32_u16(uint a, uint b, uint c) {\n"
+        "    return (a & 0xffffu) * (b & 0xffffu) + (a >> 16) * (b >> 16) + c;\n"
+        "}\n"
+    ),
+    "dot4_u32_u8": (
+        "uint dot4_u32_u8(uint a, uint b, uint c) {\n"
+        "    return (a & 0xffu) * (b & 0xffu) + ((a >> 8) & 0xffu) * ((b >> 8) & 0xffu)\n"
+        "        + ((a >> 16) & 0xffu) * ((b >> 16) & 0xffu) + (a >> 24) * (b >> 24) + c;\n"
+        "}\n"
+    ),
+}
 # The inline float constants of the encoding, as LLVM prints them, and the bits they hold.
 FLOAT_INLINE = {
     "0.5": 0x3f000000, "-0.5": 0xbf000000, "1.0": 0x3f800000, "-1.0": 0xbf800000, "2.0": 0x40000000,
@@ -1626,6 +1644,18 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             if len(expression) > ALU_EXPRESSION_LIMIT:
                 raise ValueError("ALU expression too large")
             vector[dst] = ("alu", expression)
+        elif m := re.fullmatch(rf"(v_dot2_u32_u16|v_dot4_u32_u8) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}, {ALU_SOURCE}", line):
+            op, dst = m[1], int(m[2])
+            if dst > 255:
+                raise ValueError("Invalid vector destination")
+            words = [alu_word(token, scalar, vector, pending) for token in m.groups()[2:]]
+            if None in words:
+                raise ValueError("Unverified ALU operand")
+            helper = "dot2_u32_u16" if op == "v_dot2_u32_u16" else "dot4_u32_u8"
+            expression = f"{helper}({', '.join(map(hlsl_word, words))})"
+            if len(expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            vector[dst] = ("alu", expression)
         elif m := re.fullmatch(r"v_or_b32_dpp v(\d+), v(\d+), v(\d+) quad_perm:\[([0-3]),([0-3]),([0-3]),([0-3])\] row_mask:0xf bank_mask:0xf", line):
             dst, src0, src1 = map(int, m.groups()[:3])
             # This lowering indexes the guest's logical 1D quad through group-shared memory.
@@ -2294,6 +2324,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     cbuffer += "".join(text for name, text in F32_HELPERS.items() if f"f32_{name}(" in body)
     if "cvt_u32_f32(" in body:
         cbuffer += CVT_U32_F32_HELPER
+    cbuffer += "".join(text for name, text in DOT_U_HELPERS.items() if f"{name}(" in body)
     uav_texel_type = image_atomic_type or ("float4" if float_image else "uint4")
     uav = f"RWTexture2D<{uav_texel_type}>" if image_output else "RWByteAddressBuffer"
     # The helper reads outputData, so it follows the UAV declaration.
