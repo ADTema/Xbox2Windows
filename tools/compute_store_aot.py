@@ -67,6 +67,34 @@ SALU = {
     "s_or_b32": "({0} | {1})",
     "s_xor_b32": "({0} ^ {1})",
     "s_lshr_b32": "({0} >> ({1} & 31u))",
+    # RDNA2 ISA (SOP2 s_bfe_u32 / s_bfe_i32):
+    #   shift = S1.u[4:0]; length = S1.u[22:16];
+    #   if (length == 0) D = 0;
+    #   else if (shift + length <= 32) D = (S0 << (32 - shift - length)) >> (32 - length); // logical u32, arithmetic i32
+    #   else D = S0 >> shift; // logical u32, arithmetic i32
+    #   SCC = (D != 0); (unread in this subset)
+    "s_bfe_u32": "s_bfe_u32({0}, {1})",
+    "s_bfe_i32": "s_bfe_i32({0}, {1})",
+}
+SALU_HELPERS = {
+    "s_bfe_u32": (
+        "uint s_bfe_u32(uint src, uint ctrl) {\n"
+        "    uint offset = ctrl & 31u;\n"
+        "    uint width = (ctrl >> 16u) & 127u;\n"
+        "    if (width == 0u) return 0u;\n"
+        "    if (offset + width <= 32u) return (src << (32u - offset - width)) >> (32u - width);\n"
+        "    return src >> offset;\n"
+        "}\n"
+    ),
+    "s_bfe_i32": (
+        "uint s_bfe_i32(uint src, uint ctrl) {\n"
+        "    uint offset = ctrl & 31u;\n"
+        "    uint width = (ctrl >> 16u) & 127u;\n"
+        "    if (width == 0u) return 0u;\n"
+        "    if (offset + width <= 32u) return asuint((asint(src) << (32u - offset - width)) >> (32u - width));\n"
+        "    return asuint(asint(src) >> offset);\n"
+        "}\n"
+    ),
 }
 # The binary32 vector ALU subset: VOP2 src0 is any source, src1 a VGPR. v_sub_f32 is src0 - src1 and v_subrev_f32
 # is src1 - src0. Each operation rounds once to nearest even on the bit pattern of a uint word, so a result is again
@@ -736,7 +764,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                     raise ValueError("Invalid scalar immediate")
                 scalar[dst] = value & 0xffffffff
         elif m := (
-            re.fullmatch(rf"(s_(?:add_u32|add_i32|sub_u32|sub_i32|and_b32|or_b32|xor_b32|lshr_b32|absdiff_i32)) s(\d+), {SALU_SOURCE}, {SALU_SOURCE}",
+            re.fullmatch(rf"(s_(?:add_u32|add_i32|sub_u32|sub_i32|and_b32|or_b32|xor_b32|lshr_b32|absdiff_i32|bfe_u32|bfe_i32)) s(\d+), {SALU_SOURCE}, {SALU_SOURCE}",
                          line)
             or re.fullmatch(rf"(s_abs_i32) s(\d+), {SALU_SOURCE}", line)
         ):
@@ -2177,6 +2205,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     if "gindex" in body:
         local += ", uint gindex : SV_GroupIndex"
     # Helpers are selected from the final body, so a float ALU result used only by a DS step still gets its definition.
+    cbuffer += "".join(text for name, text in SALU_HELPERS.items() if f"{name}(" in body)
     cbuffer += "".join(text for name, text in F32_HELPERS.items() if f"f32_{name}(" in body)
     if "cvt_u32_f32(" in body:
         cbuffer += CVT_U32_F32_HELPER
