@@ -6395,6 +6395,14 @@ bits. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_bitcmp$' 
 The fixture evaluates the emitted expression on the CPU and checks both
 operand positions for mask refusal. It does not execute a GPU draw.
 
+**Scalar bitfield extract with a wide width.** `s_bfe_u32` takes the offset from S1[4:0] and the width from
+S1[22:16]. HLSL reduces a shift count to 5 bits, so the old mask `(1u << (width & 127)) - 1` was 0 at width 32 and
+truncated at widths 33 to 127, where the ISA gives `S0 >> offset`. The mask is now all ones for widths of 32 or
+more, and every shift count stays in 0..31. Width 0 still gives 0, and SCC is still the nonzero test of the result.
+`startup_gfx2hlsl_sop2_complement` checks SGPR, in-place, `m0`, inline and literal forms against an ISA reference.
+The old formula, a 6-bit width, a dropped field mask and a dropped SCC write each fail it. It runs on the CPU and
+does not draw on a GPU.
+
 ## Pixel color without a texture sample
 
 For an unsampled pixel program, a matched P1/P2 interpolation in the entry mask can supply attr0.x/y/z/w from a four-component TEXCOORD0. The profile binds entry v0/v1 to the barycentric pair and the observed m0 source to the interpolation base. Each completed P2 produces a distinct value, including when the destination overwrites v0. The test vertex shader varies all four channels across a full-screen triangle. CPU references check all four output words at 1,024 pixel centers; an incorrect channel at an interior pixel must fail. Run `ctest --preset dev --no-tests=error -R '^pixel_aot_attribute_'`.

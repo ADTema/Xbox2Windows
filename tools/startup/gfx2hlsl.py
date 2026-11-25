@@ -1960,7 +1960,7 @@ SCA = {
     's_add_i32': ('{0} + {1}', None), 's_add_u32': ('{0} + {1}', None), 's_sub_i32': ('{0} - {1}', None), 's_sub_u32': ('{0} - {1}', None),
     's_mul_i32': ('{0} * {1}', None), 's_min_u32': ('min({0}, {1})', None), 's_max_u32': ('max({0}, {1})', None),
     's_min_i32': ('uint(min(int({0}), int({1})))', None), 's_max_i32': ('uint(max(int({0}), int({1})))', None),
-    's_bfe_u32': ('({0} >> ({1} & 31)) & ((1u << (({1} >> 16) & 127)) - 1)', '$ != 0'),
+    's_bfe_u32': ('({0} >> ({1} & 31)) & ((({1} >> 16) & 127) >= 32 ? 0xffffffffu : ((1u << (({1} >> 16) & 31)) - 1))', '$ != 0'),
     's_brev_b32': ('reversebits({0})', None),
     's_pack_hh_b32_b16': ('({0} >> 16) | ({1} & 0xffff0000u)', None),
     # s_bfm_b32: a mask of S0[4:0] ones shifted left by S1[4:0]; SCC unchanged.
