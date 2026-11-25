@@ -1631,6 +1631,8 @@ class Stage:
             f16 = name.endswith('_f16')
             writes_exec = name in ('v_cmpx_class_f32', 'v_cmpx_class_f16')
             sdwa = name != base
+            if f16 and sdwa:
+                raise Unsupported('SDWA form of %s' % name)
             if sdwa:
                 self.check_compare_sdwa_destination(base, writes_exec, ops)
             if len(ops) == 3:
@@ -1641,12 +1643,14 @@ class Stage:
             else:
                 raise Unsupported('%s with %d operands' % (base, len(ops)))
             if sdwa:
-                value, mask = self.compare_sdwa_sources(base, 'u32', [value, mask], mods, float_src0=f16 is False)
+                value, mask = self.compare_sdwa_sources(base, 'u32', [value, mask], mods, float_src0=True)
             elif f16:
                 # abs() and - apply to bit 15 of the half, before the class test.
                 # The decoder prints an absolute source as |v4| and a negated one as -v4, so both
                 # spellings are accepted here as well as abs(...).
                 token = value
+                if re.fullmatch(r'-[1-9]\d*', token):
+                    raise Unsupported('%s source %s: ambiguous signed inline half' % (base, value))
                 negative = token.startswith('-')
                 if negative:
                     token = token[1:]
@@ -1654,7 +1658,7 @@ class Stage:
                     token.startswith('abs(') and token.endswith(')'))
                 if absolute:
                     token = token[4:-1] if token.startswith('abs(') else token[1:-1]
-                if token in FLOATS:
+                if token in FLOATS or re.fullmatch(r'-[1-9]\d*', token):
                     # A float-printed operand would otherwise be lowered as its binary32 bit pattern.
                     raise Unsupported('%s source %s: f16 class compares need the raw half' % (base, value))
                 bits = self.u(token)
@@ -1662,6 +1666,8 @@ class Stage:
                     bits = '(%s & 0x7fffu)' % bits
                 if negative:
                     bits = '(%s ^ 0x8000u)' % bits
+                if mask in FLOATS:
+                    raise Unsupported('%s mask %s: expected an integer class mask' % (base, mask))
                 value, mask = bits, self.u(mask)
             else:
                 value, mask = self.f(value), self.u(mask)
@@ -1676,7 +1682,10 @@ class Stage:
             elif dst in ('vcc', 'vcc_lo'):
                 self.emit('vcc = %s;' % predicate)
             else:
-                d = reg_range(dst)[1]
+                reg = reg_range(dst)
+                if not reg or reg[0] != 's':
+                    raise Unsupported('%s into %s' % (base, dst))
+                d = reg[1]
                 self.set_s(d, predicate)
                 self.masks.add(d)
             return None

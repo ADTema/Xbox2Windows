@@ -126,6 +126,19 @@ try:
 except G.Unsupported as reason:
     check('a float-printed operand is refused', 'need the raw half' in str(reason), str(reason))
 
+for asm, expected in (
+    ('v_cmp_class_f16_e64 s14, -1, v0', 'ambiguous signed inline half'),
+    ('v_cmp_class_f16_e64 s14, v4, 1.0', 'expected an integer class mask'),
+    ('v_cmp_class_f16_e64 null, v4, v0', 'into null'),
+    ('v_cmp_class_f16_sdwa vcc_lo, v4, v0 src0_sel:WORD_1 src1_sel:DWORD', 'SDWA form'),
+):
+    stage = Stage()
+    try:
+        stage.one(asm.split()[0], asm)
+        check(f'refused: {asm}', False, ' '.join(stage.lines))
+    except G.Unsupported as reason:
+        check(f'refused: {asm}', expected in str(reason), str(reason))
+
 # 8. The helper is in the preamble the generated shader is built with, with the ten half classes.
 pipe = object.__new__(G.Pipeline)
 pipe.uds, pipe.resources, pipe.samplers, pipe.uses_sampler_heap = [], {}, {}, False

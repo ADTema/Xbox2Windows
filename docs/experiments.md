@@ -6236,6 +6236,16 @@ operand (the census form uses the inline `-1`, i.e. every class) and the value a
 `_e64` spellings share the path, and the `v_cmpx_` form writes EXEC and clears the straight-line assumption.
 Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_cmp_class$' -V`.
 
+**The startup binary16 class comparison.** The e32 and e64 forms classify the
+low 16 raw bits of SRC0 and compare the resulting class bit against integer
+SRC1. The e64 source modifiers change the half's sign bit. The literal
+`0x7c01` reaches the helper unchanged. The EXEC-writing form intersects the
+new predicate with a previously narrowed EXEC. SDWA and ambiguous signed
+inline source spellings remain refused in this path. The fixture checks all
+65,536 inputs against an independent binary16 classification and runs decoded
+source-word and refusal controls. Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_cmp_class_f16$' -V`.
+
 **An `op_sel` the lowering does not model is refused.** `set_vf()` used to accept an `op_sel` modifier and emit
 the same text as without it. `op_sel` selects which half of a packed source the operation reads, so dropping
 it silently changes the operand; the float path now refuses it (#1754). The same test pins the exact shift,
