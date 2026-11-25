@@ -11,8 +11,9 @@
 //   console list resets through slot 139, so the desktop order is not known to hold at 10 and 11.
 // - Slots 26 to 31 are not named here. The slots that follow are the desktop ones moved up by four
 //   (32 is SetDescriptorHeaps, desktop 28), so four console methods sit somewhere in 26 to 31.
-//   As a hypothesis, d3d12_xs_device.cpp implements 28, 29 and 30 as BeginQuery, EndQuery and
-//   ResolveQueryData. No fixture here establishes which console methods sit there.
+//   As a hypothesis, d3d12_xs_device.cpp binds 28, 29 and 30 as BeginQuery, EndQuery and
+//   ResolveQueryData, only with the diagnostic X2W_D3D12_QUERY_SLOTS=1. No fixture here establishes
+//   which console methods sit there.
 // - Slots 32 to 59 are named as the desktop slots 28 to 55 plus four. Implemented and checked
 //   against the desktop order: 32, 34, 36, 40, 42, 44, 47, 48, 50 and 52. Past 52 the rule is not
 //   checked: ExecuteIndirect (desktop 59) is at 61, desktop plus two, so the run of four has ended

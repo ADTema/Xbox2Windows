@@ -37,23 +37,31 @@ Which console methods sit at command-list slots 28 to 30 is not established by a
 shows only that four console methods sit in 26 to 31 (32 is `SetDescriptorHeaps`, desktop 28 plus four) and that
 the plus-four run has ended by 61 (`ExecuteIndirect`, desktop 59 plus two). As a hypothesis, slots 28 to 30 are
 implemented as `BeginQuery(heap, type, index)`, `EndQuery(heap, type, index)` and
-`ResolveQueryData(heap, type, start, count, buffer, offset)`. The fixture below calls those slots directly, so it
-checks the forwarding, the refusals and the end at Close, not the numbering.
+`ResolveQueryData(heap, type, start, count, buffer, offset)`. Because that is a hypothesis, the bindings are a
+diagnostic opt-in: only with `X2W_D3D12_QUERY_SLOTS=1` (in render mode) are the three slots bound. Unset, they stay
+no-ops as before. The fixture below calls those slots directly, so it checks the forwarding, the refusals and the
+end at Close, not the numbering.
 
 The query heap comes from device slot 39 with the desktop desc, which the stand-in keeps. Only occlusion and
-binary-occlusion queries on an occlusion heap are forwarded to the desktop list. These calls are refused and logged
-(`x2w-render ... refused`, the first 16 of each method): an index outside the heap, an `EndQuery` without a
-`BeginQuery` on the same list, and a resolve over a query still open on the list, to anything but a committed
-readback buffer without title memory, or past that buffer's end. A query still open at Close is ended there, since
-the desktop Close would otherwise fail and drop the list. The readback buffer stays in `COPY_DEST` and is not moved
-through the list's state tracking.
+binary-occlusion queries on an occlusion heap, recorded on a DIRECT list, are forwarded to the desktop list. A
+resolve is forwarded only when every index in its range was ended, with the same query type, on the current
+recording; a new `BeginQuery` on an index clears its completion, and Close clears all of them. These calls are
+refused and logged (`x2w-render ... refused`, the first 16 of each method): another command-list type, an index
+outside the heap, an `EndQuery` without a `BeginQuery` on the same list, a resolve over an index not so ended, and
+a resolve to anything but a committed readback buffer without title memory, or past that buffer's end. A query
+still open at Close is ended there, since the desktop Close would otherwise fail and drop the list. The readback
+buffer stays in `COPY_DEST` and is not moved through the list's state tracking.
 
-`startup_list_queries_{warp,hardware}` resolves a query around a draw over an 8x8 target (64 samples) and an empty
-one (0) into a readback buffer filled with a sentinel, reads it through the console `Map`, checks that six
-mismatched calls are refused without a debug-layer error, and leaves one query open at Close.
-`startup_list_queries_ignored_{warp,hardware}_control` runs it with `X2W_TEST_QUERY_IGNORE=1`, which leaves the
-three slots as no-ops; it must report the untouched sentinel in the first word. `command_list_slot_names.h` still
-names 56 to 58 as the query methods by the plus-four rule.
+Known limit: a resolve recorded on a later list than the `EndQuery` calls it covers is refused. Whether a caller
+resolves on the recording that ended its queries has not been observed.
+
+`startup_list_queries_{warp,hardware}` sets `X2W_D3D12_QUERY_SLOTS=1`. It resolves a query around a draw over an
+8x8 target (64 samples) and an empty one (0) into a readback buffer filled with a sentinel, and reads it through
+the console `Map`. It then checks that the refused calls, among them resolves over a never-begun index, a range
+with a hole and an index ended with the other occlusion type, leave the sentinel untouched with no debug-layer
+error, and it leaves one query open at Close. `startup_list_queries_default_{warp,hardware}_control` runs it
+without the switch: the slots stay no-ops and it must report the untouched sentinel in the first word.
+`command_list_slot_names.h` still names 56 to 58 as the query methods by the plus-four rule.
 
 ## Default viewport and scissor
 
@@ -786,6 +794,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking |
 | `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` and forwards [single-record indirect Dispatch](experiments.md#gpu-written-indirect-dispatch-arguments), [DrawIndexed](experiments.md#gpu-written-indirect-indexed-draw-arguments), [Draw](experiments.md#gpu-written-indirect-draw-arguments), and [DispatchMesh](experiments.md#gpu-written-indirect-mesh-dispatch-arguments) for supported desktop pipelines and tracked placed buffers |
 | `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}` and, when needed, RTV variants `req_<key>.rtv`. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running, or start the run with `run.ps1 -Translate` (see [Translating shaders during a run](#translating-shaders-during-a-run)). Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` without publishing a new manifest. `X2W_FXC=` (empty) publishes the manifest alone. Rerun `--pending` with compilation enabled to fill in missing bytecode for an existing manifest. |
+| `X2W_D3D12_QUERY_SLOTS=1` | diagnostic, in render mode: binds command-list slots 28 to 30 to the hypothesised occlusion query methods (see [Occlusion queries](#occlusion-queries)). Unset, the three slots stay no-ops |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_PRESENT_SIGNATURE_EVERY=<n>` | in render mode, samples a coarse signature of the presented picture every `n` presents from the start, without a script request (`0` off). Unset, sampling starts, every 4 presents, only once a script with a `wait` asks for it: see [Waiting for the presented picture](#waiting-for-the-presented-picture) |
 | `X2W_D3D12_DUMP_SURFACE=<bmp>` | writes the last presented surface |

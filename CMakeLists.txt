@@ -922,10 +922,10 @@ target_link_libraries(startup_list_queries PRIVATE d3d12_xs_shim d3d12 dxgi d3dc
 foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_list_queries_${backend} COMMAND startup_list_queries ${backend})
     set_tests_properties(startup_list_queries_${backend} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
-    # Negative control: with the query slots left as no-ops the buffer keeps its sentinel.
-    add_test(NAME startup_list_queries_ignored_${backend}_control COMMAND startup_list_queries ${backend})
-    set_tests_properties(startup_list_queries_ignored_${backend}_control PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
-        PASS_REGULAR_EXPRESSION "word 0: got 0xa5a5a5a5a5a5a5a5" ENVIRONMENT "X2W_TEST_QUERY_IGNORE=1")
+    # Negative control: without X2W_D3D12_QUERY_SLOTS=1 the slots stay no-ops and the buffer keeps its sentinel.
+    add_test(NAME startup_list_queries_default_${backend}_control COMMAND startup_list_queries ${backend} default)
+    set_tests_properties(startup_list_queries_default_${backend}_control PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "word 0: got 0xa5a5a5a5a5a5a5a5")
 endforeach()
 
 add_executable(startup_indirect_draw_indexed tests/startup_indirect_draw_indexed.cpp tests/desktop_gpu.cpp)

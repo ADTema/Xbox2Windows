@@ -1901,6 +1901,9 @@ struct Pass {
     // held without a reference until Close; releasing a heap mid-recording is invalid on desktop too.
     struct OpenQuery { ID3D12QueryHeap* heap; UINT type, index; };
     std::vector<OpenQuery> open_queries;
+    // Queries ended on this recording by slot 29: what a resolve may cover. A new BeginQuery on the index removes its
+    // entry, and Close clears the list with the rest of the Pass.
+    std::vector<OpenQuery> ended_queries;
 };
 LONG render_draws, render_draws_skipped, render_pipelines_real, render_pipelines_missing;
 // Heap-indexed title root signatures not set on the desktop list, and real draws refused under one, by decision.
@@ -1990,7 +1993,8 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
 }
 
 // Query slots 28 to 30, as a hypothesis (command_list_slot_names.h): no fixture here establishes which console
-// methods sit there. The heap reaches device slot 39 with the desktop desc. Only occlusion queries are
+// methods sit there, so they are bound only with X2W_D3D12_QUERY_SLOTS=1. The heap reaches device slot 39 with the
+// desktop desc. Only occlusion queries are
 // forwarded (shortcut: other heap types are refused until a caller needs them); a call that does not fit the
 // heap it names is refused and logged with its values instead of reaching the desktop list.
 enum QueryMethod { begin_query, end_query, resolve_query };
@@ -2002,8 +2006,12 @@ void refuse_query(QueryMethod method, const char* reason, UINT type, UINT index,
         log("x2w-render %s refused: %s (type %u, index %u, count %u)", names[method], reason, type, index, count);
 }
 // The desktop heap behind a wrapped occlusion heap that holds [index, index + count), or null with the reason.
-ID3D12QueryHeap* occlusion_heap(void* heap, UINT type, UINT index, UINT count, const char** reason)
+// Only a DIRECT recording is supported in this first slice.
+ID3D12QueryHeap* occlusion_heap(ID3D12GraphicsCommandList* list, void* heap, UINT type, UINT index, UINT count,
+                               const char** reason)
 {
+    if (!list) return *reason = "list is closed", nullptr;
+    if (list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return *reason = "requires a direct command list", nullptr;
     const Wrapper* w = as_wrapper(heap);
     if (!w || w->own().kind != query_heap_kind || !w->own().real) return *reason = "not a desktop query heap", nullptr;
     const auto& desc = w->own().query_heap;
@@ -2017,12 +2025,16 @@ ID3D12QueryHeap* occlusion_heap(void* heap, UINT type, UINT index, UINT count, c
 void __stdcall list_begin_query(Wrapper* self, void* heap, UINT type, UINT index)
 {
     auto* list = recording(self);
-    const char* reason = "list is closed";
-    ID3D12QueryHeap* real = list ? occlusion_heap(heap, type, index, 1, &reason) : nullptr;
+    const char* reason = nullptr;
+    ID3D12QueryHeap* real = occlusion_heap(list, heap, type, index, 1, &reason);
     if (!real) return refuse_query(begin_query, reason, type, index, 1);
     Pass& pass = pass_of(self);
     for (const auto& open : pass.open_queries)
         if (open.heap == real && open.index == index) return refuse_query(begin_query, "query already begun", type, index, 1);
+    auto& ended = pass.ended_queries;
+    ended.erase(std::remove_if(ended.begin(), ended.end(),
+                               [&](const Pass::OpenQuery& q) { return q.heap == real && q.index == index; }),
+                ended.end());
     pass.open_queries.push_back({real, type, index});
     list->BeginQuery(real, static_cast<D3D12_QUERY_TYPE>(type), index);
 }
@@ -2030,14 +2042,16 @@ void __stdcall list_begin_query(Wrapper* self, void* heap, UINT type, UINT index
 void __stdcall list_end_query(Wrapper* self, void* heap, UINT type, UINT index)
 {
     auto* list = recording(self);
-    const char* reason = "list is closed";
-    ID3D12QueryHeap* real = list ? occlusion_heap(heap, type, index, 1, &reason) : nullptr;
+    const char* reason = nullptr;
+    ID3D12QueryHeap* real = occlusion_heap(list, heap, type, index, 1, &reason);
     if (!real) return refuse_query(end_query, reason, type, index, 1);
-    auto& open = pass_of(self).open_queries;
+    Pass& pass = pass_of(self);
+    auto& open = pass.open_queries;
     const auto found = std::find_if(open.begin(), open.end(),
                                     [&](const Pass::OpenQuery& q) { return q.heap == real && q.type == type && q.index == index; });
     if (found == open.end()) return refuse_query(end_query, "not begun on this list", type, index, 1);
     open.erase(found);
+    pass.ended_queries.push_back({real, type, index});
     list->EndQuery(real, static_cast<D3D12_QUERY_TYPE>(type), index);
 }
 // At Close: a query begun on the desktop list and never ended would make the desktop Close fail and drop the whole
@@ -2057,12 +2071,18 @@ void end_open_queries(Wrapper* self, ID3D12GraphicsCommandList* list)
 void __stdcall list_resolve_query(Wrapper* self, void* heap, UINT type, UINT start, UINT count, void* destination, u64 offset)
 {
     auto* list = recording(self);
-    const char* reason = "list is closed";
-    ID3D12QueryHeap* real = list ? occlusion_heap(heap, type, start, count, &reason) : nullptr;
+    const char* reason = nullptr;
+    ID3D12QueryHeap* real = occlusion_heap(list, heap, type, start, count, &reason);
     if (!real) return refuse_query(resolve_query, reason, type, start, count);
-    for (const auto& open : pass_of(self).open_queries)
-        if (open.heap == real && open.index >= start && open.index - start < count)
-            return refuse_query(resolve_query, "a query in the range is still open", type, start, count);
+    // Resolving a query that was never ended, or ended with the other occlusion type, reads uninitialized data and
+    // can remove the device: every index in the range must have a matching EndQuery on this recording.
+    const auto& ended = pass_of(self).ended_queries;
+    for (UINT i = 0; i < count; ++i)
+        if (std::none_of(ended.begin(), ended.end(), [&](const Pass::OpenQuery& q) {
+                return q.heap == real && q.index == start + i && q.type == type;
+            }))
+            return refuse_query(resolve_query, "an index in the range was not ended with this type on this recording", type,
+                                start, count);
     const Wrapper* w = as_wrapper(destination);
     if (!w || w->own().kind != resource_kind || !w->own().real)
         return refuse_query(resolve_query, "destination has no desktop resource", type, start, count);
@@ -3908,8 +3928,9 @@ void build_tables()
         list_typed[47] = reinterpret_cast<ListTyped>(&list_index_buffer);
         list_typed[48] = reinterpret_cast<ListTyped>(&list_vertex_buffers);
         list_typed[x2w_list_slots::execute_indirect_slot] = reinterpret_cast<ListTyped>(&list_execute_indirect);
-        // X2W_TEST_QUERY_IGNORE=1 (fixtures only): leave the query slots as no-ops, the negative control.
-        if (!GetEnvironmentVariableW(L"X2W_TEST_QUERY_IGNORE", nullptr, 0)) {
+        // X2W_D3D12_QUERY_SLOTS=1 (diagnostic): which console methods sit at 28 to 30 is a hypothesis, so the query
+        // bindings are opt-in. Unset, the slots stay no-ops.
+        if (wchar_t on[4]{}; GetEnvironmentVariableW(L"X2W_D3D12_QUERY_SLOTS", on, 4) && on[0] == L'1') {
             list_typed[28] = reinterpret_cast<ListTyped>(&list_begin_query);
             list_typed[29] = reinterpret_cast<ListTyped>(&list_end_query);
             list_typed[30] = reinterpret_cast<ListTyped>(&list_resolve_query);

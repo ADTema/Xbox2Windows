@@ -1,17 +1,22 @@
 // Occlusion queries recorded on a console command list (slots 28, 29 and 30).
 //
-//   startup_list_queries <warp|hardware>
+//   startup_list_queries <warp|hardware> [default]
 //
-// Through D3D12XboxCreateDevice the probe creates an occlusion query heap (device slot 39) and a readback
-// buffer in COPY_DEST (device slot 27), fills the buffer with a sentinel, and records on a console list:
+// The probe sets X2W_D3D12_QUERY_SLOTS=1, the opt-in that binds the three slots, unless "default" is given.
+// Through D3D12XboxCreateDevice it creates an occlusion query heap of 8 (device slot 39) and a readback buffer
+// in COPY_DEST (device slot 27), fills the buffer with a sentinel, and records on a DIRECT console list:
 //
 //   query 0: BeginQuery / EndQuery (slots 28, 29) around a draw that covers an 8x8 target   -> 64 samples
 //   query 1: BeginQuery / EndQuery around nothing                                           -> 0 samples
 //   query 2: BeginQuery / EndQuery with the pipeline-statistics type on the occlusion heap   -> refused
 //   query 3: EndQuery without a BeginQuery                                                  -> refused
+//   query 4: BeginQuery / EndQuery with the binary-occlusion type                           -> forwarded
+//   queries 5 and 7: BeginQuery / EndQuery; query 6 never begun                             -> forwarded
 //   query 2: BeginQuery (occlusion) without an EndQuery                                     -> ended at Close
-//   ResolveQueryData (slot 30) of queries 0 and 1 to offset 0; one resolve over the still-open
-//   query 2, one past the heap's count and one past the buffer's end                        -> refused
+//   ResolveQueryData (slot 30) of queries 0 and 1 (occlusion) to word 0                     -> forwarded
+//   Resolves that must leave their words untouched (refused): query 3 (never begun), queries 5 to 7 (a
+//   hole at 6), query 4 as occlusion (ended with the other type), queries 1 and 2 (2 still open), a range
+//   past the heap's count, and one past the buffer's end.
 //
 // Which console methods sit at slots 28 to 30 is a hypothesis: the probe calls those slots directly, so it
 // checks the forwarding, the refusals and the end at Close, not the numbering.
@@ -21,8 +26,8 @@
 // debug layer must store no errors. A refused call that reached the desktop list would add one or make the
 // desktop Close fail (an EndQuery without its BeginQuery does: exit code 3).
 //
-// With X2W_TEST_QUERY_IGNORE=1 the stand-in leaves the three slots as no-ops, as before they were
-// implemented: the buffer keeps its sentinel and the probe fails with exit code 1.
+// With "default" the opt-in is not set and the three slots stay no-ops, the behaviour before this change:
+// the buffer keeps its sentinel and the probe fails with exit code 1.
 //
 // Exit codes: 0 pass, 1 wrong query results, 2 usage, 3 setup failure, 4 debug-layer error, 77 no physical adapter.
 #include <d3d12.h>
@@ -53,7 +58,7 @@ Word invoke(void* object, unsigned index, Word a = 0, Word b = 0, Word c = 0, Wo
 
 constexpr UINT side = 8;
 constexpr std::uint64_t sentinel = 0xa5a5a5a5a5a5a5a5ull;
-constexpr UINT heap_count = 4, buffer_words = 8;
+constexpr UINT heap_count = 8, buffer_words = 12;
 
 constexpr char shader[] = R"(
 float4 vs(uint id : SV_VertexID) : SV_Position
@@ -110,8 +115,10 @@ UINT64 debug_errors(ID3D12Device* device)
 
 int main(int argc, char** argv) try
 {
-    const bool warp = argc == 2 && std::strcmp(argv[1], "warp") == 0;
-    if (!warp && (argc != 2 || std::strcmp(argv[1], "hardware") != 0)) return 2;
+    const bool default_slots = argc == 3 && std::strcmp(argv[2], "default") == 0;
+    if (argc != 2 && !default_slots) return 2;
+    const bool warp = std::strcmp(argv[1], "warp") == 0;
+    if (!warp && std::strcmp(argv[1], "hardware") != 0) return 2;
     ComPtr<ID3D12Debug> debug;
     const HRESULT debug_hr = D3D12GetDebugInterface(IID_PPV_ARGS(&debug));
     if (debug_hr != DXGI_ERROR_SDK_COMPONENT_MISSING) check(debug_hr, "get debug layer");
@@ -134,6 +141,7 @@ int main(int argc, char** argv) try
     SetEnvironmentVariableA("X2W_D3D12_PERMISSIVE", "1");
     SetEnvironmentVariableA("X2W_D3D12_LIST_NOOP", "1");
     SetEnvironmentVariableA("X2W_D3D12_RENDER", "1");
+    SetEnvironmentVariableA("X2W_D3D12_QUERY_SLOTS", default_slots ? nullptr : "1");
     const std::array<unsigned char, 64> parameters{};
     ComPtr<ID3D12Device> guest;
     check(D3D12XboxCreateDevice(adapter.Get(), parameters.data(), IID_PPV_ARGS(&guest)), "create guest device");
@@ -230,12 +238,23 @@ int main(int argc, char** argv) try
     invoke(list, 28, arg(heap.Get()), statistics, 2);  // refused: the heap holds occlusion queries
     invoke(list, 29, arg(heap.Get()), statistics, 2);  // refused
     invoke(list, 29, arg(heap.Get()), occlusion, 3);   // refused: query 3 was never begun
+    const Word binary = D3D12_QUERY_TYPE_BINARY_OCCLUSION;
+    invoke(list, 28, arg(heap.Get()), binary, 4);
+    invoke(list, 29, arg(heap.Get()), binary, 4);
+    invoke(list, 28, arg(heap.Get()), occlusion, 5);
+    invoke(list, 29, arg(heap.Get()), occlusion, 5);
+    invoke(list, 28, arg(heap.Get()), occlusion, 7);
+    invoke(list, 29, arg(heap.Get()), occlusion, 7);
     invoke(list, 28, arg(heap.Get()), occlusion, 2);   // never ended: the stand-in ends it at Close
     transition(desktop, target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON);
     invoke(list, 30, arg(heap.Get()), occlusion, 0, 2, arg(results.Get()), 0);
-    invoke(list, 30, arg(heap.Get()), occlusion, 1, 2, arg(results.Get()), 16);  // refused: query 2 is still open
-    invoke(list, 30, arg(heap.Get()), occlusion, 3, 2, arg(results.Get()), 16);  // refused: past the heap's count
-    invoke(list, 30, arg(heap.Get()), occlusion, 0, 2, arg(results.Get()), 56);  // refused: past the buffer's end
+    // Each refused resolve below targets its own words, which must keep the sentinel.
+    invoke(list, 30, arg(heap.Get()), occlusion, 3, 1, arg(results.Get()), 16);  // word 2: query 3 never begun
+    invoke(list, 30, arg(heap.Get()), occlusion, 5, 3, arg(results.Get()), 24);  // words 3-5: hole at query 6
+    invoke(list, 30, arg(heap.Get()), occlusion, 4, 1, arg(results.Get()), 48);  // word 6: query 4 is binary
+    invoke(list, 30, arg(heap.Get()), occlusion, 1, 2, arg(results.Get()), 56);  // words 7-8: query 2 still open
+    invoke(list, 30, arg(heap.Get()), occlusion, 7, 2, arg(results.Get()), 72);  // words 9-10: past the heap's count
+    invoke(list, 30, arg(heap.Get()), occlusion, 0, 2, arg(results.Get()), 88);  // past the buffer's end
     check(static_cast<HRESULT>(invoke(list, 9)), "close guest list");
 
     void* lists[] = {list};
