@@ -64,7 +64,7 @@
 #include "present_view_format.h"
 #include "state_block_blend.h"
 #include "title_heap_memory.h"
-#include "xmem_section_lease.h"
+#include "startup_stubs/xmem_section_buffer.h"
 #include <d3d12sdklayers.h>
 #include <d3d12shader.h>
 #include <d3dcompiler.h>
