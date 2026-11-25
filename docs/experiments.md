@@ -7470,6 +7470,15 @@ symbolic descriptors and reserved scalar encodings stay refused; an SGPR that
 held a compare mask may be overwritten and loses its mask mark.
 `s_mul_hi_i32` is still refused by name.
 
+**Vector unsigned multiply-high.** The startup shader translator lowers
+`v_mul_hi_u32` to the same halfword-product helper as `s_mul_hi_u32`.
+Synthetic VOP3A instructions cover register inputs and the literal
+`0xaaaaaaab`. FXC and DXC draws check the high word against a 64-bit reference.
+The controls also detect an omitted carry or a replacement with the low word.
+Build `offscreen_check`, then run
+`ctest --preset dev --no-tests=error -j 1 -R '^startup_gfx2hlsl_mul_hi_' -V`.
+[Refs #1792](https://github.com/R0Y00/Xbox2Windows/issues/1792)
+
 **Scalar bit tests.** Startup translation sets SCC for `s_bitcmp0_b32` and
 `s_bitcmp1_b32` by comparing the selected bit of the first word to zero or
 one. Only the low five bits of the index are used. EXEC, VCC and SGPRs tracked
