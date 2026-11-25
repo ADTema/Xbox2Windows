@@ -125,13 +125,17 @@ def check(directory, draw, backend, fmt, width, height):
             raise AssertionError(f"{fmt}: no {reason} refusal for {w}x{h}")
     lines = re.findall(r"partial-tile BC view (\d+x\d+) format \d+ layout 0x105: (\w+), (\d+) tiled bytes", log)
     # One line per first publication at an address: the first backing and the exchanged one, the 256x196
-    # boundary (padded size equal to the reported size), then the backing announced as XG rows (refused)
-    # and the one announced as opt-in tiled BC7 blocks (published).
+    # boundary (padded size equal to the reported size), the backing announced as XG rows (refused), the
+    # one announced as opt-in tiled BC7 blocks, and the one published before an XG row copy over it.
     view = f"{width}x{height}"
     boundary = [("256x196", "published", "65536")]
-    expected = ([(view, "published", str(tiled_bytes))] * 2 + boundary +
-                [(view, "partial_tile_xg_rows", str(tiled_bytes)), (view, "published", str(tiled_bytes))]
+    published = (view, "published", str(tiled_bytes))
+    expected = ([published] * 2 + boundary + [(view, "partial_tile_xg_rows", str(tiled_bytes)), published, published]
                 if partial else boundary)
+    # Rows announced before the first publication, and rows copied over a published view: both refused.
+    held = re.findall(rf"reason=partial_tile_xg_rows res\{{dim=3 fmt={code} size={view}x1 ", log)
+    if len(held) != (2 if partial else 0):
+        raise AssertionError(f"{fmt}: {len(held)} partial_tile_xg_rows refusals for {view}")
     if lines != expected:
         raise AssertionError(f"{fmt}: partial-tile lines {lines}, expected {expected}")
     print(f"{backend} {fmt} {width}x{height}: {4 * WIDTH * HEIGHT} RGBA pixels exact; exchanged tiles differ in "

@@ -202,6 +202,19 @@ int draw_bc_address_srvs(void* guest, void* list)
             v.address = ptr(backing.data());
             invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
         }
+        // Published first, then overwritten by an XG row copy: a second request is refused and leaves the
+        // destination naming the view it held before (the first backing's).
+        alignas(4096) static std::array<char, 4 * tile> reused{};
+        v.address = ptr(reused.data());
+        invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+        v.address = ptr(backing[0].data());
+        invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+        v.address = ptr(reused.data());
+        std::array<char, 32> written{};
+        std::memcpy(written.data(), reinterpret_cast<const void*>(cpu), written.size());
+        x2w_d3d12_texture_written(reused.data(), reused.size());
+        invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+        if (std::memcmp(written.data(), reinterpret_cast<const void*>(cpu), written.size())) return 44;
     }
     return 0;
 }

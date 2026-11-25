@@ -265,9 +265,8 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         view_slot<18, 2>(self, reinterpret_cast<u64>(buffer), reinterpret_cast<u64>(&adjusted), destination, 0);
         return;
     }
-    // A partial-tile view stays refused when the XG stand-in copied desktop-footprint rows to the address
-    // (before the first publication there, only such a copy leaves a write record), or when its padded
-    // tiles run past the size the stand-in reported, which the title may not own.
+    // A partial-tile view stays refused when the last XG stand-in copy to the address wrote desktop-footprint
+    // rows, or when its padded tiles run past the size the stand-in reported, which the title may not own.
     bool first = false;
     const char* held = nullptr;
     if (tiled_bc_srv(*resource) && (resource->Width % 64 || resource->Height % 64)) {
@@ -277,10 +276,9 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         }
         AcquireSRWLockShared(&written_lock);
         const auto found = written_textures().find(input->address);
-        // The opt-in BC7 4 KiB copy announces tiled blocks (with their size); a plain XG copy, rows.
-        const bool rows = found != written_textures().end() && !found->second.bc7_width;
+        const bool rows = found != written_textures().end() && found->second.desktop_rows;
         ReleaseSRWLockShared(&written_lock);
-        if (first && rows) held = "partial_tile_xg_rows";
+        if (rows) held = "partial_tile_xg_rows";
         else if (x2w_startup::Bc16Surface(*resource).size() > xg_reported_bytes(self, *resource))
             held = "partial_tile_beyond_xg_size";
     }
