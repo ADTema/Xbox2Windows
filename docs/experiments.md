@@ -15424,6 +15424,23 @@ python -B tools/startup/gfx2hlsl.py --refusals out/startup/shader_cache
 
 `off` names no offset at all, so it is translated exactly as the literal 0: the same emitted HLSL, the same descriptor offset for a table load, and the same fixed-word marking of an `s_buffer_load` result. Before this change, `s_buffer_load_dword s0, s[4:7], off` was refused with `operand 'off'`, and the `s_load` form with the misleading register-offset message. `tests/startup_gfx2hlsl_smem_offset_check.py` drives each load handler on a scalar symbol state with no machine code. It compares the `off` form of `s_buffer_load_dword`, `_dwordx2` and `_dwordx4`, of `s_load_dword` and `_dwordx2` from a root buffer and of `s_load_dwordx8` from a descriptor table with the literal 0, keeps the literal and `m0` behaviour above, and requires five other operand spellings to be refused by both kinds of load. With the `off` handling removed in-process, both `off` forms must be refused again. Test: `startup_gfx2hlsl_smem_offset`. Not covered here: whether the full set of locally refused shaders now translates, which needs local inputs.
 
+## Startup translator: integer vector operations
+
+The `VEC_U` table of `tools/startup/gfx2hlsl.py` lowers these two- and one-source integer operations to single HLSL expressions, and no check ran them before: `v_add_nc_u32`, `v_sub_nc_u32`, `v_subrev_nc_u32`, `v_mul_lo_u32`, `v_and_b32`, `v_or_b32`, `v_xor_b32`, `v_not_b32`, `v_lshlrev_b32`, `v_lshrrev_b32`, `v_ashrrev_i32`, `v_min_u32`, `v_max_u32`, `v_min_i32`, `v_max_i32` and `v_mul_u32_u24`.
+
+`tests/startup_gfx2hlsl_int_alu_check.py` draws them with the pixel fixture of the bit-operation check above. The shared runner is `tests/startup_gfx2hlsl_lane_alu.py`. Each draw applies one operation to each of four pixels' flat inputs. The lanes alternate the `_e32` and `_e64` spellings (`v_mul_lo_u32` exists only as VOP3), and the four result words are compared exactly.
+
+The references follow the AMD RDNA 2 ISA reference: 32-bit wrapping arithmetic, `rev` shifts of S1 by S0[4:0], an arithmetic shift for `v_ashrrev_i32`, signed or unsigned comparisons by name, and the product of the low 24 bits for `v_mul_u32_u24`. Every operation has eight input sets (two draws). They include shift counts above 31, sign-bit values for the signed and unsigned pairs, wrapping products, and sources with bits above bit 23.
+
+Each operation also has a wrong lowering that must read its own mutated words in the first draw:
+- add as subtract, the two subtract orders exchanged;
+- a 24-bit multiply for `v_mul_lo_u32`, a full multiply for `v_mul_u32_u24`;
+- OR, XOR and AND exchanged, NOT dropped;
+- shift operands exchanged, the shift count masked to 4 bits, a logical shift for the arithmetic one;
+- min and max exchanged, unsigned comparisons for the signed pair.
+
+On WARP 10.0.26100.9818 and on an AMD Radeon RX 6600 (driver 32.0.21045.29003), all 64 draws matched through FXC `ps_5_1` and DXC `ps_6_0`, and all 32 mutated draws read their mutated words. The controls also keep modifiers (`clamp`, `-v`, `|v|`, `mul:2`) and wrong operand counts refused. `binary <llvm-mc>` reassembles the pixel bodies (llvm-mc 19 here; the CI job passes llvm-mc 15). Tests: `startup_gfx2hlsl_int_alu_controls`, `startup_gfx2hlsl_int_alu_warp` and `startup_gfx2hlsl_int_alu_hardware`.
+
 **Constant register offsets for `s_load_dword*`.** An SGPR that holds a known constant (`s_movk_i32 s9, 0x40` before the load) is translated as the literal offset, which reaches descriptors in a bindless heap. Limits: the proof is used only in shaders without branches, because symbols are not merged at control-flow joins; `s_movk_i32` sign-extends its 16-bit immediate, so `0x8000` and above become negative and stay refused; the run-time sampler heap index is unchanged; an SGPR with an unknown value, `m0`, and a total above 0xfffff stay refused. Measured on CPU only (translation checks); D3D12 and GPU behavior are not measured. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_sload_const_offset$' -V` or `python3 -B tests/startup_gfx2hlsl_sload_const_offset_check.py`. [Part of #1723](https://github.com/R0Y00/Xbox2Windows/issues/1723)
 
 ### Scalar writes to and symbolic tracking of `m0`
