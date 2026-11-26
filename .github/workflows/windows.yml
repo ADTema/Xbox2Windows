@@ -307,6 +307,7 @@ jobs:
             tests/startup_gfx2hlsl_int_alu_check.py \
             tests/startup_gfx2hlsl_interp_f16_check.py             tests/startup_gfx2hlsl_interp_p2_hi_check.py \
             tests/startup_gfx2hlsl_sgpr_spill_check.py \
+            tests/startup_gfx2hlsl_spill_branches_check.py \
             tests/startup_gfx2hlsl_mad_check.py \
             tests/startup_gfx2hlsl_neg_check.py \
             tests/startup_gfx2hlsl_compute_check.py \
