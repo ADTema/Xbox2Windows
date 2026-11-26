@@ -7327,10 +7327,17 @@ class Pipeline:
         # one is enabled). Without hardware inputs the model assumes the center pair alone: v0, v1.
         self.persp_center_vgpr = 0
         if ps_hw_inputs is not None:
+            # SPI_PS_INPUT_ADDR allocates the entry VGPRs in bit order; SPI_PS_INPUT_ENA chooses which of the
+            # allocated inputs are loaded. Every enabled input is also allocated (LLVM AMDGPUAsmPrinter
+            # getSIProgramInfo: "all enabled inputs are tagged in InputAddr as well"; SIISelLowering
+            # processPSInputArgs marks an input allocated, then enabled only when it is used).
             ena, addr = ps_hw_inputs
-            if ena != addr or not 0 <= ena <= 0xffff:
+            if not (0 <= ena <= 0xffff and 0 <= addr <= 0xffff):
                 raise Unsupported('unverified pixel input enable/address combination')
-            self.persp_center_vgpr = (2 if addr & 1 else 0) if addr & 2 else None
+            if ena & ~addr:
+                raise Unsupported('contradictory pixel input enable/address masks: an enabled input is not allocated')
+            # Layout from the address mask; an input allocated but not enabled holds no loaded value.
+            self.persp_center_vgpr = (2 if addr & 1 else 0) if ena & 2 else None
             if ena & (1 << 15):
                 # SPI PS inputs 0..6 supply IJ pairs (the pull model supplies three);
                 # line stipple through sample coverage each occupy one VGPR.
@@ -7978,10 +7985,16 @@ def fnv(data, h=1469598103934665603):
     return h
 
 
-def pipeline_key(vs_code, ps_code, root_blob, layout=b''):
-    """Hash the startup translation revision and the three blobs in runtime order, then a stream's input layout."""
+def pipeline_key(vs_code, ps_code, root_blob, layout=b'', ps_inputs=None):
+    """Hash the startup translation revision and the three blobs in runtime order, then a stream's input layout.
+
+    A pipeline with a stream description (req_<key>.psin) also hashes its pixel input masks: b'psin1' and then
+    SPI_PS_INPUT_ENA and SPI_PS_INPUT_ADDR as little-endian u32. Two pipelines with the same stages, root
+    signature and input layout but different masks are then two requests with their own results. Without a
+    description the key is unchanged."""
     key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-17'))))
-    return fnv(layout, key) if layout else key
+    key = fnv(layout, key) if layout else key
+    return key if ps_inputs is None else fnv(b'psin1' + struct.pack('<II', *ps_inputs), key)
 
 
 def compute_key(cs_code, data, root_blob, desc, state_a=b'', state_b=b''):
@@ -8171,14 +8184,15 @@ def has_complete_mesh57_bytecode(path):
 
 
 def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_formats=(), rtv_request='', vs_fetch=None,
-                 ps_attr_map=None):
+                 ps_attr_map=None, ps_hw_inputs=None):
     """Writes <key>.vs.hlsl, <key>.ps.hlsl and <key>.txt (last), or <key>.fail with the reason.
 
     With check, the pair is compiled to .vs.cso and .ps.cso first and a missing fxc is a failure.
     check=False, or X2W_FXC set to the empty string, publishes the manifest without bytecode."""
     name = os.path.join(out_dir, '%016x' % key)
     try:
-        pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats, vs_fetch=vs_fetch, ps_attr_map=ps_attr_map)
+        pipe = Pipeline(vs_code, ps_code, root_blob, rtv_formats=rtv_formats, vs_fetch=vs_fetch, ps_attr_map=ps_attr_map,
+                        ps_hw_inputs=ps_hw_inputs)
         vs, ps, manifest = pipe.hlsl_vs(), pipe.hlsl_ps(), pipe.manifest()
         if rtv_request:
             manifest += rtv_request + '\n'
@@ -8267,27 +8281,21 @@ def load_request(out_dir, key, refusals=None, pair_info=None, *, validate_base_k
         decoded[kind] = ins
         return kind
 
-    name = os.path.join(out_dir, 'req_%016x' % key)
-    request = ''
-    formats = ()
-    base = key
-    if os.path.isfile(name + '.rtv'):
-        with open(name + '.rtv', encoding='ascii') as file:
-            request = file.read(256)
-        if not re.fullmatch(r'rtv1 [0-9]{1,20}(?: [0-9]{1,10}){1,8}', request) or fnv(request.encode('ascii')) != key:
-            raise Unsupported('invalid RTV variant request')
-        base, *formats = map(int, request.split()[1:])
-        if base > 0xffffffffffffffff or any(fmt > 0xffffffff for fmt in formats):
-            raise Unsupported('invalid RTV variant values')
-        name = os.path.join(out_dir, 'req_%016x' % base)
+    request, base, formats, description = request_source(out_dir, key)
+    name = os.path.join(out_dir, 'req_%016x' % base)
     a, b, root = (open(name + ext, 'rb').read() for ext in ('.a', '.b', '.root'))
     if pair_info is not None and not request:
         import hashlib
         pair_info.append((hashlib.sha256(struct.pack('<Q', len(a)) + a + b).digest(), root))
     # A stream with an input layout publishes it as .ia (before .a) and hashes it into the key.
     layout = open(name + '.ia', 'rb').read() if os.path.isfile(name + '.ia') else b''
-    if (request or validate_base_key) and pipeline_key(a, b, root, layout) != base:
-        raise Unsupported('RTV variant source key mismatch' if request else 'shader request source key mismatch')
+    if request or validate_base_key:
+        # The masks of a stream description are part of the key (pipeline_key).
+        masks = read_ps_inputs(description, base)
+        if pipeline_key(a, b, root, layout, masks) != base:
+            raise Unsupported('RTV variant source key mismatch' if request else
+                              'pixel input description names another pipeline' if masks is not None else
+                              'shader request source key mismatch')
     fetch = attr_map = None
     if a.startswith(b'DXBC') or b.startswith(b'DXBC'):
         # Slot 86 records complete containers in canonical (VS, PS) order.
@@ -8310,6 +8318,98 @@ def load_request(out_dir, key, refusals=None, pair_info=None, *, validate_base_k
     else:
         kinds = {classify_stage(a): a, classify_stage(b): b}
     return kinds, root, formats, request, fetch, decoded, attr_map
+
+
+def request_source(out_dir, key):
+    """The source of a graphics request: (rtv1 line or '', source key, RTV formats, stream description path).
+
+    A base request is its own source. An RTV variant (req_<key>.rtv) names its source pipeline and is translated
+    from that pipeline's blobs and stream description, req_<source>.psin. This is the one place that names the
+    description a request depends on: the translation reads its masks from that path, and pending_keys checks
+    the same path to withdraw a published result or retry a failure after the description changes or, for a
+    result recorded as translated with it (dependency_record), is removed. The path is returned whether or not the
+    file exists. An invalid variant line is refused by name."""
+    name = os.path.join(out_dir, 'req_%016x' % key)
+    request = ''
+    formats = ()
+    base = key
+    if os.path.isfile(name + '.rtv'):
+        with open(name + '.rtv', encoding='ascii') as file:
+            request = file.read(256)
+        if not re.fullmatch(r'rtv1 [0-9]{1,20}(?: [0-9]{1,10}){1,8}', request) or fnv(request.encode('ascii')) != key:
+            raise Unsupported('invalid RTV variant request')
+        base, *formats = map(int, request.split()[1:])
+        if base > 0xffffffffffffffff or any(fmt > 0xffffffff for fmt in formats):
+            raise Unsupported('invalid RTV variant values')
+    return request, base, formats, os.path.join(out_dir, 'req_%016x.psin' % base)
+
+
+def request_ps_inputs(out_dir, key):
+    """The pixel input masks (SPI_PS_INPUT_ENA, SPI_PS_INPUT_ADDR) of one graphics request, or None.
+
+    They come from the stream description request_source() names: req_<key>.psin, the separately captured
+    description of exactly that pipeline (see read_ps_inputs), or for an RTV variant its source pipeline's. The
+    masks are part of the request's identity: the key must equal pipeline_key() of the stage blobs, root
+    signature, input layout and these masks, so a description copied from another pipeline, left stale after a
+    stage change or rewritten with another mask pair is refused, never applied. No file means no captured
+    description: the translation keeps its model without hardware inputs."""
+    _, base, _, description = request_source(out_dir, key)
+    masks = read_ps_inputs(description, base)
+    if masks is None:
+        return None
+    name = os.path.join(out_dir, 'req_%016x' % base)
+    a, b, root = (open(name + ext, 'rb').read() for ext in ('.a', '.b', '.root'))
+    layout = open(name + '.ia', 'rb').read() if os.path.isfile(name + '.ia') else b''
+    if pipeline_key(a, b, root, layout, masks) != base:
+        raise Unsupported('pixel input description names another pipeline')
+    return masks
+
+
+def dependency_record(out_dir, key):
+    """<key>.psdep: written when a graphics request is translated with a stream description, before its manifest.
+
+    It marks a result as known to depend on the description request_source() names, so pending_keys can withdraw
+    that result when the description is removed. A legacy request that never had a description has no record, and
+    its inputs are not read again. The record holds the description line the result was translated with."""
+    return os.path.join(out_dir, '%016x.psdep' % key)
+
+
+def record_dependency(out_dir, key, base, masks):
+    path = dependency_record(out_dir, key)
+    line = 'psin1 %016x ena=0x%04x addr=0x%04x\n' % (base, *masks)
+    with suppress(FileNotFoundError, UnicodeError), open(path) as existing:
+        if existing.read() == line:
+            return
+    temporary = '%s.%d.tmp' % (path, os.getpid())
+    try:
+        with open(temporary, 'w') as record:
+            record.write(line)
+        os.replace(temporary, path)
+    finally:
+        with suppress(FileNotFoundError):
+            os.remove(temporary)
+
+
+def read_ps_inputs(path, key):
+    """The (enable, address) masks in the stream description at `path` (req_<key>.psin), one ASCII line
+    'psin1 <key> ena=<mask> addr=<mask>' (the key as 16 hex digits, the masks as 0x-prefixed 16-bit values), or
+    None without the file. The line must name `key`; a malformed line or a missing mask is refused by name."""
+    if not os.path.isfile(path):
+        return None
+    with open(path, 'rb') as file:
+        line = file.read(128)
+    fields = line.decode('ascii', 'replace').split()
+    if not re.fullmatch(rb'psin1 [0-9a-f]{16}(?: (?:ena|addr)=0x[0-9a-f]{1,4}){0,2}\n?', line):
+        raise Unsupported('invalid pixel input description')
+    masks = dict(field.split('=') for field in fields[2:])
+    if len(masks) != len(fields) - 2:
+        raise Unsupported('invalid pixel input description')
+    if int(fields[1], 16) != key:
+        raise Unsupported('pixel input description names another pipeline')
+    for field, label in (('ena', 'enable'), ('addr', 'address')):
+        if field not in masks:
+            raise Unsupported('pixel input %s mask missing from the stream description' % label)
+    return int(masks['ena'], 16), int(masks['addr'], 16)
 
 
 def mesh57_key(ms, ps, root):
@@ -8390,15 +8490,32 @@ def translate_request(out_dir, key):
             open(os.path.join(out_dir, '%016x.fail' % key), 'w').write(str(reason) + '\n')
             return 'unsupported: %s' % reason
     try:
-        kinds, root, formats, request, fetch, _, attr_map = load_request(out_dir, key, validate_base_key=True)
+        try:
+            _, base, _, description = request_source(out_dir, key)
+            if os.path.isfile(dependency_record(out_dir, key)) and not os.path.isfile(description):
+                raise Unsupported('pixel input description missing for a request translated with one')
+            kinds, root, formats, request, fetch, _, attr_map = load_request(out_dir, key, validate_base_key=True)
+            ps_inputs = request_ps_inputs(out_dir, key)
+            if ps_inputs is not None:
+                record_dependency(out_dir, key, base, ps_inputs)  # before the manifest is published
+        except Unsupported:
+            # A result published earlier was translated from sources or masks this request no longer confirms.
+            with suppress(FileNotFoundError):
+                os.remove(os.path.join(out_dir, '%016x.txt' % key))
+            raise
     except (Unsupported, OSError, UnicodeError) as reason:
         open(os.path.join(out_dir, '%016x.fail' % key), 'w').write(str(reason) + '\n')
         return 'unsupported: %s' % reason
     if set(kinds) != {'vs', 'ps'}:
         open(os.path.join(out_dir, '%016x.fail' % key), 'w').write('stages %s\n' % sorted(kinds))
         return 'stages %s' % sorted(kinds)
-    return translate_to(out_dir, key, kinds['vs'], kinds['ps'], root, rtv_formats=formats, rtv_request=request, vs_fetch=fetch,
-                        ps_attr_map=attr_map)
+    result = translate_to(out_dir, key, kinds['vs'], kinds['ps'], root, rtv_formats=formats, rtv_request=request,
+                          vs_fetch=fetch, ps_attr_map=attr_map, ps_hw_inputs=ps_inputs)
+    if ps_inputs is not None and result == 'ok':
+        # An unchanged manifest is not rewritten; mark it as checked against this description (pending_keys).
+        with suppress(FileNotFoundError):
+            os.utime(os.path.join(out_dir, '%016x.txt' % key))
+    return result
 
 
 REFUSALS_CAVEAT = ('Counts after the first refusal are approximate. Skipped instructions leave later state '
@@ -8449,7 +8566,8 @@ def request_refusals(out_dir, key, pair_info=None):
     """Collect reached refusal sites for one request without publishing a translation."""
     refusals = []
     try:
-        kinds, root, formats, _, fetch, decoded, attr_map = load_request(out_dir, key, refusals, pair_info)
+        kinds, root, formats, request, fetch, decoded, attr_map = load_request(out_dir, key, refusals, pair_info)
+        ps_inputs = request_ps_inputs(out_dir, key)
     except Unsupported as reason:
         refusals.append((str(reason), 'pipeline'))
         return refusals
@@ -8469,7 +8587,7 @@ def request_refusals(out_dir, key, pair_info=None):
         if set(kinds) != {'vs', 'ps'}:
             raise Unsupported('stages %s' % sorted(kinds))
         pipe = Pipeline(kinds['vs'], kinds['ps'], root, rtv_formats=formats, vs_fetch=fetch,
-                        refusals=refusals, decoded=decoded, ps_attr_map=attr_map)
+                        refusals=refusals, decoded=decoded, ps_attr_map=attr_map, ps_hw_inputs=ps_inputs)
         op = 'hlsl_vs'
         pipe.hlsl_vs()
         op = 'hlsl_ps'
@@ -8720,8 +8838,21 @@ def pending_keys(out_dir, skip_failed):
         stages = ('.cs.cso',) if m.group(2) == 'c67' else ('.ms57.cso', '.ps57.cso') if mesh else ('.vs.cso', '.ps.cso')
         ready_bytecode = has_complete_mesh57_bytecode if mesh else has_bytecode
         manifest = result + ('.ms57.txt' if mesh else '.txt')
-        # A published manifest with bytecode (or manifest-only mode) is done; otherwise resume (#2008).
-        if os.path.isfile(manifest):
+        # A published manifest with bytecode (or manifest-only mode) is done; otherwise resume (#2008). The stream
+        # description the translation reads (request_source: the request's own, or an RTV variant's source
+        # pipeline's) is a dependency like the request file. Rewritten after the result was published, the result
+        # is checked again, so one translated with other masks is not kept in silence; rewritten after a refusal,
+        # the request is retried.
+        described = None
+        lost = False
+        if m.group(2) in ('a', 'rtv'):
+            with suppress(Unsupported, OSError, UnicodeError):  # no description, or a variant line refused later
+                described = os.path.getmtime(request_source(out_dir, key)[3])
+            # A result translated with a description recorded it (dependency_record). With that description gone,
+            # the result is checked again and withdrawn; a legacy request without a record is not read again.
+            lost = described is None and os.path.isfile(result + '.psdep')
+        if os.path.isfile(manifest) and not lost and not (
+                described is not None and described > os.path.getmtime(manifest)):
             if manifest_only or all(ready_bytecode(result + s) for s in stages):
                 continue
             if mesh and has_complete_mesh57_bytecode(result + '.ms57.cso'):
@@ -8729,8 +8860,12 @@ def pending_keys(out_dir, skip_failed):
                     if b'ps none' in published.read().splitlines():
                         continue
         fail = os.path.join(out_dir, '%016x.fail' % key)
-        # A repeated pass retries a failure only once its request is rewritten.
-        if skip_failed and os.path.exists(fail) and os.path.getmtime(fail) >= os.path.getmtime(os.path.join(out_dir, name)):
+        # A repeated pass retries a failure only once its request or its stream description is rewritten. A result
+        # still published without its recorded description is checked even with an older .fail, which a success on
+        # the manifest-only path leaves in place.
+        recheck = lost and os.path.isfile(manifest)
+        if skip_failed and not recheck and os.path.exists(fail) and os.path.getmtime(fail) >= max(
+                os.path.getmtime(os.path.join(out_dir, name)), described or 0):
             continue
         keys.append(key)
     return keys
