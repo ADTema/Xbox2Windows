@@ -8009,6 +8009,17 @@ one. Only the low five bits of the index are used. EXEC, VCC and SGPRs tracked
 as lane masks are refused because their per-lane projections lose the other
 bits. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_bitcmp$' -V`.
 
+**Scalar absolute value.** Startup translation lowers `s_abs_i32` to
+`(asint(S0) < 0 ? (0u - S0) : S0)` with `SCC = (D != 0)`, matching `pixel_aot`
+(INT_MIN stays). Lane masks and descriptor-bearing sources are refused. Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_abs$' -V`
+(or `python3 -B tests/startup_gfx2hlsl_s_abs_check.py`). The `_dispatch_warp`
+/ `_dispatch_hardware` variants compile the translated expression into a
+compute shader and compare UAV readback for INT_MIN, -1, 0 and a positive
+word (plus an SCC-dependent branch token) against the same reference:
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_abs_dispatch_warp$' -V`.
+[Refs #1723](https://github.com/R0Y00/Xbox2Windows/issues/1723).
+
 **Scalar bit set and clear.** Startup translation lowers `s_bitset0_b32` and
 `s_bitset1_b32` in place: bit `S0[4:0]` of the destination is cleared or set,
 and SCC is unchanged (same form as `pixel_aot` / #1579; Refs #2023 Item J).
