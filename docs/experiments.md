@@ -16038,6 +16038,17 @@ ctest --preset dev --no-tests=error -R "^startup_image_sample_d_draw_(warp|hardw
 
 `tests/startup_gfx2hlsl_mul24_align_check.py` translates each instruction, evaluates the emitted text on the CPU against a reference written with unbounded integers, and checks that `v_mul_hi_u32_u24` is refused. Run with `python3 -B tests/startup_gfx2hlsl_mul24_align_check.py` (`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_mul24_align$' -V`). `tests/startup_gfx2hlsl_mul24_align_draw_check.py` draws the six translated instructions through FXC `ps_5_1` and DXC `ps_6_0` and compares the GPU readback with the same reference (`startup_gfx2hlsl_mul24_align_warp` and `_hardware`); both compilers run before the test fails, so one compiler's failure does not hide the other's result. The draw covers the six translated instructions only.
 
+## Startup list Dispatch
+
+Command-list slot 14 (`Dispatch`) is recorded on the desktop list only when the list is open and direct or compute, a desktop compute pipeline and a desktop compute root signature are bound, the compute root declares no static samplers and only root SRV parameters (slot 43), the compute pipeline was built against that same root signature, every root SRV the root declares was set since the root was bound (a rejected or unaligned replacement clears its binding), and every group count is at most 65535. Zero groups on an axis is forwarded and runs nothing. A root with other parameters is refused with `compute root arguments are not forwarded`, a pipeline from another root with `compute pipeline was built against another root signature`, an unset or rejected root SRV with `a compute root SRV is not bound`, because this path forwards none of the compute root-argument slots (35, 37, 39, 41, 45) to the desktop list and the dispatch would run with them unset. Other refusals are logged as `x2w-render Dispatch(x, y, z) refused: <reason>`.
+
+Only the decision is checked: `tests/startup_list_dispatch_check.cpp` runs without a device and its five mutated runs must fail. Executing a dispatch on a GPU, with real results read back, is not verified yet.
+
+```powershell
+cmake --build --preset dev --target startup_list_dispatch_check
+ctest --preset dev --no-tests=error -R "^startup_list_dispatch" -V
+```
+
 ## Non-constant scalar symbols at branch targets in the startup translator
 
 Follow-up to #2279, which drops scalar constants at a join that another path writes, over the textual range between
@@ -16059,6 +16070,37 @@ fall-through enter, when the fall-through wrote S as a plain run-time number. On
 is 0, so bit 0 of the result is 0 (1 for `s_orn2_b64`) whatever S holds. This relies on the one-lane model, in which
 a lane whose exec bit is 0 takes the branch; it is pure Python only, not run on a GPU, and its words are built from
 the field layouts rather than assembled.
+
+## Translated compute Dispatch
+
+With a device slot 67 placeholder bound, command-list slot 14 looks up the translation of the pipeline's published request (`<key>.txt` with `stage cs`, and `<key>.cs.cso`) and records it on the desktop list. It binds, from the compute descriptor tables of slot 35: raw buffers named by 16-byte hardware buffer descriptors, and 2D textures named by the token of a view the caller created (device slot 18 for an input, slot 19 for an output the program stores `float4` to). `smp` manifest lines become static samplers, and entry values come from the compute root constants of slots 37 and 39. A buffer input must resolve to a complete GPU-backed range; a buffer output must be a placed buffer that aliases the caller's memory and allows unordered access; a texture view must be 2D, created on the desktop, and for an output have a float or normalized format that is not packed, on a texture that is not also an input of the call. Any other manifest line (other texture kinds, sampler heaps, comparison samplers, root views, `stride` and `descword3` entry values) leaves the pipeline untranslated, and a Dispatch that cannot be bound completely is refused with one logged reason: no Dispatch is recorded and nothing is bound (the upload of an input texture the caller filled in memory may already be recorded; it only syncs content). No view is ever bound null. The entry values live in the compute root-constant store of #1975: a word no slot 37 or 39 call wrote since the compute root was set (slot 33 with another root, or a list reset) has no value and is refused with `an entry value was not set since the compute root`; setting the same root again keeps the words, and the graphics words of slot 40 are separate.
+
+`tests/startup_compute_dispatch_check.py` drives a source-built gfx1013 program through the stand-in's list on WARP and on a physical adapter (exit 77 without one) and reads the 320 output words back from the aliased memory. Controls in the same run: before the offline translation, without a Dispatch, and with the two descriptors exchanged, every output word must keep its sentinel. The two entry values arrive through slot 37 and slot 39, with other values written through slot 40 in between; `dispatch-same-root` must still give the expected words, and five refused modes must log their reason and keep the sentinels: a missing word, another compute root set and the first set again, a list reset, a compute root that is not the pipeline's, and one buffer named as input and output. `tests/startup_compute_dispatch_texture_check.py` does the same for a program that stores to a 32x8 RGBA16_FLOAT texture (1024 halves read back through CopyTextureRegion; controls: before translation, without a Dispatch, a texture without unordered access) and for the raw buffer program with a level-zero sample of a 1x1 texture XORed into each stored word (control: no view at the table entry). The texture output program is also bound under a manifest edited to declare no entry values.
+
+The log line `x2w-render compute dispatches: translated <n>, refused <n>, no translation <n>, not modelled <n>` follows the render totals; "not modelled" counts calls whose manifest exists but holds a line the runtime does not bind. It is followed by a census: the refused calls per first refusal reason of their key, and every dispatched key by call count, each with its count, the calls recorded and the first refused table descriptor.
+
+Measured on three fixture programs. The sampling fixture uses a 1x1 texture, so it does not tell sampler filter or address modes apart. Programs with other texture kinds, sampler heaps, the same texture as input and output, or buffer outputs in memory that is not aliased are not dispatched.
+
+```powershell
+cmake --build --preset dev --target startup_stream_consumer
+ctest --preset dev --no-tests=error -R "^startup_compute_dispatch_" -V
+```
+
+### An input named by a resource heap record
+
+A compute root signature that indexes the resource heap directly (root flag 0x400) passes the heap pointer in one SGPR after the root parameters. `gfx2hlsl.py` lowers one form of a load through that pointer: `s_lshl_b32 R, <root constant word>, 5`, then, with no write of `R` and no branch target in between, `s_load_dwordx4 D, s[H:H+1], R` with a constant zero in `s[H+1]` and no `offset:` modifier. `D` is then a buffer descriptor, and the manifest names it `srv <i> buf heap rootconst <parameter> <word>`. Slot 32 now records the title memory of the list's view heap on every call; at Dispatch the stand-in reads the 16-byte descriptor at byte `word << 5` (32-bit arithmetic, as the program computes it) of that memory and binds the buffer through the path a `table` record takes. A record outside the heap refuses the dispatch (`a heap record is outside the list's view heap`) and binds nothing.
+
+Every other form keeps a refusal that names it: another shift or index, an index register written again, a branch target between the shift and the load, a high word that is not a constant zero, an `offset:` modifier, eight dwords (an image record), and an index read from a buffer (`s_load of a resource heap record whose index is read from a buffer`). A formatted load or a store through such a record, and the graphics stages, are refused as before.
+
+`tests/startup_gfx2hlsl_heap_record_check.py` compares the manifest and the HLSL of a source-built gfx1013 program whole, runs 19 refused controls and one translator mutation (without the write tracking, a refused control translates), and with `--llvm-mc` reassembles every instruction. `tests/startup_compute_dispatch_heap_check.py` dispatches that program through the stand-in's list on WARP and on a physical adapter (exit 77 without one): the input descriptor is only in heap record 2, records 0 and 1 hold the output's descriptor, and all 320 output words must match; before translation and for a record outside the heap every word keeps its sentinel. Changing the runtime's shift to 4, or ignoring the index, makes the dispatch test fail (`an output buffer is also an input`).
+
+Measured on one synthetic program. The offset is a literal byte offset into the title's heap memory, as a table offset is; a heap whose descriptor increment on the desktop adapter is not 32 bytes (WARP is such an adapter, so its run covers the literal offset only) is not checked against a caller that addresses records by that increment. In a local set of 184 compute programs with a register-offset load through the heap pointer, every such load lowers in 4 programs and none of the 184 translates yet: 151 hold a load whose index is read from a buffer, and the 4 stop at other instructions.
+
+```powershell
+python -B tests/startup_gfx2hlsl_heap_record_check.py --llvm-mc llvm-mc-15
+cmake --build --preset dev --target startup_stream_consumer
+ctest --preset dev --no-tests=error -R "^startup_compute_dispatch_heap_" -V
+```
 
 ## Startup compute dual-offset/stride-64 LDS ops and 32-bit LDS atomics
 
