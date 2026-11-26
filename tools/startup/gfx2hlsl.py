@@ -6658,12 +6658,68 @@ class Stage:
         self.set_s(dst[1], '(%s == 0u ? 0xffffffffu : 31u - firstbithigh(%s))' % (src_u, src_u))
         return None
 
+    def op_s_quadmask_b64(self, ops, mods):
+        """Collapse each nibble of a 64-bit source into bits of D.lo; D.hi = 0 (#1723).
+
+        RDNA 2 ISA SOP1 / pixel_aot: bit g of D.lo is 1 iff nibble g of the 64-bit source is
+        nonzero (sixteen nibbles → bits 0..15). SCC = (D.lo | D.hi) != 0.
+        Integer inline constants are 64-bit; 32-bit literals zero-extend.
+        Lane masks and descriptor SGPRs are refused.
+        """
+        if mods or len(ops) != 2:
+            raise Unsupported('s_quadmask_b64 with %d operands, expected 2 unmodified' % len(ops))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[2] != dst[1] + 1 or dst[2] > 105 or dst[1] % 2:
+            raise Unsupported('s_quadmask_b64 destination %s' % ops[0])
+        if any(r in self.masks for r in range(dst[1], dst[2] + 1)) or self.is_lane_mask(ops[0]):
+            raise Unsupported('s_quadmask_b64 on a lane mask')
+
+        def nibble_mask(word):
+            folded = 0
+            for group in range(8):
+                if word & (0xf << (group * 4)):
+                    folded |= 1 << group
+            return folded
+
+        def nibble_expr(src_u):
+            return '(%s)' % ' | '.join(
+                '((%s & 0x%xu) != 0u ? %du : 0u)' % (src_u, 0xf << (g * 4), 1 << g)
+                for g in range(8))
+
+        imm = re.fullmatch(r'0x[0-9a-fA-F]{1,8}|-?\d+', ops[1])
+        if imm:
+            value = int(ops[1], 0) & 0xffffffffffffffff
+            folded = nibble_mask(value & 0xffffffff) | (nibble_mask(value >> 32) << 8)
+            self.set_s(dst[1], '0x%08xu' % folded, ('const', folded), scc='$ != 0')
+            self.set_s(dst[1] + 1, '0u', ('const', 0))
+            return None
+        src = reg_range(ops[1])
+        if src is None or src[0] != 's' or src[2] > 105 or src[2] - src[1] != 1 or src[1] % 2:
+            raise Unsupported('s_quadmask_b64 source %s' % ops[1])
+        if any(r in self.masks for r in range(src[1], src[2] + 1)):
+            raise Unsupported('s_quadmask_b64 on a lane mask')
+        for n in range(src[1], src[2] + 1):
+            sym = self.sym.get(n)
+            if sym and sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+                raise Unsupported('s_quadmask_b64 on %s data' % sym[0])
+        lo_sym, hi_sym = self.sym.get(src[1]), self.sym.get(src[2])
+        if (lo_sym and lo_sym[0] == 'const' and hi_sym and hi_sym[0] == 'const'):
+            folded = nibble_mask(lo_sym[1] & 0xffffffff) | (nibble_mask(hi_sym[1] & 0xffffffff) << 8)
+            self.set_s(dst[1], '0x%08xu' % folded, ('const', folded), scc='$ != 0')
+            self.set_s(dst[1] + 1, '0u', ('const', 0))
+            return None
+        lo_u, hi_u = self.S(src[1]), self.S(src[2])
+        # Low 8 bits from the low word; next 8 bits from the high word. High result word is 0.
+        expr = '((%s) | ((%s) << 8u))' % (nibble_expr(lo_u), nibble_expr(hi_u))
+        self.set_s(dst[1], expr, scc='$ != 0')
+        self.set_s(dst[1] + 1, '0u', ('const', 0))
+        return None
 
     def op_s_quadmask_b32(self, ops, mods):
         """Collapse each nibble of S0 to one bit of D; SCC = result != 0 (#1723).
 
         RDNA 2 ISA SOP1 / pixel_aot: bit g of D is 1 iff nibble g of S0 is nonzero.
-        Lane masks and descriptor-bearing SGPRs are refused. The 64-bit form stays out of scope.
+        Lane masks and descriptor-bearing SGPRs are refused.
         """
         if mods or len(ops) != 2:
             raise Unsupported('s_quadmask_b32 with %d operands, expected 2 unmodified' % len(ops))

@@ -8319,6 +8319,18 @@ word (plus an SCC-dependent branch token) against the same reference:
 `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_abs_dispatch_warp$' -V`.
 [Refs #1723](https://github.com/R0Y00/Xbox2Windows/issues/1723).
 
+**Scalar 64-bit quad mask.** Startup translation lowers `s_quadmask_b64` so each
+output bit is the OR of one four-bit group of the 64-bit source: sixteen nibbles
+become bits 0..15 of `D.lo`, `D.hi` is 0, and `SCC = (D.lo | D.hi) != 0`, matching
+`pixel_aot`. Integer inline constants are interpreted at 64 bits.
+An encoded 32-bit literal zero-extends to 64 bits.
+Lane masks, descriptor-bearing SGPRs, and odd-aligned pairs are refused. Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_quadmask_b64$' -V`
+(or `python3 -B tests/startup_gfx2hlsl_s_quadmask_b64_check.py`). The fixture is
+CPU-only and compares negative inline constants with 32-bit literals that
+have the same low word.
+[Refs #1723](https://github.com/R0Y00/Xbox2Windows/issues/1723).
+
 **Scalar find-first-zero.** Startup translation lowers `s_ff0_i32_b32` to
 `firstbitlow(~S0)` (0xffffffff when every bit is set), matching `pixel_aot` /
 `ff0_i32_b32`. SCC is unchanged. Lane masks and descriptor-bearing sources are
