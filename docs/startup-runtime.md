@@ -118,7 +118,11 @@ the registers the routine loaded. The routine's code is not in the shader contai
 
 The stand-in reads the `INPUT_LAYOUT` subobject and publishes it next to the request as `req_<key>.ia`, before
 `.a`. The file holds `ia1 <count>` and then one line per element: semantic, index, format, slot, offset, class
-and step rate. A stream with a non-empty layout includes that text in its cache key; other keys are unchanged.
+and step rate. A stream with a non-empty layout includes that text in its cache key; other keys are unchanged. A layout declared
+with zero elements publishes nothing by default, so the fetch is refused and not drawn, like an absent or unreadable
+layout. With the experimental opt-in `X2W_STREAM_ZERO_FILL=1` it is published as the single line `ia1 0`, and the
+translation reads every fetched register as zero. That zero value is an assumption, not a measurement: no independent
+reference shows what a fetched input holds for a zero-element layout, so no startup claim rests on it.
 One log line per stream gives the element count and, for each element, format, slot, offset and class:
 `x2w-draw stream input layout: 2 elements (format/slot/offset/class) 6/0/0/0 6/0/4294967295/0`.
 
