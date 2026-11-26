@@ -15735,6 +15735,17 @@ The [MASM fixture](../tests/cpu/switch_sal.asm) emits explicit `/6` byte sequenc
 
 Not covered by this experiment: `SAL` outside leaf/switch-lifted functions, and title CPU code execution.
 
+## Startup list Dispatch
+
+Command-list slot 14 (`Dispatch`) is recorded on the desktop list only when the list is open and direct or compute, a desktop compute pipeline and a desktop compute root signature are bound, the compute root declares no static samplers and only root SRV parameters (slot 43), the compute pipeline was built against that same root signature, every root SRV the root declares was set since the root was bound (a rejected or unaligned replacement clears its binding), and every group count is at most 65535. Zero groups on an axis is forwarded and runs nothing. A root with other parameters is refused with `compute root arguments are not forwarded`, a pipeline from another root with `compute pipeline was built against another root signature`, an unset or rejected root SRV with `a compute root SRV is not bound`. Of the compute root arguments, only root SRVs (slot 43) reach the desktop list: slot 35 records descriptor tables without setting them, and slots 37, 39, 41 and 45 have no handler yet, so a dispatch under any other argument would run with it unset. The first 16 refusals in a process are logged as `x2w-render Dispatch(x, y, z) refused: <reason>`.
+
+`tests/startup_list_dispatch_check.cpp` checks the decision without a device; its five mutated runs must fail. `tests/startup_list_dispatch_native.cpp` drives slots 86, 25, 33, 43, 148, 14, 9 and 139 of the stand-in on a desktop device, on WARP and on a hardware adapter (77 without one), with the debug layer when it is installed. Each refused case must log exactly one refusal line with the expected reason: a root SRV never set, a rejected or misaligned slot 43 replacement after a valid one, a root changed and changed back without slot 43, a pipeline built against another root, a root with a descriptor table, a root with a static sampler, an unset root SRV with zero groups, more than 65535 groups, a closed list, and a Reset list without new bindings. A forwarded case must log no line. Around each call on an open list the fixture records a pipeline-statistics query on the desktop list: `CSInvocations` must be 4 per group for a forwarded call and 0 for a refused one. The fully bound call is recorded alone and counted first, so a slot 14 that records nothing fails on its count. Each of the three recordings is executed to a fence, and the debug layer must report no error. The shader only declares its root SRV, so this shows that the desktop `Dispatch` is recorded and runs, not what a shader reads through the bound SRV. The `skip_srv` control drops slot 43 from the first forwarded case and must report that case as refused.
+
+```powershell
+cmake --build --preset dev --target startup_list_dispatch_check startup_list_dispatch_native
+ctest --preset dev --no-tests=error -R "^startup_list_dispatch" -V
+```
+
 ## Startup translator: explicit-gradient image_sample_d
 
 `tools/startup/gfx2hlsl.py` lowers the gfx1013 `image_sample_d` form in a pixel stage to `tex.SampleGrad(smp, uv, ddx, ddy)`. The address dwords are ddx, then ddy (one register per coordinate axis each), then the coordinates: six registers for 2D, seven for a 2D array (slice last), nine for a volume (a contiguous nine-dword volume address encoded as a sixteen-register range is trimmed to nine). Only `dim:`, `dmask:` and the cache-policy bits `dlc`, `glc`, `slc` are accepted.
