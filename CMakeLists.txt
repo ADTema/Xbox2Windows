@@ -3486,6 +3486,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Scalar sign-extends and conditional moves (batch 3 #2).
     add_test(NAME startup_gfx2hlsl_s_sext_cmov COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_sext_cmov_check.py")
+    # s_bfm_b64 (#1723).
+    add_test(NAME startup_gfx2hlsl_bfm_b64 COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_bfm_b64_check.py")
     # SDWA forms of the float-result conversions (#1727).
     add_test(NAME startup_gfx2hlsl_sdwa_cvt COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sdwa_cvt_check.py")
@@ -3901,6 +3904,15 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_bit_alu_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_bit_alu_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    endforeach()
+    # s_bfm_b64 read back on a desktop adapter: widths 0/1/31/32/33/63 x offsets 0/1/31/32/63 from run-time root
+    # constants against the bit-loop reference (FXC 5_1 and DXC 6_0), with an uncapped reference and a mutated lowering
+    # that the draw must reject. The startup_gfx2hlsl_bfm_b64 test above holds the CPU controls.
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_bfm_b64_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_bfm_b64_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_gfx2hlsl_bfm_b64_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     endforeach()
     # gfx2hlsl two- and one-source integer vector operations (VEC_U): translation controls, then the same draw
     # of the translated pairs with reference words and one mutated lowering per operation.
