@@ -15795,6 +15795,29 @@ cmake --build --preset release --target startup_stream_consumer
 ctest --preset release --no-tests=error -R '^startup_(copied_vertex_srv|address_buffer_srv|frame_copy)_(warp|hardware)$' -V
 ```
 
+### Direct indexed draws after CPU writes
+
+For a direct translated draw with no vertex-stream SRVs, the shim binds a
+live placed index-buffer alias when the drawn range and alignment are known.
+The recording holds the desktop resource. The draw can then consume CPU
+changes completed before submission, as required for CPU-accessible buffers
+by [ID3D12Resource::Map](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12resource-map#advanced-usage-models).
+Draws that slice and rebase a vertex stream still use the recording-time
+index snapshot together with the stream range computed from it.
+
+`startup_direct_index_late_write` reuses the source-built #2714 repro. It
+draws a visible or fully clipped triangle and compares all 32 pixels after
+the fence. Unchanged controls, both directions of a pre-submit rewrite, and
+a 32-bit index view with one leading decoy element distinguish the requested
+range and the time at which its contents are read. The fixture requires
+support for opening existing heaps. It does not identify the index writer
+or geometry used by an executable trace.
+
+```powershell
+cmake --build --preset release --target startup_stream_consumer
+ctest --preset release --no-tests=error -R '^startup_direct_index_late_write_(warp|hardware)$' -V
+```
+
 ```powershell
 cmake --build --preset release --target startup_memory_srv_report_check startup_stream_consumer d3d12_xs_shim
 ctest --preset release --no-tests=error -R '^(startup_memory_srv_report|startup_address_srv_)' -V
