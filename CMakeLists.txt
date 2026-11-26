@@ -102,6 +102,13 @@ target_compile_features(memory_query_check PRIVATE cxx_std_17)
 target_link_libraries(memory_query_check PRIVATE psapi)
 add_test(NAME desktop_memory_query COMMAND memory_query_check)
 
+# tracy_new.cpp against a recording stand-in for Tracy's memory macros (no Tracy fetched, runs in every build).
+add_executable(tracy_new_check tests/tracy_new_check.cpp)
+target_compile_features(tracy_new_check PRIVATE cxx_std_17)
+target_include_directories(tracy_new_check PRIVATE tests/fixtures/tracy_fake)
+target_compile_definitions(tracy_new_check PRIVATE X2W_TRACY=1 X2W_TRACY_HEAP="test C++ heap")
+add_test(NAME tracy_new COMMAND tracy_new_check)
+
 add_executable(xmem_committed_memory_check tests/xmem_committed_memory_check.cpp)
 target_compile_features(xmem_committed_memory_check PRIVATE cxx_std_17)
 target_link_libraries(xmem_committed_memory_check PRIVATE OneCore)
@@ -551,11 +558,11 @@ target_link_libraries(d3d12_xs_shim PRIVATE user32 gdi32 d3dcompiler dxgi x2w_bu
 target_compile_options(d3d12_xs_shim PRIVATE /bigobj)
 set_target_properties(xmem_shim d3d12_xs_shim ${startup_stub_targets} PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-# Developer-only measurement build: Tracy zones in the stand-ins (src/startup_stubs/profile_zone.h).
+# Developer-only measurement build: Tracy zones and memory pools in the stand-ins (src/startup_stubs/profile_zone.h).
 # One shared TracyClient.dll serves every instrumented DLL. Off (the default), nothing is fetched, defined or linked.
 # On, Tracy (BSD-3-Clause, see docs/startup-runtime.md) is fetched at the pinned commit below, or taken from an existing
 # checkout with -DFETCHCONTENT_SOURCE_DIR_TRACY=<path>. The client opens a local socket; see docs/startup-runtime.md.
-option(X2W_TRACY "Instrument the startup stand-ins with Tracy zones (fetches Tracy v0.15.0)" OFF)
+option(X2W_TRACY "Instrument the startup stand-ins with Tracy zones and memory pools (fetches Tracy v0.15.0)" OFF)
 if(X2W_TRACY)
     include(FetchContent)
     set(CMAKE_POLICY_DEFAULT_CMP0091 NEW)  # Tracy's 3.13 minimum would otherwise ignore MSVC_RUNTIME_LIBRARY
@@ -576,7 +583,8 @@ if(X2W_TRACY)
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
     foreach(target IN ITEMS d3d12_xs_shim startup_stub_xcrdapi xmem_shim)
         target_link_libraries(${target} PRIVATE Tracy::TracyClient)
-        target_compile_definitions(${target} PRIVATE X2W_TRACY=1)
+        target_compile_definitions(${target} PRIVATE X2W_TRACY=1 X2W_TRACY_HEAP="${target} C++ heap")
+        target_sources(${target} PRIVATE src/startup_stubs/tracy_new.cpp)
     endforeach()
 endif()
 add_executable(startup_null_views_check tests/startup_null_views_check.cpp)
