@@ -799,11 +799,12 @@ def names_one_value(sym):
     if sym is None:
         return False
     if sym[0] == 'desc':
-        # ('desc', source, load offset, dword) and, in a compute stage, the offset of the s_load that read it: the
-        # source does not record an addend on the pointer, so only the same load proves the same words.
+        # A compute descriptor can also carry an integer tag identifying the load or constant high word.
         return len(sym) == 4 or (len(sym) == 5 and isinstance(sym[4], int))
-    # An add on a pointer keeps its symbol and marks it 'added' (the offset is not in the tuple), so only an
-    # untouched pointer, exactly (kind, source), names one value.
+    # A table and a known byte offset identify one descriptor address. The legacy 'added'
+    # marker carries no offset, so two occurrences of it can denote different addresses.
+    if sym[0] == 'ptr' and len(sym) == 3 and sym[1][0] == 'table':
+        return isinstance(sym[2], int)
     return sym[0] in ('const', 'ud', 'execcopy') or (sym[0] in ('ptr', 'ptrhi') and len(sym) == 2)
 
 
@@ -2479,6 +2480,10 @@ class Stage:
                 target = int(parse(asm)[1][0].split('_')[1], 16)
                 targets.add(target)
                 branches.append((off, target))
+        # Forward edges reach each block in disassembly order. A back edge could
+        # repeat a pointer advance before the next table load.
+        self.forward_table_adds = (getattr(self, 'kind', None) in ('vs', 'ps') and bool(branches)
+                                   and all(target > pc for pc, target in branches))
         # Targets that only forward s_cbranch_execz branches (and the fall-through) enter: on a taken edge the lane's
         # exec bit is 0 at the target. Compute stages have their own execz handling and are left out.
         names = {off: name for off, _n, name, _asm in self.ins}
@@ -3424,8 +3429,9 @@ class Stage:
         if base not in ('s_add_u32', 's_addc_u32') or len(srcs) != 2 or not syms[0]:
             return False
         if getattr(self, 'has_branches', False):
-            # The symbolic update runs once in disassembly order; a branch could skip it or repeat it at run time.
-            return False
+            if (not getattr(self, 'forward_table_adds', False) or base != 's_add_u32'
+                    or syms[0][0] != 'ptr' or syms[0][1][0] != 'table'):
+                return False
         reg = reg_range(dname)
         if not reg or reg[0] != 's' or reg[1] != reg[2] or reg[1] > 105:
             return False
@@ -3437,6 +3443,10 @@ class Stage:
             if added > 0xfffff:
                 raise Unsupported('descriptor pointer offset %s' % srcs[1])
             before = syms[0][2] if len(syms[0]) > 2 else 0
+            if not isinstance(before, int):
+                raise Unsupported('add through a pointer with unknown byte offset')
+            if getattr(self, 'forward_table_adds', False) and before + added > 0xfffff:
+                raise Unsupported('accumulated table pointer offset %#x' % (before + added))
             self.sym[d] = ('ptr', syms[0][1], before + added)
             if syms[0][1][0] in PTR64_SOURCES and d + 1 <= 105:
                 # The carry-in of an s_addc_u32 is only the carry of this very add: remember where the next
@@ -3595,7 +3605,7 @@ class Stage:
                     self.sym[d] = own[:4] + ('modified',)
                     getattr(self.pipe, 'other_modified', set()).add(desc_key(own))
                 else:
-                    self.sym[d] = own if len(own) > 2 else own + ('added',)  # the added offset is not tracked
+                    self.sym[d] = own[:2] + ('added',)  # this operation has no proven byte offset
             else:
                 self.sym[d] = ('descnum',)
             return None
@@ -4012,10 +4022,8 @@ class Stage:
                 for i in range(count):
                     self.set_s(dst[1] + i, '%s.Load(%d)' % (buf, base_off + off + 4 * i))
                 return
-            # The pointer symbol does not record an addend or a rewritten high word, so two loads through such a
-            # pointer may read different words under the same (source, offset). In a compute or vertex stage (the
-            # stages that accept a raw descriptor conversion before a store) those loads are told apart by the
-            # offset of the s_load; loads through the untouched pair keep one identity.
+            # A compute or vertex raw-store conversion must distinguish loads through different high words
+            # even when the source and byte offset match. Keep the load PC for a changed pointer pair.
             # A 32-bit table pointer carries a high word the program sets to a constant: loads through the same
             # untouched low word and the same constant read the same words (tag -1 - constant).
             hi = self.sym.get(base[1] + 1)
