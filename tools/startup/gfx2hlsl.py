@@ -5770,16 +5770,80 @@ class Stage:
                    % (rest, shift, bits, value, shift))
 
     def op_s_ff1_i32_b32(self, ops, mods):
-        if self.kind != 'cs' or mods or len(ops) != 2 or ops[1] != 'exec_lo':
-            raise Unsupported('s_ff1_i32_b32 requires compute exec_lo')
+        """Find first set bit in a 32-bit scalar; SCC unchanged (#2022 Item F).
+
+        The compute-entry special case on `exec_lo` still folds to lane 0. Every other accepted
+        source uses `firstbitlow` (0xffffffff when the word is zero), matching `pixel_aot`.
+        """
+        if mods or len(ops) != 2:
+            raise Unsupported('s_ff1_i32_b32 with %d operands, expected 2 unmodified' % len(ops))
         dst = reg_range(ops[0])
         if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
-            raise Unsupported('s_ff1_i32_b32 requires one SGPR destination')
-        if self.past_entry or not self.exec_known:
-            raise Unsupported('s_ff1_i32_b32 requires the compute entry EXEC mask')
-        # At dispatch entry even the last partial wave starts at lane zero.
-        # FF1 reports its index and leaves SCC unchanged.
-        self.set_s(dst[1], '0u', ('const', 0))
+            raise Unsupported('s_ff1_i32_b32 destination %s' % ops[0])
+        if ops[1] == 'exec_lo':
+            if self.kind != 'cs':
+                raise Unsupported('s_ff1_i32_b32 of exec_lo outside compute')
+            if getattr(self, 'past_entry', False) or not getattr(self, 'exec_known', False):
+                raise Unsupported('s_ff1_i32_b32 requires the compute entry EXEC mask')
+            # At dispatch entry even the last partial wave starts at lane zero.
+            self.set_s(dst[1], '0u', ('const', 0))
+            return None
+        if self.is_lane_mask(ops[0]) or self.is_lane_mask(ops[1]) or dst[1] in self.masks:
+            raise Unsupported('s_ff1_i32_b32 on a lane mask')
+        imm = re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', ops[1])
+        if imm:
+            value = int(ops[1], 0) & 0xffffffff
+            # firstbitlow of zero is -1; otherwise the lowest set bit index.
+            folded = 0xffffffff if value == 0 else (value & -value).bit_length() - 1
+            self.set_s(dst[1], '0x%08xu' % folded, ('const', folded))
+            return None
+        src = reg_range(ops[1])
+        if not src or src[0] != 's' or src[1] != src[2] or src[1] > 105:
+            raise Unsupported('s_ff1_i32_b32 source %s' % ops[1])
+        if src[1] in self.masks:
+            raise Unsupported('s_ff1_i32_b32 on a lane mask')
+        sym = self.sym.get(src[1])
+        if sym and sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+            raise Unsupported('s_ff1_i32_b32 on %s data' % sym[0])
+        if sym and sym[0] == 'const':
+            value = sym[1] & 0xffffffff
+            folded = 0xffffffff if value == 0 else (value & -value).bit_length() - 1
+            self.set_s(dst[1], '0x%08xu' % folded, ('const', folded))
+            return None
+        self.set_s(dst[1], 'firstbitlow(%s)' % self.u(ops[1]))
+        return None
+
+    def op_s_ff1_i32_b64(self, ops, mods):
+        """Find first set bit of a 64-bit source; SCC unchanged (#2022 Item F).
+
+        A 32-bit SOP1 literal or inline constant zero-extends to 64 bits (high word 0)
+        and folds. An SGPR pair uses the same 64-bit firstbitlow scan as SCALAR_BITS
+        (`_ctz64` / #2072). Kept as a Stage method so immediates are not refused by the
+        pair-only SCALAR_BITS template.
+        """
+        if mods or len(ops) != 2:
+            raise Unsupported('s_ff1_i32_b64 with %d operands, expected 2 unmodified' % len(ops))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
+            raise Unsupported('s_ff1_i32_b64 destination %s' % ops[0])
+        if self.is_lane_mask(ops[0]) or dst[1] in self.masks:
+            raise Unsupported('s_ff1_i32_b64 on a lane mask')
+        imm = re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', ops[1])
+        if imm:
+            # Encoding: one 32-bit literal/inline; the ISA zero-extends it (hi = 0).
+            value = int(ops[1], 0) & 0xffffffff
+            folded = 0xffffffff if value == 0 else (value & -value).bit_length() - 1
+            self.set_s(dst[1], '0x%08xu' % folded, ('const', folded))
+            return None
+        src = reg_range(ops[1])
+        if src is None or src[0] != 's' or src[2] > 105 or src[2] - src[1] != 1:
+            raise Unsupported('s_ff1_i32_b64 source %s' % ops[1])
+        if any(r in self.masks for r in range(src[1], src[2] + 1)):
+            raise Unsupported('s_ff1_i32_b64 on a lane mask')
+        lo, hi = self.S(src[1]), self.S(src[2])
+        self.masks.discard(dst[1])
+        self.set_s(dst[1], _ctz64(lo, hi))
+        return None
 
     def op_s_abs_i32(self, ops, mods):
         """Signed absolute value; SCC = result != 0 (#1723).
@@ -7213,7 +7277,8 @@ SCALAR_BITS = {
     's_bcnt0_i32_b64': (True, lambda lo, hi: '(64u - countbits(%s) - countbits(%s))' % (lo, hi), '$ != 0'),
     's_bcnt1_i32_b64': (True, lambda lo, hi: '(countbits(%s) + countbits(%s))' % (lo, hi), '$ != 0'),
     's_ff0_i32_b64': (True, lambda lo, hi: _ctz64('(~%s)' % lo, '(~%s)' % hi), None),
-    's_ff1_i32_b64': (True, _ctz64, None),
+    # s_ff1_i32_b64 stays on Stage.op_s_ff1_i32_b64 (immediates + SGPR pairs) so SCALAR_BITS
+    # does not overwrite the zero-extended immediate fold from #2022 Item F.
     's_flbit_i32_b64': (True, _clz64, None),
     's_flbit_i32_i64': (True, _flbit_i64, None),
 }

@@ -8115,6 +8115,20 @@ destination with a known bit index folds. Run
 `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_bitset$' -V`
 (or `python3 -B tests/startup_gfx2hlsl_s_bitset_check.py`). The fixture is
 CPU-only; Windows WARP/hardware draws are left for an independent retest.
+**Scalar find-first-one.** Startup translation lowers `s_ff1_i32_b32` of a
+general scalar to `firstbitlow` (0xffffffff when the word is zero), matching
+`pixel_aot` / Mesa. The compute-entry special case on `exec_lo` still folds to
+lane 0. SCC is unchanged. Lane masks and descriptor-bearing sources are
+refused. `s_ff1_i32_b64` accepts a 32-bit SOP1 literal/inline (ISA zero-extends
+the high word to 0) and folds it, and also lowers a live SGPR pair with the same
+64-bit firstbitlow scan as the scalar bit-scan forms. Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_ff1$' -V`
+(or `python3 -B tests/startup_gfx2hlsl_s_ff1_check.py`). The `_dispatch_warp`
+/ `_dispatch_hardware` variants compile the translated `firstbitlow` into a
+compute shader and compare UAV readback for inputs 0, 1, 0x80000000 and
+0x00010000 (and the zero-extended b64 immediates) against the same reference:
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_ff1_dispatch_warp$' -V`.
+[Refs #2022](https://github.com/R0Y00/Xbox2Windows/issues/2022) Item F.
 
 **Scalar find-first-bit-high.** Startup translation lowers `s_flbit_i32_b32` to
 `S0 == 0 ? 0xffffffff : 31 - firstbithigh(S0)`, matching `pixel_aot` /
