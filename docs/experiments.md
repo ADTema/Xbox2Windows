@@ -16103,6 +16103,20 @@ Building on #2443 (Slice 1), `X2W_D3D12_RELEASE_RETIRED=1` extends desktop objec
 ctest --preset dev --no-tests=error -R '^startup_resource_(retire|budget)' -V
 ```
 
+## Refusing unmodelled modifiers in the startup translator
+
+Several `Stage` instruction handlers accepted a `mods` list without reading it, so an encoding modifier such as
+`clamp`, `omod` (`mul:2`), or `op_sel` on `v_mov_b32`, `v_cvt_pkrtz_f16_f32`, or `v_interp_mov_f32` was silently
+dropped from the emitted HLSL (#1771). `MODIFIER_FREE_HANDLERS` declares these five handlers (`op_v_mov_b32`,
+`op_v_cvt_pkrtz_f16_f32`, `op_v_interp_p1_f32`, `op_v_interp_p2_f32`, and `op_v_interp_mov_f32`), and `Stage.one`
+refuses any non-empty `mods` list before dispatching to them. Scalar-ALU handlers are omitted because their encodings
+have no modifier field. Separately, `op_v_interp_p1_f32` and `op_v_interp_p2_f32` refuse `abs`/`neg` modifiers (`|...|`
+or `-...`) printed on the ignored data-source operand (`ops[1]`).
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_modifier_free$' -V
+```
+
 ## Source `abs` modifiers (`|src|` and `-|src|`) on `v_cndmask_b32_e64` in the startup translator
 
 `Stage.u_src` in [`tools/startup/gfx2hlsl.py`](../tools/startup/gfx2hlsl.py#L1506-L1521) now strips `|...|` after `split_neg(tok)` for `v_cndmask_b32_e64` data sources (`src0` and `src1`, both VGPRs and SGPRs), clearing the `off_diag.py` refusal `operand '|v0|' at v_cndmask_b32_e64 v0, v0, |v0|, s30`. Per the RDNA2 VOP3A source-modifier order, `abs` clears bit 31 (`& 0x7fffffffu`) first and `neg` flips bit 31 (`^ 0x80000000u`) second:
