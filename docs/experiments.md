@@ -8202,6 +8202,18 @@ against the same reference (including `flbit(0) == 0xffffffff`):
 `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_flbit_dispatch_warp$' -V`.
 [Refs #1723](https://github.com/R0Y00/Xbox2Windows/issues/1723).
 
+**Scalar quad mask.** Startup translation lowers `s_quadmask_b32` so each
+output bit is the OR of one four-bit group of the source (8-bit result), with
+`SCC = (D != 0)`, matching `pixel_aot`. Lane masks and descriptor-bearing
+sources are refused. The 64-bit form stays refused. Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_quadmask$' -V`
+(or `python3 -B tests/startup_gfx2hlsl_s_quadmask_check.py`). The
+`_dispatch_warp` / `_dispatch_hardware` variants compile the translated
+expression into a compute shader and compare UAV readback for 0, a low
+nibble, bit 31 and `0x000f0000` (plus an SCC-dependent branch token):
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_quadmask_dispatch_warp$' -V`.
+[Refs #1723](https://github.com/R0Y00/Xbox2Windows/issues/1723).
+
 **Scalar immediate comparisons.** The startup translator sign-extends the
 16-bit field of `s_movk_i32` and `s_cmpk_*_i32`, and zero-extends the field
 of `s_cmpk_*_u32`. The source-built check covers all six relations against
